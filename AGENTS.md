@@ -27,9 +27,10 @@ DECIDE. NO DEFAULTS. NO "SENSIBLE CHOICE". NO "I'LL PICK ONE AND MENTION IT".**
 
 The first build is committed. **`core/` and the first server build are written, and both pass `make all`.**
 The server has the first slice plus delete and edit in 1:1 chats, `received` and `marks`, driven in its
-tests by `core/src/client.rs` as a real client. **The bare web page runs it in the author's Chromium**
-through `web/wasm/`: two people on two origins signed up, set their words, started a 1:1 chat and
-exchanged encrypted text both ways, with `received` marks, and a reload reopened it from IndexedDB.
+tests by `core/src/client.rs` as a real client. **The account screens replaced the bare page and run in the author's Chromium**
+through `web/wasm/`. On the bare page, two people on two origins signed up, set their words, started a
+1:1 chat and exchanged encrypted text both ways, with `received` marks, and a reload reopened it from
+IndexedDB.
 `core/`'s own tests have not run under WASM. **Running its tests under a WASM runtime, and covering its remaining
 error paths, are still to do:** see [core/tests/AGENTS.md](core/tests/AGENTS.md).
 
@@ -38,7 +39,7 @@ error paths, are still to do:** see [core/tests/AGENTS.md](core/tests/AGENTS.md)
 - **Next:** the web client, designed in [web/AGENTS.md](web/AGENTS.md), built in the author's order:
   first `core/src/client.rs`, with the server's tests driving it and `received` and `marks` added to the
   server, all passing `make all`; then `web/wasm/` and a bare worker that logs in and sends a message in
-  the author's Chromium, both done; then the screens. Running `core/`'s tests in WASM waits until after it starts:
+  the author's Chromium, both done; then the account screens (sign up, log in, the setup link and the words), checked in the author's Chromium. The chat list is next. Running `core/`'s tests in WASM waits until after it starts:
   see [core/tests/AGENTS.md](core/tests/AGENTS.md).
 
 Delete this section when it stops being true.
@@ -563,6 +564,9 @@ ULID text. The cookie is called `keryx_session`.
 ```
 Anyone
 GET  /api/v1                        the guide, as plain text
+GET  /api/v1/public/features        -> registration, captcha. Anyone, before an account.
+                                    The login screen reads it and offers sign up only when
+                                    registration is true
 GET  /api/v1/captcha                -> id, image
 POST /api/v1/register               username, password, display_name?, captcha? -> account
 POST /api/v1/login                  username, password, captcha?, device?{id, challenge, signature}
@@ -811,10 +815,14 @@ accepts the first for each step. The loser gets a rejection, catches up and retr
   keep_for = "1d"           # captchas expired longer ago than this go
   # For the tests only, never in production: every captcha has this answer.
   # test_answer = "12345"
+  # pass_code = "THE CODE" # accepted as well as the drawn answer. Unset: only the drawn one
   ```
 
   **`test_answer` is how tests pass the captcha simply**, with one static answer. The
-  server warns at startup whenever it is set.
+  server warns at startup whenever it is set. **`pass_code` is accepted as well as the
+  drawn answer**, still against a captcha id, and one check uses that id up either way.
+  Case follows `case_sensitive`. The server warns at startup whenever it is set, and
+  the code itself is not logged.
 - **The password logs in. The words decrypt.** The password only authenticates to
   the server and decrypts nothing. **The words never leave the device.**
 - **Words can reset a forgotten password**, by signing a challenge from the server, along with

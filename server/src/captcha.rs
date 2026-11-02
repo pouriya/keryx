@@ -71,6 +71,8 @@ pub struct Settings {
     pub keep_for: u64,
     /// For the tests only: every captcha has this answer.
     pub test_answer: Option<String>,
+    /// Accepted as well as the drawn answer. Unset: only the drawn answer.
+    pub pass_code: Option<String>,
 }
 
 impl Default for Settings {
@@ -85,6 +87,7 @@ impl Default for Settings {
             sweep_every: 600,
             keep_for: 86_400,
             test_answer: None,
+            pass_code: None,
         }
     }
 }
@@ -249,10 +252,20 @@ pub async fn check(app: &App, given: Option<CaptchaAnswer>) -> Result<(), Refuse
             answer.push(latin);
         }
     }
-    let right = if settings.case_sensitive {
-        answer == stored
-    } else {
-        answer.to_lowercase() == stored.to_lowercase()
+    let same = |left: &str, right: &str| {
+        if settings.case_sensitive {
+            left == right
+        } else {
+            left.to_lowercase() == right.to_lowercase()
+        }
     };
-    if right { Ok(()) } else { Err(wrong) }
+    let pass = settings
+        .pass_code
+        .as_deref()
+        .filter(|code| !code.is_empty());
+    if same(&answer, &stored) || pass.is_some_and(|code| same(&answer, code)) {
+        Ok(())
+    } else {
+        Err(wrong)
+    }
 }

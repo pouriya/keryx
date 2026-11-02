@@ -39,10 +39,10 @@ use keryx_core::protocol::{
     AccountInfo, AccountKeysBody, AccountListReply, AccountReply, Bytes, ChallengeBody,
     ChallengeReply, ChatDeviceListReply, ChatReply, ClientFrame, ContentKind, CountReply,
     CreateAccountBody, CreateChatBody, CreatedAccountReply, DeviceListReply, DeviceReply,
-    DevicesReply, EmptyReply, GroupInfoReply, KeyPackageListReply, KeyPackagesBody, LoginBody,
-    LoginReply, ReducedDeviceItem, ReducedDeviceListReply, RegisterBody, RegisterDeviceBody,
-    ResetBody, SelfChatReply, ServerFrame, SessionListReply, SetupBody, SetupReply, SignedBody,
-    WrapListReply,
+    DevicesReply, EmptyReply, FeaturesReply, GroupInfoReply, KeyPackageListReply, KeyPackagesBody,
+    LoginBody, LoginReply, ReducedDeviceItem, ReducedDeviceListReply, RegisterBody,
+    RegisterDeviceBody, ResetBody, SelfChatReply, ServerFrame, SessionListReply, SetupBody,
+    SetupReply, SignedBody, WrapListReply,
 };
 use keryx_core::ulid::Ulid;
 use serde::de::DeserializeOwned;
@@ -649,6 +649,14 @@ async fn hash_password(password: String) -> Result<String, Refused> {
 // -------------------------------------------------------------------------------------------------
 // Accounts and logins
 // -------------------------------------------------------------------------------------------------
+
+pub async fn run_features(app: &App, caller: &Caller) -> Result<FeaturesReply, Refused> {
+    check(app, caller, Need::Anyone).await?;
+    Ok(FeaturesReply {
+        registration: app.settings.registration.allow,
+        captcha: app.settings.captcha.is_some(),
+    })
+}
 
 pub async fn run_register(
     app: &App,
@@ -1594,6 +1602,13 @@ async fn captcha_route(State(app): Shared) -> Response {
     respond(operation!("Captcha", "captcha", captcha::run_issue(&app)))
 }
 
+async fn features(State(app): Shared, headers: HeaderMap) -> Response {
+    respond(operation!("Features", "features", async {
+        let caller = caller_of(&app, &headers).await?;
+        run_features(&app, &caller).await
+    }))
+}
+
 async fn register(State(app): Shared, headers: HeaderMap, body: Body) -> Response {
     respond(operation!("Register", "register", async {
         let caller = caller_of(&app, &headers).await?;
@@ -2150,6 +2165,7 @@ fn router(app: Arc<App>, www: &FilePath) -> Router {
         .route("/api/v1", get(guide))
         .route("/api/v1/ws", get(websocket))
         .route("/api/v1/captcha", get(captcha_route))
+        .route("/api/v1/public/features", get(features))
         .route("/api/v1/register", post(register))
         .route("/api/v1/login", post(login))
         .route("/api/v1/login/token", post(login_token))
@@ -2395,6 +2411,14 @@ pub async fn serve(settings: Settings) -> Result<(), ServeError> {
         && captcha.test_answer.is_some()
     {
         tracing::warn!(msg = "Every captcha has one fixed answer, which is for tests only");
+    }
+    if let Some(captcha) = &settings.captcha
+        && captcha
+            .pass_code
+            .as_ref()
+            .is_some_and(|code| !code.is_empty())
+    {
+        tracing::warn!(msg = "A captcha pass code is set, so that code is accepted too");
     }
 
     #[cfg(not(target_os = "linux"))]

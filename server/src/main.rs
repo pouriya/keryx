@@ -153,7 +153,8 @@ fn read_configuration(path: &Path) -> anyhow::Result<Settings> {
                 .optional_any("case_sensitive")
                 .optional("sweep_every", DurationValue::new().to_int())
                 .optional("keep_for", DurationValue::new().to_int())
-                .optional_any("test_answer"),
+                .optional_any("test_answer")
+                .optional_any("pass_code"),
         );
     let settings: Settings = match tanzim::Config::default()
         .with_source(tanzim::source::file(path.to_string_lossy()))

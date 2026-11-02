@@ -8,8 +8,8 @@ use keryx_core::client::{
 };
 use keryx_core::mls::{AccountKey, Device, stamp_account_key};
 use keryx_core::protocol::{
-    AccountKeysBody, Bytes, ChatItem, ChatMode, ChatType, ClientFrame, ContentKind, Kind, MarkItem,
-    MessageFrame, SendFrame, ServerFrame, WrapEntry,
+    AccountKeysBody, Bytes, CaptchaAnswer, ChatItem, ChatMode, ChatType, ClientFrame, ContentKind,
+    Kind, MarkItem, MessageFrame, SendFrame, ServerFrame, WrapEntry,
 };
 use keryx_core::seed::derive;
 use keryx_core::ulid::Ulid;
@@ -219,6 +219,7 @@ fn signing_up_registers_then_logs_in_and_new_words_set_up_a_device() {
         Command::Setup {
             token: Secret("from-the-link".to_string()),
             password: Secret("a long enough password".to_string()),
+            captcha: None,
         },
     );
     let (asked, _, path, body) = request(&out);
@@ -561,6 +562,81 @@ fn the_directory_search_is_escaped_and_answered() {
 }
 
 #[test]
+fn the_login_screen_reads_what_the_server_allows() {
+    let mut client = Client::new(Auth::Cookie, platform());
+    let out = client.step(
+        Input::Loaded {
+            first: None,
+            second: None,
+        },
+        NOW,
+    );
+    assert_eq!(events(&out), vec![Event::NeedLogin]);
+    let (asked, method, path, body) = request(&out);
+    assert_eq!(method, "GET");
+    assert_eq!(path, "/api/v1/public/features");
+    assert!(body.is_null());
+    let out = ok(
+        &mut client,
+        asked,
+        json!({"registration": false, "captcha": true}),
+    );
+    assert_eq!(
+        events(&out),
+        vec![Event::Features {
+            registration: false,
+            captcha: true,
+        }]
+    );
+}
+
+#[test]
+fn a_captcha_is_fetched_and_signup_then_waits_for_another() {
+    let mut client = Client::new(Auth::Cookie, platform());
+    let out = command(&mut client, Command::Captcha);
+    let (asked, method, path, _) = request(&out);
+    assert_eq!(method, "GET");
+    assert_eq!(path, "/api/v1/captcha");
+    let captcha_id = id();
+    let out = ok(
+        &mut client,
+        asked,
+        json!({"id": captcha_id, "image": "data:image/png;base64,YQ=="}),
+    );
+    assert_eq!(
+        events(&out),
+        vec![Event::Captcha {
+            id: captcha_id,
+            image: "data:image/png;base64,YQ==".to_string(),
+        }]
+    );
+
+    let out = command(
+        &mut client,
+        Command::SignUp {
+            username: "sara_x".to_string(),
+            password: Secret("a long enough password".to_string()),
+            display_name: None,
+            captcha: Some(CaptchaAnswer {
+                id: captcha_id,
+                answer: "THE CODE".to_string(),
+            }),
+        },
+    );
+    let (asked, _, path, body) = request(&out);
+    assert_eq!(path, "/api/v1/register");
+    assert_eq!(body["captcha"]["answer"], "THE CODE");
+    let out = ok(&mut client, asked, json!({"account": id()}));
+    assert_eq!(
+        events(&out),
+        vec![Event::Registered {
+            username: "sara_x".to_string(),
+        }]
+    );
+    assert!(requests(&out).is_empty());
+}
+
+#[test]
 fn loading_saved_state_comes_back_or_asks_to_log_in() {
     let mut client = Client::new(Auth::Cookie, platform());
     let out = client.step(
@@ -663,6 +739,11 @@ fn a_logout_waits_for_the_server_and_a_terminate_signs_with_the_words() {
     let out = ok(&mut client, request(&out).0, json!({}));
     assert!(out.iter().any(|output| matches!(output, Output::Wipe)));
     assert!(events(&out).contains(&Event::LoggedOut));
+    let (_, method, path, _) = request(&out);
+    assert_eq!(
+        (method.as_str(), path.as_str()),
+        ("GET", "/api/v1/public/features")
+    );
     let out = command(&mut client, Command::LogOut);
     assert!(matches!(&events(&out)[0], Event::Error { code, .. } if code == "no_device"));
 
@@ -1766,6 +1847,9 @@ impl World {
                     "wraps" => reply_ok(json!({ "wrap_list": chat.wrap_list })),
                     _ => panic!("No such route: {method} {path}"),
                 }
+            }
+            ("GET", ["public", "features"]) => {
+                reply_ok(json!({"registration": true, "captcha": false}))
             }
             _ => panic!("No such route: {method} {path}"),
         }

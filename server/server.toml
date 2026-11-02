@@ -90,3 +90,4 @@ backlog = 1024
 # keep_for = "1d"           # captchas expired longer ago than this go
 # For the tests only, never in production: every captcha has this answer.
 # test_answer = "12345"
+# pass_code = "THE CODE"   # accepted as well as the drawn answer. Unset: only the drawn one

@@ -83,13 +83,15 @@ and `received`, history pages, acting on `revoked`, logout and terminate.
 **Its commands and events are what the page and the web worker exchange**, chosen by the author, and
 Android uses the same list. The first list, which grows as the code needs:
 
-- Commands, from the person: sign up, log in, `/setup` with its token, generate words (12 or 24), set
+- Commands, from the person: sign up, log in, a new captcha, `/setup` with its token, generate words (12 or 24), set
   words, restore, the chat list, open a chat, load older, start a chat, search the directory, send
   text, edit, delete, seen, typing, the device list, terminate (with the words), log out, and "the
   network is back".
 - Events, to show: the words (shown once), words needed, signed in, the chats, a message, an edit, a
   delete, pending, sent with its sequence id, marks, typing, search results, the device list, online,
-  offline, and an error with its code and text.
+  offline, what `GET /api/v1/public/features` said, a captcha image, and an error with its code and text. The features
+  read goes out when the person is asked to log in, and again after a logout, and sign up is offered
+  only when `registration` is set.
 - The platform's own, in: a server frame, a REST reply with its id, connected, closed, the timer,
   saved, save failed, and the two loaded snapshot slots. Out: a frame to send, a REST request with an
   id, connect, disconnect, save to a slot, and wake at a time.
@@ -148,7 +150,8 @@ with nothing missing below it. On every reconnect, each chat this session alread
 forward with `after_seq` from there to the latest, commits applied in order and content opened. A
 live frame that skips ahead starts the same fill. Live frames arriving during a fill are kept and
 handled after it, in order. After a reload there is no last id: the first `chats` list sets it, and
-nothing is backfilled.
+nothing is backfilled. The device is still there and the name is not, so the page hears `signed_in`
+when this account's name comes back.
 
 **Unanswered sends are matched by their exact signature** in those same pages, and resent only when
 absent. The old check looked at the newest 50 by send time and kind, and could duplicate or

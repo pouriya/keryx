@@ -151,6 +151,42 @@ fn an_expired_one_fails_and_the_sweep_removes_old_ones() {
 }
 
 #[test]
+fn a_pass_code_is_accepted_and_the_drawn_answer_still_is() {
+    let server = with_captcha("test_answer = \"12345\"\npass_code = \"THE CODE\"");
+    let issued = issue(&server);
+    let drawn = json!({"id": issued["id"], "answer": "12345"});
+    assert_eq!(register(&server, "sara_x", Some(drawn)).0, 200);
+    let issued = issue(&server);
+    let pass = json!({"id": issued["id"], "answer": "the code"});
+    assert_eq!(register(&server, "babak_x", Some(pass.clone())).0, 200);
+    assert_eq!(
+        register(&server, "reza_x", Some(pass)).1["code"],
+        "captcha_wrong",
+        "the earlier try used it up"
+    );
+
+    let server = with_captcha("pass_code = \"THE CODE\"\ncase_sensitive = true");
+    let issued = issue(&server);
+    let pass = json!({"id": issued["id"], "answer": "the code"});
+    assert_eq!(
+        register(&server, "sara_x", Some(pass)).1["code"],
+        "captcha_wrong"
+    );
+    let issued = issue(&server);
+    let pass = json!({"id": issued["id"], "answer": "THE CODE"});
+    assert_eq!(register(&server, "sara_x", Some(pass)).0, 200);
+}
+
+#[test]
+fn a_pass_code_warns_at_startup() {
+    let mut server = with_captcha("pass_code = \"THE CODE\"");
+    server.stop();
+    let log = std::fs::read_to_string(server.path("server.log")).unwrap();
+    assert!(log.contains("A captcha pass code is set"));
+    assert!(!log.contains("THE CODE"));
+}
+
+#[test]
 fn test_answer_warns_at_startup() {
     let mut server = with_captcha("test_answer = \"12345\"");
     server.stop();

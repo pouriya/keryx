@@ -18,6 +18,7 @@ else logs in with `POST /login/token`, which returns a token, and sends it as
 ## Anyone
 
     GET  /api/v1                 this guide
+    GET  /public/features        -> registration, captcha
     GET  /captcha                -> id, image. Only with a [captcha] section
     POST /register               username, password, display_name?, captcha?{id, answer} -> account
     POST /login                  username, password, captcha?, device?{id, challenge, signature}

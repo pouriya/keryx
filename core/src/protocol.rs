@@ -435,6 +435,14 @@ pub enum ServerFrame {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmptyReply {}
 
+/// What anyone can read before an account exists. `registration` is `[registration] allow`.
+/// `captcha` is whether a `[captcha]` section is set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeaturesReply {
+    pub registration: bool,
+    pub captcha: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CaptchaReply {
     pub id: Ulid,

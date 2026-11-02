@@ -90,6 +90,28 @@ fn the_web_client_is_served_with_index_for_any_path() {
 }
 
 #[test]
+fn features_say_whether_registration_and_a_captcha_are_on() {
+    let closed = Server::start("", "");
+    let (status, body) = closed.call("GET", "/api/v1/public/features", None, None);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["data"]["registration"], false);
+    assert_eq!(body["data"]["captcha"], false);
+
+    let open = open_server();
+    let (status, body) = open.call("GET", "/api/v1/public/features", None, None);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["data"]["registration"], true);
+    assert_eq!(body["data"]["captcha"], false);
+
+    let captcha = Server::start("", "[registration]\nallow = true\n[captcha]\n");
+    let (status, body) = captcha.call("GET", "/api/v1/public/features", None, None);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["data"]["registration"], true);
+    assert_eq!(body["data"]["captcha"], true);
+}
+
+#[test]
 fn a_new_server_is_closed_and_an_operator_makes_accounts() {
     let server = Server::start("", "");
     let body = json!({"username": "sara_x", "password": PASSWORD});

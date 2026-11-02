@@ -30,12 +30,12 @@ use crate::mls::{
 };
 use crate::protocol::{
     AccountBrief, AccountInfo, AccountKeysBody, AccountListReply, AccountReply, Bytes,
-    CaptchaAnswer, ChallengeBody, ChallengeReply, ChatDevice, ChatDeviceListReply, ChatItem,
-    ChatReply, ChatType, ClientFrame, ContentKind, CountReply, CreateChatBody, DeviceProof,
-    DeviceReply, DevicesReply, EmptyReply, GroupInfoReply, Header, KeyPackageItem,
-    KeyPackageListReply, KeyPackagesBody, Kind, LoginBody, LoginReply, MarkItem, MessageFrame,
-    RefusedReply, RegisterBody, RegisterDeviceBody, SendFrame, ServerFrame, SetupBody, SetupReply,
-    SignedBody, WelcomeItem, WrapEntry, WrapItem, WrapListReply,
+    CaptchaAnswer, CaptchaReply, ChallengeBody, ChallengeReply, ChatDevice, ChatDeviceListReply,
+    ChatItem, ChatReply, ChatType, ClientFrame, ContentKind, CountReply, CreateChatBody,
+    DeviceProof, DeviceReply, DevicesReply, EmptyReply, FeaturesReply, GroupInfoReply, Header,
+    KeyPackageItem, KeyPackageListReply, KeyPackagesBody, Kind, LoginBody, LoginReply, MarkItem,
+    MessageFrame, RefusedReply, RegisterBody, RegisterDeviceBody, SendFrame, ServerFrame,
+    SetupBody, SetupReply, SignedBody, WelcomeItem, WrapEntry, WrapItem, WrapListReply,
 };
 use crate::queue::{Level, Queue, Target};
 use crate::seed::{self, AccountKeys};
@@ -123,10 +123,14 @@ pub enum Command {
         #[serde(default)]
         captcha: Option<CaptchaAnswer>,
     },
+    /// A new captcha image, for the one under the password.
+    Captcha,
     /// The one-time link's token, from after the `#`, then logs in.
     Setup {
         token: Secret,
         password: Secret,
+        #[serde(default)]
+        captcha: Option<CaptchaAnswer>,
     },
     /// New words to show, 12 or 24. Nothing keeps them.
     GenerateWords {
@@ -311,6 +315,20 @@ pub enum Event {
         words: Secret,
     },
     NeedLogin,
+    /// What `GET /api/v1/public/features` said. Sign up is offered only when `registration` is set.
+    Features {
+        registration: bool,
+        captcha: bool,
+    },
+    /// A captcha image. `id` is what the answer is sent back with.
+    Captcha {
+        id: Ulid,
+        image: String,
+    },
+    /// The account exists. Login is a second captcha, so it waits for another one.
+    Registered {
+        username: String,
+    },
     /// Logged in with no device: new words, or `restore` with the account's own.
     NeedWords {
         restore: bool,
@@ -457,10 +475,13 @@ enum Asked {
     Register {
         username: String,
         password: Secret,
+        captcha: Option<CaptchaAnswer>,
     },
     Setup {
         password: Secret,
+        captcha: Option<CaptchaAnswer>,
     },
+    Captcha,
     Challenge {
         username: String,
         password: Secret,
@@ -516,6 +537,7 @@ enum Asked {
         device: Ulid,
     },
     LogOut,
+    Features,
 }
 
 /// A REST request, kept until it is answered, to go again if nothing answered.
@@ -780,6 +802,7 @@ fn background(asked: &Asked) -> bool {
         asked,
         Asked::Register { .. }
             | Asked::Setup { .. }
+            | Asked::Captcha
             | Asked::Challenge { .. }
             | Asked::Login { .. }
             | Asked::Search
@@ -1120,13 +1143,17 @@ impl Client {
                     username: username.clone(),
                     password: password.0.clone(),
                     display_name,
-                    captcha,
+                    captcha: captcha.clone(),
                 };
                 self.request(
                     "POST",
                     "/api/v1/register".to_string(),
                     Some(&body),
-                    Asked::Register { username, password },
+                    Asked::Register {
+                        username,
+                        password,
+                        captcha,
+                    },
                 );
             }
             Command::LogIn {
@@ -1134,7 +1161,12 @@ impl Client {
                 password,
                 captcha,
             } => self.log_in(username, password, captcha),
-            Command::Setup { token, password } => {
+            Command::Captcha => self.get("/api/v1/captcha".to_string(), Asked::Captcha),
+            Command::Setup {
+                token,
+                password,
+                captcha,
+            } => {
                 let body = SetupBody {
                     token: token.0.clone(),
                     password: password.0.clone(),
@@ -1143,7 +1175,7 @@ impl Client {
                     "POST",
                     "/api/v1/setup".to_string(),
                     Some(&body),
-                    Asked::Setup { password },
+                    Asked::Setup { password, captcha },
                 );
             }
             Command::GenerateWords { count } => match seed::generate(count) {
@@ -1578,7 +1610,7 @@ impl Client {
         }
         if !self.session_lost {
             self.session_lost = true;
-            self.event(Event::NeedLogin);
+            self.show_login();
         }
     }
 
@@ -1596,6 +1628,17 @@ impl Client {
         self.out.push(Output::Disconnect);
         self.socket = Socket::Down;
         self.event(Event::LoggedOut);
+        self.public_features();
+    }
+
+    /// The account screen is up, so ask what anyone can read before an account exists.
+    fn show_login(&mut self) {
+        self.event(Event::NeedLogin);
+        self.public_features();
+    }
+
+    fn public_features(&mut self) {
+        self.get("/api/v1/public/features".to_string(), Asked::Features);
     }
 
     /// Sends again what is due, retries the connection when due, and otherwise, after
@@ -1663,7 +1706,7 @@ impl Client {
 
     fn loaded(&mut self, first: Option<Vec<u8>>, second: Option<Vec<u8>>) {
         if first.is_none() && second.is_none() {
-            return self.event(Event::NeedLogin);
+            return self.show_login();
         }
         match Device::import(first.as_deref(), second.as_deref()) {
             Ok(mut imported) => {
@@ -1675,13 +1718,13 @@ impl Client {
                 self.account = Some(imported.device.record().account);
                 self.device = Some(imported.device);
                 if self.auth == Auth::Token && self.token.is_none() {
-                    return self.event(Event::NeedLogin);
+                    return self.show_login();
                 }
                 self.connect();
             }
             Err(error) => {
                 self.error("load_failed", &error.to_string());
-                self.event(Event::NeedLogin);
+                self.show_login();
             }
         }
     }
@@ -3288,14 +3331,28 @@ impl Client {
 
     fn reply(&mut self, asked: Asked, body: &str) {
         match asked {
-            Asked::Register { username, password } => {
+            Asked::Register {
+                username,
+                password,
+                captcha,
+            } => {
                 if let Some(AccountReply { .. }) = self.data(body) {
-                    self.log_in(username, password, None);
+                    // Registering used the captcha up. Login checks another one.
+                    if captcha.is_some() {
+                        self.event(Event::Registered { username });
+                    } else {
+                        self.log_in(username, password, None);
+                    }
                 }
             }
-            Asked::Setup { password } => {
+            Asked::Setup { password, captcha } => {
                 if let Some(SetupReply { username, .. }) = self.data(body) {
-                    self.log_in(username, password, None);
+                    self.log_in(username, password, captcha);
+                }
+            }
+            Asked::Captcha => {
+                if let Some(CaptchaReply { id, image }) = self.data(body) {
+                    self.event(Event::Captcha { id, image });
                 }
             }
             Asked::Challenge {
@@ -3552,6 +3609,18 @@ impl Client {
                 }
             }
             Asked::LogOut => self.ended(),
+            Asked::Features => {
+                if let Some(FeaturesReply {
+                    registration,
+                    captcha,
+                }) = self.data(body)
+                {
+                    self.event(Event::Features {
+                        registration,
+                        captcha,
+                    });
+                }
+            }
         }
     }
 
@@ -3613,6 +3682,18 @@ impl Client {
 
     fn account_known(&mut self, info: AccountInfo) {
         let account = info.id;
+        // A reload keeps the device and loses the name, so the page hears `signed_in` when it comes back.
+        let device_id = self.device.as_ref().map(|device| device.record().device);
+        if self.account == Some(account) && self.username.is_none() {
+            self.username = Some(info.username.clone());
+            if let Some(id) = device_id {
+                self.event(Event::SignedIn {
+                    account,
+                    username: info.username.clone(),
+                    device: Some(id),
+                });
+            }
+        }
         self.event(Event::Account {
             account: AccountBrief {
                 id: info.id,
