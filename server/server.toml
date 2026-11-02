@@ -1,0 +1,92 @@
+# keryx's configuration, commented. Copy it, change it, and give its path to every command with
+# --config. Every path must be absolute, and an unknown key stops startup.
+
+# Where `serve` listens, and the port every other subcommand connects to by default.
+listen = "127.0.0.1:7777"
+
+# Where people reach this server. Setup links start with it, its scheme decides whether the login
+# cookie is Secure, and the WebSocket's Origin must match it.
+public_url = "http://127.0.0.1:7777"
+
+# How many devices an account may have. Unset: unlimited. A role can raise it for its holders.
+# max_devices = 8
+
+[database]
+type = "sqlite"
+# One file, created with its tables the first time `serve` starts. Its directory must exist.
+path = "/var/lib/keryx/keryx.db"
+
+# What `keryx user add` and the like send. It counts as admin, and sits here in plain text: whoever
+# can read this file gets accounts and metadata, never message content. Unset: no operator access.
+# [operator]
+# token = "..."
+
+[registration]
+# Whether people may sign up themselves. Off: only `keryx user add` makes accounts.
+allow = false
+
+[session]
+# Slides forward on each use.
+lifetime = "30d"
+
+[chat]
+# A chat's task ends after this long with nothing to do, and restarts on the next event.
+idle_after = "5m"
+
+[www]
+# The web client's files. A path with no file gets index.html.
+directory = "/var/lib/keryx/www"
+
+[password]
+min_length = 12
+
+[limits]
+websocket_frame = "1MiB"
+rest_body = "1MiB"        # not file uploads
+history_page = 200
+outgoing_frames = 1024    # full: the connection closes, and the device refetches
+ping_after = "5s"         # quiet this long: the first ping
+ping_every = "15s"        # then one ping this often
+ping_timeout = "5s"       # each ping's time to answer, or the connection closes
+key_packages = 100        # the most one device may keep on the server
+
+[limits.body]             # one message's body. A file's bytes upload separately
+text = "64KiB"
+reaction = "1KiB"
+voice = "16KiB"
+image = "16KiB"
+video = "16KiB"
+doc = "16KiB"
+file = "16KiB"
+video_call = "16KiB"
+voice_call = "16KiB"
+text_call = "64KiB"
+
+# Without this section the server speaks plain HTTP, for local use or behind a reverse proxy.
+[tcp]
+send_timeout = "15s"      # no byte taken for this long: the connection closes. WebSocket and REST
+# user_timeout = "20s"    # Linux only: unacknowledged this long, and the kernel drops the connection
+nodelay = true
+# keepalive_idle = "30s"
+# keepalive_interval = "10s"
+# keepalive_retries = 3
+# send_buffer = "256KiB"  # unset: the operating system decides. Linux doubles what it is given
+# receive_buffer = "256KiB"
+backlog = 1024
+
+# [tls]
+# certificate = "/path/cert.pem"
+# key = "/path/key.pem"
+
+# Without this section there is no captcha. It guards registration and password login.
+# [captcha]
+# length = 5
+# alphabet = "digits"       # digits (1-9) | letters | mixed
+# ttl = "2m"
+# difficulty = "easy"       # easy | medium | hard
+# style = "random"          # amelia | lucy | mila | random
+# case_sensitive = false
+# sweep_every = "10m"       # how often old captchas are deleted
+# keep_for = "1d"           # captchas expired longer ago than this go
+# For the tests only, never in production: every captcha has this answer.
+# test_answer = "12345"

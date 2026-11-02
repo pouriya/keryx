@@ -1,0 +1,22 @@
+# One Cargo.lock and one target/ for both crates, which is what keeps the crypto versions
+# identical between the CLI and the WASM build. Make targets stay inside server/ and core/.
+[workspace]
+members = ["server", "core"]
+resolver = "3"
+
+# Here and not in server/, because Cargo ignores profiles outside the workspace root.
+[profile.release]
+opt-level = 3       # Not borhan's 'z': keryx forwards media and speed beats size.
+lto = true
+codegen-units = 1
+strip = true
+# No `panic = 'abort'`, unlike borhan: unwinding keeps one bad frame's panic inside
+# that connection's task instead of ending every call on the server.
+
+# Argon2 unoptimized takes about 300 ms a hash, and the tests log in and create accounts through the
+# API, so dev and test builds optimize it and its BLAKE2. This is a copy of activeplano's setting.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3

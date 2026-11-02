@@ -1,0 +1,78 @@
+[package]
+name = "keryx-core"
+version = "0.1.0"
+edition = "2024"
+description = "Shared by every keryx client: words to keys, MLS, key wrapping, the outgoing queue"
+authors = ["Pouriya Jahanbakhsh <pouriya.jahanbakhsh@gmail.com>"]
+# openmls 0.9 needs 1.91. Without this an older toolchain reports a wall of errors instead
+# of saying it is too old.
+rust-version = "1.91"
+license = "MIT"
+repository = "https://github.com/pouriya/keryx"
+
+[dependencies]
+# MLS (RFC 9420): membership and one exported key per epoch. Its messages are not used for
+# content, because it deletes each key after one use. See the root AGENTS.md.
+openmls = "0.9.2"
+
+# The crypto under openmls. Chosen over openmls_libcrux_crypto by measurement in WASM: 5.3 ms
+# against 12.8 ms for the same flow, 645 KB against 727 KB gzipped.
+openmls_rust_crypto = "0.6.0"
+
+# The trait a device's key signs through, which openmls does not re-export. Already in the tree.
+openmls_traits = "0.6.0"
+
+# Holds a device's random Ed25519 key in the form openmls signs with. Already in the tree.
+openmls_basic_credential = "0.6.0"
+
+# Words to seed. English only, so every other language's list stays out. `std` is what parsing,
+# the seed and a real error type need, and `zeroize` wipes the words held inside it. Adds
+# bitcoin_hashes and unicode-normalization to the tree.
+bip39 = { version = "3.0.0", default-features = false, features = ["std", "zeroize"] }
+
+# The master key, derived from the seed, and checking stamps and signatures with public keys
+# alone. openmls_basic_credential cannot build a key from given bytes. Already in the tree.
+ed25519-dalek = { version = "2.2.0", default-features = false, features = ["std", "zeroize"] }
+
+# The Diffie-Hellman step of key wrapping. Repeatable wrapping needs to choose the ephemeral
+# key itself, which HPKE's API does not allow. Already in the tree.
+x25519-dalek = { version = "3.0.0", default-features = false, features = ["static_secrets", "zeroize"] }
+
+# Deriving keys from the seed and in wrapping. Already in the tree.
+hkdf = "0.13.0"
+sha2 = "0.11.1"
+
+# Message bodies and wrapped keys. `aes` and `alloc` are what's used, so `getrandom` and the
+# rest stay off. Already in the tree.
+aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc"] }
+
+# Random bytes for ULIDs, words and nonces, straight from the OS.
+getrandom = "0.4.3"
+
+# Wipes words and keys from memory when dropped. Already in the tree.
+zeroize = "1.9.1"
+
+# std::time panics in a browser. On native targets this is std::time itself. Already in the
+# tree.
+web-time = "1.1.0"
+
+thiserror = "2.0.20"
+
+# The envelope's JSON. `derive` is what's used. Already in the tree.
+serde = { version = "1.0.229", default-features = false, features = ["std", "derive"] }
+
+# Binary fields in the envelope. Chosen over the `base64` crate because it is already in the tree,
+# and constant-time, which suits key material. `alloc` is for encoding to a String.
+base64ct = { version = "1.8.3", default-features = false, features = ["alloc"] }
+
+# The browser build. `js` makes openmls use the browser's clock and random source. getrandom 0.2
+# is pulled in under openmls_rust_crypto, and it refuses to compile for WASM without its own `js`.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+openmls = { version = "0.9.2", features = ["js"] }
+getrandom = { version = "0.4.3", features = ["wasm_js"] }
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+
+[dev-dependencies]
+# Reading and writing envelope frames in the tests. Already in the tree.
+serde_json = "1.0.154"
+

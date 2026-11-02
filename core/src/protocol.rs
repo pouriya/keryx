@@ -1,0 +1,372 @@
+//! Wire types: what WebSocket and REST carry.
+//!
+//! JSON, the same on both. Every frame has a `type`. A request's `ref` is a ULID the client makes,
+//! which the server holds in memory only for that request and sends back in its answer. What is
+//! saved goes by its sequence id, so the server never stores a client's ULID. Binary fields are standard base64, ULIDs are text, and kinds are the schema's numbers. Unknown
+//! fields are ignored, because a new optional field does not bump the version.
+
+use crate::ulid::Ulid;
+use base64ct::{Base64, Encoding};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+/// Bytes on the wire, as base64.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Bytes(pub Vec<u8>);
+
+/// Never the contents: these may be ciphertext or an unencrypted message, and neither is logged.
+impl std::fmt::Debug for Bytes {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "Bytes({} bytes)", self.0.len())
+    }
+}
+
+impl Serialize for Bytes {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&Base64::encode_string(&self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for Bytes {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        match Base64::decode_vec(&text) {
+            Ok(bytes) => Ok(Self(bytes)),
+            Err(_) => Err(serde::de::Error::custom("this is not valid base64")),
+        }
+    }
+}
+
+/// An enum whose wire form is its schema number, refusing any number it doesn't know.
+macro_rules! numbered {
+    ($(#[$meta:meta])* $name:ident { $($variant:ident = $number:literal,)+ }) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(try_from = "u8", into = "u8")]
+        pub enum $name {
+            $($variant = $number,)+
+        }
+
+        impl From<$name> for u8 {
+            fn from(value: $name) -> u8 {
+                value as u8
+            }
+        }
+
+        impl TryFrom<u8> for $name {
+            type Error = String;
+
+            fn try_from(number: u8) -> Result<Self, String> {
+                match number {
+                    $($number => Ok(Self::$variant),)+
+                    _ => Err(format!("{number} is not a {}", stringify!($name))),
+                }
+            }
+        }
+    };
+}
+
+numbered!(
+    /// The numbers are the `message.kind` column's.
+    Kind {
+        Content = 0,
+        Edit = 1,
+        Delete = 2,
+        Commit = 3,
+        DeviceNotice = 4,
+    }
+);
+
+numbered!(
+    /// The numbers are the `message.content_kind` column's. 10 is reserved for `media_bundle`,
+    /// which is not built.
+    ContentKind {
+        Text = 0,
+        Voice = 1,
+        Reaction = 2,
+        Image = 3,
+        Video = 4,
+        Doc = 5,
+        File = 6,
+        VideoCall = 7,
+        VoiceCall = 8,
+        TextCall = 9,
+    }
+);
+
+numbered!(
+    /// The numbers are the `conversation.type` column's.
+    ChatType {
+        SelfChat = 0,
+        Direct = 1,
+        Group = 2,
+        Channel = 3,
+    }
+);
+
+numbered!(
+    /// The numbers are the `conversation.mode` column's.
+    ChatMode {
+        Private = 0,
+        Mixed = 1,
+        Open = 2,
+    }
+);
+
+/// Everything about a message that its device vouches for, apart from its body. The server
+/// assigns the sequence id afterwards, so it cannot be here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Header {
+    pub chat: Ulid,
+    pub device: Ulid,
+    pub kind: Kind,
+    pub content_kind: Option<ContentKind>,
+    pub encrypted: bool,
+    pub epoch: Option<u64>,
+    pub pointer_seq: Option<u64>,
+    pub call_seq: Option<u64>,
+    pub client_sent_at: i64,
+}
+
+impl Header {
+    /// The fixed binary layout: AES's associated data, and with the body after it, what the
+    /// device signs. **Permanent:** stored signatures depend on it, and `tests/protocol.rs`
+    /// pins the exact bytes. A leading byte says whether an optional field is present, so two
+    /// different headers can never give the same bytes.
+    pub fn bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(128);
+        bytes.extend_from_slice(b"keryx v1 message");
+        bytes.extend_from_slice(self.chat.bytes());
+        bytes.extend_from_slice(self.device.bytes());
+        bytes.push(self.kind as u8);
+        match self.content_kind {
+            Some(content_kind) => bytes.extend_from_slice(&[1, content_kind as u8]),
+            None => bytes.extend_from_slice(&[0, 0]),
+        }
+        bytes.push(u8::from(self.encrypted));
+        for field in [self.epoch, self.pointer_seq, self.call_seq] {
+            match field {
+                Some(value) => {
+                    bytes.push(1);
+                    bytes.extend_from_slice(&value.to_be_bytes());
+                }
+                None => bytes.extend_from_slice(&[0; 9]),
+            }
+        }
+        bytes.extend_from_slice(&self.client_sent_at.to_be_bytes());
+        bytes
+    }
+}
+
+/// One epoch's key, wrapped to one account.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WrapItem {
+    pub account: Ulid,
+    pub wrapped: Bytes,
+}
+
+/// An MLS Welcome for one device a commit added.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WelcomeItem {
+    pub device: Ulid,
+    pub body: Bytes,
+}
+
+/// A message or action from a client. The server knows the device from the session. A commit is
+/// one of these with kind 3, carrying its wraps and welcomes, so there is one path into the task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendFrame {
+    #[serde(rename = "ref")]
+    pub reference: Ulid,
+    pub chat: Ulid,
+    pub kind: Kind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_kind: Option<ContentKind>,
+    pub encrypted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pointer_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_seq: Option<u64>,
+    pub client_sent_at: i64,
+    pub body: Bytes,
+    pub signature: Bytes,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wrap_list: Vec<WrapItem>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub welcome_list: Vec<WelcomeItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ClientFrame {
+    Send(Box<SendFrame>),
+    Seen {
+        #[serde(rename = "ref")]
+        reference: Ulid,
+        chat: Ulid,
+        up_to_seq: u64,
+        client_seen_at: i64,
+    },
+    /// Not saved and not answered, so it has no `ref` and no sequence id.
+    Typing {
+        chat: Ulid,
+        on: bool,
+    },
+    /// The server works out which chats, and the client never sends a list.
+    Sync {
+        #[serde(rename = "ref")]
+        reference: Ulid,
+    },
+    History {
+        #[serde(rename = "ref")]
+        reference: Ulid,
+        chat: Ulid,
+        after_seq: u64,
+        limit: u32,
+    },
+    GroupInfo {
+        #[serde(rename = "ref")]
+        reference: Ulid,
+        chat: Ulid,
+        epoch: u64,
+        body: Bytes,
+    },
+    /// Asks whether the server is alive, for a browser, which cannot send a WebSocket ping. Answered
+    /// with `done`.
+    Ping {
+        #[serde(rename = "ref")]
+        reference: Ulid,
+    },
+    /// The right wraps, from a device that found stored ones wrong or missing.
+    Wraps {
+        #[serde(rename = "ref")]
+        reference: Ulid,
+        chat: Ulid,
+        epoch: u64,
+        wrap_list: Vec<WrapItem>,
+    },
+}
+
+/// A stored message. **A removed one has only `chat` and `seq`**, so pages have no gaps, and a
+/// client knows something was there, not what.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageFrame {
+    pub chat: Ulid,
+    pub seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<Ulid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<Kind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_kind: Option<ContentKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encrypted: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pointer_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_sent_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_saved_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<Bytes>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<Bytes>,
+}
+
+impl MessageFrame {
+    /// The signed header, to check this message against. `None` for a removed message, or one
+    /// missing a field a stored message always has.
+    pub fn header(&self) -> Option<Header> {
+        Some(Header {
+            chat: self.chat,
+            device: self.device?,
+            kind: self.kind?,
+            content_kind: self.content_kind,
+            encrypted: self.encrypted?,
+            epoch: self.epoch,
+            pointer_seq: self.pointer_seq,
+            call_seq: self.call_seq,
+            client_sent_at: self.client_sent_at?,
+        })
+    }
+}
+
+/// One of a person's chats and its last state, for the list a client shows first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatItem {
+    pub chat: Ulid,
+    #[serde(rename = "type")]
+    pub chat_type: ChatType,
+    pub mode: ChatMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_kind: Option<Kind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_content_seq: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ServerFrame {
+    /// The first frame on every connection: what this server does, under `server.toml`'s names. The
+    /// ping settings are in seconds.
+    Features {
+        ping_after: u64,
+        ping_every: u64,
+        ping_timeout: u64,
+    },
+    /// Stored, under this sequence id.
+    Sent {
+        #[serde(rename = "ref")]
+        reference: Ulid,
+        seq: u64,
+        server_saved_at: i64,
+    },
+    /// Done, for what takes no sequence id.
+    Done {
+        #[serde(rename = "ref")]
+        reference: Ulid,
+    },
+    /// `code` is for programs, and `message` for people.
+    Refused {
+        #[serde(rename = "ref")]
+        reference: Ulid,
+        code: String,
+        message: String,
+    },
+    Message(Box<MessageFrame>),
+    Chats {
+        #[serde(rename = "ref")]
+        reference: Ulid,
+        chat_list: Vec<ChatItem>,
+    },
+    Page {
+        #[serde(rename = "ref")]
+        reference: Ulid,
+        message_list: Vec<MessageFrame>,
+    },
+    Welcome {
+        chat: Ulid,
+        body: Bytes,
+    },
+    Typing {
+        chat: Ulid,
+        account: Ulid,
+        on: bool,
+    },
+    /// A device of someone sharing a chat ended. `statement` is its signed revocation or logout,
+    /// which a client verifies before removing the device from each chat.
+    Revoked {
+        account: Ulid,
+        device: Ulid,
+        statement: Bytes,
+    },
+}

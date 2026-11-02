@@ -1,0 +1,111 @@
+[package]
+name = "keryx"
+version = "0.1.0"
+edition = "2024"
+description = "A self-hosted messenger: chat, calls, MCP and end-to-end encryption"
+authors = ["Pouriya Jahanbakhsh <pouriya.jahanbakhsh@gmail.com>"]
+# openmls, through keryx-core, needs 1.91. Without this an older toolchain reports a wall
+# of errors instead of saying it is too old.
+rust-version = "1.91"
+license = "MIT"
+repository = "https://github.com/pouriya/keryx"
+
+[dependencies]
+# Everything clients share: the wire types, ULIDs and verify_* with public keys. `keryx serve` calls
+# nothing else of its crypto, and a subcommand is a client, so it may.
+keryx-core = { path = "../core" }
+
+# rt-multi-thread and macros run the server, net and sync are its connections and queues, `signal` is
+# the graceful shutdown, and `time` the idle timeouts and pings.
+tokio = { version = "1.53.1", default-features = false, features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "sync",
+    "signal",
+    "time",
+] }
+
+# The router. `ws` is the chat transport, and `matched-path` the route template on the access log.
+# `query` is the directory search. JSON bodies are parsed by hand so that a bad one gets the wrapped
+# refusal, so `json` stays off.
+axum = { version = "0.8.9", default-features = false, features = [
+    "http1",
+    "tokio",
+    "query",
+    "matched-path",
+    "ws",
+] }
+
+# Serving, with optional TLS from [tls]. `no-provider`, because the plain `tls-rustls` pulls in
+# aws-lc-rs, and borhan's rustls uses ring.
+axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls-no-provider"] }
+
+# Only to switch on the ring provider that axum-server leaves out. Already in the tree.
+rustls = { version = "0.23.37", default-features = false, features = ["ring", "std"] }
+
+# The [tcp] settings. `all`, for Linux's TCP_USER_TIMEOUT. Already in the tree.
+socket2 = { version = "0.6.5", features = ["all"] }
+
+# Serves the web client from [www] directory, so keryx does not own a path check.
+tower-http = { version = "0.6.11", default-features = false, features = ["fs"] }
+
+# The database. `bundled` compiles SQLite from source: no libsqlite3-dev on the host, and the same
+# version on every machine.
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
+
+# The configuration. The file loader and TOML, and no environment variables. The validators turn
+# "5m" and "1MiB" into numbers and refuse unknown keys, with the line and caret. They add humantime
+# and bytesize to the tree.
+tanzim = { version = "0.28.0", default-features = false, features = [
+    "load-file",
+    "parse-toml",
+    "validate-static_map",
+    "validate-duration",
+    "validate-bytesize",
+] }
+
+# Passwords: Argon2id, whose defaults are 19 MiB, 2 passes and 1 lane.
+argon2 = "0.6.0"
+
+# Draws the captcha. Without `audio`, which adds hound and which nothing here serves.
+captcha = { version = "1.0.0", default-features = false }
+
+# Hashing session tokens and setup links, which are random and need no slow hash. Already in the tree.
+sha2 = "0.11.1"
+
+# Session tokens, setup links and ids, straight from the OS. Already in the tree.
+getrandom = "0.4.3"
+
+# Captcha images and tokens. The wire's binary fields go through keryx-core. Already in the tree.
+base64ct = { version = "1.8.3", default-features = false, features = ["alloc"] }
+
+# Subcommands are clients of `serve`. Blocking on purpose: a command is one request and then exit.
+# `rustls`, so a static binary finds no OpenSSL to link. `json` is the reply, and gzip stays off.
+ureq = { version = "3.4.2", default-features = false, features = ["json", "rustls"] }
+
+clap = { version = "4.6.6", default-features = false, features = [
+    "std",
+    "derive",
+    "help",
+    "usage",
+    "error-context",
+] }
+
+serde = { version = "1.0.229", default-features = false, features = ["std", "derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.20"
+anyhow = "1.0"
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = [
+    "std",
+    "fmt",
+    "json",
+] }
+
+[dev-dependencies]
+# A directory per test, removed when the test ends. Already in the tree.
+tempfile = "3.27.0"
+
+# The WebSocket client in the tests. Blocking, as the tests are. The version axum already pulls in.
+tungstenite = "0.29.0"
