@@ -1,0 +1,251 @@
+.page {
+  justify-content: flex-start;
+  gap: 0.4rem;
+  width: min(26rem, 100%);
+  height: 100dvh;
+  min-height: 0;
+  max-height: 100dvh;
+  padding: 0.7rem 0.85rem 0.55rem;
+  overflow: hidden;
+}
+
+.page h1 {
+  margin: 0;
+  font-size: 1.25rem;
+}
+
+.page form {
+  flex: 1;
+  min-height: 0;
+  margin-top: 0;
+}
+
+.heading {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  justify-content: center;
+}
+
+.lead {
+  margin: 0;
+  font-size: 0.8125rem;
+  line-height: 1.3;
+  color: var(--muted);
+}
+
+.actions {
+  margin-top: 0;
+}
+
+.choice {
+  display: flex;
+  gap: 0.4rem;
+  width: 100%;
+  margin: 0;
+}
+
+.choice button {
+  flex: 1;
+  height: 2rem;
+  font: inherit;
+  font-size: 0.875rem;
+  color: inherit;
+  cursor: pointer;
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+}
+
+.choice button[aria-pressed="true"] {
+  color: var(--paper);
+  background: var(--ink);
+  border-color: var(--ink);
+}
+
+.choice button:focus-visible,
+.info:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 2px;
+}
+
+.info {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 1.5rem;
+  height: 1.5rem;
+  padding: 0;
+  font: inherit;
+  font-weight: 600;
+  line-height: 1;
+  color: inherit;
+  cursor: pointer;
+  background: none;
+  border: 1.5px solid var(--ink);
+  border-radius: 50%;
+}
+
+.phrase,
+.boxes {
+  display: grid;
+  flex: 1;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-auto-rows: minmax(0, 1fr);
+  gap: 0.25rem;
+  width: 100%;
+  min-height: 0;
+  padding: 0;
+  margin: 0;
+  list-style: none;
+  counter-reset: word;
+  text-align: start;
+}
+
+.phrase li {
+  display: flex;
+  gap: 0.35rem;
+  align-items: center;
+  min-width: 0;
+  min-height: 0;
+  padding: 0 0.4rem;
+  overflow: hidden;
+  font-size: 0.8125rem;
+  background: color-mix(in srgb, var(--line) 45%, var(--paper));
+  border-radius: 0.45rem;
+}
+
+.phrase li::before {
+  flex: none;
+  font-size: 0.65rem;
+  color: var(--muted);
+  content: counter(word);
+  counter-increment: word;
+}
+
+.boxes label {
+  position: relative;
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  min-height: 0;
+}
+
+.boxes span {
+  position: absolute;
+  inset-inline-start: 0.4rem;
+  font-size: 0.65rem;
+  color: var(--muted);
+  pointer-events: none;
+}
+
+.boxes input {
+  box-sizing: border-box;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  padding: 0 0.35rem 0 1.35rem;
+  font: inherit;
+  font-size: 0.8125rem;
+  color: var(--ink);
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 0.45rem;
+}
+
+.boxes input:focus {
+  border-color: var(--ink);
+}
+
+.boxes input:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 1px;
+}
+
+.boxes input[aria-invalid="true"] {
+  border-color: var(--danger);
+}
+
+.wrong {
+  margin: 0;
+  font-size: 0.75rem;
+  color: var(--danger);
+}
+
+.shade {
+  position: fixed;
+  inset: 0;
+  z-index: 2;
+  display: grid;
+  padding: 1.25rem;
+  background: color-mix(in srgb, var(--ink) 35%, transparent);
+}
+
+.shade > * {
+  grid-area: 1 / 1;
+}
+
+.backdrop {
+  margin: -1.25rem;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.card {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 0.9rem;
+  width: min(22rem, 100%);
+  justify-self: center;
+  align-self: center;
+  padding: 1.25rem;
+  text-align: start;
+  background: var(--paper);
+  border-radius: 1rem;
+}
+
+.card h2 {
+  margin: 0;
+  font-size: 1.15rem;
+}
+
+.card p {
+  margin: 0;
+  line-height: 1.45;
+}
+
+.card button {
+  height: 2.75rem;
+}
+
+@media (min-width: 600px) {
+  .page {
+    height: auto;
+    max-height: none;
+    padding-top: 2.5rem;
+    padding-bottom: 2rem;
+    overflow: visible;
+  }
+
+  .page h1 {
+    font-size: 1.75rem;
+  }
+
+  .phrase,
+  .boxes {
+    flex: none;
+    grid-auto-rows: auto;
+  }
+
+  .phrase li {
+    padding: 0.45rem 0.6rem;
+  }
+
+  .boxes input {
+    height: 2.25rem;
+  }
+}

@@ -1,6 +1,7 @@
 # The server `make dev` starts beside Vite. Paths must be absolute, so the Makefile writes a copy
 # under tmp/ with @ROOT@ replaced by the repository's path. public_url is Vite's address, so the
-# WebSocket's Origin check and the cookie match. Registration is open and there is no captcha.
+# WebSocket's Origin check and the cookie match. Registration is open. Captcha is on, and
+# pass_code is accepted as well as the drawn answer.
 listen = "127.0.0.1:7777"
 public_url = "http://127.0.0.1:5173"
 
@@ -22,3 +23,6 @@ directory = "@ROOT@/web/dist"
 
 [password]
 min_length = 12
+
+[captcha]
+pass_code = "THE CODE"

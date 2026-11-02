@@ -1,0 +1,57 @@
+@import "@fontsource/inter/latin-400.css";
+@import "@fontsource/inter/latin-600.css";
+@import "@fontsource/vazirmatn/arabic-400.css";
+@import "@fontsource/vazirmatn/latin-400.css";
+@import "@fontsource/vazirmatn/arabic-600.css";
+@import "@fontsource/vazirmatn/latin-600.css";
+
+:root {
+  --ink: #121212;
+  --paper: #ffffff;
+  --muted: #6d6d6d;
+  --line: #d4d4d4;
+  --danger: #c0392b;
+  --accent: #2f6feb;
+  --font: "Inter", sans-serif;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ink: #ffffff;
+    --paper: #121212;
+    --muted: #a3a3a3;
+    --line: #6a6a6a;
+    --danger: #ff6b6b;
+    color-scheme: dark;
+  }
+}
+
+html[lang="fa"] {
+  --font: "Vazirmatn", "Inter", sans-serif;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font);
+  font-size: 1rem;
+  line-height: 1.4;
+  color: var(--ink);
+  background: var(--paper);
+}
+
+p {
+  margin: 0;
+}
+
+svg.logo {
+  width: 4rem;
+  height: 4rem;
+  fill: currentColor;
+}
