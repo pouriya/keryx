@@ -1,7 +1,7 @@
 //! The schema's rules, and the storage trait's own promises.
 
 use keryx::storage::sqlite::Sqlite;
-use keryx::storage::{BuiltInRole, NewAccount, Storage};
+use keryx::storage::{BuiltInRole, NewAccount, SetupLink, Storage};
 use keryx_core::ulid::Ulid;
 use rusqlite::{Connection, params};
 use tempfile::TempDir;
@@ -403,4 +403,99 @@ async fn one_file_with_the_classic_journal_and_opening_twice_keeps_everything() 
     let again = Sqlite::open(&path).unwrap();
     let account = again.account_by_id(id).await.unwrap().unwrap();
     assert_eq!(account.username, "sara_x");
+}
+
+#[tokio::test]
+async fn a_setup_link_says_whether_it_is_unknown_used_or_expired() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("keryx.db");
+    let storage = Sqlite::open(&path).unwrap();
+    let id = Ulid::new().unwrap();
+    let hash = [7u8; 32];
+    storage
+        .create_account(NewAccount {
+            id,
+            username: "sara_x".to_string(),
+            display_name: None,
+            password_hash: None,
+            admin: false,
+            setup: Some((hash, 100)),
+            now: 1,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        storage.setup_link([9u8; 32], 50).await.unwrap(),
+        SetupLink::Unknown
+    ));
+    let SetupLink::Ready(ready) = storage.setup_link(hash, 50).await.unwrap() else {
+        panic!("the link is inside its 7 days");
+    };
+    assert_eq!(ready.username, "sara_x");
+    assert!(
+        storage
+            .finish_setup(id, hash, "hash".to_string(), 50)
+            .await
+            .unwrap()
+    );
+    assert!(matches!(
+        storage.setup_link(hash, 500).await.unwrap(),
+        SetupLink::Used
+    ));
+
+    let expired = Ulid::new().unwrap();
+    storage
+        .create_account(NewAccount {
+            id: expired,
+            username: "old_x".to_string(),
+            display_name: None,
+            password_hash: None,
+            admin: false,
+            setup: Some(([8u8; 32], 100)),
+            now: 1,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        storage.setup_link([8u8; 32], 101).await.unwrap(),
+        SetupLink::Expired
+    ));
+    assert!(
+        !storage
+            .finish_setup(expired, [8u8; 32], "hash".to_string(), 101)
+            .await
+            .unwrap()
+    );
+}
+
+#[test]
+fn opening_the_first_database_keeps_a_used_link() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("keryx.db");
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE account_setup (
+                 token_hash BLOB PRIMARY KEY,
+                 account_id BLOB NOT NULL,
+                 expires_at INTEGER NOT NULL
+             ) WITHOUT ROWID, STRICT;
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+    drop(connection);
+    Sqlite::open(&path).unwrap();
+    let check = Connection::open(&path).unwrap();
+    let version: i64 = check
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 2);
+    let names: Vec<String> = check
+        .prepare("PRAGMA table_info(account_setup)")
+        .unwrap()
+        .query_map([], |row| row.get(1))
+        .unwrap()
+        .map(|name| name.unwrap())
+        .collect();
+    assert!(names.contains(&"used_at".to_string()));
 }

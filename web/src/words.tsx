@@ -151,6 +151,7 @@ function NewWords() {
   }, [words]);
   const ready =
     places?.every((place, index) => answers[index]?.trim().toLowerCase() === parts[place]) ?? false;
+  const filled = places?.every((_, index) => (answers[index] ?? "").trim() !== "") ?? false;
   return (
     <main className={`${screen.screen} ${styles.page}`}>
       <div className={styles.heading}>
@@ -173,7 +174,10 @@ function NewWords() {
             {parts
               .map((word, position) => ({ word, position }))
               .map((line) => (
-                <li key={line.position}>{line.word}</li>
+                <li key={line.position}>
+                  <span className={styles.index}>{line.position + 1}</span>
+                  <span className={styles.token}>{line.word}</span>
+                </li>
               ))}
           </ol>
           <div className={`${screen.actions} ${styles.actions}`}>
@@ -214,9 +218,13 @@ function NewWords() {
           ))}
           <WordList />
           <Problem />
+          {filled && !ready ? <p className={styles.wrong}>{t("wordsMismatch")}</p> : null}
           <div className={`${screen.actions} ${styles.actions}`}>
             <button className={screen.primary} type="submit" disabled={!ready || busy}>
               {t("continue")}
+            </button>
+            <button className={screen.quiet} type="button" onClick={() => setWritten(false)}>
+              {t("back")}
             </button>
           </div>
         </form>

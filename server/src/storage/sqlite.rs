@@ -18,7 +18,7 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use super::{
     Account, Appended, BuiltInRole, ChatAccess, DeviceKey, DeviceUsage, Error, GroupInfoPut,
     MessageBrief, NewAccount, NewDevice, NewMessage, NewSession, NewWrap, Position, PositionReport,
-    Registered, Result, Session, Storage,
+    Registered, Result, Session, SetupLink, Storage,
 };
 
 /// How long a connection waits for a lock another process holds, such as a backup.
@@ -55,9 +55,18 @@ impl Sqlite {
         let version: i64 = writer.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version == 0 {
             writer.execute_batch(&format!(
-                "BEGIN IMMEDIATE;\n{}\nPRAGMA user_version = 1;\nCOMMIT;",
+                "BEGIN IMMEDIATE;\n{}\nPRAGMA user_version = 2;\nCOMMIT;",
                 include_str!("sqlite.sql")
             ))?;
+        } else if version == 1 {
+            // The first build deleted a used link, so a second try looked like one that was never
+            // issued. The row now stays, and this column is what says it was used.
+            writer.execute_batch(
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE account_setup ADD COLUMN used_at INTEGER;
+                 PRAGMA user_version = 2;
+                 COMMIT;",
+            )?;
         }
         Ok(Self {
             writer: Arc::new(Mutex::new(writer)),
@@ -359,35 +368,65 @@ impl Storage for Sqlite {
         .await
     }
 
-    async fn take_setup(&self, token_hash: [u8; 32], now: i64) -> Result<Option<AccountBrief>> {
-        self.write(move |connection| {
-            let found: Option<([u8; 16], i64)> = connection
+    async fn setup_link(&self, token_hash: [u8; 32], now: i64) -> Result<SetupLink> {
+        self.read(move |connection| {
+            let found: Option<([u8; 16], i64, Option<i64>)> = connection
                 .query_row(
-                    "DELETE FROM account_setup WHERE token_hash = ?1
-                     RETURNING account_id, expires_at",
+                    "SELECT account_id, expires_at, used_at FROM account_setup
+                     WHERE token_hash = ?1",
                     params![token_hash],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()?;
-            let Some((account, expires_at)) = found else {
-                return Ok(None);
+            let Some((account, expires_at, used_at)) = found else {
+                return Ok(SetupLink::Unknown);
             };
-            if expires_at < now {
-                return Ok(None);
+            if used_at.is_some() {
+                return Ok(SetupLink::Used);
             }
-            connection
-                .query_row(
-                    "SELECT id, username, display_name FROM account WHERE id = ?1",
-                    params![account],
-                    |row| {
-                        Ok(AccountBrief {
-                            id: Ulid::from_bytes(row.get(0)?),
-                            username: row.get(1)?,
-                            display_name: row.get(2)?,
-                        })
-                    },
-                )
-                .optional()
+            if expires_at < now {
+                return Ok(SetupLink::Expired);
+            }
+            connection.query_row(
+                "SELECT id, username, display_name FROM account WHERE id = ?1",
+                params![account],
+                |row| {
+                    Ok(SetupLink::Ready(AccountBrief {
+                        id: Ulid::from_bytes(row.get(0)?),
+                        username: row.get(1)?,
+                        display_name: row.get(2)?,
+                    }))
+                },
+            )
+        })
+        .await
+    }
+
+    async fn finish_setup(
+        &self,
+        account: Ulid,
+        token_hash: [u8; 32],
+        password_hash: String,
+        now: i64,
+    ) -> Result<bool> {
+        self.write(move |connection| {
+            let changed = connection.execute(
+                "UPDATE account_setup SET used_at = ?2
+                 WHERE token_hash = ?1 AND used_at IS NULL AND expires_at >= ?2",
+                params![token_hash, now],
+            )?;
+            if changed == 0 {
+                return Ok(false);
+            }
+            connection.execute(
+                "UPDATE account SET password_hash = ?2 WHERE id = ?1",
+                params![account.bytes(), password_hash],
+            )?;
+            connection.execute(
+                "DELETE FROM login_session WHERE account_id = ?1",
+                params![account.bytes()],
+            )?;
+            Ok(true)
         })
         .await
     }

@@ -174,6 +174,12 @@ fn a_new_server_is_closed_and_an_operator_makes_accounts() {
     refused(
         server.call("POST", "/api/v1/setup", None, Some(&setup)),
         404,
+        "link_used",
+    );
+    let unknown = json!({"token": "not-a-link", "password": PASSWORD});
+    refused(
+        server.call("POST", "/api/v1/setup", None, Some(&unknown)),
+        404,
         "bad_link",
     );
 

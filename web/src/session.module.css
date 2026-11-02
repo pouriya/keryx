@@ -145,8 +145,11 @@
 }
 
 .primary {
+  display: grid;
+  place-items: center;
   color: var(--paper);
   background: var(--ink);
+  text-decoration: none;
 }
 
 .quiet {

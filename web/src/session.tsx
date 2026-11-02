@@ -221,10 +221,20 @@ function setupToken(): string | null {
   }
 }
 
+function useSetupToken(): string | null {
+  const [token, setToken] = useState(setupToken);
+  useEffect(() => {
+    const read = () => setToken(setupToken());
+    window.addEventListener("hashchange", read);
+    return () => window.removeEventListener("hashchange", read);
+  }, []);
+  return token;
+}
+
 function Setup() {
   const t = useText();
   const busy = useStore((state) => state.busy);
-  const token = setupToken();
+  const token = useSetupToken();
   const picture = useCaptcha();
   const [password, setPassword] = useState("");
   if (token === null) {
@@ -233,6 +243,11 @@ function Setup() {
         <Logo />
         <h1>{t("setupTitle")}</h1>
         <p className={styles.note}>{t("setupMissing")}</p>
+        <div className={styles.actions}>
+          <a className={styles.primary} href="/">
+            {t("logIn")}
+          </a>
+        </div>
       </main>
     );
   }

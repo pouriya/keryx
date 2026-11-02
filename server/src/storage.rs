@@ -71,6 +71,18 @@ pub struct NewAccount {
     pub now: i64,
 }
 
+/// A one-time setup link, looked up by the hash of the part after `#`.
+pub enum SetupLink {
+    /// Nothing was issued for this hash.
+    Unknown,
+    /// The password was already chosen with it.
+    Used,
+    /// Older than its 7 days, and never used.
+    Expired,
+    /// Unused and still inside its 7 days.
+    Ready(AccountBrief),
+}
+
 /// What a request's token proves.
 #[derive(Clone, Copy)]
 pub struct Session {
@@ -203,12 +215,22 @@ pub trait Storage: Send + Sync + 'static {
         term: String,
         limit: u32,
     ) -> impl Future<Output = Result<Vec<AccountBrief>>> + Send;
-    /// Uses up a one-time link. `None` if it is unknown or expired.
-    fn take_setup(
+    /// What a one-time setup link is. A used link stays, so a second try is not the same as one
+    /// that was never issued.
+    fn setup_link(
         &self,
         token_hash: [u8; 32],
         now: i64,
-    ) -> impl Future<Output = Result<Option<AccountBrief>>> + Send;
+    ) -> impl Future<Output = Result<SetupLink>> + Send;
+    /// Sets the password and marks the link used, in one step. `false` if it was used or expired
+    /// between the lookup and this call.
+    fn finish_setup(
+        &self,
+        account: Ulid,
+        token_hash: [u8; 32],
+        password_hash: String,
+        now: i64,
+    ) -> impl Future<Output = Result<bool>> + Send;
     /// Sets the password and ends all of the account's sessions.
     fn set_password(&self, account: Ulid, hash: String) -> impl Future<Output = Result<()>> + Send;
     /// Sets the public keys and creates the self chat under `chat`, in one step. `false` if the

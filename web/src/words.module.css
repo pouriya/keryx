@@ -98,43 +98,56 @@
   padding: 0;
   margin: 0;
   list-style: none;
-  counter-reset: word;
   text-align: start;
 }
 
 .phrase li {
+  container-type: size;
+  position: relative;
   display: flex;
-  gap: 0.35rem;
   align-items: center;
+  justify-content: center;
+  height: 100%;
   min-width: 0;
   min-height: 0;
-  padding: 0 0.4rem;
+  padding: 0.08em 0.15em;
   overflow: hidden;
-  font-size: 0.8125rem;
+  line-height: 1;
+  text-align: center;
   background: color-mix(in srgb, var(--line) 45%, var(--paper));
   border-radius: 0.45rem;
 }
 
-.phrase li::before {
-  flex: none;
-  font-size: 0.65rem;
+.index {
+  position: absolute;
+  top: 0.3rem;
+  inset-inline-start: 0.4rem;
+  font-size: min(28cqh, 12cqi);
+  line-height: 1;
   color: var(--muted);
-  content: counter(word);
-  counter-increment: word;
+}
+
+.token {
+  font-size: min(58cqh, 22cqi);
+  line-height: 0.95;
 }
 
 .boxes label {
+  container-type: size;
   position: relative;
   display: flex;
   align-items: center;
+  height: 100%;
   min-width: 0;
   min-height: 0;
 }
 
 .boxes span {
   position: absolute;
+  top: 0.3rem;
   inset-inline-start: 0.4rem;
-  font-size: 0.65rem;
+  font-size: min(28cqh, 12cqi);
+  line-height: 1;
   color: var(--muted);
   pointer-events: none;
 }
@@ -144,9 +157,9 @@
   width: 100%;
   height: 100%;
   min-height: 0;
-  padding: 0 0.35rem 0 1.35rem;
+  padding: 0 0.3em 0 1.5em;
   font: inherit;
-  font-size: 0.8125rem;
+  font-size: min(42cqh, 16cqi);
   color: var(--ink);
   background: var(--paper);
   border: 1px solid var(--line);
@@ -223,29 +236,7 @@
 }
 
 @media (min-width: 600px) {
-  .page {
-    height: auto;
-    max-height: none;
-    padding-top: 2.5rem;
-    padding-bottom: 2rem;
-    overflow: visible;
-  }
-
   .page h1 {
     font-size: 1.75rem;
-  }
-
-  .phrase,
-  .boxes {
-    flex: none;
-    grid-auto-rows: auto;
-  }
-
-  .phrase li {
-    padding: 0.45rem 0.6rem;
-  }
-
-  .boxes input {
-    height: 2.25rem;
   }
 }

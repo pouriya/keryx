@@ -13,7 +13,13 @@ export function Problem() {
       ? t("badChecksum")
       : error.code === "wrong_words"
         ? t("wrongWords")
-        : error.message;
+        : error.code === "bad_link"
+          ? t("linkUnknown")
+          : error.code === "link_used"
+            ? t("linkUsed")
+            : error.code === "link_expired"
+              ? t("linkExpired")
+              : error.message;
   return (
     <p className={styles.error} role="alert">
       {message}

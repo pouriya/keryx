@@ -735,16 +735,39 @@ pub async fn run_setup(
 ) -> Result<SetupReply, Refused> {
     check(app, caller, Need::Anyone).await?;
     check_password(app, &input.password)?;
+    let now = Ulid::now();
     let token_hash = sha256(input.token.as_bytes());
-    let Some(account) = app.storage.take_setup(token_hash, Ulid::now()).await? else {
-        return Err(refused(404, "bad_link", "That link is not valid"));
+    let account = match app.storage.setup_link(token_hash, now).await? {
+        storage::SetupLink::Ready(account) => account,
+        link => return Err(refuse_link(link)),
     };
     let password_hash = hash_password(input.password).await?;
-    app.storage.set_password(account.id, password_hash).await?;
+    if !app
+        .storage
+        .finish_setup(account.id, token_hash, password_hash, now)
+        .await?
+    {
+        return Err(refuse_link(
+            app.storage.setup_link(token_hash, Ulid::now()).await?,
+        ));
+    }
     Ok(SetupReply {
         account: account.id,
         username: account.username,
     })
+}
+
+/// The three ways a setup link is refused. Each says which one it was.
+fn refuse_link(link: storage::SetupLink) -> Refused {
+    match link {
+        storage::SetupLink::Used => refused(404, "link_used", "This setup link was already used"),
+        storage::SetupLink::Expired => {
+            refused(404, "link_expired", "This setup link is older than 7 days")
+        }
+        storage::SetupLink::Unknown | storage::SetupLink::Ready(_) => {
+            refused(404, "bad_link", "This is not a setup link")
+        }
+    }
 }
 
 /// A session, with what to tell the client, and its token for the route to hand over its own way.

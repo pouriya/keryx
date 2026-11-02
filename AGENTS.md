@@ -762,7 +762,9 @@ accepts the first for each step. The loser gets a rejection, catches up and retr
   their password and then their words. The operator never learns the password. **The token follows a
   `#`**, as in `https://chat.example.com/setup#<token>`, because browsers never send that part to a
   server, so no log can record it, and the client posts it in a body. The address comes from a
-  `public_url` key in `server.toml`. A link lasts 7 days, fixed in code.
+  `public_url` key in `server.toml`. A link lasts 7 days, fixed in code. A try says which
+  it was: no such link, the link was already used, or it is older than those 7 days and was never
+  used. The row stays after the password is set, so a second try can say it was used.
 - **Registering and the one-time link only create the account or its password.** The client then logs
   in the normal way, so there is one way into a session, and with `[captcha]` on, a person signing up
   solves two captchas.

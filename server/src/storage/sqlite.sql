@@ -98,7 +98,9 @@ CREATE TABLE account_setup (
     -- [Registration off] whose password and words this link sets.
     account_id  BLOB NOT NULL REFERENCES account (id) ON DELETE CASCADE,
     -- [Registration off] an unused link stops working.
-    expires_at  INTEGER NOT NULL
+    expires_at  INTEGER NOT NULL,
+    -- [Registration off] set when the password is chosen, so a later try can say the link was used.
+    used_at     INTEGER
 ) WITHOUT ROWID, STRICT;
 
 CREATE TABLE login_session (
