@@ -7,6 +7,7 @@ use std::time::Duration;
 use anyhow::Context;
 use clap::{CommandFactory, Parser, Subcommand};
 use keryx::api::{self, Settings};
+use keryx_core::protocol::CreateAccountBody;
 use serde_json::{Value, json};
 use tanzim::validator::{ByteSize, Duration as DurationValue, StaticMap};
 use tracing_subscriber::filter::LevelFilter;
@@ -303,7 +304,11 @@ fn run_user_add(
         remote,
         insecure,
         "/api/v1/accounts",
-        &json!({"username": username, "admin": admin, "display_name": display_name}),
+        &serde_json::to_value(CreateAccountBody {
+            username,
+            admin,
+            display_name,
+        })?,
     )?;
     if json_output {
         println!("{}", serde_json::to_string_pretty(&reply)?);

@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use axum::extract::ws::Utf8Bytes;
 use keryx_core::protocol::{
-    Bytes, ChatMode, ClientFrame, ContentKind, Kind, MessageFrame, SendFrame, ServerFrame,
-    WelcomeItem, WrapItem,
+    Bytes, ChatMode, ChatType, ClientFrame, ContentKind, Kind, MessageFrame, SendFrame,
+    ServerFrame, WelcomeItem, WrapItem,
 };
 use keryx_core::ulid::Ulid;
 use tokio::sync::{Notify, mpsc, oneshot};
@@ -23,7 +23,10 @@ use crate::api::{
     App, Caller, DELETE_OWN, EDIT_OWN, MESSAGE_COMMIT, Need, Refused, SEND_UNENCRYPTED, TRACE,
     check, new_id, operation, refused, send_permission,
 };
-use crate::storage::{Appended, GroupInfoPut, NewMessage, NewWelcome, NewWrap, Session, Storage};
+use crate::storage::{
+    Appended, GroupInfoPut, NewMessage, NewWelcome, NewWrap, Position, PositionReport, Session,
+    Storage,
+};
 
 /// How many events may wait for a chat's task before their senders wait in turn.
 const CHAT_QUEUE: usize = 256;
@@ -288,7 +291,36 @@ async fn handle(app: &Arc<App>, job: Job) {
                     let result = operation!(
                         "Seen",
                         "seen",
-                        run_seen(app, session, reference, chat, up_to_seq, client_seen_at)
+                        run_position(
+                            app,
+                            session,
+                            reference,
+                            Position::Seen,
+                            chat,
+                            up_to_seq,
+                            client_seen_at
+                        )
+                    );
+                    Some(answer_of(reference, result))
+                }
+                ClientFrame::Received {
+                    reference,
+                    chat,
+                    up_to_seq,
+                    client_received_at,
+                } => {
+                    let result = operation!(
+                        "Received",
+                        "received",
+                        run_position(
+                            app,
+                            session,
+                            reference,
+                            Position::Received,
+                            chat,
+                            up_to_seq,
+                            client_received_at
+                        )
                     );
                     Some(answer_of(reference, result))
                 }
@@ -633,13 +665,16 @@ pub async fn hand_welcomes(app: &App, account: Ulid, device: Ulid) -> Result<(),
     Ok(())
 }
 
-async fn run_seen(
+/// A `seen` or `received`: keeps the highest, and tells the other members' online devices when it
+/// rises, except in a channel, where only the waiting sign is drawn.
+async fn run_position(
     app: &Arc<App>,
     session: Session,
     reference: Ulid,
+    position: Position,
     chat: Ulid,
     up_to_seq: u64,
-    client_seen_at: i64,
+    client_at: i64,
 ) -> Result<ServerFrame, Refused> {
     check(app, &Caller::Session(session), Need::Member(chat)).await?;
     let device = session.device()?;
@@ -647,18 +682,32 @@ async fn run_seen(
         return Err(refused(404, "not_member", "You are not in that chat"));
     };
     if up_to_seq > access.last_seq {
-        return Err(refused(400, "bad_seen", "That message does not exist yet"));
+        let code = match position {
+            Position::Received => "bad_received",
+            Position::Seen => "bad_seen",
+        };
+        return Err(refused(400, code, "That message does not exist yet"));
     }
-    app.storage
-        .record_seen(
+    let mark = app
+        .storage
+        .record_position(PositionReport {
+            position,
             chat,
-            session.account,
+            account: session.account,
             device,
             up_to_seq,
-            client_seen_at,
-            Ulid::now(),
-        )
+            client_at,
+            now: Ulid::now(),
+        })
         .await?;
+    if let Some(mark) = mark
+        && access.chat_type != ChatType::Channel
+    {
+        let mut member_list = app.storage.member_accounts(chat).await?;
+        member_list.retain(|account| *account != session.account);
+        app.hub
+            .deliver(&member_list, None, &ServerFrame::Marks { chat, mark });
+    }
     Ok(ServerFrame::Done { reference })
 }
 

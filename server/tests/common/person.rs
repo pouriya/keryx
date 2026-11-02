@@ -1,12 +1,20 @@
-//! A person with an account, their words' keys, and one registered device: `keryx-core` as the client.
-//! For the tests that talk as one. Apart from `mod.rs`, because a test file that has no use for it would
-//! fail clippy on dead code, and `#[allow]` is not used here.
+//! A person: `keryx-core`'s [`Client`] driven against the real server the way an app drives it, and
+//! the raw pieces the tests that break rules sign with by hand, once the client has set things up.
+//! Apart from `mod.rs`, because a test file that has no use for it would fail clippy on dead code,
+//! and `#[allow]` is not used here.
 
+use std::collections::VecDeque;
+use std::net::TcpStream;
+use std::time::{Duration, Instant};
+
+use keryx_core::client::{Auth, Client, Command, Event, Input, Output, Platform, Secret};
 use keryx_core::mls::{AccountKey, Device, stamp_account_key};
-use keryx_core::protocol::Bytes;
+use keryx_core::protocol::{Bytes, ChatType};
 use keryx_core::seed::{AccountKeys, derive};
 use keryx_core::ulid::Ulid;
 use serde_json::{Value, json};
+use tungstenite::stream::MaybeTlsStream;
+use tungstenite::{ClientRequestBuilder, Message, WebSocket};
 
 use crate::common::Server;
 
@@ -15,6 +23,274 @@ pub const SARA_WORDS: &str =
     "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 pub const BABAK_WORDS: &str =
     "legal winner thank year wave sausage worth useful legal winner thank yellow";
+
+/// How long a test waits for something before failing.
+const PATIENCE: Duration = Duration::from_secs(20);
+
+/// The client, with what an app does around it: the requests, the socket, the two slots and the timer.
+pub struct App {
+    pub client: Client,
+    socket: Option<WebSocket<MaybeTlsStream<TcpStream>>>,
+    pub slots: [Option<Vec<u8>>; 2],
+    wake_at: Option<i64>,
+    pub token: Option<String>,
+    pub self_chat: Option<Ulid>,
+    /// Shown and not yet waited for.
+    pub events: VecDeque<Event>,
+}
+
+impl App {
+    pub fn new() -> Self {
+        let platform = Platform {
+            platform: 0,
+            os: "linux".to_string(),
+            os_version: "7".to_string(),
+            web_platform: None,
+            web_platform_version: None,
+        };
+        Self {
+            client: Client::new(Auth::Token, platform),
+            socket: None,
+            slots: [None, None],
+            wake_at: None,
+            token: None,
+            self_chat: None,
+            events: VecDeque::new(),
+        }
+    }
+
+    /// Registers, logs in, sets up the words, and waits for the self chat to be ready.
+    pub fn sign_up(server: &Server, username: &str, words: &str) -> Self {
+        let mut app = Self::new();
+        app.command(
+            server,
+            Command::SignUp {
+                username: username.to_string(),
+                password: Secret(PASSWORD.to_string()),
+                display_name: None,
+                captcha: None,
+            },
+        );
+        app.wait(server, |event| {
+            matches!(event, Event::NeedWords { restore: false })
+        });
+        app.command(
+            server,
+            Command::SetWords {
+                words: Secret(words.to_string()),
+            },
+        );
+        app.wait(server, |event| matches!(event, Event::ChatReady { .. }));
+        app
+    }
+
+    pub fn id(&self) -> Ulid {
+        self.client.account().unwrap()
+    }
+
+    pub fn command(&mut self, server: &Server, command: Command) {
+        self.feed(server, Input::Command { command });
+    }
+
+    pub fn feed(&mut self, server: &Server, input: Input) {
+        let outputs = self.client.step(input, Ulid::now());
+        self.run(server, outputs);
+    }
+
+    /// Does what the client asked, feeding each answer back, until it asks for nothing more.
+    fn run(&mut self, server: &Server, outputs: Vec<Output>) {
+        let mut todo: VecDeque<Output> = outputs.into();
+        while let Some(output) = todo.pop_front() {
+            let input = match output {
+                Output::Send { text } => {
+                    if let Some(socket) = self.socket.as_mut() {
+                        let _ = socket.send(Message::text(text.0.clone()));
+                    }
+                    None
+                }
+                Output::Request {
+                    id,
+                    method,
+                    path,
+                    body,
+                    bearer,
+                } => {
+                    if let Some(bearer) = &bearer {
+                        self.token = Some(bearer.0.clone());
+                    }
+                    let body: Option<Value> = body
+                        .as_ref()
+                        .map(|body| serde_json::from_str(&body.0).unwrap());
+                    let bearer = bearer.as_ref().map(|bearer| bearer.0.as_str());
+                    let (status, reply) = server.call(&method, &path, bearer, body.as_ref());
+                    if path == "/api/v1/login/token" && status == 200 {
+                        self.token = Some(reply["data"]["token"].as_str().unwrap().to_string());
+                    }
+                    Some(Input::Reply {
+                        id,
+                        status,
+                        body: reply.to_string(),
+                    })
+                }
+                Output::Connect { bearer } => {
+                    let url = format!("{}/api/v1/ws", server.origin.replace("http://", "ws://"));
+                    let mut request = ClientRequestBuilder::new(url.parse().unwrap())
+                        .with_sub_protocol("keryx.v1");
+                    if let Some(bearer) = &bearer {
+                        request =
+                            request.with_header("Authorization", format!("Bearer {}", bearer.0));
+                    }
+                    match tungstenite::connect(request) {
+                        Ok((socket, _)) => {
+                            if let MaybeTlsStream::Plain(stream) = socket.get_ref() {
+                                stream
+                                    .set_read_timeout(Some(Duration::from_millis(20)))
+                                    .unwrap();
+                            }
+                            self.socket = Some(socket);
+                            Some(Input::Connected)
+                        }
+                        Err(_) => Some(Input::Closed {
+                            code: 1006,
+                            reason: String::new(),
+                        }),
+                    }
+                }
+                Output::Disconnect => {
+                    self.socket = None;
+                    None
+                }
+                Output::Save { id, slot, bytes } => {
+                    self.slots[usize::from(slot)] = Some(bytes);
+                    Some(Input::Saved { id })
+                }
+                Output::Wipe => {
+                    self.slots = [None, None];
+                    None
+                }
+                Output::WakeAt { at } => {
+                    self.wake_at = Some(at);
+                    None
+                }
+                Output::Event { event } => {
+                    if let Event::Chats { chat_list } = &event {
+                        for item in chat_list {
+                            if item.chat_type == ChatType::SelfChat {
+                                self.self_chat = Some(item.chat);
+                            }
+                        }
+                    }
+                    self.events.push_back(event);
+                    None
+                }
+            };
+            if let Some(input) = input {
+                let more = self.client.step(input, Ulid::now());
+                todo.extend(more);
+            }
+        }
+    }
+
+    /// Reads one frame if one comes soon, and fires the timer when it is due.
+    pub fn read_once(&mut self, server: &Server) {
+        if let Some(at) = self.wake_at
+            && Ulid::now() >= at
+        {
+            self.wake_at = None;
+            self.feed(server, Input::Timer);
+        }
+        let Some(socket) = self.socket.as_mut() else {
+            std::thread::sleep(Duration::from_millis(20));
+            return;
+        };
+        let input = match socket.read() {
+            Ok(Message::Text(text)) => Input::Frame {
+                text: text.as_str().to_string(),
+            },
+            Ok(Message::Close(frame)) => {
+                self.socket = None;
+                match frame {
+                    Some(frame) => Input::Closed {
+                        code: u16::from(frame.code),
+                        reason: frame.reason.to_string(),
+                    },
+                    None => Input::Closed {
+                        code: 1005,
+                        reason: String::new(),
+                    },
+                }
+            }
+            Ok(_) => return,
+            Err(tungstenite::Error::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return;
+            }
+            Err(_) => {
+                self.socket = None;
+                Input::Closed {
+                    code: 1006,
+                    reason: String::new(),
+                }
+            }
+        };
+        self.feed(server, input);
+    }
+
+    /// The first event that matches, reading the socket until it comes. Others are kept for later,
+    /// and an error event fails the test unless it is what was wanted.
+    pub fn wait(&mut self, server: &Server, wanted: impl Fn(&Event) -> bool) -> Event {
+        let started = Instant::now();
+        loop {
+            for index in 0..self.events.len() {
+                if wanted(&self.events[index]) {
+                    return self.events.remove(index).unwrap();
+                }
+                if let Event::Error { code, message } = &self.events[index] {
+                    panic!("The client failed: {code}: {message}");
+                }
+            }
+            assert!(
+                started.elapsed() < PATIENCE,
+                "Waited too long, holding {:?}",
+                self.events
+            );
+            self.read_once(server);
+        }
+    }
+
+    /// The person behind this app, holding the device the client set up, for signing by hand.
+    pub fn into_person(self, words: &str) -> Person {
+        assert!(
+            self.slots.iter().any(Option::is_some),
+            "The client saved nothing"
+        );
+        let id = self.id();
+        let username = String::new();
+        let token = self.token.clone().unwrap();
+        let self_chat = self.self_chat.unwrap();
+        let device = self.client.into_device().unwrap();
+        let keys = derive(words).unwrap();
+        let key = AccountKey {
+            account: id,
+            account_public: *keys.account_public(),
+            master_public: *keys.master_public(),
+            stamp: stamp_account_key(&keys, &id),
+        };
+        Person {
+            id,
+            username,
+            keys,
+            key,
+            self_chat,
+            token,
+            device,
+        }
+    }
+}
 
 pub struct Person {
     pub id: Ulid,
@@ -42,7 +318,7 @@ pub fn log_in(server: &Server, username: &str) -> String {
     reply["data"]["token"].as_str().unwrap().to_string()
 }
 
-/// Asks for an id, stamps it, and registers it on this session.
+/// Asks for an id, stamps it, and registers it on this session, by hand.
 pub fn add_device(server: &Server, account: Ulid, keys: &AccountKeys, token: &str) -> Device {
     let (status, reply) = server.call("POST", "/api/v1/devices/id", Some(token), None);
     assert_eq!(status, 200, "{reply}");
@@ -66,56 +342,10 @@ pub fn add_device(server: &Server, account: Ulid, keys: &AccountKeys, token: &st
     device
 }
 
-/// Registers, logs in, sets up the words, adds a device, and uploads three key packages.
+/// Signs up through the client, then hands back the person for the tests that sign by hand.
 pub fn sign_up(server: &Server, username: &str, words: &str) -> Person {
-    let (status, reply) = server.call(
-        "POST",
-        "/api/v1/register",
-        None,
-        Some(&json!({"username": username, "password": PASSWORD})),
-    );
-    assert_eq!(status, 200, "{reply}");
-    let id = ulid_of(&reply["data"]["account"]);
-    let token = log_in(server, username);
-    let keys = derive(words).unwrap();
-    let key = AccountKey {
-        account: id,
-        account_public: *keys.account_public(),
-        master_public: *keys.master_public(),
-        stamp: stamp_account_key(&keys, &id),
-    };
-    let (status, reply) = server.call(
-        "PUT",
-        "/api/v1/account/keys",
-        Some(&token),
-        Some(&json!({
-            "master_public": Bytes(key.master_public.to_vec()),
-            "account_public": Bytes(key.account_public.to_vec()),
-            "account_stamp": Bytes(key.stamp.to_vec()),
-        })),
-    );
-    assert_eq!(status, 200, "{reply}");
-    let self_chat = ulid_of(&reply["data"]["self_chat"]);
-    let device = add_device(server, id, &keys, &token);
-    let mut body_list = Vec::new();
-    for _ in 0..3 {
-        body_list.push(Bytes(device.key_package().unwrap()));
-    }
-    let (status, reply) = server.call(
-        "POST",
-        "/api/v1/key_packages",
-        Some(&token),
-        Some(&json!({"body_list": body_list})),
-    );
-    assert_eq!(status, 200, "{reply}");
-    assert_eq!(reply["data"]["count"], 3);
-    Person {
-        id,
-        username: username.to_string(),
-        keys,
-        key,
-        self_chat,
-        token,
-        device,
-    }
+    let app = App::sign_up(server, username, words);
+    let mut person = app.into_person(words);
+    person.username = username.to_string();
+    person
 }

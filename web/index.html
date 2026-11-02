@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>keryx</title>
+    <style>
+      body { font: 14px system-ui, sans-serif; margin: 1rem; max-width: 60rem; }
+      fieldset { margin-block: 0.5rem; }
+      input, textarea { margin: 0.2rem; }
+      textarea { width: 30rem; }
+      #log { white-space: pre-wrap; background: #f4f4f4; padding: 0.5rem; max-height: 50vh; overflow: auto; }
+      [hidden] { display: none; }
+    </style>
+  </head>
+  <body>
+    <p id="elsewhere" hidden>
+      keryx is open in another tab. <button id="use-here" type="button">Use here</button>
+    </p>
+    <main id="app" hidden>
+      <p>The bare page: core's client in a worker, with no screens yet.</p>
+      <fieldset>
+        <legend>Account</legend>
+        <input id="username" placeholder="username" autocomplete="username" />
+        <input id="password" type="password" placeholder="password" autocomplete="current-password" />
+        <button data-command="sign_up" type="button">Sign up</button>
+        <button data-command="log_in" type="button">Log in</button>
+        <button data-command="log_out" type="button">Log out</button>
+      </fieldset>
+      <fieldset>
+        <legend>Words</legend>
+        <textarea id="words" rows="2" placeholder="the words" autocomplete="off" spellcheck="false"></textarea>
+        <br />
+        <button data-command="generate_words" type="button">Generate 12</button>
+        <button data-command="set_words" type="button">Set words</button>
+        <button data-command="restore" type="button">Restore</button>
+      </fieldset>
+      <fieldset>
+        <legend>Chats</legend>
+        <input id="search" placeholder="search the directory" />
+        <button data-command="search" type="button">Search</button>
+        <input id="account" placeholder="account id" size="28" />
+        <button data-command="start_chat" type="button">Start chat</button>
+        <br />
+        <button data-command="chat_list" type="button">Chat list</button>
+        <input id="chat" placeholder="chat id" size="28" />
+        <button data-command="open_chat" type="button">Open</button>
+        <input id="text" placeholder="a message" />
+        <button data-command="send_text" type="button">Send</button>
+        <button data-command="devices" type="button">Devices</button>
+      </fieldset>
+      <div id="log"></div>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

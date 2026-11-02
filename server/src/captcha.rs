@@ -14,9 +14,9 @@ use std::time::Duration;
 use base64ct::{Base64, Encoding};
 use captcha::Captcha;
 use captcha::filters::{Cow, Dots, Grid, Noise, Wave};
+use keryx_core::protocol::{CaptchaAnswer, CaptchaReply};
 use keryx_core::ulid::Ulid;
 use serde::Deserialize;
-use serde_json::{Value, json};
 
 use crate::api::{self, App, Caller, Need, Refused, millis, new_id, refused};
 use crate::storage::Storage;
@@ -89,13 +89,6 @@ impl Default for Settings {
     }
 }
 
-/// What a client sends back.
-#[derive(Deserialize)]
-pub struct Answer {
-    pub id: Ulid,
-    pub answer: String,
-}
-
 /// Runs for as long as the process: every `sweep_every`, captchas expired more than `keep_for` ago go.
 pub fn start_sweep(app: Arc<App>) {
     let Some(settings) = &app.settings.captcha else {
@@ -119,7 +112,7 @@ pub fn start_sweep(app: Arc<App>) {
 }
 
 /// A new captcha: drawn, stored, and its image.
-pub async fn run_issue(app: &App) -> Result<Value, Refused> {
+pub async fn run_issue(app: &App) -> Result<CaptchaReply, Refused> {
     api::check(app, &Caller::Nobody, Need::Anyone).await?;
     let Some(settings) = &app.settings.captcha else {
         return Err(refused(404, "captcha_off", "This server has no captcha"));
@@ -223,15 +216,15 @@ pub async fn run_issue(app: &App) -> Result<Value, Refused> {
     let id = new_id()?;
     let expires_at = Ulid::now().saturating_add(millis(settings.ttl));
     app.storage.create_captcha(id, answer, expires_at).await?;
-    Ok(json!({
-        "id": id,
-        "image": format!("data:image/png;base64,{}", Base64::encode_string(&png)),
-    }))
+    Ok(CaptchaReply {
+        id,
+        image: format!("data:image/png;base64,{}", Base64::encode_string(&png)),
+    })
 }
 
 /// Passes if there is no `[captcha]`, or the answer is right. The row goes whatever the answer is.
 /// Persian and Arabic digits read as Latin ones, because people here type them.
-pub async fn check(app: &App, given: Option<Answer>) -> Result<(), Refused> {
+pub async fn check(app: &App, given: Option<CaptchaAnswer>) -> Result<(), Refused> {
     let Some(settings) = &app.settings.captcha else {
         return Ok(());
     };

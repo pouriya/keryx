@@ -1,7 +1,7 @@
 use keryx_core::mls::{Device, verify_message};
 use keryx_core::protocol::{
-    Bytes, ChatItem, ChatMode, ChatType, ClientFrame, ContentKind, Header, Kind, MessageFrame,
-    SendFrame, ServerFrame, WelcomeItem, WrapItem,
+    Bytes, ChatItem, ChatMode, ChatType, ClientFrame, ContentKind, Header, Kind, MarkItem,
+    MessageFrame, SendFrame, ServerFrame, WelcomeItem, WrapItem,
 };
 use keryx_core::seed::derive;
 use keryx_core::ulid::Ulid;
@@ -192,9 +192,31 @@ fn every_client_frame_has_the_agreed_shape() {
                 reference: ulid(REF),
                 chat: ulid(CHAT),
                 after_seq: 41,
+                before_seq: None,
                 limit: 100,
             },
             json!({"type": "history", "ref": REF, "chat": CHAT, "after_seq": 41, "limit": 100}),
+        ),
+        (
+            ClientFrame::History {
+                reference: ulid(REF),
+                chat: ulid(CHAT),
+                after_seq: 0,
+                before_seq: Some(43),
+                limit: 100,
+            },
+            json!({"type": "history", "ref": REF, "chat": CHAT, "after_seq": 0, "before_seq": 43,
+                   "limit": 100}),
+        ),
+        (
+            ClientFrame::Received {
+                reference: ulid(REF),
+                chat: ulid(CHAT),
+                up_to_seq: 42,
+                client_received_at: 1800,
+            },
+            json!({"type": "received", "ref": REF, "chat": CHAT, "up_to_seq": 42,
+                   "client_received_at": 1800}),
         ),
         (
             ClientFrame::GroupInfo {
@@ -253,6 +275,20 @@ fn every_server_frame_has_the_agreed_shape() {
         last_kind: Some(Kind::Content),
         last_at: Some(1800),
         last_content_seq: None,
+        epoch: None,
+        last_content: None,
+        mark_list: Vec::new(),
+    };
+    let marked = ChatItem {
+        last_content_seq: Some(5),
+        epoch: Some(3),
+        last_content: Some(Box::new(removed.clone())),
+        mark_list: vec![MarkItem {
+            account: ulid(ID),
+            received_seq: 42,
+            seen_seq: Some(41),
+        }],
+        ..chat.clone()
     };
     let cases = [
         (
@@ -284,11 +320,26 @@ fn every_server_frame_has_the_agreed_shape() {
         (
             ServerFrame::Chats {
                 reference: ulid(REF),
-                chat_list: vec![chat],
+                chat_list: vec![chat, marked],
             },
             json!({"type": "chats", "ref": REF, "chat_list": [{
                 "chat": CHAT, "type": 1, "mode": 0, "last_seq": 42, "last_kind": 0, "last_at": 1800,
+            }, {
+                "chat": CHAT, "type": 1, "mode": 0, "last_seq": 42, "last_kind": 0, "last_at": 1800,
+                "last_content_seq": 5, "epoch": 3, "last_content": {"chat": CHAT, "seq": 5},
+                "mark_list": [{"account": ID, "received_seq": 42, "seen_seq": 41}],
             }]}),
+        ),
+        (
+            ServerFrame::Marks {
+                chat: ulid(CHAT),
+                mark: MarkItem {
+                    account: ulid(ID),
+                    received_seq: 42,
+                    seen_seq: None,
+                },
+            },
+            json!({"type": "marks", "chat": CHAT, "account": ID, "received_seq": 42}),
         ),
         (
             ServerFrame::Page {

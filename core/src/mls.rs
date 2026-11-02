@@ -831,6 +831,37 @@ impl Device {
         Ok(())
     }
 
+    /// Drop this chat's group, so it can be rejoined by external commit. Every epoch key already
+    /// held stays, so the messages this device could read still open.
+    pub fn forget_chat(&mut self, chat: Ulid) -> Result<(), MlsError> {
+        let provider = &self.provider;
+        let Some(state) = self.chats.get_mut(&chat) else {
+            return Err(MlsError::UnknownChat { chat });
+        };
+        if let Err(source) = state.group.delete(provider.storage()) {
+            return Err(group_error("drop a group", source));
+        }
+        self.chats.remove(&chat);
+        Ok(())
+    }
+
+    /// Commits a run left waiting for their answer, since the queue that held them is gone. A join
+    /// is dropped and anything else cleared, so the next commit can be built. If the server did
+    /// accept one, the client finds it among the messages and rejoins. True if anything went.
+    pub fn drop_pending_commits(&mut self) -> Result<bool, MlsError> {
+        let mut chat_list = Vec::new();
+        for (chat, state) in &self.chats {
+            if state.joining || state.group.pending_commit().is_some() {
+                chat_list.push(*chat);
+            }
+        }
+        let dropped = !chat_list.is_empty();
+        for chat in chat_list {
+            self.commit_rejected(chat)?;
+        }
+        Ok(dropped)
+    }
+
     /// Apply another device's commit, after checking every device it brings in.
     pub fn process_commit(
         &mut self,

@@ -852,8 +852,9 @@ fn lowering_the_limit_stops_existing_devices_at_their_next_request() {
 fn key_packages_have_a_limit_and_a_claim_uses_one_up() {
     let server = Server::start(
         "",
-        "[registration]\nallow = true\n[limits]\nkey_packages = 4\n",
+        "[registration]\nallow = true\n[limits]\nkey_packages = 10\n",
     );
+    // Each client keeps 10, and starting its self chat used one of its own, so two more go past 10.
     let sara = sign_up(&server, "sara_x", SARA_WORDS);
     let babak = sign_up(&server, "babak_x", BABAK_WORDS);
     let too_many = json!({"body_list": [Bytes(vec![1]), Bytes(vec![2])]});
@@ -869,7 +870,7 @@ fn key_packages_have_a_limit_and_a_claim_uses_one_up() {
     );
     let route = format!("/api/v1/accounts/{}/key_packages/claim", babak.id);
     let mut seen = Vec::new();
-    for _ in 0..3 {
+    for _ in 0..9 {
         let (status, reply) = server.call("POST", &route, Some(&sara.token), None);
         assert_eq!(status, 200, "{reply}");
         let key_package_list = reply["data"]["key_package_list"].as_array().unwrap();

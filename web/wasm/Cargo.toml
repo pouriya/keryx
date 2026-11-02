@@ -1,0 +1,25 @@
+[package]
+name = "keryx-wasm"
+version = "0.1.0"
+edition = "2024"
+description = "The wasm-bindgen glue around keryx-core's client, for the browser"
+authors = ["Pouriya Jahanbakhsh <pouriya.jahanbakhsh@gmail.com>"]
+rust-version = "1.91"
+license = "MIT"
+repository = "https://github.com/pouriya/keryx"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+keryx-core = { path = "../../core", features = ["wasm"] }
+
+# Pinned to the wasm-bindgen CLI on the author's machine, since the two must be identical. Raising it
+# means installing the matching CLI first. See web/AGENTS.md.
+wasm-bindgen = "=0.2.129"
+
+# Its `Ts` wrapper carries core's types across as plain objects, typed in TypeScript, with bytes as a
+# Uint8Array. Already in the tree under core's `wasm` feature. Not its `into_wasm_abi`, which it marks
+# deprecated because a failed conversion leaks memory.
+tsify = { version = "0.5.8", default-features = false, features = ["js"] }

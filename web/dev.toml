@@ -1,0 +1,24 @@
+# The server `make dev` starts beside Vite. Paths must be absolute, so the Makefile writes a copy
+# under tmp/ with @ROOT@ replaced by the repository's path. public_url is Vite's address, so the
+# WebSocket's Origin check and the cookie match. Registration is open and there is no captcha.
+listen = "127.0.0.1:7777"
+public_url = "http://127.0.0.1:5173"
+
+[database]
+type = "sqlite"
+path = "@ROOT@/tmp/dev/keryx.db"
+
+[registration]
+allow = true
+
+[session]
+lifetime = "30d"
+
+[chat]
+idle_after = "5m"
+
+[www]
+directory = "@ROOT@/web/dist"
+
+[password]
+min_length = 12

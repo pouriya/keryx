@@ -5,7 +5,7 @@ fn queue() -> Queue<&'static str> {
 }
 
 fn next_item(queue: &mut Queue<&'static str>) -> Option<&'static str> {
-    let outgoing = queue.take_next()?;
+    let outgoing = queue.take_next(false)?;
     Some(outgoing.item)
 }
 
@@ -27,7 +27,7 @@ fn content_keeps_the_order_it_was_sent_in() {
     queue.push(Level::Content, "first", Target::None);
     queue.push(Level::Content, "second", Target::Seq(9));
     assert_eq!(next_item(&mut queue), Some("first"));
-    let second = queue.take_next().unwrap();
+    let second = queue.take_next(false).unwrap();
     assert_eq!(second.item, "second");
     assert_eq!(second.pointer_seq, Some(9));
 }
@@ -47,7 +47,7 @@ fn an_action_waits_for_its_targets_sequence_id_and_nothing_overtakes_it() {
     assert_eq!(next_item(&mut queue), None);
 
     queue.confirm(target, 41);
-    let reply = queue.take_next().unwrap();
+    let reply = queue.take_next(false).unwrap();
     assert_eq!(reply.item, "reply");
     assert_eq!(reply.pointer_seq, Some(41));
     assert_eq!(next_item(&mut queue), Some("later"));
@@ -70,10 +70,10 @@ fn after_a_reconnect_unanswered_items_go_again_in_order() {
     let third = queue.push(Level::Content, "third", Target::None);
     let commit = queue.push(Level::Keys, "commit", Target::None);
     queue.push(Level::Typing, "stale", Target::None);
-    let _ = queue.take_next();
-    let _ = queue.take_next();
-    let _ = queue.take_next();
-    let _ = queue.take_next();
+    let _ = queue.take_next(false);
+    let _ = queue.take_next(false);
+    let _ = queue.take_next(false);
+    let _ = queue.take_next(false);
     assert_eq!(
         queue.in_flight_list(),
         vec![(commit, &"commit"), (first, &"first"), (second, &"second")]
@@ -101,13 +101,13 @@ fn giving_up_on_a_message_takes_whatever_waits_on_it() {
     let reply = queue.push(Level::Content, "reply", Target::Pending(target));
     let reaction = queue.push(Level::Content, "reaction", Target::Pending(reply));
     let free = queue.push(Level::Content, "free", Target::None);
-    let _ = queue.take_next();
+    let _ = queue.take_next(false);
 
     assert_eq!(
         queue.drop_with_dependents(target),
         vec![target, reply, reaction]
     );
-    assert_eq!(queue.take_next().unwrap().id, free);
+    assert_eq!(queue.take_next(false).unwrap().id, free);
     queue.confirm(free, 1);
     assert!(queue.is_empty());
 }
@@ -118,7 +118,19 @@ fn a_lost_commit_can_be_dropped() {
     let commit = queue.push(Level::Keys, "commit", Target::None);
     let typing = queue.push(Level::Typing, "typing", Target::None);
     assert_eq!(queue.drop_with_dependents(typing), vec![typing]);
-    let _ = queue.take_next();
+    let _ = queue.take_next(false);
     assert_eq!(queue.drop_with_dependents(commit), vec![commit]);
     assert!(queue.is_empty());
+}
+
+#[test]
+fn only_typing_goes_while_a_commit_waits() {
+    let mut queue = queue();
+    queue.push(Level::Content, "text", Target::None);
+    queue.push(Level::Keys, "commit", Target::None);
+    queue.push(Level::Typing, "typing", Target::None);
+    assert_eq!(queue.take_next(true).unwrap().item, "typing");
+    assert!(queue.take_next(true).is_none());
+    assert_eq!(queue.take_next(false).unwrap().item, "commit");
+    assert_eq!(queue.take_next(false).unwrap().item, "text");
 }

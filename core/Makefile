@@ -31,10 +31,10 @@ test:
 	cargo test --target ${TARGET}
 
 
-# The browser build. Compiling is the check: it is what breaks when a dependency or an API rules
-# WASM out, and the hard constraint in AGENTS.md has no other guard until the web client exists.
+# The browser build, with the `wasm` feature the web client uses. Compiling is the check: it is what
+# breaks when a dependency or an API rules WASM out, or when tsify cannot describe a type.
 wasm:
-	cargo check --target ${WASM_TARGET}
+	cargo check --target ${WASM_TARGET} --features wasm
 
 
 # Runs the tests, then rewrites the table between the markers from llvm-cov's summary. Its columns

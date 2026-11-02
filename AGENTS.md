@@ -25,16 +25,21 @@ DECIDE. NO DEFAULTS. NO "SENSIBLE CHOICE". NO "I'LL PICK ONE AND MENTION IT".**
 
 ## Status
 
-Nothing is committed. **`core/` and the first server build are written, and both pass `make all`.**
-The server has the first slice plus delete and edit in 1:1 chats, driven in its tests by `keryx-core`
-as a real client. There is no web client yet, so no browser has used it. `core/` has no browser or Android bindings yet, and no module on its
-closed list holds them. Its WASM build is compiled by the gate but has not been run; only the earlier
-`openmls` probe ran under Node. **Running its tests under a WASM runtime, and covering its remaining
+The first build is committed. **`core/` and the first server build are written, and both pass `make all`.**
+The server has the first slice plus delete and edit in 1:1 chats, `received` and `marks`, driven in its
+tests by `core/src/client.rs` as a real client. **The bare web page runs it in the author's Chromium**
+through `web/wasm/`: two people on two origins signed up, set their words, started a 1:1 chat and
+exchanged encrypted text both ways, with `received` marks, and a reload reopened it from IndexedDB.
+`core/`'s own tests have not run under WASM. **Running its tests under a WASM runtime, and covering its remaining
 error paths, are still to do:** see [core/tests/AGENTS.md](core/tests/AGENTS.md).
 
 - **Proven:** `openmls` 0.9.2 runs in WASM under Node: adding a member, a message, an external
-  commit, and all three members exporting the same key. Not yet tried in a browser.
-- **Next:** the web client, against a server that already works. Running `core/`'s tests in WASM waits until after it starts: see [core/tests/AGENTS.md](core/tests/AGENTS.md).
+  commit, and all three members exporting the same key. It now runs in Chromium too, through the bare page.
+- **Next:** the web client, designed in [web/AGENTS.md](web/AGENTS.md), built in the author's order:
+  first `core/src/client.rs`, with the server's tests driving it and `received` and `marks` added to the
+  server, all passing `make all`; then `web/wasm/` and a bare worker that logs in and sends a message in
+  the author's Chromium, both done; then the screens. Running `core/`'s tests in WASM waits until after it starts:
+  see [core/tests/AGENTS.md](core/tests/AGENTS.md).
 
 Delete this section when it stops being true.
 
@@ -51,14 +56,20 @@ core/           Rust shared by every client: wire types, words, MLS, key wrappin
   AGENTS.md     Binding rules for core/
   tests/        Integration tests
     AGENTS.md   The rule about the coverage table, and the table
-web/            The browser client. Not created yet
+web/            The browser client: a bare page for now
+  AGENTS.md     The web client's decisions and rules
+  wasm/         A workspace crate holding only the wasm-bindgen glue around keryx-core
 android/        The Android client. Not created yet
 ```
 
 **`server/` and `core/` follow the strict rules.** The file lists are closed, code
 style and logging are fixed, everything goes through `make`, and all tests are
-integration tests. Client code style in `web/` and `android/` is deliberately
-undecided for now.
+integration tests. **`web/` is loose for now, by the author's choice:** see
+[web/AGENTS.md](web/AGENTS.md). Code style in `android/` is undecided.
+
+**`web/wasm/` is its own crate, not a module in `core/`**, so `core/` holds no JavaScript glue and
+its native coverage is not pulled down by code its tests cannot run. Android gets a sibling crate
+the same way. It shares the workspace's one `Cargo.lock`.
 
 **`core/` exists because keys must come out byte-identical everywhere.** The CLI,
 the browser (WASM) and Android (FFI) all turn the same words into the same keys
@@ -66,7 +77,7 @@ and read the same MLS state. One implementation means one thing to audit.
 
 **The workspace is what keeps crypto versions identical** between the server and
 the WASM build, because there is one `Cargo.lock`. Make targets stay inside
-`server/` and `core/`.
+`server/`, `core/` and `web/`.
 
 ## What has been decided
 
@@ -90,7 +101,7 @@ the WASM build, because there is one `Cargo.lock`. Make targets stay inside
 | Web delivery | Built on its own, copied into the server's Docker image, and served from `[www] directory = "..."` in `server.toml` through `tower-http`'s ServeDir, so keryx does not own a path check. A path with no file gets `index.html`, so `/setup#token` works. Not embedded in the binary |
 | Database | SQLite in **one `.db` file, with no `.wal`**, using its classic `DELETE` journal: a `-journal` file exists only during a write, so a crash mid-write rolls back. One writer and one reader connection, each behind a lock, which take turns. If that becomes too slow, the answer is Postgres |
 | v1 scope | Direct and group chats, channels, 1:1 calls, encrypted attachments, local message search, all four MCP roles |
-| Web stack | React, Vite and TypeScript, with all crypto done by `keryx-core` compiled to WASM |
+| Web stack | React, Vite and TypeScript, with all crypto done by `keryx-core` compiled to WASM. The rest is in [web/AGENTS.md](web/AGENTS.md) |
 
 ### RBAC
 
@@ -186,7 +197,10 @@ the WASM build, because there is one `Cargo.lock`. Make targets stay inside
 - **Each user has their own list of conversations, worked out by the server.** The
   client never sends the list. It shows the list, updates state with the latest for
   all of them, then fetches pages in the background from the last id it has to the
-  latest.
+  latest. **How, chosen by the author:** on every reconnect, each chat this session already
+  knew is paged forward with `after_seq` from the last sequence id it handled, commits applied in
+  order and content opened. After a reload there is no last id, so nothing is backfilled and a
+  chat opens on its newest page. See [core/AGENTS.md](core/AGENTS.md).
 
 ### Removal
 
@@ -340,8 +354,8 @@ holds it in memory only for that request and sends it back in its answer, so req
 match over one socket: a `send` gets its sequence id this way, and a history request its page. **The
 server never stores a client's ULID, and it is not in the signed header.** What is saved goes by
 its sequence id, from 1. REST carries the same bodies. A client sends `send`,
-`seen`, `typing`, `sync`, `history`, `group_info`, `wraps` and `ping`. The server sends `features`, `sent`, `done`,
-`refused`, `message`, `chats`, `page`, `welcome`, `typing` and `revoked`. `group_info` and `wraps` are not
+`seen`, `received`, `typing`, `sync`, `history`, `group_info`, `wraps` and `ping`. The server sends `features`, `sent`, `done`,
+`refused`, `message`, `chats`, `page`, `welcome`, `typing`, `marks` and `revoked`. `group_info` and `wraps` are not
 messages, so they take no sequence id and stay out of history, and what has no sequence id is
 answered with `done`. Binary fields are standard base64 with padding, through `base64ct`, which is
 already in the tree and constant-time. Kinds and modes are the schema's numbers. **A commit is a `send` with kind 3 plus its wraps, welcomes and
@@ -393,6 +407,37 @@ Whatever is saved to show later gets the next number. Whatever is not saved gets
 - **A person may turn receipts off, default on.** That hides their times from others,
   and they then cannot see other people's. A group's owner can forbid it by permission.
   The server still stores the times either way.
+- **Delivery works like `seen`, chosen by the author for the web client's ticks.** A device that now
+  holds messages sends `received` with "received up to N", and the server keeps the highest per
+  member, beside `seen_seq`. It is real delivery, not the server handing a message to a socket, and
+  it survives a reload. **Received times are kept like seen times**, one row per `received` with the
+  client's and the server's time, so a message's info shows every timing detail to whoever RBAC
+  lets read it. That is one more record of when each person was reachable. **It mirrors `seen`, chosen
+  by the author:** a `received_seq` column on `member`, a `received` table with the same columns as
+  `seen`, and a `received` frame {ref, chat, up_to_seq, client_received_at} answered with `done`.
+- **Senders learn positions through `marks`, chosen by the author.** A client sends `received` with
+  its chat and "up to N", as it does `seen`. When a member's received or seen position rises, the
+  server sends `marks` with the chat, the account, `received_seq` and `seen_seq` to the online
+  devices of that chat's other members. Each entry of the `chats` list carries the other members'
+  positions too, so a reload draws the marks at once. Someone with receipts off shows no seen
+  position, under the rule above. **The entry's field is `mark_list`, chosen by the author:**
+  `[{account, received_seq, seen_seq}]`, one per other member, the same fields as `marks`, with no
+  `seen_seq` for someone with receipts off, and empty in a channel. No `marks` go out in a channel
+  either.
+- **Each `chats` entry carries its newest content message, chosen by the author**, as a full message
+  frame, still ciphertext, so one request gives every preview. Its field is `last_content`.
+- **Each `chats` entry carries the chat's current `epoch`, chosen by the author:** the epoch of the
+  last accepted commit, which the server already keeps for ordering commits. A device back from
+  being away compares it with its own and catches up or rejoins at once, rather than noticing only
+  when its own commit loses. It is an optional field, so the version does not change.
+- **`history` takes an optional `before_seq`, chosen by the author.** With it, the server returns up
+  to `limit` messages just below it, still oldest first, and one past the last sequence id gives the
+  newest page. So a chat opens on its newest page and scrolling up loads older ones.
+- **What a sender sees, as drawn by the web client.** A message in the queue, or sent but not yet
+  answered with its sequence id, shows as waiting. In a direct chat it gets one mark with its
+  sequence id, two once the other person's device has received it, and both marks change colour
+  once they have seen it. In a group it gets one mark, which changes colour at the first `seen`. In a
+  channel only the waiting sign goes away.
 
 ### Devices
 
@@ -973,7 +1018,8 @@ another device still holding the key.
 
 - Android, when its phase comes: whether anything moves in from `/p/test/android`,
   and its stack
-- Web and Android code style and their own AGENTS.md files
+- Android code style and its own AGENTS.md. The web client's open questions are in
+  [web/AGENTS.md](web/AGENTS.md)
 - CI, release targets and installers
 - Docker: Dockerfile location, base images, and how the web build reaches the image
 
@@ -1048,3 +1094,4 @@ Short imperative subjects with a type prefix: `feat: …`, `fix: …`, `ref: …
 | `/p/test/borhan` | Where the rules in `server/AGENTS.md` come from |
 | `/p/test/android` | MoQ relay, web and Android experiments, `PROGRESS.md`, load test |
 | `/p/test/web-transport` | The author's fork of the WebTransport libraries, including `qmux` |
+| `tmp/telegram-tt` | Telegram Web A (`Ajaxy/telegram-tt`), a shallow clone of its latest commit, chosen by the author over Web K for the web client's inspiration. Its tags stopped in May 2025. It is GPL-3.0, so ideas only, never its code. `tmp/` is git-ignored |

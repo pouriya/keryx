@@ -87,13 +87,19 @@ impl<T: Clone> Queue<T> {
     }
 
     /// The next thing to send, if anything may go. An action waiting for its target's sequence
-    /// id holds back the whole content level, so that nothing can overtake it.
-    pub fn take_next(&mut self) -> Option<Outgoing<T>> {
-        let mut entry = self.keys.pop_front();
+    /// id holds back the whole content level, so that nothing can overtake it. With `only_typing`,
+    /// as while a commit waits for its save or its answer, only typing may go, so nothing is sealed
+    /// under a key that is about to change.
+    pub fn take_next(&mut self, only_typing: bool) -> Option<Outgoing<T>> {
+        let mut entry = None;
+        if !only_typing {
+            entry = self.keys.pop_front();
+        }
         if entry.is_none() {
             entry = self.typing.pop_front();
         }
         if entry.is_none()
+            && !only_typing
             && let Some(first) = self.content.front()
             && !matches!(first.target, Target::Pending(_))
         {
@@ -145,6 +151,33 @@ impl<T: Clone> Queue<T> {
                 Level::Content => self.content.push_front(entry),
             }
         }
+    }
+
+    /// Something handed out cannot go yet, such as a message whose chat is still being joined. It
+    /// goes back to the front of its level, so nothing behind it overtakes it.
+    pub fn put_back(&mut self, id: u64) {
+        let mut index = 0;
+        while index < self.in_flight.len() {
+            if self.in_flight[index].id == id {
+                let entry = self.in_flight.remove(index);
+                if entry.level == Level::Keys {
+                    self.keys.push_front(entry);
+                } else {
+                    self.content.push_front(entry);
+                }
+                return;
+            }
+            index += 1;
+        }
+    }
+
+    /// What is still waiting to be handed out, in the order it would go.
+    pub fn queued_list(&self) -> Vec<(u64, &T)> {
+        let mut list = Vec::new();
+        for entry in self.keys.iter().chain(&self.typing).chain(&self.content) {
+            list.push((entry.id, &entry.item));
+        }
+        list
     }
 
     /// What was sent and not answered, oldest first, for matching against the updates by client

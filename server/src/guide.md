@@ -90,9 +90,18 @@ itself. To check the server yourself, send a WebSocket ping, or a `ping` frame, 
 
 Every frame is JSON with a `type`. A request's `ref` is a ULID you make, which comes back in its answer.
 
-You send: `send`, `seen`, `typing`, `sync`, `history`, `group_info`, `wraps`, `ping`.
+You send: `send`, `seen`, `received`, `typing`, `sync`, `history`, `group_info`, `wraps`, `ping`.
 
-The server sends: `features`, `sent`, `done`, `refused`, `message`, `chats`, `page`, `welcome`, `typing`, `revoked`.
+The server sends: `features`, `sent`, `done`, `refused`, `message`, `chats`, `page`, `welcome`, `typing`,
+`marks`, `revoked`.
+
+`received` and `seen` each carry `chat` and `up_to_seq`, and the server keeps the highest of each. When
+one rises, the other members' online devices get `marks` with the `account`, its `received_seq` and its
+`seen_seq`. Each `chats` entry carries the same positions in `mark_list`, and its newest content
+message in `last_content`. Neither goes out in a channel.
+
+`history` returns up to `limit` messages after `after_seq`, oldest first. With `before_seq`, it
+returns the newest `limit` below it instead, still oldest first.
 
 A commit is a `send` with kind 3, carrying `epoch`, `wrap_list` and `welcome_list`. The first commit for
 each epoch wins, and a loser gets `refused` with the code `commit_lost`. A chat's group starts when

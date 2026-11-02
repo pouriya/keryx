@@ -3,9 +3,11 @@
 
 use std::future::Future;
 
-use keryx_core::protocol::{Bytes, ChatItem, ChatMode, ChatType, ContentKind, Kind, MessageFrame};
+use keryx_core::protocol::{
+    AccountBrief, ChatDevice, ChatItem, ChatMode, ChatType, ContentKind, DeviceItem,
+    KeyPackageItem, Kind, MarkItem, MessageFrame, SessionItem, WrapEntry,
+};
 use keryx_core::ulid::Ulid;
-use serde::Serialize;
 
 pub mod sqlite;
 
@@ -26,6 +28,24 @@ pub struct BuiltInRole {
     pub scope: i64,
     pub name: &'static str,
     pub permission_list: Vec<&'static str>,
+}
+
+/// Which of a member's two positions a report moves: "received up to N" or "seen up to N".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Position {
+    Received,
+    Seen,
+}
+
+/// One `received` or `seen` from a device.
+pub struct PositionReport {
+    pub position: Position,
+    pub chat: Ulid,
+    pub account: Ulid,
+    pub device: Ulid,
+    pub up_to_seq: u64,
+    pub client_at: i64,
+    pub now: i64,
 }
 
 pub struct Account {
@@ -51,15 +71,6 @@ pub struct NewAccount {
     pub now: i64,
 }
 
-/// What anyone logged in can see of an account.
-#[derive(Serialize)]
-pub struct AccountBrief {
-    pub id: Ulid,
-    pub username: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub display_name: Option<String>,
-}
-
 /// What a request's token proves.
 #[derive(Clone, Copy)]
 pub struct Session {
@@ -75,16 +86,6 @@ pub struct NewSession {
     pub account: Ulid,
     pub device: Option<Ulid>,
     pub now: i64,
-    pub expires_at: i64,
-}
-
-#[derive(Serialize)]
-pub struct SessionItem {
-    pub id: Ulid,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub device: Option<Ulid>,
-    pub created_at: i64,
-    pub last_used_at: i64,
     pub expires_at: i64,
 }
 
@@ -122,53 +123,6 @@ pub struct DeviceKey {
     pub account: Ulid,
     pub public_key: Vec<u8>,
     pub ended: bool,
-}
-
-#[derive(Serialize)]
-pub struct DeviceLogItem {
-    pub online_at: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub offline_at: Option<i64>,
-    pub ip: String,
-}
-
-/// All of a device's record, for its owner on a registered device. A password-only session is
-/// shown only `platform` and the day of `last_active_at`.
-#[derive(Serialize)]
-pub struct DeviceItem {
-    pub id: Ulid,
-    pub platform: i64,
-    pub os: String,
-    pub os_version: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub web_platform: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub web_platform_version: Option<String>,
-    pub first_ip: String,
-    pub last_ip: String,
-    pub created_at: i64,
-    pub last_active_at: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub terminated_at: Option<i64>,
-    pub log_list: Vec<DeviceLogItem>,
-}
-
-/// A device in a chat, as members need it to compare with their MLS members.
-#[derive(Serialize)]
-pub struct ChatDevice {
-    pub account: Ulid,
-    pub device: Ulid,
-    pub public_key: Bytes,
-    pub stamp: Bytes,
-    pub master_public: Bytes,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub statement: Option<Bytes>,
-}
-
-#[derive(Serialize)]
-pub struct KeyPackageItem {
-    pub device: Ulid,
-    pub body: Bytes,
 }
 
 /// What a member's check needs to know about a chat.
@@ -228,13 +182,6 @@ pub enum GroupInfoPut {
     AlreadyStarted,
     /// Not for the chat's current epoch.
     Stale,
-}
-
-#[derive(Serialize)]
-pub struct WrapRow {
-    pub epoch: u64,
-    pub account: Ulid,
-    pub wrapped: Bytes,
 }
 
 pub trait Storage: Send + Sync + 'static {
@@ -408,22 +355,20 @@ pub trait Storage: Send + Sync + 'static {
     /// wipes its target and the target's edits and walks the preview back, and a commit stores its
     /// wraps and welcomes and moves the epoch on.
     fn append_message(&self, message: NewMessage) -> impl Future<Output = Result<Appended>> + Send;
+    /// Oldest first. With `before_seq`, the newest `limit` below it.
     fn history(
         &self,
         chat: Ulid,
         after_seq: u64,
+        before_seq: Option<u64>,
         limit: u32,
     ) -> impl Future<Output = Result<Vec<MessageFrame>>> + Send;
-    /// Keeps the highest. A lower or equal one changes nothing.
-    fn record_seen(
+    /// Keeps the highest, with a row of times for each rise. A lower or equal one changes nothing
+    /// and gives `None`, and a rise gives the member's positions after it.
+    fn record_position(
         &self,
-        chat: Ulid,
-        account: Ulid,
-        device: Ulid,
-        up_to_seq: u64,
-        client_seen_at: i64,
-        now: i64,
-    ) -> impl Future<Output = Result<()>> + Send;
+        report: PositionReport,
+    ) -> impl Future<Output = Result<Option<MarkItem>>> + Send;
 
     fn group_info(&self, chat: Ulid)
     -> impl Future<Output = Result<Option<(u64, Vec<u8>)>>> + Send;
@@ -434,7 +379,7 @@ pub trait Storage: Send + Sync + 'static {
         body: Vec<u8>,
         now: i64,
     ) -> impl Future<Output = Result<GroupInfoPut>> + Send;
-    fn wraps(&self, chat: Ulid) -> impl Future<Output = Result<Vec<WrapRow>>> + Send;
+    fn wraps(&self, chat: Ulid) -> impl Future<Output = Result<Vec<WrapEntry>>> + Send;
     /// Replaces what is stored, because this is how a device corrects a bad wrap.
     fn put_wraps(
         &self,

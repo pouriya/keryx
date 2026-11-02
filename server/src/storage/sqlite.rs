@@ -8,15 +8,17 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use keryx_core::protocol::{Bytes, ChatItem, ChatMode, ChatType, Kind, MessageFrame};
+use keryx_core::protocol::{
+    AccountBrief, Bytes, ChatDevice, ChatItem, ChatMode, ChatType, DeviceItem, DeviceLogItem,
+    KeyPackageItem, Kind, MarkItem, MessageFrame, SessionItem, WrapEntry,
+};
 use keryx_core::ulid::Ulid;
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
 use super::{
-    Account, AccountBrief, Appended, BuiltInRole, ChatAccess, ChatDevice, DeviceItem, DeviceKey,
-    DeviceLogItem, DeviceUsage, Error, GroupInfoPut, KeyPackageItem, MessageBrief, NewAccount,
-    NewDevice, NewMessage, NewSession, NewWrap, Registered, Result, Session, SessionItem, Storage,
-    WrapRow,
+    Account, Appended, BuiltInRole, ChatAccess, DeviceKey, DeviceUsage, Error, GroupInfoPut,
+    MessageBrief, NewAccount, NewDevice, NewMessage, NewSession, NewWrap, Position, PositionReport,
+    Registered, Result, Session, Storage,
 };
 
 /// How long a connection waits for a lock another process holds, such as a backup.
@@ -1039,8 +1041,10 @@ impl Storage for Sqlite {
     async fn chat_list(&self, account: Ulid) -> Result<Vec<ChatItem>> {
         self.read(move |connection| {
             let mut statement = connection.prepare(
-                "SELECT c.id, c.type, c.mode, c.last_seq, c.last_kind, c.last_at, c.last_content_seq
+                "SELECT c.id, c.type, c.mode, c.last_seq, c.last_kind, c.last_at, c.last_content_seq,
+                 g.epoch
                  FROM member m JOIN conversation c ON c.id = m.conversation_id
+                 LEFT JOIN mls_group g ON g.conversation_id = c.id
                  WHERE m.account_id = ?1
                  ORDER BY COALESCE(c.last_at, c.created_at) DESC",
             )?;
@@ -1058,11 +1062,46 @@ impl Storage for Sqlite {
                     last_kind: opt_numbered(row.get(4)?)?,
                     last_at: row.get(5)?,
                     last_content_seq: opt_unsigned(row.get(6)?),
+                    epoch: opt_unsigned(row.get(7)?),
+                    last_content: None,
+                    mark_list: Vec::new(),
                 })
             })?;
             let mut chat_list = Vec::new();
             for chat in rows {
                 chat_list.push(chat?);
+            }
+            let mut content = connection.prepare(&format!(
+                "SELECT {MESSAGE_COLUMNS} FROM message WHERE conversation_id = ?1 AND seq = ?2"
+            ))?;
+            let mut marks = connection.prepare(
+                "SELECT account_id, received_seq, seen_seq FROM member
+                 WHERE conversation_id = ?1 AND account_id != ?2 ORDER BY account_id",
+            )?;
+            for item in &mut chat_list {
+                if let Some(seq) = item.last_content_seq {
+                    let message = content
+                        .query_row(params![item.chat.bytes(), int(seq)], message_frame)
+                        .optional()?;
+                    if let Some(message) = message {
+                        item.last_content = Some(Box::new(message));
+                    }
+                }
+                if item.chat_type == ChatType::Channel {
+                    continue;
+                }
+                let rows = marks.query_map(params![item.chat.bytes(), account.bytes()], |row| {
+                    let received_seq: i64 = row.get(1)?;
+                    let seen_seq: i64 = row.get(2)?;
+                    Ok(MarkItem {
+                        account: Ulid::from_bytes(row.get(0)?),
+                        received_seq: unsigned(received_seq),
+                        seen_seq: Some(unsigned(seen_seq)),
+                    })
+                })?;
+                for mark in rows {
+                    item.mark_list.push(mark?);
+                }
             }
             Ok(chat_list)
         })
@@ -1246,53 +1285,99 @@ impl Storage for Sqlite {
         .await
     }
 
-    async fn history(&self, chat: Ulid, after_seq: u64, limit: u32) -> Result<Vec<MessageFrame>> {
+    async fn history(
+        &self,
+        chat: Ulid,
+        after_seq: u64,
+        before_seq: Option<u64>,
+        limit: u32,
+    ) -> Result<Vec<MessageFrame>> {
         self.read(move |connection| {
-            let mut statement = connection.prepare(&format!(
-                "SELECT {MESSAGE_COLUMNS} FROM message WHERE conversation_id = ?1 AND seq > ?2
-                 ORDER BY seq LIMIT ?3"
-            ))?;
             let mut message_list = Vec::new();
-            for message in
-                statement.query_map(params![chat.bytes(), int(after_seq), limit], message_frame)?
-            {
-                message_list.push(message?);
+            if let Some(before_seq) = before_seq {
+                let mut statement = connection.prepare(&format!(
+                    "SELECT {MESSAGE_COLUMNS} FROM message
+                     WHERE conversation_id = ?1 AND seq > ?2 AND seq < ?3
+                     ORDER BY seq DESC LIMIT ?4"
+                ))?;
+                let rows = statement.query_map(
+                    params![chat.bytes(), int(after_seq), int(before_seq), limit],
+                    message_frame,
+                )?;
+                for message in rows {
+                    message_list.push(message?);
+                }
+                message_list.reverse();
+            } else {
+                let mut statement = connection.prepare(&format!(
+                    "SELECT {MESSAGE_COLUMNS} FROM message WHERE conversation_id = ?1 AND seq > ?2
+                     ORDER BY seq LIMIT ?3"
+                ))?;
+                let rows = statement
+                    .query_map(params![chat.bytes(), int(after_seq), limit], message_frame)?;
+                for message in rows {
+                    message_list.push(message?);
+                }
             }
             Ok(message_list)
         })
         .await
     }
 
-    async fn record_seen(
-        &self,
-        chat: Ulid,
-        account: Ulid,
-        device: Ulid,
-        up_to_seq: u64,
-        client_seen_at: i64,
-        now: i64,
-    ) -> Result<()> {
-        self.write(move |connection| {
-            let changed = connection.execute(
+    async fn record_position(&self, report: PositionReport) -> Result<Option<MarkItem>> {
+        let (update, insert) = match report.position {
+            Position::Received => (
+                "UPDATE member SET received_seq = ?3
+                 WHERE conversation_id = ?1 AND account_id = ?2 AND received_seq < ?3",
+                "INSERT INTO received (conversation_id, account_id, up_to_seq, device_id,
+                 client_received_at, server_received_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            ),
+            Position::Seen => (
                 "UPDATE member SET seen_seq = ?3
                  WHERE conversation_id = ?1 AND account_id = ?2 AND seen_seq < ?3",
+                "INSERT INTO seen (conversation_id, account_id, up_to_seq, device_id,
+                 client_seen_at, server_seen_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            ),
+        };
+        self.write(move |connection| {
+            let PositionReport {
+                chat,
+                account,
+                device,
+                up_to_seq,
+                client_at,
+                now,
+                ..
+            } = report;
+            let changed = connection.execute(
+                update,
                 params![chat.bytes(), account.bytes(), int(up_to_seq)],
             )?;
-            if changed > 0 {
-                connection.execute(
-                    "INSERT INTO seen (conversation_id, account_id, up_to_seq, device_id,
-                     client_seen_at, server_seen_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![
-                        chat.bytes(),
-                        account.bytes(),
-                        int(up_to_seq),
-                        device.bytes(),
-                        client_seen_at,
-                        now
-                    ],
-                )?;
+            if changed == 0 {
+                return Ok(None);
             }
-            Ok(())
+            connection.execute(
+                insert,
+                params![
+                    chat.bytes(),
+                    account.bytes(),
+                    int(up_to_seq),
+                    device.bytes(),
+                    client_at,
+                    now
+                ],
+            )?;
+            let (received_seq, seen_seq): (i64, i64) = connection.query_row(
+                "SELECT received_seq, seen_seq FROM member
+                 WHERE conversation_id = ?1 AND account_id = ?2",
+                params![chat.bytes(), account.bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            Ok(Some(MarkItem {
+                account,
+                received_seq: unsigned(received_seq),
+                seen_seq: Some(unsigned(seen_seq)),
+            }))
         })
         .await
     }
@@ -1354,14 +1439,14 @@ impl Storage for Sqlite {
         .await
     }
 
-    async fn wraps(&self, chat: Ulid) -> Result<Vec<WrapRow>> {
+    async fn wraps(&self, chat: Ulid) -> Result<Vec<WrapEntry>> {
         self.read(move |connection| {
             let mut statement = connection.prepare(
                 "SELECT epoch, account_id, wrapped_key FROM epoch_key WHERE conversation_id = ?1
                  ORDER BY epoch, account_id",
             )?;
             let rows = statement.query_map(params![chat.bytes()], |row| {
-                Ok(WrapRow {
+                Ok(WrapEntry {
                     epoch: unsigned(row.get(0)?),
                     account: Ulid::from_bytes(row.get(1)?),
                     wrapped: Bytes(row.get(2)?),

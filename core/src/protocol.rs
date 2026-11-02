@@ -20,6 +20,11 @@ impl std::fmt::Debug for Bytes {
     }
 }
 
+/// In TypeScript, the base64 text.
+#[cfg(feature = "wasm")]
+#[wasm_bindgen::prelude::wasm_bindgen(typescript_custom_section)]
+const BYTES_TYPE: &str = "export type Bytes = string;";
+
 impl Serialize for Bytes {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&Base64::encode_string(&self.0))
@@ -45,6 +50,13 @@ macro_rules! numbered {
         pub enum $name {
             $($variant = $number,)+
         }
+
+        /// In TypeScript, the numbers it may be.
+        #[cfg(feature = "wasm")]
+        const _: () = {
+            #[wasm_bindgen::prelude::wasm_bindgen(typescript_custom_section)]
+            const TYPE: &str = concat!("export type ", stringify!($name), " = never", $(" | ", stringify!($number),)+ ";");
+        };
 
         impl From<$name> for u8 {
             fn from(value: $name) -> u8 {
@@ -208,6 +220,15 @@ pub enum ClientFrame {
         up_to_seq: u64,
         client_seen_at: i64,
     },
+    /// "Received up to N": this device now holds those messages. Kept like `seen`, and answered
+    /// with `done`.
+    Received {
+        #[serde(rename = "ref")]
+        reference: Ulid,
+        chat: Ulid,
+        up_to_seq: u64,
+        client_received_at: i64,
+    },
     /// Not saved and not answered, so it has no `ref` and no sequence id.
     Typing {
         chat: Ulid,
@@ -218,11 +239,16 @@ pub enum ClientFrame {
         #[serde(rename = "ref")]
         reference: Ulid,
     },
+    /// Up to `limit` messages after `after_seq`, oldest first. With `before_seq`, the newest `limit`
+    /// of those below it instead, still oldest first, so one past the last sequence id gives the
+    /// newest page and scrolling up asks below the oldest one shown.
     History {
         #[serde(rename = "ref")]
         reference: Ulid,
         chat: Ulid,
         after_seq: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before_seq: Option<u64>,
         limit: u32,
     },
     GroupInfo {
@@ -250,6 +276,7 @@ pub enum ClientFrame {
 
 /// A stored message. **A removed one has only `chat` and `seq`**, so pages have no gaps, and a
 /// client knows something was there, not what.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageFrame {
     pub chat: Ulid,
@@ -297,6 +324,7 @@ impl MessageFrame {
 }
 
 /// One of a person's chats and its last state, for the list a client shows first.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatItem {
     pub chat: Ulid,
@@ -311,6 +339,27 @@ pub struct ChatItem {
     pub last_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_content_seq: Option<u64>,
+    /// The epoch of the last accepted commit, so a device back from being away knows whether it is
+    /// behind. None until the group is started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<u64>,
+    /// The newest content message, still as stored, so one request gives every preview.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_content: Option<Box<MessageFrame>>,
+    /// The other members' positions, so a reload draws the marks at once. Empty in a channel.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mark_list: Vec<MarkItem>,
+}
+
+/// How far one member's devices have received and seen a chat. No `seen_seq` for someone with
+/// receipts off.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarkItem {
+    pub account: Ulid,
+    pub received_seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seen_seq: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -362,6 +411,12 @@ pub enum ServerFrame {
         account: Ulid,
         on: bool,
     },
+    /// A member's received or seen position rose, sent to the other members' online devices.
+    Marks {
+        chat: Ulid,
+        #[serde(flatten)]
+        mark: MarkItem,
+    },
     /// A device of someone sharing a chat ended. `statement` is its signed revocation or logout,
     /// which a client verifies before removing the device from each chat.
     Revoked {
@@ -369,4 +424,337 @@ pub enum ServerFrame {
         device: Ulid,
         statement: Bytes,
     },
+}
+
+// -------------------------------------------------------------------------------------------------
+// REST: each route's body and reply, read and written by the server and clients alike, so a renamed
+// field breaks both sides at compile time. Every reply is wrapped as `{"ok": true, "data": ...}`.
+// -------------------------------------------------------------------------------------------------
+
+/// A reply with nothing in it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmptyReply {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptchaReply {
+    pub id: Ulid,
+    /// A `data:image/png;base64,` URL.
+    pub image: String,
+}
+
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptchaAnswer {
+    pub id: Ulid,
+    pub answer: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegisterBody {
+    pub username: String,
+    pub password: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub captcha: Option<CaptchaAnswer>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountReply {
+    pub account: Ulid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateAccountBody {
+    pub username: String,
+    #[serde(default)]
+    pub admin: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreatedAccountReply {
+    pub account: Ulid,
+    pub link: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupBody {
+    pub token: String,
+    pub password: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupReply {
+    pub account: Ulid,
+    pub username: String,
+}
+
+/// A returning device's signature on a `device_login` challenge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceProof {
+    pub id: Ulid,
+    pub challenge: Bytes,
+    pub signature: Bytes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoginBody {
+    pub username: String,
+    pub password: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub captcha: Option<CaptchaAnswer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<DeviceProof>,
+}
+
+/// `token` only from `/api/v1/login/token`, which sets no cookie.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoginReply {
+    pub account: Ulid,
+    pub device: Option<Ulid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChallengeBody {
+    pub username: String,
+    /// `password_reset` or `device_login`.
+    pub purpose: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChallengeReply {
+    pub challenge: Bytes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResetBody {
+    pub username: String,
+    pub challenge: Bytes,
+    pub new_password: String,
+    pub signature: Bytes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionItem {
+    pub id: Ulid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<Ulid>,
+    pub created_at: i64,
+    pub last_used_at: i64,
+    pub expires_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionListReply {
+    pub session_list: Vec<SessionItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountKeysBody {
+    pub master_public: Bytes,
+    pub account_public: Bytes,
+    pub account_stamp: Bytes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelfChatReply {
+    pub self_chat: Ulid,
+}
+
+/// An account, with its three keys once its words are set up.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountInfo {
+    pub id: Ulid,
+    pub username: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub master_public: Option<Bytes>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_public: Option<Bytes>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_stamp: Option<Bytes>,
+}
+
+/// What anyone logged in can see of an account.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountBrief {
+    pub id: Ulid,
+    pub username: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountListReply {
+    pub account_list: Vec<AccountBrief>,
+}
+
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceLogItem {
+    pub online_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offline_at: Option<i64>,
+    pub ip: String,
+}
+
+/// All of a device's record, for its owner on a registered device.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceItem {
+    pub id: Ulid,
+    /// 0 desktop, 1 mobile.
+    pub platform: i64,
+    pub os: String,
+    pub os_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_platform: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_platform_version: Option<String>,
+    pub first_ip: String,
+    pub last_ip: String,
+    pub created_at: i64,
+    pub last_active_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminated_at: Option<i64>,
+    pub log_list: Vec<DeviceLogItem>,
+}
+
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceListReply {
+    pub device_list: Vec<DeviceItem>,
+}
+
+/// What a password-only session sees of a device: enough to choose what to terminate.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReducedDeviceItem {
+    pub id: Ulid,
+    pub platform: i64,
+    pub last_active_day: i64,
+}
+
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReducedDeviceListReply {
+    pub device_list: Vec<ReducedDeviceItem>,
+}
+
+/// `GET /api/v1/devices`: the whole list on a registered device, the reduced one otherwise.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum DevicesReply {
+    Full(DeviceListReply),
+    Reduced(ReducedDeviceListReply),
+}
+
+/// A device id: the one handed out to stamp, or the one registered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceReply {
+    pub device: Ulid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegisterDeviceBody {
+    pub device: Ulid,
+    pub public_key: Bytes,
+    pub stamp: Bytes,
+    /// 0 desktop, 1 mobile.
+    pub platform: i64,
+    pub os: String,
+    pub os_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_platform: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_platform_version: Option<String>,
+}
+
+/// A terminate or logout statement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedBody {
+    pub signature: Bytes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyPackagesBody {
+    pub body_list: Vec<Bytes>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CountReply {
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyPackageItem {
+    pub device: Ulid,
+    pub body: Bytes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyPackageListReply {
+    pub key_package_list: Vec<KeyPackageItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateChatBody {
+    pub account: Ulid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatReply {
+    pub chat: Ulid,
+    pub created: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupInfoReply {
+    pub epoch: u64,
+    pub group_info: Bytes,
+}
+
+/// A device in a chat, as members need it to compare with their MLS members. `statement` is set
+/// once it has ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatDevice {
+    pub account: Ulid,
+    pub device: Ulid,
+    pub public_key: Bytes,
+    pub stamp: Bytes,
+    pub master_public: Bytes,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub statement: Option<Bytes>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatDeviceListReply {
+    pub device_list: Vec<ChatDevice>,
+}
+
+/// One stored wrap: an epoch's key, wrapped to one account.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WrapEntry {
+    pub epoch: u64,
+    pub account: Ulid,
+    pub wrapped: Bytes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WrapListReply {
+    pub wrap_list: Vec<WrapEntry>,
+}
+
+/// A refusal, as REST carries it: the same `code` and `message` as the WebSocket's `refused`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefusedReply {
+    pub code: String,
+    pub message: String,
 }

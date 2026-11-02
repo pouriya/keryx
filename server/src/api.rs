@@ -35,10 +35,18 @@ use keryx_core::mls::{
     verify_account_key, verify_device_login, verify_device_stamp, verify_logout,
     verify_password_reset, verify_revocation,
 };
-use keryx_core::protocol::{Bytes, ClientFrame, ContentKind, ServerFrame};
+use keryx_core::protocol::{
+    AccountInfo, AccountKeysBody, AccountListReply, AccountReply, Bytes, ChallengeBody,
+    ChallengeReply, ChatDeviceListReply, ChatReply, ClientFrame, ContentKind, CountReply,
+    CreateAccountBody, CreateChatBody, CreatedAccountReply, DeviceListReply, DeviceReply,
+    DevicesReply, EmptyReply, GroupInfoReply, KeyPackageListReply, KeyPackagesBody, LoginBody,
+    LoginReply, ReducedDeviceItem, ReducedDeviceListReply, RegisterBody, RegisterDeviceBody,
+    ResetBody, SelfChatReply, ServerFrame, SessionListReply, SetupBody, SetupReply, SignedBody,
+    WrapListReply,
+};
 use keryx_core::ulid::Ulid;
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -642,19 +650,11 @@ async fn hash_password(password: String) -> Result<String, Refused> {
 // Accounts and logins
 // -------------------------------------------------------------------------------------------------
 
-#[derive(Deserialize)]
-pub struct RegisterInput {
-    pub username: String,
-    pub password: String,
-    pub display_name: Option<String>,
-    pub captcha: Option<captcha::Answer>,
-}
-
 pub async fn run_register(
     app: &App,
     caller: &Caller,
-    input: RegisterInput,
-) -> Result<Value, Refused> {
+    input: RegisterBody,
+) -> Result<AccountReply, Refused> {
     check(app, caller, Need::Anyone).await?;
     if !app.settings.registration.allow {
         return Err(refused(
@@ -683,23 +683,15 @@ pub async fn run_register(
     if !created {
         return Err(refused(409, "username_taken", "That username is taken"));
     }
-    Ok(json!({"account": id}))
-}
-
-#[derive(Deserialize)]
-pub struct CreateAccountInput {
-    pub username: String,
-    #[serde(default)]
-    pub admin: bool,
-    pub display_name: Option<String>,
+    Ok(AccountReply { account: id })
 }
 
 /// `keryx user add`: an account with no password, and the one-time link where its person sets one.
 pub async fn run_create_account(
     app: &App,
     caller: &Caller,
-    input: CreateAccountInput,
-) -> Result<Value, Refused> {
+    input: CreateAccountBody,
+) -> Result<CreatedAccountReply, Refused> {
     check(app, caller, Need::Server(ACCOUNT_CREATE)).await?;
     check_username(&input.username, false)?;
     let id = new_id()?;
@@ -722,16 +714,17 @@ pub async fn run_create_account(
     }
     let base = app.settings.public_url.trim_end_matches('/');
     tracing::info!(msg = "Created an account", account = %id, admin = input.admin);
-    Ok(json!({"account": id, "link": format!("{base}/setup#{token}")}))
+    Ok(CreatedAccountReply {
+        account: id,
+        link: format!("{base}/setup#{token}"),
+    })
 }
 
-#[derive(Deserialize)]
-pub struct SetupInput {
-    pub token: String,
-    pub password: String,
-}
-
-pub async fn run_setup(app: &App, caller: &Caller, input: SetupInput) -> Result<Value, Refused> {
+pub async fn run_setup(
+    app: &App,
+    caller: &Caller,
+    input: SetupBody,
+) -> Result<SetupReply, Refused> {
     check(app, caller, Need::Anyone).await?;
     check_password(app, &input.password)?;
     let token_hash = sha256(input.token.as_bytes());
@@ -740,30 +733,18 @@ pub async fn run_setup(app: &App, caller: &Caller, input: SetupInput) -> Result<
     };
     let password_hash = hash_password(input.password).await?;
     app.storage.set_password(account.id, password_hash).await?;
-    Ok(json!({"account": account.id, "username": account.username}))
-}
-
-#[derive(Deserialize)]
-pub struct DeviceProof {
-    pub id: Ulid,
-    pub challenge: Bytes,
-    pub signature: Bytes,
-}
-
-#[derive(Deserialize)]
-pub struct LoginInput {
-    pub username: String,
-    pub password: String,
-    pub captcha: Option<captcha::Answer>,
-    pub device: Option<DeviceProof>,
+    Ok(SetupReply {
+        account: account.id,
+        username: account.username,
+    })
 }
 
 /// A session, with what to tell the client, and its token for the route to hand over its own way.
 pub async fn run_login(
     app: &App,
     caller: &Caller,
-    input: LoginInput,
-) -> Result<(Value, String), Refused> {
+    input: LoginBody,
+) -> Result<(LoginReply, String), Refused> {
     check(app, caller, Need::Anyone).await?;
     captcha::check(app, input.captcha).await?;
     let wrong = refused(401, "bad_login", "That username or password is wrong");
@@ -825,20 +806,19 @@ pub async fn run_login(
             expires_at: now.saturating_add(millis(app.settings.session.lifetime)),
         })
         .await?;
-    Ok((json!({"account": account.id, "device": device}), token))
-}
-
-#[derive(Deserialize)]
-pub struct ChallengeInput {
-    pub username: String,
-    pub purpose: String,
+    let reply = LoginReply {
+        account: account.id,
+        device,
+        token: None,
+    };
+    Ok((reply, token))
 }
 
 pub async fn run_challenge(
     app: &App,
     caller: &Caller,
-    input: ChallengeInput,
-) -> Result<Value, Refused> {
+    input: ChallengeBody,
+) -> Result<ChallengeReply, Refused> {
     check(app, caller, Need::Anyone).await?;
     let purpose = match input.purpose.as_str() {
         "password_reset" => PURPOSE_RESET,
@@ -873,22 +853,16 @@ pub async fn run_challenge(
             now,
         )
         .await?;
-    Ok(json!({"challenge": Bytes(challenge.to_vec())}))
-}
-
-#[derive(Deserialize)]
-pub struct ResetInput {
-    pub username: String,
-    pub challenge: Bytes,
-    pub new_password: String,
-    pub signature: Bytes,
+    Ok(ChallengeReply {
+        challenge: Bytes(challenge.to_vec()),
+    })
 }
 
 pub async fn run_password_reset(
     app: &App,
     caller: &Caller,
-    input: ResetInput,
-) -> Result<Value, Refused> {
+    input: ResetBody,
+) -> Result<EmptyReply, Refused> {
     check(app, caller, Need::Anyone).await?;
     check_password(app, &input.new_password)?;
     let denied = refused(403, "bad_signature", "That reset could not be proven");
@@ -922,17 +896,21 @@ pub async fn run_password_reset(
     let password_hash = hash_password(input.new_password).await?;
     app.storage.set_password(account.id, password_hash).await?;
     tracing::info!(msg = "Reset a password", account = %account.id);
-    Ok(json!({}))
+    Ok(EmptyReply {})
 }
 
-pub async fn run_sessions(app: &App, caller: &Caller) -> Result<Value, Refused> {
+pub async fn run_sessions(app: &App, caller: &Caller) -> Result<SessionListReply, Refused> {
     check(app, caller, Need::Session).await?;
     let session = caller.session()?;
     let session_list = app.storage.list_sessions(session.account).await?;
-    Ok(json!({"session_list": session_list}))
+    Ok(SessionListReply { session_list })
 }
 
-pub async fn run_delete_session(app: &App, caller: &Caller, id: Ulid) -> Result<Value, Refused> {
+pub async fn run_delete_session(
+    app: &App,
+    caller: &Caller,
+    id: Ulid,
+) -> Result<EmptyReply, Refused> {
     check(app, caller, Need::Session).await?;
     let session = caller.session()?;
     if !app.storage.delete_session(session.account, id).await? {
@@ -942,14 +920,7 @@ pub async fn run_delete_session(app: &App, caller: &Caller, id: Ulid) -> Result<
             "That session does not exist",
         ));
     }
-    Ok(json!({}))
-}
-
-#[derive(Deserialize)]
-pub struct AccountKeysInput {
-    pub master_public: Bytes,
-    pub account_public: Bytes,
-    pub account_stamp: Bytes,
+    Ok(EmptyReply {})
 }
 
 /// The words' public keys, once, and the self chat in the same step, so a new device's notice always
@@ -957,8 +928,8 @@ pub struct AccountKeysInput {
 pub async fn run_account_keys(
     app: &App,
     caller: &Caller,
-    input: AccountKeysInput,
-) -> Result<Value, Refused> {
+    input: AccountKeysBody,
+) -> Result<SelfChatReply, Refused> {
     check(app, caller, Need::Session).await?;
     let session = caller.session()?;
     let master: [u8; 32] = fixed(&input.master_public, "master_public")?;
@@ -986,10 +957,10 @@ pub async fn run_account_keys(
             "This account already has its keys",
         ));
     }
-    Ok(json!({"self_chat": chat}))
+    Ok(SelfChatReply { self_chat: chat })
 }
 
-pub async fn run_account(app: &App, caller: &Caller, id: Ulid) -> Result<Value, Refused> {
+pub async fn run_account(app: &App, caller: &Caller, id: Ulid) -> Result<AccountInfo, Refused> {
     check(app, caller, Need::Session).await?;
     let Some(account) = app.storage.account_by_id(id).await? else {
         return Err(refused(
@@ -998,29 +969,37 @@ pub async fn run_account(app: &App, caller: &Caller, id: Ulid) -> Result<Value, 
             "That account does not exist",
         ));
     };
-    let mut reply = json!({"id": account.id, "username": account.username});
-    if let Some(display_name) = account.display_name {
-        reply["display_name"] = json!(display_name);
-    }
+    let mut reply = AccountInfo {
+        id: account.id,
+        username: account.username,
+        display_name: account.display_name,
+        master_public: None,
+        account_public: None,
+        account_stamp: None,
+    };
     if let (Some(master), Some(public), Some(stamp)) = (
         account.master_public,
         account.account_public,
         account.account_stamp,
     ) {
-        reply["master_public"] = json!(Bytes(master));
-        reply["account_public"] = json!(Bytes(public));
-        reply["account_stamp"] = json!(Bytes(stamp));
+        reply.master_public = Some(Bytes(master));
+        reply.account_public = Some(Bytes(public));
+        reply.account_stamp = Some(Bytes(stamp));
     }
     Ok(reply)
 }
 
-pub async fn run_directory(app: &App, caller: &Caller, term: String) -> Result<Value, Refused> {
+pub async fn run_directory(
+    app: &App,
+    caller: &Caller,
+    term: String,
+) -> Result<AccountListReply, Refused> {
     check(app, caller, Need::Server(DIRECTORY_SEARCH)).await?;
     let account_list = app
         .storage
         .search_accounts(term, app.settings.limits.history_page)
         .await?;
-    Ok(json!({"account_list": account_list}))
+    Ok(AccountListReply { account_list })
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -1030,28 +1009,30 @@ pub async fn run_directory(app: &App, caller: &Caller, term: String) -> Result<V
 /// A password-only session sees each device's platform and last-active day, enough to choose what to
 /// terminate. IP addresses and logs need a registered device, so a stolen password does not reveal
 /// location or activity history.
-pub async fn run_devices(app: &App, caller: &Caller) -> Result<Value, Refused> {
+pub async fn run_devices(app: &App, caller: &Caller) -> Result<DevicesReply, Refused> {
     check(app, caller, Need::Session).await?;
     let session = caller.session()?;
     let device_list = app.storage.list_devices(session.account).await?;
     if session.device.is_some() {
-        return Ok(json!({"device_list": device_list}));
+        return Ok(DevicesReply::Full(DeviceListReply { device_list }));
     }
     let mut reduced = Vec::with_capacity(device_list.len());
     for device in &device_list {
         if device.terminated_at.is_none() {
-            reduced.push(json!({
-                "id": device.id,
-                "platform": device.platform,
-                "last_active_day": device.last_active_at / (24 * 60 * 60 * 1000),
-            }));
+            reduced.push(ReducedDeviceItem {
+                id: device.id,
+                platform: device.platform,
+                last_active_day: device.last_active_at / (24 * 60 * 60 * 1000),
+            });
         }
     }
-    Ok(json!({"device_list": reduced}))
+    Ok(DevicesReply::Reduced(ReducedDeviceListReply {
+        device_list: reduced,
+    }))
 }
 
 /// A new device's id, which its stamp signs, so a client can never choose its own.
-pub async fn run_device_id(app: &App, caller: &Caller) -> Result<Value, Refused> {
+pub async fn run_device_id(app: &App, caller: &Caller) -> Result<DeviceReply, Refused> {
     check(app, caller, Need::Session).await?;
     let session = caller.session()?;
     let id = new_id()?;
@@ -1065,27 +1046,15 @@ pub async fn run_device_id(app: &App, caller: &Caller) -> Result<Value, Refused>
             now,
         )
         .await?;
-    Ok(json!({"device": id}))
-}
-
-#[derive(Deserialize)]
-pub struct RegisterDeviceInput {
-    pub device: Ulid,
-    pub public_key: Bytes,
-    pub stamp: Bytes,
-    pub platform: i64,
-    pub os: String,
-    pub os_version: String,
-    pub web_platform: Option<String>,
-    pub web_platform_version: Option<String>,
+    Ok(DeviceReply { device: id })
 }
 
 pub async fn run_register_device(
     app: &App,
     caller: &Caller,
-    input: RegisterDeviceInput,
+    input: RegisterDeviceBody,
     ip: String,
-) -> Result<Value, Refused> {
+) -> Result<DeviceReply, Refused> {
     check(app, caller, Need::Session).await?;
     let session = caller.session()?;
     if session.device.is_some() {
@@ -1155,14 +1124,11 @@ pub async fn run_register_device(
                 Some(input.device),
                 &ServerFrame::Message(notice),
             );
-            Ok(json!({"device": input.device}))
+            Ok(DeviceReply {
+                device: input.device,
+            })
         }
     }
-}
-
-#[derive(Deserialize)]
-pub struct SignedInput {
-    pub signature: Bytes,
 }
 
 /// A device has ended: stop delivering to it at once, and tell everyone sharing a chat, whose clients
@@ -1204,8 +1170,8 @@ pub async fn run_terminate(
     app: &App,
     caller: &Caller,
     device: Ulid,
-    input: SignedInput,
-) -> Result<Value, Refused> {
+    input: SignedBody,
+) -> Result<EmptyReply, Refused> {
     check(app, caller, Need::Session).await?;
     let session = caller.session()?;
     let signature: [u8; 64] = fixed(&input.signature, "signature")?;
@@ -1239,7 +1205,7 @@ pub async fn run_terminate(
         ));
     }
     end_device(app, session.account, device, signature).await?;
-    Ok(json!({}))
+    Ok(EmptyReply {})
 }
 
 /// Signed by the device's own key. The client wipes its keys only after this answers.
@@ -1247,8 +1213,8 @@ pub async fn run_logout(
     app: &App,
     caller: &Caller,
     device: Ulid,
-    input: SignedInput,
-) -> Result<Value, Refused> {
+    input: SignedBody,
+) -> Result<EmptyReply, Refused> {
     check(app, caller, Need::Session).await?;
     let session = caller.session()?;
     let signature: [u8; 64] = fixed(&input.signature, "signature")?;
@@ -1267,19 +1233,14 @@ pub async fn run_logout(
         ));
     }
     end_device(app, session.account, device, signature).await?;
-    Ok(json!({}))
-}
-
-#[derive(Deserialize)]
-pub struct KeyPackagesInput {
-    pub body_list: Vec<Bytes>,
+    Ok(EmptyReply {})
 }
 
 pub async fn run_key_packages(
     app: &App,
     caller: &Caller,
-    input: KeyPackagesInput,
-) -> Result<Value, Refused> {
+    input: KeyPackagesBody,
+) -> Result<CountReply, Refused> {
     check(app, caller, Need::Device).await?;
     let device = caller.session()?.device()?;
     let mut package_list = Vec::with_capacity(input.body_list.len());
@@ -1296,7 +1257,7 @@ pub async fn run_key_packages(
         )
         .await?;
     match added {
-        Some(count) => Ok(json!({"count": count})),
+        Some(count) => Ok(CountReply { count }),
         None => Err(refused(
             409,
             "too_many_key_packages",
@@ -1311,7 +1272,7 @@ pub async fn run_claim_key_packages(
     app: &App,
     caller: &Caller,
     account: Ulid,
-) -> Result<Value, Refused> {
+) -> Result<KeyPackageListReply, Refused> {
     check(app, caller, Need::Device).await?;
     let key_package_list = app.storage.claim_key_packages(account).await?;
     if key_package_list.is_empty() {
@@ -1321,25 +1282,20 @@ pub async fn run_claim_key_packages(
             "That person cannot be added yet",
         ));
     }
-    Ok(json!({"key_package_list": key_package_list}))
+    Ok(KeyPackageListReply { key_package_list })
 }
 
 // -------------------------------------------------------------------------------------------------
 // Chats
 // -------------------------------------------------------------------------------------------------
 
-#[derive(Deserialize)]
-pub struct CreateChatInput {
-    pub account: Ulid,
-}
-
 /// The pair's chat, made if it is new. If two people start it at once they get the same id, and the
 /// first to upload epoch 0's group info wins, while the other waits for its Welcome.
 pub async fn run_create_chat(
     app: &App,
     caller: &Caller,
-    input: CreateChatInput,
-) -> Result<Value, Refused> {
+    input: CreateChatBody,
+) -> Result<ChatReply, Refused> {
     check(app, caller, Need::Device).await?;
     check(app, caller, Need::Server(CHAT_CREATE_DIRECT)).await?;
     let session = caller.session()?;
@@ -1366,10 +1322,14 @@ pub async fn run_create_chat(
         .storage
         .direct_chat(new_id()?, low, high, Ulid::now())
         .await?;
-    Ok(json!({"chat": chat, "created": created}))
+    Ok(ChatReply { chat, created })
 }
 
-pub async fn run_group_info(app: &App, caller: &Caller, chat: Ulid) -> Result<Value, Refused> {
+pub async fn run_group_info(
+    app: &App,
+    caller: &Caller,
+    chat: Ulid,
+) -> Result<GroupInfoReply, Refused> {
     check(app, caller, Need::Device).await?;
     check(app, caller, Need::Member(chat)).await?;
     let Some((epoch, body)) = app.storage.group_info(chat).await? else {
@@ -1379,21 +1339,32 @@ pub async fn run_group_info(app: &App, caller: &Caller, chat: Ulid) -> Result<Va
             "This chat has no group info yet",
         ));
     };
-    Ok(json!({"epoch": epoch, "group_info": Bytes(body)}))
+    Ok(GroupInfoReply {
+        epoch,
+        group_info: Bytes(body),
+    })
 }
 
-pub async fn run_chat_devices(app: &App, caller: &Caller, chat: Ulid) -> Result<Value, Refused> {
+pub async fn run_chat_devices(
+    app: &App,
+    caller: &Caller,
+    chat: Ulid,
+) -> Result<ChatDeviceListReply, Refused> {
     check(app, caller, Need::Device).await?;
     check(app, caller, Need::Member(chat)).await?;
     let device_list = app.storage.chat_devices(chat).await?;
-    Ok(json!({"device_list": device_list}))
+    Ok(ChatDeviceListReply { device_list })
 }
 
-pub async fn run_chat_wraps(app: &App, caller: &Caller, chat: Ulid) -> Result<Value, Refused> {
+pub async fn run_chat_wraps(
+    app: &App,
+    caller: &Caller,
+    chat: Ulid,
+) -> Result<WrapListReply, Refused> {
     check(app, caller, Need::Device).await?;
     check(app, caller, Need::Member(chat)).await?;
     let wrap_list = app.storage.wraps(chat).await?;
-    Ok(json!({"wrap_list": wrap_list}))
+    Ok(WrapListReply { wrap_list })
 }
 
 /// What a device's frames do: reads answer here, and everything else goes through the chat's task.
@@ -1420,13 +1391,18 @@ pub async fn run_frame(
             reference,
             chat,
             after_seq,
+            before_seq,
             limit,
         } => {
-            let (reference, chat, after_seq) = (*reference, *chat, *after_seq);
+            let (reference, chat, after_seq, before_seq) =
+                (*reference, *chat, *after_seq, *before_seq);
             let limit = (*limit).min(app.settings.limits.history_page);
             let result = operation!("History", "history", async {
                 check(app, &caller, Need::Member(chat)).await?;
-                let message_list = app.storage.history(chat, after_seq, limit).await?;
+                let message_list = app
+                    .storage
+                    .history(chat, after_seq, before_seq, limit)
+                    .await?;
                 Ok(ServerFrame::Page {
                     reference,
                     message_list,
@@ -1436,6 +1412,9 @@ pub async fn run_frame(
         }
         ClientFrame::Send(frame) => (frame.chat, Some(frame.reference)),
         ClientFrame::Seen {
+            reference, chat, ..
+        }
+        | ClientFrame::Received {
             reference, chat, ..
         }
         | ClientFrame::GroupInfo {
@@ -1489,7 +1468,7 @@ pub async fn run_frame(
 // REST
 // -------------------------------------------------------------------------------------------------
 
-fn respond(result: Result<Value, Refused>) -> Response {
+fn respond<T: Serialize>(result: Result<T, Refused>) -> Response {
     match result {
         Ok(data) => (
             StatusCode::OK,
@@ -1658,7 +1637,7 @@ async fn login_token(State(app): Shared, headers: HeaderMap, body: Body) -> Resp
     respond(operation!("Login", "login_token", async {
         let caller = caller_of(&app, &headers).await?;
         let (mut data, token) = run_login(&app, &caller, parse(body)?).await?;
-        data["token"] = json!(token);
+        data.token = Some(token);
         Ok(data)
     }))
 }

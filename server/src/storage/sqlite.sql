@@ -368,6 +368,9 @@ CREATE TABLE member (
     -- [Read state] the highest "seen up to N". Who has not seen message N: seen_seq < N and
     -- joined_seq <= N, except its sender. Replaces a row per message per member.
     seen_seq         INTEGER NOT NULL DEFAULT 0,
+    -- [Read state, Marks] the highest "received up to N": a device of this member holds those
+    -- messages. Drives the second mark in a direct chat.
+    received_seq     INTEGER NOT NULL DEFAULT 0,
     -- [Owners, Unencrypted switching, RBAC] groups and channels can have several owners, and
     -- ownership can be transferred. Recorded inside MLS too, which is what clients trust, so a
     -- server cannot make someone an owner. When the last owner leaves, the chat is removed.
@@ -513,6 +516,25 @@ CREATE TABLE seen (
     client_seen_at   INTEGER NOT NULL,
     -- [Seen times] catches a client lying about its time.
     server_seen_at   INTEGER NOT NULL,
+    PRIMARY KEY (conversation_id, account_id, up_to_seq)
+) WITHOUT ROWID, STRICT;
+
+-- [Received times] one row per `received`, like `seen`: a member's device got message N at the time
+-- on their first row reaching N. Deleted once the messages it covers expire. Not tied to `member`,
+-- so a member who leaves keeps their received times.
+CREATE TABLE received (
+    -- [Received times] which chat.
+    conversation_id     BLOB NOT NULL REFERENCES conversation (id) ON DELETE CASCADE,
+    -- [Received times] who.
+    account_id          BLOB NOT NULL REFERENCES account (id),
+    -- [Received times, Read state] the "received up to N" the client sent.
+    up_to_seq           INTEGER NOT NULL,
+    -- [Devices] which device reported it.
+    device_id           BLOB NOT NULL REFERENCES device (id),
+    -- [Received times] the device's own time, shown unless later than the server's or far from it.
+    client_received_at  INTEGER NOT NULL,
+    -- [Received times] catches a client lying about its time.
+    server_received_at  INTEGER NOT NULL,
     PRIMARY KEY (conversation_id, account_id, up_to_seq)
 ) WITHOUT ROWID, STRICT;
 

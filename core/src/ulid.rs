@@ -204,6 +204,11 @@ impl fmt::Display for Ulid {
     }
 }
 
+/// In TypeScript, its text form.
+#[cfg(feature = "wasm")]
+#[wasm_bindgen::prelude::wasm_bindgen(typescript_custom_section)]
+const ULID_TYPE: &str = "export type Ulid = string;";
+
 /// On the wire, a ULID is its text form.
 impl Serialize for Ulid {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {

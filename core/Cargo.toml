@@ -65,6 +65,28 @@ serde = { version = "1.0.229", default-features = false, features = ["std", "der
 # and constant-time, which suits key material. `alloc` is for encoding to a String.
 base64ct = { version = "1.8.3", default-features = false, features = ["alloc"] }
 
+# The client's JSON: frames, REST bodies and the text plaintext `{"text": "..."}`. A real dependency,
+# chosen by the author, since `client.rs` writes and reads them. `std` is what it needs. Already in
+# the tree.
+serde_json = { version = "1.0.154", default-features = false, features = ["std"] }
+
+# The snapshot slots in `Loaded` and `Save`, so they reach JavaScript as a Uint8Array rather than an
+# array of numbers. JSON comes out the same. Already in the tree.
+serde_bytes = "0.11.19"
+
+# Writes the TypeScript types from these Rust ones for `web/wasm/`, behind the `wasm` feature. `js`
+# makes the values cross through serde-wasm-bindgen, so bytes arrive as a Uint8Array.
+tsify = { version = "0.5.8", default-features = false, features = ["js"], optional = true }
+
+# The custom TypeScript for types with their own serde form: ULIDs, base64 and numbered kinds. Pinned
+# to the wasm-bindgen CLI on the author's machine, as in `web/wasm/`.
+wasm-bindgen = { version = "=0.2.129", optional = true }
+
+[features]
+# The browser's glue: TypeScript types for what crosses into JavaScript. Off for native builds and the
+# tests, so the server and the coverage see no change.
+wasm = ["dep:tsify", "dep:wasm-bindgen"]
+
 # The browser build. `js` makes openmls use the browser's clock and random source. getrandom 0.2
 # is pulled in under openmls_rust_crypto, and it refuses to compile for WASM without its own `js`.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -73,6 +95,4 @@ getrandom = { version = "0.4.3", features = ["wasm_js"] }
 getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
 
 [dev-dependencies]
-# Reading and writing envelope frames in the tests. Already in the tree.
-serde_json = "1.0.154"
 

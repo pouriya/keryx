@@ -18,13 +18,14 @@ Lines measured by `cargo-llvm-cov`, per file and in total.
 <!-- coverage:start -->
 | File | Lines | Covered | Coverage |
 |------|------:|--------:|---------:|
-| `src/mls.rs` | 1038 | 962 | 92.68% |
-| `src/protocol.rs` | 62 | 51 | 82.26% |
-| `src/queue.rs` | 107 | 106 | 99.07% |
+| `src/client.rs` | 2570 | 2092 | 81.40% |
+| `src/mls.rs` | 1059 | 979 | 92.45% |
+| `src/protocol.rs` | 51 | 51 | 100.00% |
+| `src/queue.rs` | 132 | 121 | 91.67% |
 | `src/seed.rs` | 66 | 60 | 90.91% |
 | `src/ulid.rs` | 81 | 77 | 95.06% |
 | `src/wrap.rs` | 104 | 99 | 95.19% |
-| **Total** | **1458** | **1355** | **92.94%** |
+| **Total** | **4063** | **3479** | **85.63%** |
 <!-- coverage:end -->
 
 ## ⚠️ To do later, marked very important by the author
@@ -48,3 +49,9 @@ Lines measured by `cargo-llvm-cov`, per file and in total.
 [server/tests/AGENTS.md](../../server/tests/AGENTS.md) binds this directory too: no unit
 tests, public surface only, the naming scheme, and adding a test file for a module on
 the closed list needs no approval.
+
+**`client.rs` is covered by a scripted server in `client.rs`, chosen by the author.** A small
+in-memory stand-in answers the client's requests and frames, builds real MLS commits and Welcomes
+with core's own `Device`, and can drop, fail, delay or refuse anything on cue, so every retry, gap
+and failure is driven by hand and counts in this table. The server's tests stay as the end-to-end
+proof against a real `keryx serve`.

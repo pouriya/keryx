@@ -7,15 +7,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{OPERATOR_TOKEN, Server};
-use keryx_core::mls::{AccountWrap, Commit, Device, sign_revocation};
+use keryx_core::client::{Command, Event, Secret};
+use keryx_core::mls::{AccountWrap, Commit, Device};
 use keryx_core::protocol::{
     Bytes, ChatType, ClientFrame, ContentKind, Header, Kind, MessageFrame, SendFrame, ServerFrame,
     WelcomeItem, WrapItem,
 };
 use keryx_core::ulid::Ulid;
-use person::{BABAK_WORDS, PASSWORD, Person, SARA_WORDS, add_device, log_in, sign_up, ulid_of};
+use person::{
+    App, BABAK_WORDS, PASSWORD, Person, SARA_WORDS, add_device, log_in, sign_up, ulid_of,
+};
 use rustls::pki_types::pem::PemObject;
-use serde_json::{Value, json};
+use serde_json::json;
 use tungstenite::protocol::frame::coding::CloseCode;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{ClientRequestBuilder, Message, WebSocket};
@@ -286,87 +289,16 @@ struct Pair {
     chat: Ulid,
 }
 
+/// Two people sign up and start their chat through their clients, which takes it to epoch 1. Then
+/// each hands over the device it set up, for the tests that sign by hand.
 fn pair_on(server: Server) -> Pair {
-    let mut sara = sign_up(&server, "sara_x", SARA_WORDS);
-    let mut babak = sign_up(&server, "babak_x", BABAK_WORDS);
-    let mut sara_socket = connect(&server, &sara.token);
-    let mut babak_socket = connect(&server, &babak.token);
-
-    let (status, reply) = server.call(
-        "POST",
-        "/api/v1/chats",
-        Some(&sara.token),
-        Some(&json!({"account": babak.id})),
-    );
-    assert_eq!(status, 200, "{reply}");
-    let chat = ulid_of(&reply["data"]["chat"]);
-
-    let (status, reply) = server.call(
-        "POST",
-        &format!("/api/v1/accounts/{}/key_packages/claim", babak.id),
-        Some(&sara.token),
-        None,
-    );
-    assert_eq!(status, 200, "{reply}");
-    let mut packages = Vec::new();
-    let mut welcome_devices = Vec::new();
-    for item in reply["data"]["key_package_list"].as_array().unwrap() {
-        let body: Bytes = serde_json::from_value(item["body"].clone()).unwrap();
-        packages.push(body.0);
-        welcome_devices.push(ulid_of(&item["device"]));
-    }
-
-    let created = sara
-        .device
-        .create_chat(chat, Ulid::now(), std::slice::from_ref(&sara.key))
-        .unwrap();
-    done(upload_group_info(
-        &mut sara_socket,
-        chat,
-        0,
-        created.group_info,
-    ));
-    let wanted = reference();
-    done(sara_socket.request(
-        &ClientFrame::Wraps {
-            reference: wanted,
-            chat,
-            epoch: 0,
-            wrap_list: wrap_items(&created.wrap_list),
-        },
-        wanted,
-    ));
-
-    let accounts = [sara.key.clone(), babak.key.clone()];
-    let commit = sara.device.add_devices(chat, &packages, &accounts).unwrap();
-    let mut welcome_list = Vec::new();
-    for device in welcome_devices {
-        welcome_list.push(WelcomeItem {
-            device,
-            body: Bytes(commit.welcome.clone().unwrap()),
-        });
-    }
-    let frame = commit_frame(&sara.device, chat, &commit, welcome_list);
-    let seq = seq_of(post(&mut sara_socket, frame));
-    let group_info = sara.device.commit_accepted(chat, Ulid::now()).unwrap();
-    done(upload_group_info(
-        &mut sara_socket,
-        chat,
-        commit.epoch,
-        group_info,
-    ));
-
-    let welcome = babak_socket.next_where(|frame| matches!(frame, ServerFrame::Welcome { .. }));
-    let ServerFrame::Welcome { chat: joined, body } = welcome else {
-        unreachable!();
-    };
-    assert_eq!(joined, chat);
-    babak
-        .device
-        .join_welcome(chat, &body.0, Ulid::now())
-        .unwrap();
-    assert_eq!(babak_socket.message(chat, seq).kind, Some(Kind::Commit));
-
+    let (sara, babak, chat) = apps_on(&server);
+    let mut sara = sara.into_person(SARA_WORDS);
+    sara.username = "sara_x".to_string();
+    let mut babak = babak.into_person(BABAK_WORDS);
+    babak.username = "babak_x".to_string();
+    let sara_socket = connect(&server, &sara.token);
+    let babak_socket = connect(&server, &babak.token);
     Pair {
         server,
         sara,
@@ -375,6 +307,48 @@ fn pair_on(server: Server) -> Pair {
         babak_socket,
         chat,
     }
+}
+
+/// Two people's clients in a started chat.
+fn apps_on(server: &Server) -> (App, App, Ulid) {
+    let mut sara = App::sign_up(server, "sara_x", SARA_WORDS);
+    let mut babak = App::sign_up(server, "babak_x", BABAK_WORDS);
+    sara.command(
+        server,
+        Command::StartChat {
+            account: babak.id(),
+        },
+    );
+    let self_chat = sara.self_chat;
+    let Event::ChatReady { chat } = sara.wait(
+        server,
+        |event| matches!(event, Event::ChatReady { chat } if Some(*chat) != self_chat),
+    ) else {
+        unreachable!();
+    };
+    babak.wait(
+        server,
+        |event| matches!(event, Event::ChatReady { chat: ready } if *ready == chat),
+    );
+    (sara, babak, chat)
+}
+
+fn shown(event: Event) -> keryx_core::client::Shown {
+    match event {
+        Event::Message { message } => message,
+        other => panic!("Wanted a message, and got {other:?}"),
+    }
+}
+
+fn text_of(message: &keryx_core::client::Shown) -> Option<&str> {
+    match &message.text {
+        Some(text) => Some(text.0.as_str()),
+        None => None,
+    }
+}
+
+fn is_message(event: &Event, chat: Ulid, seq: u64) -> bool {
+    matches!(event, Event::Message { message } if message.chat == chat && message.seq == seq)
 }
 
 fn open_server() -> Server {
@@ -392,6 +366,7 @@ fn history(socket: &mut Socket, chat: Ulid, after_seq: u64, limit: u32) -> Vec<M
             reference: wanted,
             chat,
             after_seq,
+            before_seq: None,
             limit,
         },
         wanted,
@@ -431,67 +406,103 @@ fn open_message(reader: &Device, sender: &Device, message: &MessageFrame) -> Vec
 
 #[test]
 fn two_people_exchange_encrypted_text_the_server_cannot_read() {
-    let mut pair = pair();
-    let chat = pair.chat;
-    let frame = sealed(&pair.sara, chat, Kind::Content, None, "سلام".as_bytes());
-    let sent = post(&mut pair.sara_socket, frame.clone());
-    let ServerFrame::Sent {
-        reference: answered,
-        seq,
-        server_saved_at,
-    } = sent
-    else {
-        panic!("{sent:?}");
-    };
-    assert_eq!(answered, frame.reference);
-    assert!(server_saved_at > 0);
-
-    // The other device gets it with its sequence id, and it opens. The sender got `sent` instead.
-    let received = pair.babak_socket.message(chat, seq);
-    assert_eq!(
-        open_message(&pair.babak.device, &pair.sara.device, &received),
-        "سلام".as_bytes()
+    let server = open_server();
+    let (mut sara, mut babak, chat) = apps_on(&server);
+    sara.command(
+        &server,
+        Command::SendText {
+            chat,
+            text: Secret("سلام".to_string()),
+        },
     );
-    assert_eq!(received.client_sent_at, Some(frame.client_sent_at));
+    let Event::Pending { local, .. } =
+        sara.wait(&server, |event| matches!(event, Event::Pending { .. }))
+    else {
+        unreachable!();
+    };
+    let Event::Sent {
+        local: sent,
+        seq,
+        saved_at,
+        ..
+    } = sara.wait(&server, |event| matches!(event, Event::Sent { .. }))
+    else {
+        unreachable!();
+    };
+    assert_eq!(sent, local);
+    assert!(saved_at > 0);
+
+    // The other device gets it with its sequence id, and it opens.
+    let message = shown(babak.wait(&server, |event| is_message(event, chat, seq)));
+    assert_eq!(text_of(&message), Some("سلام"));
+    assert_eq!(message.account, Some(sara.id()));
 
     // The reply goes the other way, and sequence ids keep growing.
-    let reply = sealed(&pair.babak, chat, Kind::Content, None, b"hello");
-    let reply_seq = seq_of(post(&mut pair.babak_socket, reply));
-    assert_eq!(reply_seq, seq + 1);
-    let received = pair.sara_socket.message(chat, reply_seq);
-    assert_eq!(
-        open_message(&pair.sara.device, &pair.babak.device, &received),
-        b"hello"
+    babak.command(
+        &server,
+        Command::SendText {
+            chat,
+            text: Secret("hello".to_string()),
+        },
     );
+    let Event::Sent { seq: reply_seq, .. } =
+        babak.wait(&server, |event| matches!(event, Event::Sent { .. }))
+    else {
+        unreachable!();
+    };
+    assert_eq!(reply_seq, seq + 1);
+    let message = shown(sara.wait(&server, |event| is_message(event, chat, reply_seq)));
+    assert_eq!(text_of(&message), Some("hello"));
 
     // History and the list agree, from either side.
-    let page = history(&mut pair.babak_socket, chat, seq - 1, 200);
-    assert_eq!(page.len(), 2);
-    assert_eq!(
-        open_message(&pair.babak.device, &pair.sara.device, &page[0]),
-        "سلام".as_bytes()
-    );
-    let item = chat_item(&mut pair.sara_socket, chat);
+    babak.events.clear();
+    babak.command(&server, Command::OpenChat { chat });
+    let Event::PageLoaded { has_older, .. } =
+        babak.wait(&server, |event| matches!(event, Event::PageLoaded { .. }))
+    else {
+        unreachable!();
+    };
+    assert!(!has_older, "the page reached the chat's first message");
+    let mut texts = Vec::new();
+    for event in babak.events.drain(..) {
+        if let Event::Message { message } = event {
+            texts.push(message.text.unwrap().0.clone());
+        }
+    }
+    assert_eq!(texts, vec!["سلام".to_string(), "hello".to_string()]);
+    sara.events.clear();
+    sara.command(&server, Command::ChatList);
+    let Event::Chats { chat_list } =
+        sara.wait(&server, |event| matches!(event, Event::Chats { .. }))
+    else {
+        unreachable!();
+    };
+    let mut item = None;
+    for listed in chat_list {
+        if listed.chat == chat {
+            item = Some(listed);
+        }
+    }
+    let item = item.unwrap();
     assert_eq!(item.chat_type, ChatType::Direct);
     assert_eq!(item.last_seq, Some(reply_seq));
     assert_eq!(item.last_content_seq, Some(reply_seq));
     assert_eq!(item.last_kind, Some(Kind::Content));
     assert!(item.last_at.is_some());
-    assert_eq!(history(&mut pair.sara_socket, chat, 0, 1).len(), 1);
 
-    // The wraps went up with the commit, and the words open them.
-    let (status, wraps) = pair.server.call(
+    // The wraps went up when the chat started and with the commit, and the words open them.
+    let (status, wraps) = server.call(
         "GET",
         &format!("/api/v1/chats/{chat}/wraps"),
-        Some(&pair.sara.token),
+        sara.token.as_deref(),
         None,
     );
     assert_eq!(status, 200);
     let wrap_list = wraps["data"]["wrap_list"].as_array().unwrap();
-    assert_eq!(wrap_list.len(), 3, "sara at epoch 0, and both people at 1");
+    assert_eq!(wrap_list.len(), 4, "both people at epoch 0, and both at 1");
 
     // The ciphertext the server stores does not hold the text.
-    let database = std::fs::read(pair.server.path("keryx.db")).unwrap();
+    let database = std::fs::read(server.path("keryx.db")).unwrap();
     assert!(
         !database
             .windows("سلام".len())
@@ -501,84 +512,98 @@ fn two_people_exchange_encrypted_text_the_server_cannot_read() {
 
 #[test]
 fn a_new_device_gets_everything_with_only_the_words() {
-    let mut pair = pair();
-    let chat = pair.chat;
-    let before = sealed(&pair.babak, chat, Kind::Content, None, b"before");
-    let seq = seq_of(post(&mut pair.babak_socket, before));
-    let old_message = pair.sara_socket.message(chat, seq);
-
-    // Sara arrives on a new device, with nobody approving anything.
-    let token = log_in(&pair.server, &pair.sara.username);
-    let mut new_device = add_device(&pair.server, pair.sara.id, &pair.sara.keys, &token);
-    let new_id = new_device.record().device;
-
-    // Her old device sees the notice in her self chat, signed with the device's stamp.
-    let notice = pair.sara_socket.next_where(|frame| {
-        matches!(frame, ServerFrame::Message(message) if message.chat == pair.sara.self_chat)
-    });
-    let ServerFrame::Message(notice) = notice else {
+    let server = open_server();
+    let (mut sara, mut babak, chat) = apps_on(&server);
+    babak.command(
+        &server,
+        Command::SendText {
+            chat,
+            text: Secret("before".to_string()),
+        },
+    );
+    let Event::Sent { seq, .. } = babak.wait(&server, |event| matches!(event, Event::Sent { .. }))
+    else {
         unreachable!();
     };
-    assert_eq!(notice.kind, Some(Kind::DeviceNotice));
-    assert_eq!(notice.device, Some(new_id));
-    assert_eq!(notice.encrypted, Some(false));
-    assert_eq!(
-        notice.signature.clone().unwrap().0,
-        new_device.record().stamp.to_vec()
-    );
-    assert!(notice.body.clone().unwrap().0.is_empty());
-    let mut new_socket = connect(&pair.server, &token);
 
-    // It sees the list and members, joins by itself, and catches up through the wraps.
-    let (status, reply) = pair.server.call(
-        "GET",
-        &format!("/api/v1/chats/{chat}/group_info"),
-        Some(&token),
-        None,
+    // Sara arrives on a new device, with nobody approving anything, and types only her words.
+    let mut new = App::new();
+    new.command(
+        &server,
+        Command::LogIn {
+            username: "sara_x".to_string(),
+            password: Secret(PASSWORD.to_string()),
+            captcha: None,
+        },
     );
-    assert_eq!(status, 200, "{reply}");
-    let group_info: Bytes = serde_json::from_value(reply["data"]["group_info"].clone()).unwrap();
-    let accounts = [pair.sara.key.clone(), pair.babak.key.clone()];
-    let join = new_device
-        .join_external(chat, &group_info.0, Ulid::now(), &accounts)
-        .unwrap();
-    let frame = commit_frame(&new_device, chat, &join, Vec::new());
-    let join_seq = seq_of(post(&mut new_socket, frame));
-    let group_info = new_device.commit_accepted(chat, Ulid::now()).unwrap();
-    done(upload_group_info(
-        &mut new_socket,
-        chat,
-        join.epoch,
-        group_info,
-    ));
+    new.wait(&server, |event| {
+        matches!(event, Event::NeedWords { restore: true })
+    });
+    new.command(
+        &server,
+        Command::Restore {
+            words: Secret(BABAK_WORDS.to_string()),
+        },
+    );
+    new.wait(
+        &server,
+        |event| matches!(event, Event::Error { code, .. } if code == "wrong_words"),
+    );
+    new.command(
+        &server,
+        Command::Restore {
+            words: Secret(SARA_WORDS.to_string()),
+        },
+    );
+    let Event::SignedIn {
+        device: Some(new_id),
+        ..
+    } = new.wait(&server, |event| {
+        matches!(
+            event,
+            Event::SignedIn {
+                device: Some(_),
+                ..
+            }
+        )
+    })
+    else {
+        unreachable!();
+    };
 
-    // Existing members apply it.
-    let commit = pair.babak_socket.message(chat, join_seq);
-    pair.babak
-        .device
-        .process_commit(chat, &commit.body.unwrap().0, Ulid::now())
-        .unwrap();
+    // Her old device sees the notice in her self chat.
+    let self_chat = sara.self_chat.unwrap();
+    sara.wait(&server, |event| {
+        matches!(event, Event::Notice { chat, device, .. } if *chat == self_chat && *device == new_id)
+    });
 
-    let (_, wraps) = pair.server.call(
-        "GET",
-        &format!("/api/v1/chats/{chat}/wraps"),
-        Some(&token),
-        None,
+    // It joins by itself, catches up through the wraps, and reads what came before.
+    new.wait(
+        &server,
+        |event| matches!(event, Event::ChatReady { chat: ready } if *ready == chat),
     );
-    for wrap in wraps["data"]["wrap_list"].as_array().unwrap() {
-        if wrap["account"] == json!(pair.sara.id) && wrap["epoch"] == json!(1) {
-            let wrapped: Bytes = serde_json::from_value(wrap["wrapped"].clone()).unwrap();
-            new_device
-                .unwrap_history(&pair.sara.keys, chat, 1, &wrapped.0)
-                .unwrap();
-        }
-    }
-    let page = history(&mut new_socket, chat, seq - 1, 1);
-    assert_eq!(page[0], old_message);
-    assert_eq!(
-        open_message(&new_device, &pair.babak.device, &page[0]),
-        b"before"
+    new.events.clear();
+    new.command(&server, Command::OpenChat { chat });
+    let message = shown(new.wait(&server, |event| is_message(event, chat, seq)));
+    assert_eq!(text_of(&message), Some("before"));
+    assert_eq!(message.account, Some(babak.id()));
+
+    // The others apply its join, so what it sends next opens for them.
+    new.command(
+        &server,
+        Command::SendText {
+            chat,
+            text: Secret("from the new one".to_string()),
+        },
     );
+    let Event::Sent { seq, .. } = new.wait(&server, |event| matches!(event, Event::Sent { .. }))
+    else {
+        unreachable!();
+    };
+    let message = shown(babak.wait(&server, |event| is_message(event, chat, seq)));
+    assert_eq!(text_of(&message), Some("from the new one"));
+    let message = shown(sara.wait(&server, |event| is_message(event, chat, seq)));
+    assert_eq!(text_of(&message), Some("from the new one"));
 }
 
 #[test]
@@ -651,6 +676,8 @@ fn only_the_sender_edits_and_a_delete_wipes_the_target_and_its_edits() {
     let second_seq = seq_of(post(&mut pair.sara_socket, second));
     let item = chat_item(&mut pair.sara_socket, chat);
     assert_eq!(item.last_content_seq, Some(second_seq));
+    // The chat's epoch is the one its last accepted commit reached: starting it added Babak.
+    assert_eq!(item.epoch, Some(1));
     let last_at = item.last_at;
 
     // Babak cannot edit or delete Sara's words. Not even a message's sender can edit what is gone.
@@ -787,20 +814,21 @@ fn the_first_commit_for_each_epoch_wins_and_group_info_follows_the_rules() {
         group_info,
     ));
 
-    // Before epoch 0 is uploaded, no commit or later epoch can come in.
+    // Before epoch 0 is uploaded, no commit or later epoch can come in: here a chat with a third
+    // person that nobody has started.
+    let third = sign_up(&pair.server, "third_x", BABAK_WORDS);
     let (_, reply) = pair.server.call(
         "POST",
         "/api/v1/chats",
         Some(&pair.sara.token),
-        Some(&json!({"account": pair.sara.id})),
+        Some(&json!({"account": third.id})),
     );
-    let self_chat = ulid_of(&reply["data"]["chat"]);
-    assert_eq!(self_chat, pair.sara.self_chat);
+    let unstarted = ulid_of(&reply["data"]["chat"]);
     assert_refused(
-        upload_group_info(&mut pair.sara_socket, self_chat, 3, vec![1]),
+        upload_group_info(&mut pair.sara_socket, unstarted, 3, vec![1]),
         "stale_epoch",
     );
-    let mut lost = commit_frame(&pair.sara.device, self_chat, &sara_commit, Vec::new());
+    let mut lost = commit_frame(&pair.sara.device, unstarted, &sara_commit, Vec::new());
     lost.epoch = Some(1);
     lost.wrap_list.clear();
     assert_refused(post(&mut pair.sara_socket, lost), "commit_lost");
@@ -950,6 +978,7 @@ fn a_stranger_gets_nothing_from_a_chat() {
                     reference: wanted,
                     chat,
                     after_seq: 0,
+                    before_seq: None,
                     limit: 10,
                 },
                 wanted,
@@ -1042,6 +1071,7 @@ fn a_stranger_gets_nothing_from_a_chat() {
                     reference: wanted,
                     chat,
                     after_seq: 0,
+                    before_seq: None,
                     limit: 10,
                 },
                 wanted,
@@ -1084,7 +1114,7 @@ fn body_limits_go_by_content_kind_and_an_edit_by_its_target() {
 }
 
 #[test]
-fn seen_keeps_the_highest_and_typing_is_not_saved() {
+fn seen_and_received_keep_the_highest_and_tell_the_sender_and_typing_is_not_saved() {
     let mut pair = pair();
     let chat = pair.chat;
     let frame = sealed(&pair.sara, chat, Kind::Content, None, b"x");
@@ -1101,10 +1131,52 @@ fn seen_keeps_the_highest_and_typing_is_not_saved() {
             wanted,
         )
     };
+    let received = |socket: &mut Socket, up_to_seq| {
+        let wanted = reference();
+        socket.request(
+            &ClientFrame::Received {
+                reference: wanted,
+                chat,
+                up_to_seq,
+                client_received_at: Ulid::now(),
+            },
+            wanted,
+        )
+    };
+    let marks = |socket: &mut Socket| match socket
+        .next_where(|frame| matches!(frame, ServerFrame::Marks { .. }))
+    {
+        ServerFrame::Marks { chat: marked, mark } => {
+            assert_eq!(marked, chat);
+            mark
+        }
+        _ => unreachable!(),
+    };
+
+    done(received(&mut pair.babak_socket, seq));
+    let mark = marks(&mut pair.sara_socket);
+    assert_eq!(mark.account, pair.babak.id);
+    assert_eq!((mark.received_seq, mark.seen_seq), (seq, Some(0)));
+    done(received(&mut pair.babak_socket, 1));
+    assert_refused(received(&mut pair.babak_socket, seq + 1), "bad_received");
+
     done(seen(&mut pair.babak_socket, seq));
+    let mark = marks(&mut pair.sara_socket);
+    assert_eq!((mark.received_seq, mark.seen_seq), (seq, Some(seq)));
     done(seen(&mut pair.babak_socket, 1));
     done(seen(&mut pair.babak_socket, seq));
     assert_refused(seen(&mut pair.babak_socket, seq + 1), "bad_seen");
+
+    let item = chat_item(&mut pair.sara_socket, chat);
+    assert_eq!(item.last_seq, Some(seq));
+    assert_eq!(item.last_content.unwrap().seq, seq);
+    assert_eq!(item.mark_list.len(), 1);
+    assert_eq!(item.mark_list[0].account, pair.babak.id);
+    assert_eq!(item.mark_list[0].received_seq, seq);
+    assert_eq!(item.mark_list[0].seen_seq, Some(seq));
+    let item = chat_item(&mut pair.babak_socket, chat);
+    assert_eq!(item.mark_list[0].account, pair.sara.id);
+    assert_eq!(item.mark_list[0].received_seq, 0);
 
     pair.sara_socket
         .send(&ClientFrame::Typing { chat, on: true });
@@ -1117,74 +1189,123 @@ fn seen_keeps_the_highest_and_typing_is_not_saved() {
     assert_eq!(account, pair.sara.id);
     assert!(on);
     assert_eq!(history(&mut pair.sara_socket, chat, seq, 10).len(), 0);
-    assert_eq!(chat_item(&mut pair.sara_socket, chat).last_seq, Some(seq));
+}
+
+#[test]
+fn history_pages_backward_from_before_seq() {
+    let mut pair = pair();
+    let chat = pair.chat;
+    let mut seq_list = Vec::new();
+    for text in [b"a", b"b", b"c", b"d"] {
+        let frame = sealed(&pair.sara, chat, Kind::Content, None, text);
+        seq_list.push(seq_of(post(&mut pair.sara_socket, frame)));
+    }
+    let last = *seq_list.last().unwrap();
+    let page = |socket: &mut Socket, before_seq| {
+        let wanted = reference();
+        match socket.request(
+            &ClientFrame::History {
+                reference: wanted,
+                chat,
+                after_seq: 0,
+                before_seq: Some(before_seq),
+                limit: 2,
+            },
+            wanted,
+        ) {
+            ServerFrame::Page { message_list, .. } => {
+                let mut found = Vec::new();
+                for message in message_list {
+                    found.push(message.seq);
+                }
+                found
+            }
+            other => panic!("Wanted a page, and got {other:?}"),
+        }
+    };
+    assert_eq!(page(&mut pair.babak_socket, last + 1), vec![last - 1, last]);
+    assert_eq!(
+        page(&mut pair.babak_socket, last - 1),
+        vec![last - 3, last - 2]
+    );
+    assert_eq!(page(&mut pair.babak_socket, 1), Vec::<u64>::new());
 }
 
 #[test]
 fn an_ended_device_is_cut_off_and_everyone_sharing_a_chat_is_told() {
-    let mut pair = pair();
-    let chat = pair.chat;
-    let id = pair.babak.device.record().device;
+    let server = open_server();
+    let (mut sara, babak, chat) = apps_on(&server);
+    let babak = babak.into_person(BABAK_WORDS);
+    let id = babak.device.record().device;
+    let mut babak_socket = connect(&server, &babak.token);
 
-    let signature = sign_revocation(&pair.babak.keys, &pair.babak.id, &id);
-    let token = log_in(&pair.server, "babak_x");
-    let (status, reply) = pair.server.call(
-        "POST",
-        &format!("/api/v1/devices/{id}/terminate"),
-        Some(&token),
-        Some(&json!({"signature": Bytes(signature.to_vec())})),
+    // Babak terminates it from a password-only session, with his words.
+    let mut other = App::new();
+    other.command(
+        &server,
+        Command::LogIn {
+            username: "babak_x".to_string(),
+            password: Secret(PASSWORD.to_string()),
+            captcha: None,
+        },
     );
-    assert_eq!(status, 200, "{reply}");
+    other.wait(&server, |event| matches!(event, Event::NeedWords { .. }));
+    other.command(
+        &server,
+        Command::Terminate {
+            device: id,
+            words: Secret(BABAK_WORDS.to_string()),
+        },
+    );
+    other.wait(
+        &server,
+        |event| matches!(event, Event::Terminated { device } if *device == id),
+    );
+    assert_eq!(babak_socket.closed(), (4403, "device_ended".to_string()));
 
-    let revoked = pair
-        .sara_socket
-        .next_where(|frame| matches!(frame, ServerFrame::Revoked { .. }));
-    let ServerFrame::Revoked {
-        account,
-        device,
-        statement,
-    } = revoked
-    else {
-        unreachable!();
-    };
-    assert_eq!(account, pair.babak.id);
-    assert_eq!(device, id);
-    let fixed: [u8; 64] = statement.0.clone().try_into().unwrap();
-    keryx_core::mls::verify_revocation(pair.babak.keys.master_public(), &account, &device, &fixed)
-        .unwrap();
+    // Sara's client checks the statement and commits the removal by itself.
+    let before = sara.client.device().unwrap().epoch(chat).unwrap();
+    let started = std::time::Instant::now();
+    loop {
+        sara.read_once(&server);
+        let device = sara.client.device().unwrap();
+        let mut still_in = false;
+        for member in device.member_list(chat).unwrap() {
+            if member.device == id {
+                still_in = true;
+            }
+        }
+        if !still_in {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the device was never removed"
+        );
+    }
     assert_eq!(
-        pair.babak_socket.closed(),
-        (4403, "device_ended".to_string())
+        sara.client.device().unwrap().epoch(chat).unwrap(),
+        before + 1
     );
 
     // A client that was offline reads it from the chat's device list.
-    let (_, listed) = pair.server.call(
+    let (_, listed) = server.call(
         "GET",
         &format!("/api/v1/chats/{chat}/devices"),
-        Some(&pair.sara.token),
+        sara.token.as_deref(),
         None,
     );
     let mut with_statement = 0;
     for device in listed["data"]["device_list"].as_array().unwrap() {
         if device["device"] == json!(id) {
-            assert_eq!(device["statement"], json!(Bytes(statement.0.clone())));
+            assert!(device["statement"].is_string());
             with_statement += 1;
         }
     }
     assert_eq!(with_statement, 1);
 
-    // A member commits its removal.
-    let accounts = [pair.sara.key.clone(), pair.babak.key.clone()];
-    let removal = pair
-        .sara
-        .device
-        .remove_devices(chat, &[id], &accounts)
-        .unwrap();
-    let frame = commit_frame(&pair.sara.device, chat, &removal, Vec::new());
-    seq_of(post(&mut pair.sara_socket, frame));
-
     // It cannot come back, by login or by Welcome.
-    let (_, asked) = pair.server.call(
+    let (_, asked) = server.call(
         "POST",
         "/api/v1/challenge",
         None,
@@ -1192,8 +1313,8 @@ fn an_ended_device_is_cut_off_and_everyone_sharing_a_chat_is_told() {
     );
     let challenge: Bytes = serde_json::from_value(asked["data"]["challenge"].clone()).unwrap();
     let fixed: [u8; 32] = challenge.0.clone().try_into().unwrap();
-    let signature = pair.babak.device.sign_device_login(&fixed).unwrap();
-    let (status, reply) = pair.server.call(
+    let signature = babak.device.sign_device_login(&fixed).unwrap();
+    let (status, reply) = server.call(
         "POST",
         "/api/v1/login/token",
         None,
@@ -1205,7 +1326,9 @@ fn an_ended_device_is_cut_off_and_everyone_sharing_a_chat_is_told() {
     );
     assert_eq!(status, 403, "{reply}");
     assert_eq!(reply["code"], "device_ended");
-    let mut welcome = sealed(&pair.sara, chat, Kind::Content, None, b"");
+    let sara_person = sara.into_person(SARA_WORDS);
+    let mut sara_socket = connect(&server, &sara_person.token);
+    let mut welcome = sealed(&sara_person, chat, Kind::Content, None, b"");
     welcome.reference = reference();
     welcome.kind = Kind::Commit;
     welcome.content_kind = None;
@@ -1214,7 +1337,7 @@ fn an_ended_device_is_cut_off_and_everyone_sharing_a_chat_is_told() {
         device: id,
         body: Bytes(vec![1]),
     }];
-    assert_refused(post(&mut pair.sara_socket, welcome), "no_such_device");
+    assert_refused(post(&mut sara_socket, welcome), "no_such_device");
 }
 
 #[test]
@@ -1469,64 +1592,291 @@ fn a_shutdown_closes_sockets_with_1001() {
 #[test]
 fn a_welcome_waits_for_an_offline_device() {
     let server = open_server();
-    let mut sara = sign_up(&server, "sara_x", SARA_WORDS);
-    let mut babak = sign_up(&server, "babak_x", BABAK_WORDS);
-    let mut sara_socket = connect(&server, &sara.token);
-    let (_, reply) = server.call(
-        "POST",
-        "/api/v1/chats",
-        Some(&sara.token),
-        Some(&json!({"account": babak.id})),
-    );
-    let chat = ulid_of(&reply["data"]["chat"]);
-    let (_, reply) = server.call(
-        "POST",
-        &format!("/api/v1/accounts/{}/key_packages/claim", babak.id),
-        Some(&sara.token),
-        None,
-    );
-    let item: &Value = &reply["data"]["key_package_list"][0];
-    let package: Bytes = serde_json::from_value(item["body"].clone()).unwrap();
-    let created = sara
-        .device
-        .create_chat(chat, Ulid::now(), std::slice::from_ref(&sara.key))
-        .unwrap();
-    done(upload_group_info(
-        &mut sara_socket,
-        chat,
-        0,
-        created.group_info,
-    ));
-    let accounts = [sara.key.clone(), babak.key.clone()];
-    let commit = sara
-        .device
-        .add_devices(chat, &[package.0], &accounts)
-        .unwrap();
-    let frame = commit_frame(
-        &sara.device,
-        chat,
-        &commit,
-        vec![WelcomeItem {
-            device: babak.device.record().device,
-            body: Bytes(commit.welcome.clone().unwrap()),
-        }],
-    );
-    seq_of(post(&mut sara_socket, frame));
+    let mut sara = App::sign_up(&server, "sara_x", SARA_WORDS);
+    let babak = App::sign_up(&server, "babak_x", BABAK_WORDS);
+    let babak_id = babak.id();
+    let slots = babak.slots.clone();
+    drop(babak);
 
-    // Babak comes online afterwards and gets it, once.
-    let mut socket = connect(&server, &babak.token);
-    let welcome = socket.next_where(|frame| matches!(frame, ServerFrame::Welcome { .. }));
-    let ServerFrame::Welcome { body, .. } = welcome else {
+    // Babak is offline while Sara starts the chat.
+    sara.command(&server, Command::StartChat { account: babak_id });
+    let self_chat = sara.self_chat;
+    let Event::ChatReady { chat } = sara.wait(
+        &server,
+        |event| matches!(event, Event::ChatReady { chat } if Some(*chat) != self_chat),
+    ) else {
         unreachable!();
     };
-    babak
-        .device
-        .join_welcome(chat, &body.0, Ulid::now())
-        .unwrap();
-    drop(socket);
-    let mut again = connect(&server, &babak.token);
-    assert_eq!(chat_item(&mut again, chat).chat, chat);
-    assert!(again.waiting.is_empty());
+
+    // He opens the app again: it loads his saved state, he logs in, and the Welcome is waiting.
+    let mut back = App::new();
+    let [first, second] = slots;
+    back.feed(&server, keryx_core::client::Input::Loaded { first, second });
+    back.wait(&server, |event| matches!(event, Event::NeedLogin));
+    back.command(
+        &server,
+        Command::LogIn {
+            username: "babak_x".to_string(),
+            password: Secret(PASSWORD.to_string()),
+            captcha: None,
+        },
+    );
+    back.wait(
+        &server,
+        |event| matches!(event, Event::ChatReady { chat: ready } if *ready == chat),
+    );
+    sara.command(
+        &server,
+        Command::SendText {
+            chat,
+            text: Secret("you are back".to_string()),
+        },
+    );
+    let Event::Sent { seq, .. } = sara.wait(&server, |event| matches!(event, Event::Sent { .. }))
+    else {
+        unreachable!();
+    };
+    let message = shown(back.wait(&server, |event| is_message(event, chat, seq)));
+    assert_eq!(text_of(&message), Some("you are back"));
+}
+
+#[test]
+fn marks_reach_the_sender_and_typing_reaches_the_other() {
+    let server = open_server();
+    let (mut sara, mut babak, chat) = apps_on(&server);
+    sara.command(
+        &server,
+        Command::SendText {
+            chat,
+            text: Secret("x".to_string()),
+        },
+    );
+    let Event::Sent { seq, .. } = sara.wait(&server, |event| matches!(event, Event::Sent { .. }))
+    else {
+        unreachable!();
+    };
+
+    // Holding it sends `received` by itself, and the sender's client hears of it.
+    babak.wait(&server, |event| is_message(event, chat, seq));
+    let Event::Marks { mark, .. } = sara.wait(
+        &server,
+        |event| matches!(event, Event::Marks { mark, .. } if mark.received_seq >= seq),
+    ) else {
+        unreachable!();
+    };
+    assert_eq!(mark.account, babak.id());
+    assert_eq!(mark.seen_seq, Some(0));
+
+    babak.command(
+        &server,
+        Command::Seen {
+            chat,
+            up_to_seq: seq,
+        },
+    );
+    let Event::Marks { mark, .. } = sara.wait(
+        &server,
+        |event| matches!(event, Event::Marks { mark, .. } if mark.seen_seq == Some(seq)),
+    ) else {
+        unreachable!();
+    };
+    assert_eq!(mark.received_seq, seq);
+
+    // A reload draws the same marks from the list.
+    sara.events.clear();
+    sara.command(&server, Command::ChatList);
+    let Event::Chats { chat_list } =
+        sara.wait(&server, |event| matches!(event, Event::Chats { .. }))
+    else {
+        unreachable!();
+    };
+    let mut found = false;
+    for item in chat_list {
+        if item.chat == chat {
+            assert_eq!(item.mark_list[0].account, babak.id());
+            assert_eq!(item.mark_list[0].seen_seq, Some(seq));
+            found = true;
+        }
+    }
+    assert!(found);
+
+    sara.command(&server, Command::Typing { chat, on: true });
+    let Event::Typing { account, on, .. } =
+        babak.wait(&server, |event| matches!(event, Event::Typing { .. }))
+    else {
+        unreachable!();
+    };
+    assert_eq!(account, sara.id());
+    assert!(on);
+}
+
+#[test]
+fn a_chat_opens_on_its_newest_page_and_older_pages_load_upwards() {
+    let server = open_server();
+    let (mut sara, mut babak, chat) = apps_on(&server);
+    let mut last = 0;
+    for number in 0..60 {
+        sara.command(
+            &server,
+            Command::SendText {
+                chat,
+                text: Secret(format!("{number}")),
+            },
+        );
+        let Event::Sent { seq, .. } =
+            sara.wait(&server, |event| matches!(event, Event::Sent { .. }))
+        else {
+            unreachable!();
+        };
+        last = seq;
+    }
+    babak.wait(&server, |event| is_message(event, chat, last));
+    babak.events.clear();
+    babak.command(&server, Command::OpenChat { chat });
+    let Event::PageLoaded { has_older, .. } =
+        babak.wait(&server, |event| matches!(event, Event::PageLoaded { .. }))
+    else {
+        unreachable!();
+    };
+    assert!(has_older);
+    let mut first_page = Vec::new();
+    for event in babak.events.drain(..) {
+        if let Event::Message { message } = event
+            && message.seq + 60 > last
+        {
+            first_page.push(message.seq);
+        }
+    }
+    assert_eq!(first_page.len(), 50);
+    assert_eq!(*first_page.last().unwrap(), last);
+
+    babak.command(&server, Command::LoadOlder { chat });
+    let Event::PageLoaded { has_older, .. } =
+        babak.wait(&server, |event| matches!(event, Event::PageLoaded { .. }))
+    else {
+        unreachable!();
+    };
+    assert!(!has_older);
+    let mut older = Vec::new();
+    for event in babak.events.drain(..) {
+        if let Event::Message { message } = event {
+            older.push(text_of(&message).unwrap().to_string());
+        }
+    }
+    assert_eq!(older.len(), 10);
+    assert_eq!(older[0], "0");
+    babak.command(&server, Command::LoadOlder { chat });
+    babak.wait(&server, |event| {
+        matches!(
+            event,
+            Event::PageLoaded {
+                has_older: false,
+                ..
+            }
+        )
+    });
+}
+
+#[test]
+fn an_edit_or_delete_can_point_at_a_message_still_waiting() {
+    let server = open_server();
+    let (mut sara, mut babak, chat) = apps_on(&server);
+    sara.command(
+        &server,
+        Command::SendText {
+            chat,
+            text: Secret("frist".to_string()),
+        },
+    );
+    let Event::Pending { local, .. } =
+        sara.wait(&server, |event| matches!(event, Event::Pending { .. }))
+    else {
+        unreachable!();
+    };
+    sara.command(
+        &server,
+        Command::Edit {
+            chat,
+            target: keryx_core::client::Pointer::Local(local),
+            text: Secret("first".to_string()),
+        },
+    );
+    let Event::Sent { seq, .. } = sara.wait(&server, |event| matches!(event, Event::Sent { .. }))
+    else {
+        unreachable!();
+    };
+    let Event::Edited {
+        message,
+        target_seq,
+    } = babak.wait(&server, |event| matches!(event, Event::Edited { .. }))
+    else {
+        unreachable!();
+    };
+    assert_eq!(target_seq, seq);
+    assert_eq!(text_of(&message), Some("first"));
+
+    sara.command(
+        &server,
+        Command::Delete {
+            chat,
+            target: keryx_core::client::Pointer::Seq(seq),
+        },
+    );
+    let Event::Deleted { target_seq, .. } =
+        babak.wait(&server, |event| matches!(event, Event::Deleted { .. }))
+    else {
+        unreachable!();
+    };
+    assert_eq!(target_seq, seq);
+}
+
+#[test]
+fn a_device_comes_back_from_its_saved_state_and_logging_out_wipes_it() {
+    let server = open_server();
+    let (sara, mut babak, chat) = apps_on(&server);
+    let sara_id = sara.client.device().unwrap().record().device;
+    let slots = sara.slots.clone();
+    drop(sara);
+
+    // A reload: the saved state, then the password, and the device proves itself.
+    let mut back = App::new();
+    let [first, second] = slots;
+    back.feed(&server, keryx_core::client::Input::Loaded { first, second });
+    back.wait(&server, |event| matches!(event, Event::NeedLogin));
+    back.command(
+        &server,
+        Command::LogIn {
+            username: "sara_x".to_string(),
+            password: Secret(PASSWORD.to_string()),
+            captcha: None,
+        },
+    );
+    let Event::SignedIn { device, .. } =
+        back.wait(&server, |event| matches!(event, Event::SignedIn { .. }))
+    else {
+        unreachable!();
+    };
+    assert_eq!(device, Some(sara_id));
+    back.wait(&server, |event| matches!(event, Event::Online));
+    back.command(
+        &server,
+        Command::SendText {
+            chat,
+            text: Secret("still me".to_string()),
+        },
+    );
+    let Event::Sent { seq, .. } = back.wait(&server, |event| matches!(event, Event::Sent { .. }))
+    else {
+        unreachable!();
+    };
+    let message = shown(babak.wait(&server, |event| is_message(event, chat, seq)));
+    assert_eq!(text_of(&message), Some("still me"));
+
+    // Logging out is confirmed by the server first, then the saved state goes.
+    back.command(&server, Command::LogOut);
+    back.wait(&server, |event| matches!(event, Event::LoggedOut));
+    assert_eq!(back.slots, [None, None]);
+    assert!(back.client.device().is_none());
 }
 
 type TlsStream = rustls::StreamOwned<rustls::ClientConnection, TcpStream>;
@@ -1559,12 +1909,31 @@ fn tls_stream(server: &Server, trust: bool, name: &'static str) -> TlsStream {
 
 #[test]
 fn the_websocket_works_over_tls_and_the_certificate_is_checked() {
+    // Set up by hand over REST: this is about the transport, and the test client speaks plain
+    // WebSocket only.
     let server = Server::start("", "[registration]\nallow = true\n# tls\n");
-    let sara = sign_up(&server, "sara_x", SARA_WORDS);
+    let (status, reply) = server.call(
+        "POST",
+        "/api/v1/register",
+        None,
+        Some(&json!({"username": "sara_x", "password": PASSWORD})),
+    );
+    assert_eq!(status, 200, "{reply}");
+    let id = ulid_of(&reply["data"]["account"]);
+    let token = log_in(&server, "sara_x");
+    let keys = keryx_core::seed::derive(SARA_WORDS).unwrap();
+    let body = json!({
+        "master_public": Bytes(keys.master_public().to_vec()),
+        "account_public": Bytes(keys.account_public().to_vec()),
+        "account_stamp": Bytes(keryx_core::mls::stamp_account_key(&keys, &id).to_vec()),
+    });
+    let (_, reply) = server.call("PUT", "/api/v1/account/keys", Some(&token), Some(&body));
+    let self_chat = ulid_of(&reply["data"]["self_chat"]);
+    add_device(&server, id, &keys, &token);
     let url = format!("{}/api/v1/ws", server.origin.replace("https://", "wss://"));
     let request = || {
         ClientRequestBuilder::new(url.parse().unwrap())
-            .with_header("Authorization", format!("Bearer {}", sara.token))
+            .with_header("Authorization", format!("Bearer {token}"))
             .with_sub_protocol("keryx.v1")
     };
 
@@ -1581,7 +1950,7 @@ fn the_websocket_works_over_tls_and_the_certificate_is_checked() {
             };
             let frame: ServerFrame = serde_json::from_str(text.as_str()).unwrap();
             if let ServerFrame::Chats { chat_list, .. } = frame {
-                assert_eq!(chat_list[0].chat, sara.self_chat);
+                assert_eq!(chat_list[0].chat, self_chat);
                 break;
             }
         }
