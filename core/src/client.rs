@@ -200,7 +200,9 @@ pub enum Input {
     Command {
         command: Command,
     },
-    /// The two snapshot slots, once, when the platform starts.
+    /// The two snapshot slots, once, when the platform starts. `resume` connects a cookie
+    /// client at once. A login for one username loads with `resume` false, so that device
+    /// is not used until its own login.
     Loaded {
         #[serde(with = "serde_bytes")]
         #[cfg_attr(feature = "wasm", tsify(type = "Uint8Array | null"))]
@@ -208,6 +210,7 @@ pub enum Input {
         #[serde(with = "serde_bytes")]
         #[cfg_attr(feature = "wasm", tsify(type = "Uint8Array | null"))]
         second: Option<Vec<u8>>,
+        resume: bool,
     },
     Saved {
         id: u64,
@@ -935,7 +938,11 @@ impl Client {
         self.now = now;
         match input {
             Input::Command { command } => self.command(command),
-            Input::Loaded { first, second } => self.loaded(first, second),
+            Input::Loaded {
+                first,
+                second,
+                resume,
+            } => self.loaded(first, second, resume),
             Input::Saved { id } => self.saved(id),
             Input::SaveFailed { id } => self.save_failed(id),
             Input::Connected => self.connected(),
@@ -1704,7 +1711,7 @@ impl Client {
     // Saving
     // ---------------------------------------------------------------------------------------------
 
-    fn loaded(&mut self, first: Option<Vec<u8>>, second: Option<Vec<u8>>) {
+    fn loaded(&mut self, first: Option<Vec<u8>>, second: Option<Vec<u8>>, resume: bool) {
         if first.is_none() && second.is_none() {
             return self.show_login();
         }
@@ -1720,7 +1727,9 @@ impl Client {
                 if self.auth == Auth::Token && self.token.is_none() {
                     return self.show_login();
                 }
-                self.connect();
+                if resume {
+                    self.connect();
+                }
             }
             Err(error) => {
                 self.error("load_failed", &error.to_string());
@@ -2667,8 +2676,10 @@ impl Client {
             let last_seq = item.last_seq.unwrap_or(0);
             state.top = state.top.max(last_seq);
             if state.known.is_none() {
-                // After a reload nothing is backfilled: this is where handling starts.
-                state.known = Some(last_seq);
+                // A reload has no handled id. Updating starts at this member's seen position when
+                // the list carries one, so what they have not seen is fetched and opened. Without
+                // it, handling starts at the latest.
+                state.known = Some(item.seen_seq.unwrap_or(last_seq));
             }
             let mut member_list = vec![me];
             for mark in &item.mark_list {
@@ -3737,6 +3748,13 @@ impl Client {
             | Asked::Setup { .. }
             | Asked::Challenge { .. }
             | Asked::Login { .. } => self.error(code, message),
+            // The socket opened and this count went out before the server closed it. A session
+            // with no device is the login screen, and that refusal is not something they did.
+            Asked::KeyPackageCount if code == "no_device" => {
+                if !self.session_lost {
+                    self.session_gone();
+                }
+            }
             _ if status == 401 => self.session_gone(),
             _ if code == "device_ended" => self.ended(),
             // An earlier try did register it, and only its answer was lost.

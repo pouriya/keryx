@@ -1,0 +1,178 @@
+.shell {
+  display: flex;
+  height: 100dvh;
+}
+
+.column {
+  display: flex;
+  flex-direction: column;
+  width: 33vw;
+  min-width: 16rem;
+  max-width: 26.5rem;
+  border-inline-end: 1px solid var(--line);
+}
+
+.header {
+  position: relative;
+  display: flex;
+  align-items: center;
+  height: 3.5rem;
+  padding-inline: 0.35rem;
+}
+
+.icon {
+  display: grid;
+  width: 2.75rem;
+  height: 2.75rem;
+  place-items: center;
+  color: inherit;
+  background: transparent;
+  border: 0;
+  border-radius: 50%;
+  cursor: pointer;
+}
+
+.menu {
+  position: absolute;
+  inset-inline-start: 0.5rem;
+  top: 3.15rem;
+  z-index: 2;
+  min-width: 12rem;
+  padding: 0.25rem;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 0.75rem;
+}
+
+.menu button {
+  display: block;
+  width: 100%;
+  padding: 0.6rem 0.8rem;
+  font: inherit;
+  color: inherit;
+  text-align: start;
+  background: transparent;
+  border: 0;
+  border-radius: 0.5rem;
+  cursor: pointer;
+}
+
+.menu button:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.list {
+  flex: 1;
+  min-height: 0;
+}
+
+.row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 0.75rem;
+  align-items: center;
+  padding: 0.55rem 0.85rem;
+}
+
+.letter {
+  display: grid;
+  width: 3rem;
+  height: 3rem;
+  place-items: center;
+  font-weight: 600;
+  background: var(--line);
+  border-radius: 50%;
+}
+
+.body {
+  min-width: 0;
+}
+
+.nameLine,
+.previewLine {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.name {
+  overflow: hidden;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.time,
+.preview {
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
+.preview {
+  display: flex;
+  gap: 0.2rem;
+  align-items: center;
+  min-width: 0;
+}
+
+.previewText {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ticks,
+.seen {
+  display: inline-flex;
+  flex: none;
+}
+
+.ticks {
+  color: var(--muted);
+}
+
+.seen {
+  color: var(--accent);
+}
+
+.unread {
+  display: grid;
+  flex: none;
+  place-items: center;
+  min-width: 1.25rem;
+  height: 1.25rem;
+  padding-inline: 0.35rem;
+  font-size: 0.75rem;
+  color: #fff;
+  background: var(--accent);
+  border-radius: 999px;
+}
+
+.rest {
+  display: grid;
+  flex: 1;
+  place-items: center;
+  color: var(--muted);
+}
+
+@media (min-width: 1276px) {
+  .column {
+    width: 25vw;
+    max-width: 33vw;
+  }
+}
+
+@media (max-width: 600px) {
+  .column {
+    width: 100%;
+    min-width: 0;
+    max-width: none;
+    border: 0;
+  }
+
+  .rest {
+    display: none;
+  }
+}

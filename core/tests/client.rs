@@ -457,6 +457,30 @@ fn a_refused_socket_stops_retrying_and_an_ended_device_wipes_itself() {
 }
 
 #[test]
+fn a_key_package_count_refused_for_no_device_returns_to_login_without_an_error() {
+    let (mut client, _, _) = ready();
+    let out = client.step(Input::Connected, NOW);
+    let (asked, _, path, _) = request(&out);
+    assert_eq!(path, "/api/v1/key_packages");
+    let out = client.step(
+        Input::Reply {
+            id: asked,
+            status: 403,
+            body:
+                json!({"ok": false, "code": "no_device", "message": "This session has no device"})
+                    .to_string(),
+        },
+        NOW,
+    );
+    assert!(events(&out).contains(&Event::NeedLogin));
+    assert!(
+        events(&out)
+            .iter()
+            .all(|event| !matches!(event, Event::Error { .. }))
+    );
+}
+
+#[test]
 fn what_cannot_be_read_or_done_is_an_error_event() {
     let (mut client, _, _) = ready();
     client.step(Input::Connected, NOW);
@@ -568,6 +592,7 @@ fn the_login_screen_reads_what_the_server_allows() {
         Input::Loaded {
             first: None,
             second: None,
+            resume: true,
         },
         NOW,
     );
@@ -643,6 +668,7 @@ fn loading_saved_state_comes_back_or_asks_to_log_in() {
         Input::Loaded {
             first: None,
             second: None,
+            resume: true,
         },
         NOW,
     );
@@ -651,6 +677,7 @@ fn loading_saved_state_comes_back_or_asks_to_log_in() {
         Input::Loaded {
             first: Some(vec![1, 2, 3]),
             second: None,
+            resume: true,
         },
         NOW,
     );
@@ -670,6 +697,7 @@ fn loading_saved_state_comes_back_or_asks_to_log_in() {
         Input::Loaded {
             first: Some(saved.clone()),
             second: None,
+            resume: true,
         },
         NOW,
     );
@@ -679,6 +707,7 @@ fn loading_saved_state_comes_back_or_asks_to_log_in() {
         Input::Loaded {
             first: Some(saved),
             second: None,
+            resume: true,
         },
         NOW,
     );
@@ -709,6 +738,40 @@ fn loading_saved_state_comes_back_or_asks_to_log_in() {
         json!(app.device().unwrap().record().device)
     );
     assert_eq!(body["device"]["signature"].as_str().unwrap().len(), 88);
+}
+
+#[test]
+fn loading_one_username_does_not_connect_until_that_login() {
+    let (saver, _, _) = ready();
+    let saved = saver
+        .into_device()
+        .unwrap()
+        .export()
+        .unwrap()
+        .bytes
+        .to_vec();
+    let mut browser = Client::new(Auth::Cookie, platform());
+    let out = browser.step(
+        Input::Loaded {
+            first: Some(saved),
+            second: None,
+            resume: false,
+        },
+        NOW,
+    );
+    assert!(
+        out.iter()
+            .all(|output| !matches!(output, Output::Connect { .. }))
+    );
+    let out = command(
+        &mut browser,
+        Command::LogIn {
+            username: "sara_x".to_string(),
+            password: Secret("a long enough password".to_string()),
+            captcha: None,
+        },
+    );
+    assert_eq!(request(&out).2, "/api/v1/challenge");
 }
 
 #[test]
@@ -1219,7 +1282,14 @@ impl World {
         self.phones[q].account = account;
         self.phones[q].device = device;
         self.phones[q].slots = [first.clone(), second.clone()];
-        self.input(q, Input::Loaded { first, second });
+        self.input(
+            q,
+            Input::Loaded {
+                first,
+                second,
+                resume: true,
+            },
+        );
         q
     }
 
@@ -2235,6 +2305,7 @@ impl World {
                 epoch: chat.epoch,
                 last_content,
                 mark_list,
+                seen_seq: None,
             });
         }
         chat_list

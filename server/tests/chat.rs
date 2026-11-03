@@ -1215,12 +1215,14 @@ fn seen_and_received_keep_the_highest_and_tell_the_sender_and_typing_is_not_save
 
     let item = chat_item(&mut pair.sara_socket, chat);
     assert_eq!(item.last_seq, Some(seq));
+    assert_eq!(item.seen_seq, Some(0));
     assert_eq!(item.last_content.unwrap().seq, seq);
     assert_eq!(item.mark_list.len(), 1);
     assert_eq!(item.mark_list[0].account, pair.babak.id);
     assert_eq!(item.mark_list[0].received_seq, seq);
     assert_eq!(item.mark_list[0].seen_seq, Some(seq));
     let item = chat_item(&mut pair.babak_socket, chat);
+    assert_eq!(item.seen_seq, Some(seq));
     assert_eq!(item.mark_list[0].account, pair.sara.id);
     assert_eq!(item.mark_list[0].received_seq, 0);
 
@@ -1658,7 +1660,14 @@ fn a_welcome_waits_for_an_offline_device() {
     // He opens the app again: it loads his saved state, he logs in, and the Welcome is waiting.
     let mut back = App::new();
     let [first, second] = slots;
-    back.feed(&server, keryx_core::client::Input::Loaded { first, second });
+    back.feed(
+        &server,
+        keryx_core::client::Input::Loaded {
+            first,
+            second,
+            resume: true,
+        },
+    );
     back.wait(&server, |event| matches!(event, Event::NeedLogin));
     back.command(
         &server,
@@ -1888,7 +1897,14 @@ fn a_device_comes_back_from_its_saved_state_and_logging_out_wipes_it() {
     // A reload: the saved state, then the password, and the device proves itself.
     let mut back = App::new();
     let [first, second] = slots;
-    back.feed(&server, keryx_core::client::Input::Loaded { first, second });
+    back.feed(
+        &server,
+        keryx_core::client::Input::Loaded {
+            first,
+            second,
+            resume: true,
+        },
+    );
     back.wait(&server, |event| matches!(event, Event::NeedLogin));
     back.command(
         &server,

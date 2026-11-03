@@ -2,7 +2,7 @@
 // what core's client asks, and feeds back what happened. Commands come from the page as they are,
 // and events go back as they are. Nothing here logs, since what passes through holds secrets.
 
-import { openStore } from "./storage";
+import { dropLegacy, lastUsername, openStore, remember, type Store, usernames } from "./storage";
 import init, {
   Client,
   type Command,
@@ -76,15 +76,84 @@ const early: Command[] = [];
 self.onmessage = (message: MessageEvent<Command>) => early.push(message.data);
 
 await init();
-const store = await openStore();
-const client = new Client("cookie", await platform());
+const described = await platform();
+let store: Store | null = null;
+let bound: string | null = null;
+let client = new Client("cookie", described);
 let socket: WebSocket | null = null;
 let timer: ReturnType<typeof setTimeout> | undefined;
+let chain: Promise<void> = Promise.resolve();
 
 function feed(input: Input) {
   for (const output of client.step(input, Date.now())) {
     run(output);
   }
+}
+
+function postKnown(names: string[], username: string | null) {
+  postMessage({ type: "known", usernames: names, username });
+}
+
+/** Drops whatever device is in memory. Its database stays. */
+function release() {
+  socket?.close();
+  socket = null;
+  clearTimeout(timer);
+  store?.close();
+  store = null;
+  bound = null;
+  client = new Client("cookie", described);
+}
+
+/** Loads this username's own snapshot. A login does not connect until that login. */
+async function bind(username: string, resume: boolean) {
+  if (bound === username && store) {
+    await remember(username);
+    return;
+  }
+  const names = await usernames();
+  if (!names.includes(username)) {
+    release();
+    return;
+  }
+  release();
+  store = await openStore(username);
+  bound = username;
+  await remember(username);
+  const [first, second] = await Promise.all(SLOTS.map((slot) => store?.get(slot) ?? null));
+  feed({
+    type: "loaded",
+    first: first ?? null,
+    second: second ?? null,
+    resume,
+  });
+}
+
+/** Points later saves at this username without loading another snapshot over the login. */
+async function keep(username: string) {
+  if (bound === username && store) {
+    await remember(username);
+    postKnown(await usernames(), username);
+    return;
+  }
+  store?.close();
+  store = await openStore(username);
+  bound = username;
+  await remember(username);
+  postKnown(await usernames(), username);
+}
+
+async function handle(command: Command) {
+  if (command.type === "log_in") {
+    await bind(command.username, false);
+  } else if (command.type === "sign_up" || command.type === "setup") {
+    release();
+  }
+  feed({ type: "command", command });
+}
+
+function enqueue(command: Command) {
+  chain = chain.then(() => handle(command)).catch(() => undefined);
 }
 
 function run(output: Output) {
@@ -133,15 +202,23 @@ function run(output: Output) {
     }
     case "save": {
       const { id, slot, bytes } = output;
-      store.put(SLOTS[slot] ?? "slot0", bytes).then(
-        () => feed({ type: "saved", id }),
-        () => feed({ type: "save_failed", id }),
-      );
+      void chain.then(async () => {
+        if (!store) {
+          feed({ type: "save_failed", id });
+          return;
+        }
+        try {
+          await store.put(SLOTS[slot] ?? "slot0", bytes);
+          feed({ type: "saved", id });
+        } catch {
+          feed({ type: "save_failed", id });
+        }
+      });
       break;
     }
     case "wipe":
       for (const slot of SLOTS) {
-        store.remove(slot);
+        void store?.remove(slot);
       }
       break;
     case "wake_at":
@@ -149,16 +226,26 @@ function run(output: Output) {
       timer = setTimeout(() => feed({ type: "timer" }), Math.max(0, output.at - Date.now()));
       break;
     case "event":
+      if (output.event.type === "signed_in") {
+        const username = output.event.username;
+        chain = chain.then(() => keep(username));
+      }
       postMessage(output.event);
       break;
   }
 }
 
-const [first, second] = await Promise.all(SLOTS.map((slot) => store.get(slot)));
-feed({ type: "loaded", first: first ?? null, second: second ?? null });
-for (const command of early.splice(0)) {
-  feed({ type: "command", command });
+await dropLegacy();
+const names = await usernames();
+const last = await lastUsername();
+postKnown(names, last !== null && names.includes(last) ? last : null);
+if (last !== null && names.includes(last)) {
+  await bind(last, true);
+} else {
+  feed({ type: "loaded", first: null, second: null, resume: true });
 }
-self.onmessage = (message: MessageEvent<Command>) =>
-  feed({ type: "command", command: message.data });
-addEventListener("online", () => feed({ type: "command", command: { type: "network_back" } }));
+for (const command of early.splice(0)) {
+  enqueue(command);
+}
+self.onmessage = (message: MessageEvent<Command>) => enqueue(message.data);
+addEventListener("online", () => enqueue({ type: "network_back" }));

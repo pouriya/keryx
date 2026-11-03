@@ -85,6 +85,38 @@
   outline-offset: 2px;
 }
 
+.choices {
+  position: absolute;
+  z-index: 2;
+  top: calc(100% + 0.25rem);
+  inset-inline: 0;
+  margin: 0;
+  padding: 0.25rem;
+  list-style: none;
+  text-align: start;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 0.875rem;
+}
+
+.choice {
+  display: block;
+  width: 100%;
+  padding: 0.55rem 0.75rem;
+  font: inherit;
+  color: inherit;
+  text-align: start;
+  cursor: pointer;
+  background: none;
+  border: 0;
+  border-radius: 0.625rem;
+}
+
+.choice:hover,
+.choice:focus-visible {
+  background: color-mix(in srgb, var(--line) 45%, var(--paper));
+}
+
 .captcha {
   display: grid;
   grid-template-columns: 3fr 1fr;

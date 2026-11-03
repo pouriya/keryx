@@ -200,8 +200,9 @@ the WASM build, because there is one `Cargo.lock`. Make targets stay inside
   all of them, then fetches pages in the background from the last id it has to the
   latest. **How, chosen by the author:** on every reconnect, each chat this session already
   knew is paged forward with `after_seq` from the last sequence id it handled, commits applied in
-  order and content opened. After a reload there is no last id, so nothing is backfilled and a
-  chat opens on its newest page. See [core/AGENTS.md](core/AGENTS.md).
+  order and content opened. After a reload there is no last id. The list carries this member's seen
+  position, and updating fetches from there, so the unread count is the content messages decrypted
+  in that fetch. A reaction does not count. A chat still opens on its newest page. See [core/AGENTS.md](core/AGENTS.md).
 
 ### Removal
 
@@ -699,6 +700,8 @@ accepts the first for each step. The loser gets a rejection, catches up and retr
 
   [registration]
   allow = false
+  password_min_length = 12
+  username_min_length = 3
 
   [session]
   lifetime = "30d"
@@ -708,9 +711,6 @@ accepts the first for each step. The loser gets a rejection, catches up and retr
 
   [www]
   directory = "/var/lib/keryx/www"
-
-  [password]
-  min_length = 12
 
   [limits]
   websocket_frame = "1MiB"
@@ -773,7 +773,9 @@ accepts the first for each step. The loser gets a rejection, catches up and retr
   words, default 12**), writes it down and confirms it. Restoring accepts any valid
   BIP39 length. People do not hand-pick words, because human choices have far less
   randomness and hand-picked phrases are what brain-wallet crackers target. The words
-  and their order produce the keys.
+  and their order produce the keys. A shutdown before they are confirmed leaves the account
+  and the password. The phrase that was only on screen is not stored, and the next login
+  generates a new one.
 - **The words are the English BIP39 list only.** BIP39 derives keys from the literal
   text, so a Persian list would be non-standard, permanent, and full of look-alike
   and ZWNJ traps.
@@ -786,11 +788,12 @@ accepts the first for each step. The loser gets a rejection, catches up and retr
   and `/api/v1/login/token` returns the token and sets no cookie, so a script can never read a
   browser's token. A token is 32 random bytes, stored as SHA-256, since a random token needs no slow
   hash.
-- **A password is at least `[password] min_length` characters, 12 by default**, and at most 1,024, so
+- **A password is at least `[registration] password_min_length` characters, 12 by default**, and at most 1,024, so
   a huge one cannot waste server time. Any characters are allowed, and digits or symbols are not
   required, because NIST advises against such rules.
-- **A username is a unique lowercase handle:** `a-z`, `0-9` and `_`, 3 to 32
-  characters, not starting with a digit. `keryx user add` may break the length limit
+- **A username is a unique lowercase handle:** `a-z`, `0-9` and `_`, at least
+  `[registration] username_min_length` characters (3 by default) and at most 32, not starting with a digit.
+  `keryx user add` may break the length limit
   and nothing else. Handles are ASCII so look-alike letters cannot impersonate anyone.
   **A display name is separate:** any language including Persian, not unique, and
   visible to the server. The directory searches both.
@@ -864,9 +867,12 @@ accepts the first for each step. The loser gets a rejection, catches up and retr
   message's sender is the new device, which is how the server applies that rule, and it carries
   the device's master stamp, so a server cannot invent one. Clients accept this one kind of unencrypted event in a self chat whatever its mode, and it holds
   no free text. Each other chat's notice comes from the device's signed MLS join.
-- **A browser keeps its keys in IndexedDB between visits.** After the words are typed
-  once, the derived device keys and MLS state stay there and the words themselves are
-  not stored. Logging out wipes them.
+- **A browser keeps its keys in IndexedDB between visits, one database per username.**
+  The database is named for that username. There is no production data, so a database that has
+  no username is deleted and never read. The username is saved when the account is created and
+  again after a login. After the words are typed once, the derived device keys and MLS state stay
+  there and the words themselves are not stored. More than one account can stay on the browser.
+  Switching to another keeps the one left behind. Logging out wipes the account that is logging out.
 - **Device state is saved as a whole snapshot, chosen for safety by the author.** openmls is
   synchronous and works in memory. `core/` hands back one blob holding all of a device's MLS
   state, so a save lands completely or not at all, unlike many small writes. Each snapshot has a

@@ -1081,7 +1081,7 @@ impl Storage for Sqlite {
         self.read(move |connection| {
             let mut statement = connection.prepare(
                 "SELECT c.id, c.type, c.mode, c.last_seq, c.last_kind, c.last_at, c.last_content_seq,
-                 g.epoch
+                 g.epoch, m.seen_seq
                  FROM member m JOIN conversation c ON c.id = m.conversation_id
                  LEFT JOIN mls_group g ON g.conversation_id = c.id
                  WHERE m.account_id = ?1
@@ -1104,6 +1104,7 @@ impl Storage for Sqlite {
                     epoch: opt_unsigned(row.get(7)?),
                     last_content: None,
                     mark_list: Vec::new(),
+                    seen_seq: Some(unsigned(row.get(8)?)),
                 })
             })?;
             let mut chat_list = Vec::new();

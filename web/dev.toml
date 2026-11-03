@@ -1,7 +1,7 @@
 # The server `make dev` starts beside Vite. Paths must be absolute, so the Makefile writes a copy
 # under tmp/ with @ROOT@ replaced by the repository's path. public_url is Vite's address, so the
-# WebSocket's Origin check and the cookie match. Registration is open. Captcha is on, and
-# pass_code is accepted as well as the drawn answer.
+# WebSocket's Origin check and the cookie match. Registration is open. There is no captcha. The
+# password and the username may be 4 characters, so trying the client is not a chore.
 listen = "127.0.0.1:7777"
 public_url = "http://127.0.0.1:5173"
 
@@ -11,6 +11,8 @@ path = "@ROOT@/tmp/dev/keryx.db"
 
 [registration]
 allow = true
+password_min_length = 4
+username_min_length = 4
 
 [session]
 lifetime = "30d"
@@ -20,9 +22,3 @@ idle_after = "5m"
 
 [www]
 directory = "@ROOT@/web/dist"
-
-[password]
-min_length = 12
-
-[captcha]
-pass_code = "THE CODE"

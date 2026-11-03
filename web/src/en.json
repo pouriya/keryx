@@ -31,5 +31,9 @@
   "wrongWords": "Those are not this account's words.",
   "signedIn": "Signed in as {name}",
   "next": "Chats come next.",
-  "logOut": "Log out"
+  "logOut": "Log out",
+  "menu": "Menu",
+  "devices": "Devices",
+  "savedMessages": "Saved messages",
+  "noMessages": "No messages yet"
 }

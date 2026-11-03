@@ -1,4 +1,5 @@
-import { type InputHTMLAttributes, useEffect, useState } from "react";
+import { type ChangeEvent, type InputHTMLAttributes, useEffect, useState } from "react";
+import { Chats } from "./chats";
 import { Logo } from "./logo";
 import { Problem } from "./problem";
 import styles from "./session.module.css";
@@ -21,7 +22,7 @@ export function App() {
     return <Words />;
   }
   if (phase === "in") {
-    return <SignedIn />;
+    return <Chats />;
   }
   if (phase === "setup") {
     return <Setup />;
@@ -37,11 +38,49 @@ export function App() {
   );
 }
 
-function Field({ label, ...input }: { label: string } & InputHTMLAttributes<HTMLInputElement>) {
+function Field({
+  label,
+  choices,
+  ...input
+}: { label: string; choices?: string[] } & InputHTMLAttributes<HTMLInputElement>) {
+  const known = choices?.filter((name) => name !== "") ?? [];
+  const [open, setOpen] = useState(false);
+  const listId = typeof input.id === "string" ? `${input.id}-list` : undefined;
+  const pick = (name: string) => {
+    input.onChange?.({ target: { value: name } } as ChangeEvent<HTMLInputElement>);
+    setOpen(false);
+  };
   return (
     <div className={styles.field}>
-      <input {...input} placeholder=" " />
+      <input
+        {...input}
+        placeholder=" "
+        onFocus={(event) => {
+          setOpen(known.length > 0);
+          input.onFocus?.(event);
+        }}
+        onBlur={(event) => {
+          setOpen(false);
+          input.onBlur?.(event);
+        }}
+      />
       <label htmlFor={input.id}>{label}</label>
+      {open && listId !== undefined ? (
+        <ul className={styles.choices} id={listId} dir="ltr">
+          {known.map((name) => (
+            <li key={name}>
+              <button
+                className={styles.choice}
+                type="button"
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={() => pick(name)}
+              >
+                {name}
+              </button>
+            </li>
+          ))}
+        </ul>
+      ) : null}
     </div>
   );
 }
@@ -143,9 +182,17 @@ function Account() {
   const registration = useStore((state) => state.registration);
   const registered = useStore((state) => state.registered);
   const picture = useCaptcha();
+  const remembered = useStore((state) => state.remembered);
+  const saved = useStore((state) => state.saved);
   const [mode, setMode] = useState<"sign_up" | "log_in">("log_in");
   const [username, setUsername] = useState("");
+  const [edited, setEdited] = useState(false);
   const [password, setPassword] = useState("");
+  useEffect(() => {
+    if (!edited && remembered !== "") {
+      setUsername(remembered);
+    }
+  }, [edited, remembered]);
   const signingUp = !registered && registration === true && mode === "sign_up";
   return (
     <main className={styles.screen}>
@@ -176,7 +223,11 @@ function Account() {
           autoCorrect="off"
           spellCheck={false}
           dir="ltr"
-          onChange={(event) => setUsername(event.target.value)}
+          choices={saved}
+          onChange={(event) => {
+            setEdited(true);
+            setUsername(event.target.value);
+          }}
         />
         <Field
           id="password"
@@ -281,31 +332,6 @@ function Setup() {
           </button>
         </div>
       </form>
-    </main>
-  );
-}
-
-function SignedIn() {
-  const t = useText();
-  const username = useStore((state) => state.username);
-  const busy = useStore((state) => state.busy);
-  return (
-    <main className={styles.screen}>
-      <Logo />
-      <h1>{t("name")}</h1>
-      <p className={styles.note}>{t("signedIn", { name: username })}</p>
-      <p className={styles.note}>{t("next")}</p>
-      <Problem />
-      <div className={styles.actions}>
-        <button
-          className={styles.quiet}
-          type="button"
-          disabled={busy}
-          onClick={() => submit({ type: "log_out" })}
-        >
-          {t("logOut")}
-        </button>
-      </div>
     </main>
   );
 }

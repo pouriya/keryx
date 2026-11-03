@@ -98,7 +98,10 @@ Android uses the same list. The first list, which grows as the code needs:
 
 **How it logs in is set when the `Client` is made, chosen by the author:** cookie or token. With a
 token, it keeps it in memory and puts it on its requests as `Bearer`. With a cookie, it never sees
-one, so a browser can never be sent down the token route by accident.
+one, so a browser can never be sent down the token route by accident. **Loading a snapshot takes
+`resume`.** A reload resumes, and a cookie client connects at once. A login for one username loads
+that username's snapshot with `resume` false, so the socket stays down until that login and another
+account's device is not sent with the password.
 
 **It keeps no timeline, chosen by the author.** It holds only what it needs to work: the chat list's
 state, each chat's last sequence id, the queue and the MLS state. Each opened message, edit or delete
@@ -149,8 +152,10 @@ does not count, so the second mark means the text really reached a device of tha
 with nothing missing below it. On every reconnect, each chat this session already knew is paged
 forward with `after_seq` from there to the latest, commits applied in order and content opened. A
 live frame that skips ahead starts the same fill. Live frames arriving during a fill are kept and
-handled after it, in order. After a reload there is no last id: the first `chats` list sets it, and
-nothing is backfilled. The device is still there and the name is not, so the page hears `signed_in`
+handled after it, in order. After a reload there is no last id. The list carries this member's seen
+position, and updating fetches from there, so the content messages they have not seen are opened
+again. The unread count is those messages, and a reaction does not count. The device is still there
+and the name is not, so the page hears `signed_in`
 when this account's name comes back.
 
 **Unanswered sends are matched by their exact signature** in those same pages, and resent only when
@@ -209,7 +214,9 @@ failing and nothing more until it succeeds. Commits stay blocked meanwhile.
 
 **Refusals that mean the session is gone are acted on:** a REST 401 asks to log in again,
 `device_ended` wipes the device, `device_limit` stops it until the person terminates a device, after
-which it reconnects. Set words after a half-finished set-up skips putting the keys when the server already holds
+which it reconnects. A `no_device` on the key-package count sent as the socket opens returns to the
+login screen and is not shown: that request goes out before the server has closed a session that
+has no device, and the person did not do it. Set words after a half-finished set-up skips putting the keys when the server already holds
 these exact ones.
 
 **The server's tests drive it against a real `keryx serve`,** replacing their own client code built

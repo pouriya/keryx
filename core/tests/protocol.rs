@@ -281,6 +281,7 @@ fn every_server_frame_has_the_agreed_shape() {
         epoch: None,
         last_content: None,
         mark_list: Vec::new(),
+        seen_seq: None,
     };
     let marked = ChatItem {
         last_content_seq: Some(5),

@@ -152,8 +152,6 @@ pub struct Settings {
     pub chat: ChatSettings,
     pub www: WwwSettings,
     #[serde(default)]
-    pub password: PasswordSettings,
-    #[serde(default)]
     pub limits: Limits,
     #[serde(default)]
     pub tcp: TcpSettings,
@@ -173,10 +171,24 @@ pub struct OperatorSettings {
     pub token: String,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize)]
 #[serde(default)]
 pub struct RegistrationSettings {
     pub allow: bool,
+    /// The shortest password. It also applies when a setup link sets one.
+    pub password_min_length: usize,
+    /// The shortest username. `keryx user add` does not use it.
+    pub username_min_length: usize,
+}
+
+impl Default for RegistrationSettings {
+    fn default() -> Self {
+        Self {
+            allow: false,
+            password_min_length: 12,
+            username_min_length: 3,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -208,18 +220,6 @@ impl Default for ChatSettings {
 #[derive(Deserialize)]
 pub struct WwwSettings {
     pub directory: PathBuf,
-}
-
-#[derive(Deserialize)]
-#[serde(default)]
-pub struct PasswordSettings {
-    pub min_length: usize,
-}
-
-impl Default for PasswordSettings {
-    fn default() -> Self {
-        Self { min_length: 12 }
-    }
 }
 
 #[derive(Deserialize)]
@@ -599,7 +599,7 @@ fn stored_key<const N: usize>(bytes: &[u8]) -> Result<[u8; N], Refused> {
     }
 }
 
-fn check_username(username: &str, length_applies: bool) -> Result<(), Refused> {
+fn check_username(username: &str, min_length: Option<usize>) -> Result<(), Refused> {
     let mut valid = !username.is_empty();
     for (index, character) in username.chars().enumerate() {
         let allowed = character.is_ascii_lowercase()
@@ -609,7 +609,9 @@ fn check_username(username: &str, length_applies: bool) -> Result<(), Refused> {
             valid = false;
         }
     }
-    if length_applies && !(3..=32).contains(&username.len()) {
+    if let Some(min_length) = min_length
+        && !(min_length..=32).contains(&username.len())
+    {
         valid = false;
     }
     if valid {
@@ -621,7 +623,7 @@ fn check_username(username: &str, length_applies: bool) -> Result<(), Refused> {
 
 fn check_password(app: &App, password: &str) -> Result<(), Refused> {
     let length = password.chars().count();
-    if length < app.settings.password.min_length || length > MAX_PASSWORD_CHARS {
+    if length < app.settings.registration.password_min_length || length > MAX_PASSWORD_CHARS {
         return Err(refused(
             400,
             "bad_password",
@@ -672,7 +674,10 @@ pub async fn run_register(
         ));
     }
     captcha::check(app, input.captcha).await?;
-    check_username(&input.username, true)?;
+    check_username(
+        &input.username,
+        Some(app.settings.registration.username_min_length),
+    )?;
     check_password(app, &input.password)?;
     let id = new_id()?;
     let password_hash = hash_password(input.password).await?;
@@ -701,7 +706,7 @@ pub async fn run_create_account(
     input: CreateAccountBody,
 ) -> Result<CreatedAccountReply, Refused> {
     check(app, caller, Need::Server(ACCOUNT_CREATE)).await?;
-    check_username(&input.username, false)?;
+    check_username(&input.username, None)?;
     let id = new_id()?;
     let (token, token_hash) = new_token()?;
     let now = Ulid::now();

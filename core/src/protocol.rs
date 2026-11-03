@@ -352,6 +352,11 @@ pub struct ChatItem {
     /// The other members' positions, so a reload draws the marks at once. Empty in a channel.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mark_list: Vec<MarkItem>,
+    /// This member's seen position. After a reload, updating fetches from here. The unread count
+    /// is the content messages opened after it, and a reaction does not count. The server does
+    /// not send the count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seen_seq: Option<u64>,
 }
 
 /// How far one member's devices have received and seen a chat. No `seen_seq` for someone with

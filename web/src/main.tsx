@@ -4,6 +4,12 @@ import { useStore } from "./store";
 import "./theme.css";
 import type { Command, Event } from "./wasm/keryx_wasm";
 
+interface Known {
+  type: "known";
+  usernames: string[];
+  username: string | null;
+}
+
 const language = useStore.getState().language;
 document.documentElement.lang = language;
 document.documentElement.dir = language === "fa" ? "rtl" : "ltr";
@@ -20,7 +26,11 @@ function take(steal: boolean) {
       }
       worker?.terminate();
       worker = new Worker(new URL("./worker.ts", import.meta.url), { type: "module" });
-      worker.onmessage = (message: MessageEvent<Event>) => {
+      worker.onmessage = (message: MessageEvent<Event | Known>) => {
+        if (message.data.type === "known") {
+          useStore.getState().setKnown(message.data.usernames, message.data.username);
+          return;
+        }
         useStore.getState().apply(message.data);
       };
       worker.onerror = (error) => {

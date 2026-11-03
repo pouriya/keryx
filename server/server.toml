@@ -24,6 +24,11 @@ path = "/var/lib/keryx/keryx.db"
 [registration]
 # Whether people may sign up themselves. Off: only `keryx user add` makes accounts.
 allow = false
+# The shortest password, also when a setup link sets one. At most 1,024, fixed in code.
+password_min_length = 12
+# The shortest username. The shape stays lowercase letters, digits and _, at most 32, not starting
+# with a digit. `keryx user add` may ignore this length.
+username_min_length = 3
 
 [session]
 # Slides forward on each use.
@@ -36,9 +41,6 @@ idle_after = "5m"
 [www]
 # The web client's files. A path with no file gets index.html.
 directory = "/var/lib/keryx/www"
-
-[password]
-min_length = 12
 
 [limits]
 websocket_frame = "1MiB"

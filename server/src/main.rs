@@ -99,7 +99,13 @@ fn read_configuration(path: &Path) -> anyhow::Result<Settings> {
             StaticMap::new().required_any("type").required_any("path"),
         )
         .optional("operator", StaticMap::new().required_any("token"))
-        .optional("registration", StaticMap::new().optional_any("allow"))
+        .optional(
+            "registration",
+            StaticMap::new()
+                .optional_any("allow")
+                .optional_any("password_min_length")
+                .optional_any("username_min_length"),
+        )
         .optional(
             "session",
             StaticMap::new().optional("lifetime", DurationValue::new().to_int()),
@@ -109,7 +115,6 @@ fn read_configuration(path: &Path) -> anyhow::Result<Settings> {
             StaticMap::new().optional("idle_after", DurationValue::new().to_int()),
         )
         .required("www", StaticMap::new().required_any("directory"))
-        .optional("password", StaticMap::new().optional_any("min_length"))
         .optional(
             "limits",
             StaticMap::new()
