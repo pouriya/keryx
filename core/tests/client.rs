@@ -2934,3 +2934,49 @@ fn a_refused_catch_up_is_reported_and_runs_again_on_the_next_connection() {
     assert_eq!(world.texts(mina, chat), vec!["rotated"]);
     assert_eq!(error_count(&world, mina, "internal"), 1);
 }
+
+fn unknown_message(world: &World, chat: Ulid) -> MessageFrame {
+    MessageFrame {
+        chat,
+        seq: 0,
+        device: Some(Ulid::from_bytes([9; 16])),
+        kind: Some(Kind::Content),
+        content_kind: Some(ContentKind::Text),
+        encrypted: Some(true),
+        epoch: Some(0),
+        pointer_seq: None,
+        call_seq: None,
+        client_sent_at: Some(world.now),
+        server_saved_at: Some(world.now),
+        body: Some(Bytes(vec![1, 2, 3])),
+        signature: Some(Bytes(vec![4; 64])),
+    }
+}
+
+fn problems(world: &World, phone: usize, chat: Ulid) -> Vec<Problem> {
+    let mut list = Vec::new();
+    for event in &world.phones[phone].events {
+        if let Event::Message { message } = event
+            && message.chat == chat
+            && let Some(problem) = message.problem
+        {
+            list.push(problem);
+        }
+    }
+    list
+}
+
+#[test]
+fn a_refused_device_list_shows_what_waited_for_it_as_from_an_unknown_device() {
+    let (mut world, _, mina, chat) = pair();
+    world.fail_rest(
+        mina,
+        &format!("GET /api/v1/chats/{chat}/devices"),
+        RestFault::Answer(403, "not_member"),
+    );
+    let message = unknown_message(&world, chat);
+    world.append(message);
+    world.settle();
+    assert_eq!(problems(&world, mina, chat), vec![Problem::UnknownDevice]);
+    assert_eq!(world.errors(mina), vec!["not_member"]);
+}

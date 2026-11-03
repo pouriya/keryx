@@ -172,7 +172,8 @@ are kept and resent on connect. Typing while offline is dropped, since it would 
 
 **A message that cannot be shown properly still appears**, with no text and a `problem`:
 `bad_signature`, `unknown_device` or `malformed`, so the timeline has no hole. An unknown device is
-decided after one fresh device list, never in a loop.
+decided after one fresh device list, never in a loop. If the server refuses that list, what waited
+for it shows as `unknown_device` rather than staying held.
 
 **Any commit or Welcome that fails to process makes the device rejoin that chat** by external commit
 from the server's group info, after dropping the chat's group but keeping every epoch key it holds, so

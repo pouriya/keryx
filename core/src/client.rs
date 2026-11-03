@@ -3820,8 +3820,12 @@ impl Client {
                 self.release(chat);
                 self.error(code, message);
             }
+            // No list is coming, so what waited for one is shown as from an unknown device.
             Asked::ChatDevices { chat, .. } => {
-                self.chat(chat).fetching_devices = false;
+                let state = self.chat(chat);
+                state.fetching_devices = false;
+                let waiting = std::mem::take(&mut state.unknown);
+                self.open_list(chat, waiting, false, true);
                 self.error(code, message);
             }
             Asked::Wraps { chat } => {
