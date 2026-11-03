@@ -2303,7 +2303,14 @@ fn messages_missed_while_away_are_fetched_on_reconnect_and_a_reload_starts_fresh
         world.texts(mina, chat),
         vec!["one".to_string(), "two".to_string()]
     );
-    assert!(world.sent_frames(mina, "received") >= 1);
+    let mut received = None;
+    for mark in &world.hub_chat(chat).position_list {
+        if mark.account == world.account(mina) {
+            received = Some(mark.received_seq);
+        }
+    }
+    // After the commit that added Mina, the two texts are 2 and 3.
+    assert_eq!(received, Some(3));
 
     world.offline(mina);
     tell(&mut world, omid, chat, "three");
@@ -2400,8 +2407,8 @@ fn what_needs_the_socket_is_kept_and_typing_is_not() {
     assert_eq!(world.sent_frames(mina, "history"), 0);
     assert_eq!(world.sent_frames(mina, "typing"), 0);
     world.online(mina);
-    assert!(world.sent_frames(mina, "seen") >= 1);
-    assert!(world.sent_frames(mina, "history") >= 1);
+    assert_eq!(world.sent_frames(mina, "seen"), 1);
+    assert_eq!(world.sent_frames(mina, "history"), 1);
     assert_eq!(world.sent_frames(mina, "typing"), 0);
 
     world.advance(8 * DAY);
@@ -2681,7 +2688,9 @@ fn a_gone_session_an_ended_device_and_the_device_limit_are_acted_on() {
     );
     world.settle();
     assert!(world.phones[second].device.is_some());
-    assert!(world.phones[second].up || world.phones[second].connecting);
+    assert!(world.phones[second].up);
+    let own = world.self_chat(world.account(second));
+    assert!(world.ready(second, own), "{:?}", world.errors(second));
 }
 
 #[test]
