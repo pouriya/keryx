@@ -1,11 +1,11 @@
 .page {
   justify-content: flex-start;
-  gap: 0.4rem;
+  gap: 0.75rem;
   width: min(26rem, 100%);
   height: 100dvh;
   min-height: 0;
   max-height: 100dvh;
-  padding: 0.7rem 0.85rem 0.55rem;
+  padding: 1.25rem 1.25rem 1rem;
   overflow: hidden;
 }
 
@@ -14,27 +14,45 @@
   font-size: 1.25rem;
 }
 
-.page form {
+.stack {
+  display: flex;
   flex: 1;
+  flex-direction: column;
+  gap: 0.75rem;
+  width: 100%;
   min-height: 0;
-  margin-top: 0;
+  margin: 0;
 }
 
-.heading {
+.top,
+.bottom {
+  width: 100%;
+}
+
+.top {
   display: flex;
-  gap: 0.5rem;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.middle {
+  display: flex;
+  flex: 1;
   align-items: center;
   justify-content: center;
+  width: 100%;
+  min-height: 0;
 }
 
 .lead {
   margin: 0;
   font-size: 0.8125rem;
-  line-height: 1.3;
+  line-height: 1.35;
   color: var(--muted);
 }
 
-.actions {
+.bottom {
   margin-top: 0;
 }
 
@@ -63,176 +81,90 @@
   border-color: var(--ink);
 }
 
-.choice button:focus-visible,
-.info:focus-visible {
+.choice button:focus-visible {
   outline: 2px solid var(--ink);
   outline-offset: 2px;
 }
 
-.info {
-  display: grid;
-  flex: none;
-  place-items: center;
-  width: 1.5rem;
-  height: 1.5rem;
-  padding: 0;
-  font: inherit;
-  font-weight: 600;
-  line-height: 1;
-  color: inherit;
-  cursor: pointer;
-  background: none;
-  border: 1.5px solid var(--ink);
-  border-radius: 50%;
-}
-
 .phrase,
-.boxes {
-  display: grid;
-  flex: 1;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  grid-auto-rows: minmax(0, 1fr);
-  gap: 0.25rem;
+.done {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.55rem 1rem;
+  justify-content: center;
+  align-content: center;
   width: 100%;
-  min-height: 0;
-  padding: 0;
   margin: 0;
+  padding: 0;
   list-style: none;
-  text-align: start;
 }
 
-.phrase li {
-  container-type: size;
-  position: relative;
+.phrase li,
+.done li {
   display: flex;
-  align-items: center;
-  justify-content: center;
-  height: 100%;
-  min-width: 0;
-  min-height: 0;
-  padding: 0.08em 0.15em;
-  overflow: hidden;
-  line-height: 1;
-  text-align: center;
-  background: color-mix(in srgb, var(--line) 45%, var(--paper));
-  border-radius: 0.45rem;
+  align-items: baseline;
+  gap: 0.3rem;
 }
 
 .index {
-  position: absolute;
-  top: 0.3rem;
-  inset-inline-start: 0.4rem;
-  font-size: min(28cqh, 12cqi);
+  font-size: 0.75rem;
   line-height: 1;
   color: var(--muted);
 }
 
 .token {
-  font-size: min(58cqh, 22cqi);
-  line-height: 0.95;
+  font-size: 1.0625rem;
+  line-height: 1.2;
 }
 
-.boxes label {
-  container-type: size;
-  position: relative;
+.entry {
   display: flex;
-  align-items: center;
-  height: 100%;
-  min-width: 0;
-  min-height: 0;
-}
-
-.boxes span {
-  position: absolute;
-  top: 0.3rem;
-  inset-inline-start: 0.4rem;
-  font-size: min(28cqh, 12cqi);
-  line-height: 1;
-  color: var(--muted);
-  pointer-events: none;
-}
-
-.boxes input {
-  box-sizing: border-box;
+  flex-direction: column;
+  gap: 0.75rem;
+  justify-content: center;
   width: 100%;
-  height: 100%;
-  min-height: 0;
-  padding: 0 0.3em 0 1.5em;
-  font: inherit;
-  font-size: min(42cqh, 16cqi);
-  color: var(--ink);
+}
+
+.entry input[aria-invalid="true"] {
+  border-color: var(--danger);
+}
+
+.matches {
+  position: absolute;
+  z-index: 2;
+  top: calc(100% + 0.25rem);
+  inset-inline: 0;
+  margin: 0;
+  padding: 0.25rem;
+  list-style: none;
+  text-align: start;
   background: var(--paper);
   border: 1px solid var(--line);
-  border-radius: 0.45rem;
+  border-radius: 0.875rem;
 }
 
-.boxes input:focus {
-  border-color: var(--ink);
+.matches button {
+  display: block;
+  width: 100%;
+  padding: 0.45rem 0.75rem;
+  font: inherit;
+  color: inherit;
+  text-align: start;
+  cursor: pointer;
+  background: none;
+  border: 0;
+  border-radius: 0.625rem;
 }
 
-.boxes input:focus-visible {
-  outline: 2px solid var(--ink);
-  outline-offset: 1px;
-}
-
-.boxes input[aria-invalid="true"] {
-  border-color: var(--danger);
+.matches button:hover,
+.matches button:focus-visible {
+  background: color-mix(in srgb, var(--line) 45%, var(--paper));
 }
 
 .wrong {
   margin: 0;
   font-size: 0.75rem;
   color: var(--danger);
-}
-
-.shade {
-  position: fixed;
-  inset: 0;
-  z-index: 2;
-  display: grid;
-  padding: 1.25rem;
-  background: color-mix(in srgb, var(--ink) 35%, transparent);
-}
-
-.shade > * {
-  grid-area: 1 / 1;
-}
-
-.backdrop {
-  margin: -1.25rem;
-  padding: 0;
-  border: 0;
-  background: transparent;
-  cursor: pointer;
-}
-
-.card {
-  position: relative;
-  z-index: 1;
-  display: flex;
-  flex-direction: column;
-  gap: 0.9rem;
-  width: min(22rem, 100%);
-  justify-self: center;
-  align-self: center;
-  padding: 1.25rem;
-  text-align: start;
-  background: var(--paper);
-  border-radius: 1rem;
-}
-
-.card h2 {
-  margin: 0;
-  font-size: 1.15rem;
-}
-
-.card p {
-  margin: 0;
-  line-height: 1.45;
-}
-
-.card button {
-  height: 2.75rem;
 }
 
 @media (min-width: 600px) {

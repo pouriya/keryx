@@ -3,8 +3,10 @@ import { Problem } from "./problem";
 import screen from "./session.module.css";
 import { submit, useStore } from "./store";
 import { useText } from "./text";
-import { isPrefix, isWord, WORDS } from "./wordlist";
+import { isPrefix, isWord, matching } from "./wordlist";
 import styles from "./words.module.css";
+
+const MATCHES = 5;
 
 function pickThree(length: number): [number, number, number] {
   const bag = Array.from({ length }, (_, index) => index);
@@ -33,69 +35,11 @@ function pickThree(length: number): [number, number, number] {
 
 export function Words() {
   const restore = useStore((state) => state.restore);
-  return restore ? <Restore /> : <NewWords />;
-}
-
-function Why() {
-  const t = useText();
-  const [open, setOpen] = useState(false);
-  const button = useRef<HTMLButtonElement>(null);
-  const close = useRef<HTMLButtonElement>(null);
-  useEffect(() => {
-    if (!open) {
-      return;
-    }
-    close.current?.focus();
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        setOpen(false);
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [open]);
-  return (
-    <>
-      <button
-        ref={button}
-        type="button"
-        className={styles.info}
-        aria-expanded={open}
-        aria-label={t("wordsWhyTitle")}
-        onClick={() => setOpen(true)}
-      >
-        !
-      </button>
-      {open ? (
-        <div className={styles.shade}>
-          <div className={styles.card} role="dialog" aria-modal="true" aria-labelledby="words-why">
-            <h2 id="words-why">{t("wordsWhyTitle")}</h2>
-            <p>{t("wordsWhy", { name: t("name") })}</p>
-            <button
-              ref={close}
-              type="button"
-              className={screen.primary}
-              onClick={() => {
-                setOpen(false);
-                button.current?.focus();
-              }}
-            >
-              {t("wordsGotIt")}
-            </button>
-          </div>
-          <button
-            type="button"
-            className={styles.backdrop}
-            aria-label={t("wordsGotIt")}
-            onClick={() => {
-              setOpen(false);
-              button.current?.focus();
-            }}
-          />
-        </div>
-      ) : null}
-    </>
-  );
+  const [fresh, setFresh] = useState(false);
+  if (!restore || fresh) {
+    return <NewWords />;
+  }
+  return <Restore onLost={() => setFresh(true)} />;
 }
 
 function Length({ count, onPick }: { count: 12 | 24; onPick: (count: 12 | 24) => void }) {
@@ -116,13 +60,81 @@ function Length({ count, onPick }: { count: 12 | 24; onPick: (count: 12 | 24) =>
   );
 }
 
-function WordList() {
+function Suggest({ prefix, onPick }: { prefix: string; onPick: (word: string) => void }) {
+  const found = matching(prefix.trim().toLowerCase(), MATCHES);
+  if (found.length === 0) {
+    return null;
+  }
   return (
-    <datalist id="bip39">
-      {WORDS.map((word) => (
-        <option key={word} value={word} />
+    <ul className={styles.matches} lang="en" dir="ltr">
+      {found.map((word) => (
+        <li key={word}>
+          <button
+            type="button"
+            onMouseDown={(event) => event.preventDefault()}
+            onClick={() => onPick(word)}
+          >
+            {word}
+          </button>
+        </li>
       ))}
-    </datalist>
+    </ul>
+  );
+}
+
+function WordField({
+  id,
+  label,
+  value,
+  active,
+  onFocus,
+  onBlur,
+  onChange,
+  onPaste,
+}: {
+  id: string;
+  label: string;
+  value: string;
+  active: boolean;
+  onFocus: () => void;
+  onBlur: () => void;
+  onChange: (value: string) => void;
+  onPaste?: (words: string[]) => void;
+}) {
+  return (
+    <div className={screen.field} lang="en" dir="ltr">
+      <input
+        id={id}
+        value={value}
+        placeholder=" "
+        autoComplete="off"
+        autoCapitalize="off"
+        autoCorrect="off"
+        spellCheck={false}
+        aria-invalid={value !== "" && !isPrefix(value)}
+        onFocus={onFocus}
+        onBlur={onBlur}
+        onChange={(event) => onChange(event.target.value.trim().toLowerCase())}
+        onPaste={(event) => {
+          if (onPaste === undefined) {
+            return;
+          }
+          const pasted = event.clipboardData
+            .getData("text")
+            .trim()
+            .toLowerCase()
+            .split(/\s+/)
+            .filter((part) => part !== "");
+          if (pasted.length < 2) {
+            return;
+          }
+          event.preventDefault();
+          onPaste(pasted);
+        }}
+      />
+      <label htmlFor={id}>{label}</label>
+      {active ? <Suggest prefix={value} onPick={onChange} /> : null}
+    </div>
   );
 }
 
@@ -135,6 +147,7 @@ function NewWords() {
   const [count, setCount] = useState<12 | 24>(12);
   const [written, setWritten] = useState(false);
   const [answers, setAnswers] = useState(["", "", ""]);
+  const [focus, setFocus] = useState<number | null>(null);
   useEffect(() => {
     send({ type: "generate_words", count });
   }, [count, send]);
@@ -146,49 +159,63 @@ function NewWords() {
   }, [words]);
   const parts = words?.split(" ") ?? [];
   const places = useMemo(() => {
-    const count = words === null ? 0 : words.split(" ").length;
-    return count >= 3 ? pickThree(count) : null;
+    const length = words === null ? 0 : words.split(" ").length;
+    return length >= 3 ? pickThree(length) : null;
   }, [words]);
   const ready =
     places?.every((place, index) => answers[index]?.trim().toLowerCase() === parts[place]) ?? false;
   const filled = places?.every((_, index) => (answers[index] ?? "").trim() !== "") ?? false;
+  const setAnswer = (index: number, value: string) => {
+    const next = answers.slice();
+    next[index] = value;
+    setAnswers(next);
+  };
+  if (words === null || places === null) {
+    return (
+      <main className={`${screen.screen} ${styles.page}`}>
+        <h1>{t("wordsTitle")}</h1>
+      </main>
+    );
+  }
   return (
     <main className={`${screen.screen} ${styles.page}`}>
-      <div className={styles.heading}>
-        <h1>{t("wordsTitle")}</h1>
-        <Why />
-      </div>
-      <Length
-        count={count}
-        onPick={(next) => {
-          if (next !== count) {
-            setCount(next);
-            forgetWords();
-          }
-        }}
-      />
-      {words !== null && places !== null && !written ? (
+      {!written ? (
         <>
-          <p className={styles.lead}>{t("wordsLead")}</p>
-          <ol className={styles.phrase} lang="en" dir="ltr">
-            {parts
-              .map((word, position) => ({ word, position }))
-              .map((line) => (
-                <li key={line.position}>
-                  <span className={styles.index}>{line.position + 1}</span>
-                  <span className={styles.token}>{line.word}</span>
-                </li>
-              ))}
-          </ol>
-          <div className={`${screen.actions} ${styles.actions}`}>
+          <div className={styles.top}>
+            <h1>{t("wordsTitle")}</h1>
+            <p className={styles.lead}>{t("wordsLead")}</p>
+            <Length
+              count={count}
+              onPick={(next) => {
+                if (next !== count) {
+                  setCount(next);
+                  forgetWords();
+                }
+              }}
+            />
+          </div>
+          <div className={styles.middle}>
+            <ol className={styles.phrase} lang="en" dir="ltr">
+              {parts
+                .map((word, position) => ({ word, position }))
+                .map((line) => (
+                  <li key={line.position}>
+                    <span className={styles.index}>{line.position + 1}</span>
+                    <span className={styles.token}>{line.word}</span>
+                  </li>
+                ))}
+            </ol>
+          </div>
+          <div className={`${screen.actions} ${styles.bottom}`}>
             <button className={screen.primary} type="button" onClick={() => setWritten(true)}>
               {t("wroteThem")}
             </button>
           </div>
         </>
       ) : null}
-      {words !== null && places !== null && written ? (
+      {written ? (
         <form
+          className={styles.stack}
           onSubmit={(event) => {
             event.preventDefault();
             if (ready) {
@@ -196,30 +223,35 @@ function NewWords() {
             }
           }}
         >
-          {places.map((place, index) => (
-            <div key={place} className={screen.field} lang="en" dir="ltr">
-              <input
-                id={`word-${place}`}
-                value={answers[index] ?? ""}
-                placeholder=" "
-                autoComplete="off"
-                autoCapitalize="off"
-                autoCorrect="off"
-                spellCheck={false}
-                list="bip39"
-                onChange={(event) => {
-                  const next = answers.slice();
-                  next[index] = event.target.value;
-                  setAnswers(next);
-                }}
-              />
-              <label htmlFor={`word-${place}`}>{t("word", { n: place + 1 })}</label>
+          <div className={styles.top}>
+            <h1>{t("wordsTitle")}</h1>
+            <p className={styles.lead}>
+              {t("checkLead", {
+                a: (places[0] ?? 0) + 1,
+                b: (places[1] ?? 0) + 1,
+                c: (places[2] ?? 0) + 1,
+              })}
+            </p>
+          </div>
+          <div className={styles.middle}>
+            <div className={styles.entry}>
+              {places.map((place, index) => (
+                <WordField
+                  key={place}
+                  id={`word-${place}`}
+                  label={t("word", { n: place + 1 })}
+                  value={answers[index] ?? ""}
+                  active={focus === index}
+                  onFocus={() => setFocus(index)}
+                  onBlur={() => setFocus(null)}
+                  onChange={(value) => setAnswer(index, value)}
+                />
+              ))}
             </div>
-          ))}
-          <WordList />
+          </div>
           <Problem />
           {filled && !ready ? <p className={styles.wrong}>{t("wordsMismatch")}</p> : null}
-          <div className={`${screen.actions} ${styles.actions}`}>
+          <div className={`${screen.actions} ${styles.bottom}`}>
             <button className={screen.primary} type="submit" disabled={!ready || busy}>
               {t("continue")}
             </button>
@@ -233,100 +265,185 @@ function NewWords() {
   );
 }
 
-function Restore() {
+function Restore({ onLost }: { onLost: () => void }) {
   const t = useText();
   const [count, setCount] = useState<12 | 24>(12);
-  const [boxes, setBoxes] = useState<string[]>(() => Array<string>(12).fill(""));
+  const [boxes, setBoxes] = useState<string[] | null>(null);
+  const [lost, setLost] = useState(false);
+  const [index, setIndex] = useState(0);
+  const [active, setActive] = useState(false);
   const sent = useRef("");
   const clearError = useStore((state) => state.clearError);
-  useEffect(() => {
-    if (boxes.some((box) => !isWord(box))) {
+  const busy = useStore((state) => state.busy);
+  const current = boxes?.[index] ?? "";
+  const submitPhrase = (phrase: string[]) => {
+    if (phrase.some((word) => !isWord(word))) {
       return;
     }
-    const phrase = boxes.join(" ");
-    if (phrase === sent.current) {
+    const text = phrase.join(" ");
+    if (text === sent.current) {
       return;
     }
-    sent.current = phrase;
-    submit({ type: "restore", words: phrase });
-  }, [boxes]);
+    sent.current = text;
+    submit({ type: "restore", words: text });
+  };
+  const edit = (at: number, value: string) => {
+    setBoxes((existing) => {
+      if (existing === null) {
+        return existing;
+      }
+      const next = existing.slice();
+      next[at] = value;
+      return next;
+    });
+    sent.current = "";
+    clearError();
+  };
+  const spread = (pasted: string[]) => {
+    if (boxes === null) {
+      return;
+    }
+    const next = boxes.slice();
+    for (let offset = 0; offset < pasted.length; offset++) {
+      const word = pasted[offset];
+      const at = index + offset;
+      if (word !== undefined && at < next.length) {
+        next[at] = word;
+      }
+    }
+    setBoxes(next);
+    sent.current = "";
+    clearError();
+    if (next.every((word) => isWord(word))) {
+      submitPhrase(next);
+    }
+  };
+  if (boxes === null && lost) {
+    return (
+      <main className={`${screen.screen} ${styles.page}`}>
+        <div className={styles.top}>
+          <h1>{t("lostTitle")}</h1>
+        </div>
+        <div className={styles.middle}>
+          <p className={styles.lead}>{t("lostBody")}</p>
+        </div>
+        <div className={`${screen.actions} ${styles.bottom}`}>
+          <button className={screen.primary} type="button" onClick={onLost}>
+            {t("lostContinue")}
+          </button>
+          <button className={screen.quiet} type="button" onClick={() => setLost(false)}>
+            {t("back")}
+          </button>
+        </div>
+      </main>
+    );
+  }
+  if (boxes === null) {
+    return (
+      <main className={`${screen.screen} ${styles.page}`}>
+        <div className={styles.top}>
+          <h1>{t("wordsTitle")}</h1>
+          <p className={styles.lead}>{t("restoreIntro")}</p>
+        </div>
+        <div className={styles.middle}>
+          <Length
+            count={count}
+            onPick={(next) => {
+              setCount(next);
+              clearError();
+            }}
+          />
+        </div>
+        <div className={`${screen.actions} ${styles.bottom}`}>
+          <button
+            className={screen.primary}
+            type="button"
+            onClick={() => {
+              setBoxes(Array<string>(count).fill(""));
+              setIndex(0);
+            }}
+          >
+            {t("continue")}
+          </button>
+          <button className={screen.quiet} type="button" onClick={() => setLost(true)}>
+            {t("lostWords")}
+          </button>
+        </div>
+      </main>
+    );
+  }
+  const last = index === boxes.length - 1;
+  const accepted = boxes.slice(0, index);
   return (
     <main className={`${screen.screen} ${styles.page}`}>
-      <div className={styles.heading}>
-        <h1>{t("wordsTitle")}</h1>
-        <Why />
-      </div>
-      <p className={styles.lead}>{t("restoreLead")}</p>
-      <Length
-        count={count}
-        onPick={(next) => {
-          if (next === count) {
+      <form
+        className={styles.stack}
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (!isWord(current)) {
             return;
           }
-          setCount(next);
-          setBoxes((current) => Array.from({ length: next }, (_, index) => current[index] ?? ""));
-          sent.current = "";
-          clearError();
+          if (last) {
+            submitPhrase(boxes);
+            return;
+          }
+          setIndex(index + 1);
         }}
-      />
-      {boxes.some((value) => value !== "" && !isPrefix(value)) ? (
-        <p className={styles.wrong}>{t("wrongWord")}</p>
-      ) : null}
-      <div className={styles.boxes}>
-        {boxes
-          .map((value, position) => ({ value, position }))
-          .map((field) => {
-            const bad = field.value !== "" && !isPrefix(field.value);
-            return (
-              <label key={field.position} lang="en" dir="ltr">
-                <span>{field.position + 1}</span>
-                <input
-                  value={field.value}
-                  aria-label={t("word", { n: field.position + 1 })}
-                  aria-invalid={bad}
-                  autoComplete="off"
-                  autoCapitalize="off"
-                  autoCorrect="off"
-                  spellCheck={false}
-                  list="bip39"
-                  onChange={(event) => {
-                    const next = boxes.slice();
-                    next[field.position] = event.target.value.trim().toLowerCase();
-                    setBoxes(next);
-                    clearError();
-                  }}
-                  onPaste={(event) => {
-                    const pasted = event.clipboardData
-                      .getData("text")
-                      .trim()
-                      .toLowerCase()
-                      .split(/\s+/)
-                      .filter((part) => part !== "");
-                    if (pasted.length < 2) {
-                      return;
-                    }
-                    event.preventDefault();
-                    setBoxes((current) => {
-                      const next = current.slice();
-                      for (let offset = 0; offset < pasted.length; offset++) {
-                        const word = pasted[offset];
-                        const at = field.position + offset;
-                        if (word !== undefined && at < next.length) {
-                          next[at] = word;
-                        }
-                      }
-                      return next;
-                    });
-                    sent.current = "";
-                    clearError();
-                  }}
-                />
-              </label>
-            );
-          })}
-      </div>
-      <WordList />
-      <Problem />
+      >
+        <div className={styles.top}>
+          <h1>{t("wordsTitle")}</h1>
+          <p className={styles.lead}>{t("wordOf", { n: index + 1, total: boxes.length })}</p>
+        </div>
+        <div className={styles.middle}>
+          <div className={styles.entry}>
+            {accepted.length > 0 ? (
+              <ol className={styles.done} lang="en" dir="ltr">
+                {accepted
+                  .map((word, position) => ({ word, position }))
+                  .map((line) => (
+                    <li key={line.position}>
+                      <span className={styles.index}>{line.position + 1}</span>
+                      <span>{line.word}</span>
+                    </li>
+                  ))}
+              </ol>
+            ) : null}
+            <WordField
+              id="restore-word"
+              label={t("word", { n: index + 1 })}
+              value={current}
+              active={active}
+              onFocus={() => setActive(true)}
+              onBlur={() => setActive(false)}
+              onChange={(value) => edit(index, value)}
+              onPaste={spread}
+            />
+            {current !== "" && !isPrefix(current) ? (
+              <p className={styles.wrong}>{t("wrongWord")}</p>
+            ) : null}
+          </div>
+        </div>
+        <Problem />
+        <div className={`${screen.actions} ${styles.bottom}`}>
+          <button className={screen.primary} type="submit" disabled={!isWord(current) || busy}>
+            {last ? t("continue") : t("nextWord")}
+          </button>
+          <button
+            className={screen.quiet}
+            type="button"
+            onClick={() => {
+              if (index === 0) {
+                setBoxes(null);
+                return;
+              }
+              setIndex(index - 1);
+              setActive(false);
+            }}
+          >
+            {t("back")}
+          </button>
+        </div>
+      </form>
     </main>
   );
 }

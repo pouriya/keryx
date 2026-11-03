@@ -2056,6 +2056,33 @@ export function isWord(value: string): boolean {
   return LIST.has(value);
 }
 
+/** At most `limit` list words that start with `prefix`. Empty until two letters. */
+export function matching(prefix: string, limit: number): string[] {
+  if (prefix.length < 2 || limit <= 0) {
+    return [];
+  }
+  let low = 0;
+  let high: number = WORDS.length;
+  while (low < high) {
+    const mid = (low + high) >> 1;
+    const word = WORDS[mid];
+    if (word === undefined || word < prefix) {
+      low = mid + 1;
+    } else {
+      high = mid;
+    }
+  }
+  const found: string[] = [];
+  for (let index = low; index < WORDS.length && found.length < limit; index++) {
+    const word = WORDS[index];
+    if (word === undefined || !word.startsWith(prefix)) {
+      break;
+    }
+    found.push(word);
+  }
+  return found;
+}
+
 /** True when `value` is empty or a prefix of a list word, so a half-typed word is not wrong yet. */
 export function isPrefix(value: string): boolean {
   if (value === "") return true;
