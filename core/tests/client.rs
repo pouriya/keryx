@@ -2018,6 +2018,13 @@ impl World {
                         chat.group_info = Some((0, body.0));
                         ServerFrame::Done { reference }
                     }
+                    // The same upload again, after its answer was lost.
+                    Some(0)
+                        if epoch == 0
+                            && matches!(&chat.group_info, Some((_, info)) if *info == body.0) =>
+                    {
+                        ServerFrame::Done { reference }
+                    }
                     Some(_) if epoch == 0 => refused(reference, "chat_started"),
                     Some(current) if current == epoch => {
                         chat.group_info = Some((epoch, body.0));
@@ -2077,6 +2084,7 @@ impl World {
             }
             let epoch = send.epoch.unwrap();
             self.chats[index].epoch = Some(epoch);
+            self.chats[index].group_info = Some((epoch, send.group_info.clone().unwrap().0));
             for wrap in &send.wrap_list {
                 let mut wrapped = wrap.wrapped.0.clone();
                 if self.garble_wraps_for == Some(wrap.account) {
@@ -2414,16 +2422,37 @@ fn what_needs_the_socket_is_kept_and_typing_is_not() {
     assert_eq!(world.sent_frames(mina, "history"), 1);
     assert_eq!(world.sent_frames(mina, "typing"), 0);
 
+    // A key change carries its group info, so nothing else goes up for it.
     world.advance(8 * DAY);
+    let uploads = world.sent_frames(omid, "group_info");
+    tell(&mut world, omid, chat, "rotated");
+    assert_eq!(world.sent_frames(omid, "group_info"), uploads);
+    let hub = world.hub_chat(chat);
+    assert_eq!(hub.group_info.as_ref().map(|(epoch, _)| *epoch), hub.epoch);
+}
+
+#[test]
+fn a_start_whose_group_info_answer_was_lost_sends_it_again_and_carries_on() {
+    let mut world = World::new();
+    let omid = world.person("omid", OMID_WORDS);
+    let mina = world.person("mina", MINA_WORDS);
     world.phones[omid]
         .frame_faults
         .push(("group_info", Fault::Lose));
-    tell(&mut world, omid, chat, "rotated");
-    let uploaded = world.sent_frames(omid, "group_info");
-    assert!(uploaded >= 1);
+    let account = world.account(mina);
+    world.command(omid, Command::StartChat { account });
+    world.settle();
+    let chat = world.direct_chat(world.account(omid), account).unwrap();
+    assert!(!world.ready(mina, chat));
+    let uploads = world.sent_frames(omid, "group_info");
     world.cut(omid);
     world.advance(2 * SECOND);
-    assert!(world.sent_frames(omid, "group_info") > uploaded);
+    assert_eq!(world.sent_frames(omid, "group_info"), uploads + 1);
+    assert!(world.ready(omid, chat), "{:?}", world.errors(omid));
+    assert!(world.ready(mina, chat), "{:?}", world.errors(mina));
+    assert!(world.errors(omid).is_empty(), "{:?}", world.errors(omid));
+    tell(&mut world, omid, chat, "started");
+    assert_eq!(world.texts(mina, chat), vec!["started"]);
 }
 
 #[test]
@@ -2697,15 +2726,7 @@ fn a_gone_session_an_ended_device_and_the_device_limit_are_acted_on() {
 }
 
 #[test]
-fn a_stale_group_info_upload_is_not_an_error_and_set_words_continues_when_the_keys_match() {
-    let (mut world, omid, _, chat) = pair();
-    world.advance(8 * DAY);
-    world.phones[omid]
-        .frame_faults
-        .push(("group_info", Fault::Refuse("stale_epoch")));
-    tell(&mut world, omid, chat, "moved");
-    assert_eq!(error_count(&world, omid, "stale_epoch"), 0);
-
+fn set_words_continues_when_the_server_already_holds_these_keys() {
     let mut world = World::new();
     let omid = world.sign_up("omid");
     world.fail_rest(omid, "PUT /api/v1/account/keys", RestFault::Lose);
@@ -3454,6 +3475,26 @@ fn a_key_change_whose_answer_was_lost_is_found_and_one_that_was_dropped_goes_aga
         assert_eq!(world.texts(mina, chat), vec!["after the change"]);
         assert!(world.errors(omid).is_empty(), "{:?}", world.errors(omid));
     }
+}
+
+#[test]
+fn a_reload_after_a_key_change_whose_answer_never_came_rejoins_and_carries_on() {
+    let (mut world, omid, mina, chat) = pair();
+    world.advance(8 * DAY);
+    world.phones[omid]
+        .frame_faults
+        .push(("commit", Fault::Lose));
+    let lost = tell(&mut world, omid, chat, "lost with the queue");
+    assert!(world.sent_seq(omid, lost).is_none());
+    let omid = world.reload(omid);
+    world.settle();
+    // Its own commit came from a state it no longer has, so it joined again.
+    assert!(world.ready(omid, chat), "{:?}", world.errors(omid));
+    let local = tell(&mut world, omid, chat, "after the reload");
+    assert!(world.sent_seq(omid, local).is_some());
+    assert_eq!(world.texts(mina, chat), vec!["after the reload"]);
+    tell(&mut world, mina, chat, "read");
+    assert_eq!(world.texts(omid, chat), vec!["read"]);
 }
 
 #[test]

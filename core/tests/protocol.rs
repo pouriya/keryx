@@ -30,6 +30,7 @@ fn send_frame() -> SendFrame {
         signature: Bytes(vec![255]),
         wrap_list: Vec::new(),
         welcome_list: Vec::new(),
+        group_info: None,
     }
 }
 
@@ -130,7 +131,7 @@ fn a_send_frame_has_the_agreed_shape() {
 }
 
 #[test]
-fn a_commit_is_a_send_carrying_its_wraps_and_welcomes() {
+fn a_commit_is_a_send_carrying_its_wraps_welcomes_and_group_info() {
     let mut commit = send_frame();
     commit.kind = Kind::Commit;
     commit.content_kind = None;
@@ -142,6 +143,7 @@ fn a_commit_is_a_send_carrying_its_wraps_and_welcomes() {
         device: ulid(CHAT),
         body: Bytes(vec![2]),
     }];
+    commit.group_info = Some(Bytes(vec![3]));
     let value = to_value(ClientFrame::Send(Box::new(commit))).unwrap();
     assert_eq!(value["type"], "send");
     assert_eq!(value["kind"], 3);
@@ -154,6 +156,7 @@ fn a_commit_is_a_send_carrying_its_wraps_and_welcomes() {
         value["welcome_list"],
         json!([{"device": CHAT, "body": "Ag=="}])
     );
+    assert_eq!(value["group_info"], "Aw==");
 }
 
 #[test]

@@ -207,6 +207,9 @@ pub struct SendFrame {
     pub wrap_list: Vec<WrapItem>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub welcome_list: Vec<WelcomeItem>,
+    /// A commit's: the chat's group info at the epoch it moves to, which the server keeps with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_info: Option<Bytes>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

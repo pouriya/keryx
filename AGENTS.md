@@ -359,8 +359,8 @@ its sequence id, from 1. REST carries the same bodies. A client sends `send`,
 `refused`, `message`, `chats`, `page`, `welcome`, `typing`, `marks` and `revoked`. `group_info` and `wraps` are not
 messages, so they take no sequence id and stay out of history, and what has no sequence id is
 answered with `done`. Binary fields are standard base64 with padding, through `base64ct`, which is
-already in the tree and constant-time. Kinds and modes are the schema's numbers. **A commit is a `send` with kind 3 plus its wraps, welcomes and
-epoch**, so there is one path into the task. A separate type would add a second path, for
+already in the tree and constant-time. Kinds and modes are the schema's numbers. **A commit is a `send` with kind 3 plus its wraps, welcomes,
+epoch and group info**, so there is one path into the task. A separate type would add a second path, for
 something stored as a message anyway. Later parts add their own types.
 
 **Not replaying a duplicate is the client's job, and the server does not deduplicate.**
@@ -949,9 +949,13 @@ nothing and it needs no time or nonce.
 - **Pinned master keys and every readable epoch key live in the device's snapshot.**
 - **Lifetime checks are skipped when joining**, because a chat idle for 84 days must still be
   joinable. Whether a device belongs is decided by its stamp.
-- **A chat's group info goes up right after the server accepts a commit, and any member can refresh
-  it**, rather than in the same step as the commit. If the committer crashes in between, a joiner
-  loses the race on a stale epoch and retries.
+- **A chat's group info goes up inside the commit and is saved in the same step, chosen by the
+  author.** It used to go up after the server accepted the commit, and a committer that crashed or
+  reloaded in between left the old group info on the server for good: every later external join was
+  built on the wrong epoch, lost with `commit_lost` and retried forever. openmls builds the new group
+  info with the commit, so this costs no extra work. A start's epoch 0 still goes up as `group_info`
+  on its own, and the same bytes sent again are accepted, since that is a resend whose answer was
+  lost. Any member may still upload the current epoch's group info.
 
 **Wrapping is repeatable, so a bad wrap is caught at once.** Running devices cannot open a wrap, as
 they drop the words' keys, so a bad one could otherwise surface months later on a new device, once

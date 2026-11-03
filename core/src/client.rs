@@ -1967,6 +1967,7 @@ impl Client {
             signature: Bytes(signature.to_vec()),
             wrap_list: Vec::new(),
             welcome_list: Vec::new(),
+            group_info: None,
         };
         self.in_flight.insert(
             local,
@@ -2154,6 +2155,7 @@ impl Client {
             signature: Bytes(signature.to_vec()),
             wrap_list,
             welcome_list,
+            group_info: Some(Bytes(commit.group_info)),
         };
         let snapshot = match device.export() {
             Ok(snapshot) => snapshot,
@@ -2425,19 +2427,12 @@ impl Client {
         let Some(device) = self.device.as_mut() else {
             return;
         };
-        let accepted = match device.commit_accepted(chat, now) {
-            Ok(group_info) => match device.epoch(chat) {
-                Ok(epoch) => Some((epoch, group_info)),
-                Err(_) => None,
-            },
-            Err(_) => None,
-        };
+        // The server stored the group info with the commit, so nothing more goes up for it.
+        let accepted = device.commit_accepted(chat, now);
         self.dirty = true;
-        let Some((epoch, group_info)) = accepted else {
+        if accepted.is_err() {
             return self.rejoin(chat);
-        };
-        self.chat(chat).group_info_out = Some((epoch, group_info));
-        self.send_outs(chat);
+        }
         match plan {
             Plan::Join { .. } => {
                 self.ready(chat);
@@ -2580,8 +2575,6 @@ impl Client {
                     state.group_info_out = None;
                 }
                 match code {
-                    // Someone moved on, and their group info is newer.
-                    "stale_epoch" => self.send_outs(chat),
                     // Someone else started this chat first: join theirs instead.
                     "chat_started" => {
                         let state = self.chat(chat);

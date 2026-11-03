@@ -209,8 +209,7 @@ failing and nothing more until it succeeds. Commits stay blocked meanwhile.
 
 **Refusals that mean the session is gone are acted on:** a REST 401 asks to log in again,
 `device_ended` wipes the device, `device_limit` stops it until the person terminates a device, after
-which it reconnects. `stale_epoch` on a group info upload is not an error, as it only means someone
-moved on. Set words after a half-finished set-up skips putting the keys when the server already holds
+which it reconnects. Set words after a half-finished set-up skips putting the keys when the server already holds
 these exact ones.
 
 **The server's tests drive it against a real `keryx serve`,** replacing their own client code built

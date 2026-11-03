@@ -201,6 +201,9 @@ pub struct Commit {
     pub commit: Vec<u8>,
     pub welcome: Option<Vec<u8>>,
     pub wrap_list: Vec<AccountWrap>,
+    /// The chat's group info at the new epoch, which the server keeps with the commit, so the
+    /// copy new devices join from is never left behind.
+    pub group_info: Vec<u8>,
 }
 
 /// Someone else's commit, applied.
@@ -495,6 +498,19 @@ fn wire_out(operation: &'static str, message: &MlsMessageOut) -> Result<Vec<u8>,
     }
 }
 
+/// The group info openmls built with a commit. Every group carries its ratchet tree, so it is
+/// always built.
+fn next_group_info(
+    group_info: Option<openmls::messages::group_info::GroupInfo>,
+) -> Result<Vec<u8>, MlsError> {
+    match group_info {
+        Some(group_info) => wire_out("encode group info", &MlsMessageOut::from(group_info)),
+        None => Err(MlsError::WrongMessage {
+            expected: "group info",
+        }),
+    }
+}
+
 fn wire_in(expected: &'static str, mut bytes: &[u8]) -> Result<MlsMessageIn, MlsError> {
     match MlsMessageIn::tls_deserialize(&mut bytes) {
         Ok(message) => Ok(message),
@@ -658,13 +674,15 @@ impl Device {
         let Some(state) = self.chats.get_mut(&chat) else {
             return Err(MlsError::UnknownChat { chat });
         };
-        let (commit, welcome, _) = match state.group.add_members(provider, signer, &packages) {
-            Ok(built) => built,
-            Err(source) => return Err(group_error("add a device", source)),
-        };
+        let (commit, welcome, group_info) =
+            match state.group.add_members(provider, signer, &packages) {
+                Ok(built) => built,
+                Err(source) => return Err(group_error("add a device", source)),
+            };
         let commit = wire_out("encode a commit", &commit)?;
         let welcome = wire_out("encode a welcome", &welcome)?;
-        self.pending_commit(chat, commit, Some(welcome), account_list)
+        let group_info = next_group_info(group_info)?;
+        self.pending_commit(chat, commit, Some(welcome), group_info, account_list)
     }
 
     /// Remove devices, such as after a signed revocation. `account_list` is every account in the
@@ -688,12 +706,13 @@ impl Device {
                 leaves.push(member.index);
             }
         }
-        let (commit, _, _) = match state.group.remove_members(provider, signer, &leaves) {
+        let (commit, _, group_info) = match state.group.remove_members(provider, signer, &leaves) {
             Ok(built) => built,
             Err(source) => return Err(group_error("remove a device", source)),
         };
         let commit = wire_out("encode a commit", &commit)?;
-        self.pending_commit(chat, commit, None, account_list)
+        let group_info = next_group_info(group_info)?;
+        self.pending_commit(chat, commit, None, group_info, account_list)
     }
 
     /// Whether this chat's key is too old to send under.
@@ -717,8 +736,10 @@ impl Device {
             Ok(bundle) => bundle,
             Err(source) => return Err(group_error("rotate the key", source)),
         };
-        let commit = wire_out("encode a commit", &bundle.into_commit())?;
-        self.pending_commit(chat, commit, None, account_list)
+        let (commit, _, group_info) = bundle.into_contents();
+        let commit = wire_out("encode a commit", &commit)?;
+        let group_info = next_group_info(group_info)?;
+        self.pending_commit(chat, commit, None, group_info, account_list)
     }
 
     /// Join a chat without anyone's help, from its public group info. This is what lets someone
@@ -743,7 +764,12 @@ impl Device {
         };
         // Lifetimes are skipped because a chat idle for months must still be joinable. Whether a
         // device belongs is decided by its stamp.
+        // Its later commits carry the ratchet tree in their group info, as every group's do.
+        let config = MlsGroupJoinConfig::builder()
+            .use_ratchet_tree_extension(true)
+            .build();
         let stage = match MlsGroup::external_commit_builder()
+            .with_config(config)
             .skip_lifetime_validation()
             .build_group(&self.provider, verifiable, self.credential())
         {
@@ -774,7 +800,9 @@ impl Device {
             let record = read_leaf(&member.credential, &member.signature_key)?;
             check_record(&mut self.pins, &record)?;
         }
-        let commit = wire_out("encode a commit", &bundle.into_commit())?;
+        let (commit, _, next) = bundle.into_contents();
+        let commit = wire_out("encode a commit", &commit)?;
+        let next = next_group_info(next)?;
         self.chats.insert(
             chat,
             Chat {
@@ -783,12 +811,11 @@ impl Device {
                 joining: true,
             },
         );
-        self.pending_commit(chat, commit, None, account_list)
+        self.pending_commit(chat, commit, None, next, account_list)
     }
 
-    /// The server accepted this device's commit, so apply it. Returns the chat's new group info
-    /// for the server.
-    pub fn commit_accepted(&mut self, chat: Ulid, now: i64) -> Result<Vec<u8>, MlsError> {
+    /// The server accepted this device's commit, so apply it.
+    pub fn commit_accepted(&mut self, chat: Ulid, now: i64) -> Result<(), MlsError> {
         let provider = &self.provider;
         let Some(state) = self.chats.get_mut(&chat) else {
             return Err(MlsError::UnknownChat { chat });
@@ -804,8 +831,7 @@ impl Device {
         }
         state.epoch_started_at = now;
         state.joining = false;
-        self.keep_current_key(chat)?;
-        self.group_info(chat)
+        self.keep_current_key(chat)
     }
 
     /// Another device's commit won this epoch. A join leaves nothing behind, and anything else
@@ -1439,6 +1465,7 @@ impl Device {
         chat: Ulid,
         commit: Vec<u8>,
         welcome: Option<Vec<u8>>,
+        group_info: Vec<u8>,
         account_list: &[AccountKey],
     ) -> Result<Commit, MlsError> {
         let state = self.chat(chat)?;
@@ -1477,6 +1504,7 @@ impl Device {
             commit,
             welcome,
             wrap_list,
+            group_info,
         })
     }
 

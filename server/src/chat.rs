@@ -413,6 +413,9 @@ async fn run_send(
     if frame.kind == Kind::Commit && frame.epoch.is_none() {
         return Err(bad("A commit needs its epoch"));
     }
+    if frame.kind == Kind::Commit && frame.group_info.is_none() {
+        return Err(bad("A commit needs its group info"));
+    }
     let is_action = matches!(frame.kind, Kind::Edit | Kind::Delete);
     if is_action && frame.pointer_seq.is_none() {
         return Err(bad("An edit or delete needs its target"));
@@ -427,9 +430,12 @@ async fn run_send(
     {
         return Err(bad("A reaction needs its target"));
     }
-    if frame.kind != Kind::Commit && !(frame.wrap_list.is_empty() && frame.welcome_list.is_empty())
+    if frame.kind != Kind::Commit
+        && !(frame.wrap_list.is_empty()
+            && frame.welcome_list.is_empty()
+            && frame.group_info.is_none())
     {
-        return Err(bad("Only a commit carries wraps and welcomes"));
+        return Err(bad("Only a commit carries wraps, welcomes and group info"));
     }
 
     let mut body_limit = None;
@@ -586,6 +592,7 @@ async fn run_send(
             body: frame.body.0.clone(),
             wrap_list,
             welcome_list,
+            group_info: frame.group_info.map(|group_info| group_info.0),
         })
         .await?;
     let seq = match appended {

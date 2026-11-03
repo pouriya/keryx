@@ -1287,8 +1287,14 @@ impl Storage for Sqlite {
                 }
                 Kind::Commit => {
                     connection.execute(
-                        "UPDATE mls_group SET epoch = ?2 WHERE conversation_id = ?1",
-                        params![chat.bytes(), opt_int(message.epoch)],
+                        "UPDATE mls_group SET epoch = ?2, group_info = ?3, updated_at = ?4
+                         WHERE conversation_id = ?1",
+                        params![
+                            chat.bytes(),
+                            opt_int(message.epoch),
+                            message.group_info,
+                            message.now
+                        ],
                     )?;
                     for wrap in &message.wrap_list {
                         connection.execute(
@@ -1463,6 +1469,18 @@ impl Storage for Sqlite {
                     Ok(GroupInfoPut::Saved)
                 }
                 None => Ok(GroupInfoPut::Stale),
+                Some(0) if epoch == 0 => {
+                    let stored: Vec<u8> = connection.query_row(
+                        "SELECT group_info FROM mls_group WHERE conversation_id = ?1",
+                        params![chat.bytes()],
+                        |row| row.get(0),
+                    )?;
+                    if stored == body {
+                        Ok(GroupInfoPut::Saved)
+                    } else {
+                        Ok(GroupInfoPut::AlreadyStarted)
+                    }
+                }
                 Some(_) if epoch == 0 => Ok(GroupInfoPut::AlreadyStarted),
                 Some(current) if current == int(epoch) => {
                     connection.execute(

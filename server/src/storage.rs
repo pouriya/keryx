@@ -180,6 +180,9 @@ pub struct NewMessage {
     /// A commit's. Empty otherwise.
     pub wrap_list: Vec<NewWrap>,
     pub welcome_list: Vec<NewWelcome>,
+    /// A commit's group info at its epoch, saved in the same step so it is never left behind.
+    /// `None` otherwise.
+    pub group_info: Option<Vec<u8>>,
 }
 
 pub enum Appended {
@@ -190,7 +193,8 @@ pub enum Appended {
 
 pub enum GroupInfoPut {
     Saved,
-    /// Epoch 0 of this chat was already uploaded by someone else, and this one lost.
+    /// Epoch 0 of this chat was already uploaded by someone else, and this one lost. The same
+    /// bytes again are `Saved`, since that is a resend whose answer was lost.
     AlreadyStarted,
     /// Not for the chat's current epoch.
     Stale,

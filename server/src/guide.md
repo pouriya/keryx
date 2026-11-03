@@ -104,10 +104,11 @@ message in `last_content`. Neither goes out in a channel.
 `history` returns up to `limit` messages after `after_seq`, oldest first. With `before_seq`, it
 returns the newest `limit` below it instead, still oldest first.
 
-A commit is a `send` with kind 3, carrying `epoch`, `wrap_list` and `welcome_list`. The first commit for
-each epoch wins, and a loser gets `refused` with the code `commit_lost`. A chat's group starts when
-someone sends `group_info` for epoch 0, and if two people start it at once the second gets
-`chat_started` and waits for its Welcome.
+A commit is a `send` with kind 3, carrying `epoch`, `wrap_list`, `welcome_list` and `group_info`, the
+chat's group info at that epoch, which is saved with it. The first commit for each epoch wins, and a
+loser gets `refused` with the code `commit_lost`. A chat's group starts when someone sends `group_info`
+for epoch 0, and if two people start it at once the second gets `chat_started` and waits for its
+Welcome. The same epoch 0 bytes sent again are accepted, as a resend whose answer was lost.
 
 ## Common refusal codes
 

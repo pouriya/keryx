@@ -152,6 +152,24 @@ fn a_new_device_reads_everything_with_only_the_words() {
         .unwrap();
     assert_eq!(opened.as_slice(), b"from the new phone");
     assert_eq!(sara_device.member_list(chat()).unwrap().len(), 3);
+
+    // Each commit carries the group info for its epoch, even from a device that joined by itself,
+    // so the next device joins from it without anyone uploading anything else.
+    let rotation = new_device.rotate(chat(), &accounts).unwrap();
+    new_device.commit_accepted(chat(), NOW).unwrap();
+    sara_device
+        .process_commit(chat(), &rotation.commit, NOW)
+        .unwrap();
+    let mut third_device = device(&babak);
+    let join = third_device
+        .join_external(chat(), &rotation.group_info, NOW, &accounts)
+        .unwrap();
+    assert_eq!(join.epoch, rotation.epoch + 1);
+    third_device.commit_accepted(chat(), NOW).unwrap();
+    let processed = sara_device
+        .process_commit(chat(), &join.commit, NOW)
+        .unwrap();
+    assert_eq!(processed.epoch, join.epoch);
 }
 
 fn wrap_for(wrap_list: &[AccountWrap], account: Ulid) -> Vec<u8> {

@@ -222,6 +222,7 @@ fn sealed_as(
         signature: Bytes(signature.to_vec()),
         wrap_list: Vec::new(),
         welcome_list: Vec::new(),
+        group_info: None,
     }
 }
 
@@ -263,6 +264,7 @@ fn commit_frame(
         signature: Bytes(signature.to_vec()),
         wrap_list: wrap_items(&commit.wrap_list),
         welcome_list,
+        group_info: Some(Bytes(commit.group_info.clone())),
     }
 }
 
@@ -646,6 +648,7 @@ fn a_new_device_cannot_remove_its_notice_but_an_older_one_can() {
             signature: Bytes(signature.to_vec()),
             wrap_list: Vec::new(),
             welcome_list: Vec::new(),
+            group_info: None,
         }
     };
 
@@ -793,6 +796,18 @@ fn the_first_commit_for_each_epoch_wins_and_group_info_follows_the_rules() {
 
     let frame = commit_frame(&pair.sara.device, chat, &sara_commit, Vec::new());
     seq_of(post(&mut pair.sara_socket, frame));
+    // The commit's group info was saved with it, so a new device joins from the right epoch.
+    let (_, reply) = pair.server.call(
+        "GET",
+        &format!("/api/v1/chats/{chat}/group_info"),
+        Some(&pair.babak.token),
+        None,
+    );
+    assert_eq!(reply["data"]["epoch"], sara_commit.epoch);
+    assert_eq!(
+        reply["data"]["group_info"],
+        json!(Bytes(sara_commit.group_info.clone()))
+    );
     let frame = commit_frame(&pair.babak.device, chat, &babak_commit, Vec::new());
     assert_refused(post(&mut pair.babak_socket, frame), "commit_lost");
     pair.babak.device.commit_rejected(chat).unwrap();
@@ -806,7 +821,8 @@ fn the_first_commit_for_each_epoch_wins_and_group_info_follows_the_rules() {
         upload_group_info(&mut pair.babak_socket, chat, 99, vec![1]),
         "stale_epoch",
     );
-    let group_info = pair.sara.device.commit_accepted(chat, Ulid::now()).unwrap();
+    pair.sara.device.commit_accepted(chat, Ulid::now()).unwrap();
+    let group_info = pair.sara.device.group_info(chat).unwrap();
     done(upload_group_info(
         &mut pair.babak_socket,
         chat,
@@ -832,6 +848,24 @@ fn the_first_commit_for_each_epoch_wins_and_group_info_follows_the_rules() {
     lost.epoch = Some(1);
     lost.wrap_list.clear();
     assert_refused(post(&mut pair.sara_socket, lost), "commit_lost");
+
+    // The same epoch 0 again is a resend whose answer was lost, and anything else lost the start.
+    done(upload_group_info(
+        &mut pair.sara_socket,
+        unstarted,
+        0,
+        vec![1],
+    ));
+    done(upload_group_info(
+        &mut pair.sara_socket,
+        unstarted,
+        0,
+        vec![1],
+    ));
+    assert_refused(
+        upload_group_info(&mut pair.sara_socket, unstarted, 0, vec![2]),
+        "chat_started",
+    );
 }
 
 #[test]
@@ -871,6 +905,17 @@ fn frames_that_break_the_rules_are_refused_with_their_reference() {
                 frame.content_kind = None;
                 frame.epoch = None;
             }),
+            "bad_message",
+        ),
+        (
+            Box::new(|frame: &mut SendFrame| {
+                frame.kind = Kind::Commit;
+                frame.content_kind = None;
+            }),
+            "bad_message",
+        ),
+        (
+            Box::new(|frame: &mut SendFrame| frame.group_info = Some(Bytes(vec![0]))),
             "bad_message",
         ),
         (
@@ -930,6 +975,7 @@ fn frames_that_break_the_rules_are_refused_with_their_reference() {
     frame.kind = Kind::Commit;
     frame.content_kind = None;
     frame.epoch = Some(2);
+    frame.group_info = Some(Bytes(vec![0]));
     frame.wrap_list = vec![WrapItem {
         account: stranger,
         wrapped: Bytes(vec![0]),
@@ -1333,6 +1379,7 @@ fn an_ended_device_is_cut_off_and_everyone_sharing_a_chat_is_told() {
     welcome.kind = Kind::Commit;
     welcome.content_kind = None;
     welcome.epoch = Some(99);
+    welcome.group_info = Some(Bytes(vec![1]));
     welcome.welcome_list = vec![WelcomeItem {
         device: id,
         body: Bytes(vec![1]),
