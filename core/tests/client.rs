@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, VecDeque};
 use keryx_core::client::{
     Auth, Client, Command, Event, Input, Output, Platform, Pointer, Problem, Secret,
 };
-use keryx_core::mls::{AccountKey, Device, stamp_account_key};
+use keryx_core::mls::{AccountKey, Device, sign_revocation, stamp_account_key};
 use keryx_core::protocol::{
     AccountKeysBody, Bytes, CaptchaAnswer, ChatItem, ChatMode, ChatType, ClientFrame, ContentKind,
     Kind, MarkItem, MessageFrame, SendFrame, ServerFrame, WrapEntry,
@@ -3145,6 +3145,36 @@ fn logging_in_again_on_a_device_ended_meanwhile_wipes_it_and_asks_for_the_words(
 }
 
 #[test]
+fn a_key_change_refused_for_good_fails_what_waited_and_the_next_send_tries_again() {
+    let (mut world, omid, mina, chat) = pair();
+    world.advance(8 * DAY);
+    world.phones[omid]
+        .frame_faults
+        .push(("commit", Fault::Refuse("forbidden")));
+    let first = tell(&mut world, omid, chat, "refused");
+    assert_eq!(world.failed(omid, first).as_deref(), Some("forbidden"));
+    assert_eq!(world.errors(omid), vec!["forbidden"]);
+    let second = tell(&mut world, omid, chat, "goes");
+    assert!(world.sent_seq(omid, second).is_some());
+    assert_eq!(world.texts(mina, chat), vec!["goes"]);
+}
+
+#[test]
+fn a_key_change_whose_state_cannot_be_saved_is_never_sent() {
+    let (mut world, omid, mina, chat) = pair();
+    world.advance(8 * DAY);
+    let commits = world.sent_frames(omid, "commit");
+    world.phones[omid].failing_saves = 1;
+    let first = tell(&mut world, omid, chat, "unsaved");
+    assert_eq!(world.failed(omid, first).as_deref(), Some("save_failed"));
+    assert_eq!(world.sent_frames(omid, "commit"), commits);
+    assert_eq!(world.errors(omid), vec!["save_failed"]);
+    let second = tell(&mut world, omid, chat, "saved");
+    assert!(world.sent_seq(omid, second).is_some());
+    assert_eq!(world.texts(mina, chat), vec!["saved"]);
+}
+
+#[test]
 fn a_start_whose_group_info_is_refused_fails_and_starting_again_works() {
     let mut world = World::new();
     let omid = world.person("omid", OMID_WORDS);
@@ -3190,4 +3220,161 @@ fn a_start_whose_first_wraps_are_refused_goes_on_to_add_the_other_person() {
     world.command(second, Command::OpenChat { chat });
     world.settle();
     assert_eq!(world.texts(second, chat), vec!["started"]);
+}
+
+#[test]
+fn a_refused_seen_is_reported_once_and_not_sent_again() {
+    let (mut world, _, mina, chat) = pair();
+    world.command(
+        mina,
+        Command::Seen {
+            chat,
+            up_to_seq: 99,
+        },
+    );
+    world.settle();
+    assert_eq!(world.errors(mina), vec!["bad_seen"]);
+    let seen = world.sent_frames(mina, "seen");
+    world.cut(mina);
+    world.advance(2 * SECOND);
+    assert_eq!(world.sent_frames(mina, "seen"), seen);
+    assert_eq!(world.errors(mina), vec!["bad_seen"]);
+}
+
+#[test]
+fn older_pages_load_until_the_first_message_even_when_asked_offline() {
+    let (mut world, omid, mina, chat) = pair();
+    let mut expected = Vec::new();
+    for n in 0..70 {
+        let text = format!("o{n}");
+        tell(&mut world, omid, chat, &text);
+        expected.push(text);
+    }
+    let mina = world.reload(mina);
+    world.settle();
+    world.command(mina, Command::OpenChat { chat });
+    world.settle();
+    assert_eq!(world.texts(mina, chat), expected[20..].to_vec());
+    world.offline(mina);
+    world.command(mina, Command::LoadOlder { chat });
+    world.online(mina);
+    assert_eq!(world.texts(mina, chat), expected);
+    world.command(mina, Command::LoadOlder { chat });
+    world.settle();
+    let mut loaded = Vec::new();
+    for event in &world.phones[mina].events {
+        if let Event::PageLoaded { has_older, .. } = event {
+            loaded.push(*has_older);
+        }
+    }
+    assert_eq!(loaded.last(), Some(&false));
+    assert!(world.errors(mina).is_empty(), "{:?}", world.errors(mina));
+}
+
+#[test]
+fn edits_and_deletes_reach_the_other_side_and_a_deleted_message_stays_removed() {
+    let (mut world, omid, mina, chat) = pair();
+    // The edit points at a message still waiting for its sequence id.
+    world.phones[omid].frame_faults.push(("send", Fault::Lose));
+    let first = world.say(omid, chat, "one");
+    world.command(
+        omid,
+        Command::Edit {
+            chat,
+            target: Pointer::Local(first),
+            text: Secret("uno".to_string()),
+        },
+    );
+    world.settle();
+    world.cut(omid);
+    world.advance(2 * SECOND);
+    let seq = world.sent_seq(omid, first).unwrap();
+    let mut edited = Vec::new();
+    for event in &world.phones[mina].events {
+        if let Event::Edited {
+            message,
+            target_seq,
+        } = event
+        {
+            edited.push((*target_seq, message.text.as_ref().unwrap().0.clone()));
+        }
+    }
+    assert_eq!(edited, vec![(seq, "uno".to_string())]);
+    world.command(
+        omid,
+        Command::Delete {
+            chat,
+            target: Pointer::Seq(seq),
+        },
+    );
+    world.settle();
+    let mut deleted = Vec::new();
+    for event in &world.phones[mina].events {
+        if let Event::Deleted { target_seq, .. } = event {
+            deleted.push(*target_seq);
+        }
+    }
+    assert_eq!(deleted, vec![seq]);
+    let mina = world.reload(mina);
+    world.settle();
+    world.command(mina, Command::OpenChat { chat });
+    world.settle();
+    let mut removed = Vec::new();
+    for event in &world.phones[mina].events {
+        if let Event::Removed { seq, .. } = event {
+            removed.push(*seq);
+        }
+    }
+    assert_eq!(removed, vec![seq, seq + 1]);
+    assert!(world.texts(mina, chat).is_empty());
+}
+
+#[test]
+fn a_revocation_from_an_unknown_account_is_checked_once_its_keys_arrive() {
+    let (mut world, _, mina, _) = pair();
+    let sara = world.person("sara", WORDS);
+    let (account, device) = (world.account(sara), world.device_of(sara));
+    let statement = sign_revocation(&derive(WORDS).unwrap(), &account, &device);
+    world.push(
+        mina,
+        ServerFrame::Revoked {
+            account,
+            device,
+            statement: Bytes(statement.to_vec()),
+        },
+    );
+    world.settle();
+    assert_eq!(
+        world.asked(mina, &format!("GET /api/v1/accounts/{account}")),
+        1
+    );
+    assert!(world.errors(mina).is_empty(), "{:?}", world.errors(mina));
+    for statement in [vec![1; 64], vec![1; 3]] {
+        world.push(
+            mina,
+            ServerFrame::Revoked {
+                account,
+                device,
+                statement: Bytes(statement),
+            },
+        );
+    }
+    world.settle();
+    assert_eq!(world.errors(mina), vec!["bad_signature", "bad_signature"]);
+}
+
+#[test]
+fn rate_limited_background_requests_wait_and_go_again() {
+    let (mut world, omid, _, _) = pair();
+    world.fail_rest(
+        omid,
+        "POST /api/v1/key_packages",
+        RestFault::Answer(429, "rate_limited"),
+    );
+    world.cut(omid);
+    world.advance(2 * SECOND);
+    let tried = world.asked(omid, "POST /api/v1/key_packages");
+    world.advance(5 * SECOND);
+    assert!(world.asked(omid, "POST /api/v1/key_packages") > tried);
+    assert!(world.errors(omid).is_empty(), "{:?}", world.errors(omid));
 }
