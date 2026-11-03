@@ -2709,3 +2709,132 @@ fn a_stale_group_info_upload_is_not_an_error_and_set_words_continues_when_the_ke
     let own = world.self_chat(world.account(omid));
     assert!(world.ready(omid, own), "{:?}", world.errors(omid));
 }
+
+fn commit_count(world: &World, chat: Ulid) -> usize {
+    let mut count = 0;
+    for message in &world.hub_chat(chat).message_list {
+        if message.kind == Some(Kind::Commit) {
+            count += 1;
+        }
+    }
+    count
+}
+
+#[test]
+fn two_devices_changing_the_key_at_once_end_on_one_commit_and_both_messages_go() {
+    let (mut world, omid, mina, chat) = pair();
+    let commits = commit_count(&world, chat);
+    let sent = world.sent_frames(omid, "commit") + world.sent_frames(mina, "commit");
+    world.advance(8 * DAY);
+    let from_omid = world.say(omid, chat, "from omid");
+    let from_mina = world.say(mina, chat, "from mina");
+    world.settle();
+    // Both committed, the server kept the first, and the loser caught up instead of rotating again.
+    assert_eq!(
+        world.sent_frames(omid, "commit") + world.sent_frames(mina, "commit"),
+        sent + 2
+    );
+    assert_eq!(commit_count(&world, chat), commits + 1);
+    assert!(world.sent_seq(omid, from_omid).is_some());
+    assert!(world.sent_seq(mina, from_mina).is_some());
+    assert!(world.errors(omid).is_empty(), "{:?}", world.errors(omid));
+    assert!(world.errors(mina).is_empty(), "{:?}", world.errors(mina));
+    assert_eq!(world.texts(omid, chat), vec!["from mina"]);
+    assert_eq!(world.texts(mina, chat), vec!["from omid"]);
+}
+
+#[test]
+fn two_members_removing_an_ended_device_at_once_commit_it_once() {
+    let (mut world, omid, mina, chat) = pair();
+    let second = world.log_in("omid");
+    world.restore(second, OMID_WORDS);
+    assert!(world.ready(second, chat), "{:?}", world.errors(second));
+    let commits = commit_count(&world, chat);
+    let ended = world.device_of(second);
+    world.command(
+        omid,
+        Command::Terminate {
+            device: ended,
+            words: Secret(OMID_WORDS.to_string()),
+        },
+    );
+    world.settle();
+    assert!(
+        world.phones[omid]
+            .events
+            .contains(&Event::Terminated { device: ended })
+    );
+    assert!(world.phones[second].wiped);
+    assert!(world.sent_frames(mina, "commit") >= 1);
+    assert_eq!(commit_count(&world, chat), commits + 1);
+    assert!(world.errors(omid).is_empty(), "{:?}", world.errors(omid));
+    assert!(world.errors(mina).is_empty(), "{:?}", world.errors(mina));
+    tell(&mut world, omid, chat, "after");
+    tell(&mut world, mina, chat, "back");
+    assert_eq!(world.texts(mina, chat), vec!["after"]);
+    assert_eq!(world.texts(omid, chat), vec!["back"]);
+}
+
+#[test]
+fn a_join_that_lost_its_race_is_tried_again_after_a_wait() {
+    let (mut world, omid, _, chat) = pair();
+    tell(&mut world, omid, chat, "before");
+    let second = world.log_in("omid");
+    world.phones[second]
+        .frame_faults
+        .push(("commit", Fault::Refuse("commit_lost")));
+    world.restore(second, OMID_WORDS);
+    let own = world.self_chat(world.account(omid));
+    assert!(!(world.ready(second, own) && world.ready(second, chat)));
+    let commits = world.sent_frames(second, "commit");
+    world.advance(2 * SECOND);
+    assert_eq!(world.sent_frames(second, "commit"), commits + 1);
+    assert!(world.ready(second, own), "{:?}", world.errors(second));
+    assert!(world.ready(second, chat), "{:?}", world.errors(second));
+    assert!(
+        world.errors(second).is_empty(),
+        "{:?}",
+        world.errors(second)
+    );
+    world.command(second, Command::OpenChat { chat });
+    world.settle();
+    assert_eq!(world.texts(second, chat), vec!["before"]);
+}
+
+#[test]
+fn two_people_starting_the_same_chat_at_once_end_in_one_group() {
+    let mut world = World::new();
+    let omid = world.person("omid", OMID_WORDS);
+    let mina = world.person("mina", MINA_WORDS);
+    let (omid_account, mina_account) = (world.account(omid), world.account(mina));
+    world.command(
+        omid,
+        Command::StartChat {
+            account: mina_account,
+        },
+    );
+    world.command(
+        mina,
+        Command::StartChat {
+            account: omid_account,
+        },
+    );
+    world.settle();
+    let chat = world.direct_chat(omid_account, mina_account).unwrap();
+    assert!(world.ready(omid, chat), "{:?}", world.errors(omid));
+    // Mina's own join was on its way when Omid's Welcome came, so she joins again after a wait.
+    world.advance(2 * SECOND);
+    assert!(world.ready(mina, chat), "{:?}", world.errors(mina));
+    // Both self chats put up their wraps, and of the two starts only the one whose group info
+    // was kept went on to its wraps.
+    assert_eq!(
+        world.sent_frames(omid, "wraps") + world.sent_frames(mina, "wraps"),
+        3
+    );
+    assert!(world.errors(omid).is_empty(), "{:?}", world.errors(omid));
+    assert!(world.errors(mina).is_empty(), "{:?}", world.errors(mina));
+    tell(&mut world, omid, chat, "hello");
+    tell(&mut world, mina, chat, "hi");
+    assert_eq!(world.texts(omid, chat), vec!["hi"]);
+    assert_eq!(world.texts(mina, chat), vec!["hello"]);
+}
