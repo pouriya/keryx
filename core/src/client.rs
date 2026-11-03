@@ -2602,8 +2602,13 @@ impl Client {
                 if matches!(state.wraps_out, Some((out, _)) if out == epoch) {
                     state.wraps_out = None;
                 }
-                self.upload_failed(chat);
                 self.error(code, message);
+                // A start's first key opens nothing yet: adding its devices commits a new one,
+                // wrapped again. Failing here would leave the server a group with nobody to add.
+                if matches!(&self.chat(chat).start_packages, Some(list) if !list.is_empty()) {
+                    return self.send_outs(chat);
+                }
+                self.upload_failed(chat);
             }
             Waiting::Position { chat, which, up_to } => {
                 self.error(code, message);
@@ -2619,6 +2624,13 @@ impl Client {
         if state.start_packages.take().is_some() {
             state.joining = false;
             state.wraps_out = None;
+            state.group_info_out = None;
+            // The group never got going, so starting again begins from the server's state.
+            if let Some(device) = self.device.as_mut()
+                && device.forget_chat(chat).is_ok()
+            {
+                self.dirty = true;
+            }
             self.fail_chat(chat, "start_failed");
         } else {
             self.send_outs(chat);

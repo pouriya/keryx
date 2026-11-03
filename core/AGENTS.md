@@ -190,6 +190,12 @@ author.
 is pending, including a rotation falling due while it waits. It goes under the new key, and fails
 only if the join or the change finally fails. At most one rotation is planned per chat at a time.
 
+**A start whose group info is refused fails, and starting again begins anew:** the device drops the
+group it made, since none of it reached the server, so a second start does not find a group and call
+the chat ready with nobody added. **A start whose first wraps are refused goes on** to add the other
+devices, with an error event: that commit makes a new key and wraps it again, and nothing was sealed
+under the first. Failing there would leave the server a group the other person could never join.
+
 **The new-device notice is checked** once its device is in the self chat's device list: its signature
 is the device's stamp, which must verify against this account's pinned master key. One that fails
 gets `problem` `bad_signature`.

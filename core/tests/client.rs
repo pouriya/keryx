@@ -3143,3 +3143,51 @@ fn logging_in_again_on_a_device_ended_meanwhile_wipes_it_and_asks_for_the_words(
     );
     assert!(world.phones[omid].client.device().is_none());
 }
+
+#[test]
+fn a_start_whose_group_info_is_refused_fails_and_starting_again_works() {
+    let mut world = World::new();
+    let omid = world.person("omid", OMID_WORDS);
+    let mina = world.person("mina", MINA_WORDS);
+    world.phones[omid]
+        .frame_faults
+        .push(("group_info", Fault::Refuse("internal")));
+    let account = world.account(mina);
+    world.command(omid, Command::StartChat { account });
+    world.settle();
+    assert_eq!(world.errors(omid), vec!["internal"]);
+    let chat = world.direct_chat(world.account(omid), account).unwrap();
+    assert!(!world.ready(omid, chat));
+    assert!(!world.ready(mina, chat));
+    world.command(omid, Command::StartChat { account });
+    world.settle();
+    assert!(world.ready(omid, chat), "{:?}", world.errors(omid));
+    assert!(world.ready(mina, chat), "{:?}", world.errors(mina));
+    tell(&mut world, omid, chat, "started");
+    assert_eq!(world.texts(mina, chat), vec!["started"]);
+}
+
+#[test]
+fn a_start_whose_first_wraps_are_refused_goes_on_to_add_the_other_person() {
+    let mut world = World::new();
+    let omid = world.person("omid", OMID_WORDS);
+    let mina = world.person("mina", MINA_WORDS);
+    world.phones[omid]
+        .frame_faults
+        .push(("wraps", Fault::Refuse("internal")));
+    let account = world.account(mina);
+    world.command(omid, Command::StartChat { account });
+    world.settle();
+    assert_eq!(world.errors(omid), vec!["internal"]);
+    let chat = world.direct_chat(world.account(omid), account).unwrap();
+    assert!(world.ready(omid, chat), "{:?}", world.errors(omid));
+    assert!(world.ready(mina, chat), "{:?}", world.errors(mina));
+    tell(&mut world, omid, chat, "started");
+    assert_eq!(world.texts(mina, chat), vec!["started"]);
+    // A device of Mina's restoring later still opens it, from the wraps the adding commit carried.
+    let second = world.log_in("mina");
+    world.restore(second, MINA_WORDS);
+    world.command(second, Command::OpenChat { chat });
+    world.settle();
+    assert_eq!(world.texts(second, chat), vec!["started"]);
+}
