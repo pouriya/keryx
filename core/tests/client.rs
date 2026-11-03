@@ -2838,3 +2838,99 @@ fn two_people_starting_the_same_chat_at_once_end_in_one_group() {
     assert_eq!(world.texts(omid, chat), vec!["hi"]);
     assert_eq!(world.texts(mina, chat), vec!["hello"]);
 }
+
+#[test]
+fn many_missed_messages_are_fetched_page_by_page_in_order() {
+    let (mut world, omid, mina, chat) = pair();
+    world.offline(mina);
+    let mut expected = Vec::new();
+    for n in 0..120 {
+        let text = format!("m{n}");
+        tell(&mut world, omid, chat, &text);
+        expected.push(text);
+    }
+    let pages = world.sent_frames(mina, "history");
+    world.online(mina);
+    assert_eq!(world.texts(mina, chat), expected);
+    assert_eq!(world.sent_frames(mina, "history"), pages + 3);
+    assert!(world.errors(mina).is_empty(), "{:?}", world.errors(mina));
+}
+
+#[test]
+fn a_live_message_that_skips_ahead_fetches_the_gap_and_keeps_what_comes_meanwhile() {
+    let (mut world, omid, mina, chat) = pair();
+    world.phones[mina].lost_list.push("message");
+    tell(&mut world, omid, chat, "one");
+    assert!(world.texts(mina, chat).is_empty());
+    let pages = world.sent_frames(mina, "history");
+    world.say(omid, chat, "two");
+    world.say(omid, chat, "three");
+    world.settle();
+    assert_eq!(world.texts(mina, chat), vec!["one", "two", "three"]);
+    assert_eq!(world.sent_frames(mina, "history"), pages + 1);
+    assert!(world.errors(mina).is_empty(), "{:?}", world.errors(mina));
+}
+
+#[test]
+fn a_refused_fill_is_reported_and_runs_again_on_the_next_connection() {
+    let (mut world, omid, mina, chat) = pair();
+    world.offline(mina);
+    tell(&mut world, omid, chat, "one");
+    tell(&mut world, omid, chat, "two");
+    world.phones[mina]
+        .frame_faults
+        .push(("history", Fault::Refuse("internal")));
+    world.online(mina);
+    assert_eq!(error_count(&world, mina, "internal"), 1);
+    // Only the chat list's preview came.
+    assert_eq!(world.texts(mina, chat), vec!["two"]);
+    world.cut(mina);
+    world.advance(2 * SECOND);
+    assert_eq!(world.texts(mina, chat), vec!["one", "two"]);
+    assert_eq!(error_count(&world, mina, "internal"), 1);
+}
+
+#[test]
+fn a_reloaded_device_behind_on_keys_catches_up_through_older_pages() {
+    let (mut world, omid, mina, chat) = pair();
+    world.offline(mina);
+    world.advance(8 * DAY);
+    let mut expected = Vec::new();
+    for n in 0..60 {
+        let text = format!("k{n}");
+        tell(&mut world, omid, chat, &text);
+        expected.push(text);
+    }
+    let mina = world.reload(mina);
+    world.settle();
+    // The commit sits under more than one page of messages.
+    assert!(world.sent_frames(mina, "history") >= 2);
+    assert!(world.errors(mina).is_empty(), "{:?}", world.errors(mina));
+    world.command(mina, Command::OpenChat { chat });
+    world.settle();
+    assert_eq!(world.texts(mina, chat), expected[10..].to_vec());
+    tell(&mut world, mina, chat, "caught up");
+    assert_eq!(world.texts(omid, chat), vec!["caught up"]);
+}
+
+#[test]
+fn a_refused_catch_up_is_reported_and_runs_again_on_the_next_connection() {
+    let (mut world, omid, mina, chat) = pair();
+    world.offline(mina);
+    world.advance(8 * DAY);
+    tell(&mut world, omid, chat, "rotated");
+    let mina = world.reload(mina);
+    world.phones[mina]
+        .frame_faults
+        .push(("history", Fault::Refuse("internal")));
+    world.settle();
+    assert_eq!(error_count(&world, mina, "internal"), 1);
+    // Behind on keys, the preview cannot be read yet.
+    assert!(world.texts(mina, chat).is_empty());
+    world.cut(mina);
+    world.advance(2 * SECOND);
+    world.command(mina, Command::OpenChat { chat });
+    world.settle();
+    assert_eq!(world.texts(mina, chat), vec!["rotated"]);
+    assert_eq!(error_count(&world, mina, "internal"), 1);
+}
