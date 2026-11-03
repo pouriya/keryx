@@ -855,6 +855,8 @@ enum RestFault {
     Answer(u16, &'static str),
     /// The server handles it, and nothing answers.
     Lose,
+    /// A 200 whose body cannot be read, without handling it.
+    Unreadable,
 }
 
 struct Phone {
@@ -1647,6 +1649,7 @@ impl World {
                 self.route(p, method, path, body);
                 (0, String::new())
             }
+            Some(RestFault::Unreadable) => (200, "{}".to_string()),
             None => self.route(p, method, path, body),
         }
     }
@@ -3386,4 +3389,273 @@ fn rate_limited_background_requests_wait_and_go_again() {
     world.advance(5 * SECOND);
     assert!(world.asked(omid, "POST /api/v1/key_packages") > tried);
     assert!(world.errors(omid).is_empty(), "{:?}", world.errors(omid));
+}
+
+#[test]
+fn a_restore_whose_wraps_are_refused_or_unreadable_shows_what_waited_and_lets_the_words_go() {
+    for fault in [RestFault::Answer(403, "not_member"), RestFault::Unreadable] {
+        let (mut world, omid, _, chat) = pair();
+        tell(&mut world, omid, chat, "history");
+        let second = world.log_in("omid");
+        world.fail_rest(second, &format!("GET /api/v1/chats/{chat}/wraps"), fault);
+        world.restore(second, OMID_WORDS);
+        assert!(world.ready(second, chat), "{:?}", world.errors(second));
+        assert_eq!(world.errors(second).len(), 1, "{:?}", world.errors(second));
+        // The key from before this device joined never came, so the preview shows with no text.
+        let mut shown = Vec::new();
+        for event in &world.phones[second].events {
+            if let Event::Message { message } = event
+                && message.chat == chat
+            {
+                shown.push(message.text.is_some());
+            }
+        }
+        assert_eq!(shown, vec![false]);
+        // Nothing else is waiting on the words: a later chat is not restored with them.
+        assert_eq!(
+            world.asked(second, &format!("GET /api/v1/chats/{chat}/wraps")),
+            1
+        );
+    }
+}
+
+#[test]
+fn an_unreadable_group_info_fails_the_join_and_releases_what_waited() {
+    let (mut world, omid, _, chat) = pair();
+    tell(&mut world, omid, chat, "before");
+    let second = world.log_in("omid");
+    world.fail_rest(
+        second,
+        &format!("GET /api/v1/chats/{chat}/group_info"),
+        RestFault::Unreadable,
+    );
+    world.restore(second, OMID_WORDS);
+    assert!(!world.ready(second, chat));
+    assert_eq!(world.errors(second), vec!["bad_reply"]);
+    // The device joins the next time it connects.
+    world.cut(second);
+    world.advance(2 * SECOND);
+    assert!(world.ready(second, chat), "{:?}", world.errors(second));
+}
+
+#[test]
+fn a_key_change_whose_answer_was_lost_is_found_and_one_that_was_dropped_goes_again() {
+    for fault in [Fault::Lose, Fault::Drop] {
+        let (mut world, omid, mina, chat) = pair();
+        world.advance(8 * DAY);
+        let commits = commit_count(&world, chat);
+        world.phones[omid].frame_faults.push(("commit", fault));
+        let local = tell(&mut world, omid, chat, "after the change");
+        assert!(world.sent_seq(omid, local).is_none());
+        world.cut(omid);
+        world.advance(2 * SECOND);
+        assert!(world.sent_seq(omid, local).is_some());
+        assert_eq!(commit_count(&world, chat), commits + 1);
+        assert_eq!(world.texts(mina, chat), vec!["after the change"]);
+        assert!(world.errors(omid).is_empty(), "{:?}", world.errors(omid));
+    }
+}
+
+#[test]
+fn live_messages_arriving_during_a_fill_are_kept_and_shown_after_it() {
+    let (mut world, omid, mina, chat) = pair();
+    world.offline(mina);
+    tell(&mut world, omid, chat, "one");
+    world.phones[mina].network = true;
+    world.command(mina, Command::NetworkBack);
+    let mut filling = false;
+    while !filling {
+        assert!(world.step_one(mina));
+        for frame in &world.phones[mina].sent {
+            if let ClientFrame::History { after_seq, .. } = frame
+                && *after_seq > 0
+            {
+                filling = true;
+            }
+        }
+    }
+    world.say(omid, chat, "two");
+    while world.phones[mina].inbox.is_empty() {
+        assert!(world.step_one(omid));
+    }
+    let pages = world.sent_frames(mina, "history");
+    world.settle();
+    assert_eq!(world.texts(mina, chat), vec!["one", "two"]);
+    assert_eq!(world.sent_frames(mina, "history"), pages + 1);
+}
+
+#[test]
+fn pages_on_their_way_when_the_connection_drops_are_asked_again() {
+    let (mut world, omid, mina, chat) = pair();
+    for n in 0..60 {
+        tell(&mut world, omid, chat, &format!("p{n}"));
+    }
+    let mina = world.reload(mina);
+    world.settle();
+    world.phones[mina]
+        .frame_faults
+        .push(("history", Fault::Drop));
+    world.command(mina, Command::OpenChat { chat });
+    world.settle();
+    world.cut(mina);
+    world.advance(2 * SECOND);
+    assert_eq!(world.texts(mina, chat).len(), 50);
+    world.phones[mina]
+        .frame_faults
+        .push(("history", Fault::Drop));
+    world.command(mina, Command::LoadOlder { chat });
+    world.settle();
+    world.cut(mina);
+    world.advance(2 * SECOND);
+    assert_eq!(world.texts(mina, chat).len(), 60);
+}
+
+#[test]
+fn a_device_whose_stamp_does_not_verify_is_refused_and_its_messages_are_not_trusted() {
+    let (mut world, omid, mina, chat) = pair();
+    let index = world.device_index(world.device_of(omid)).unwrap();
+    world.devices[index].stamp = vec![7; 64];
+    let mina = world.reload(mina);
+    world.settle();
+    tell(&mut world, omid, chat, "unproven");
+    world.command(mina, Command::OpenChat { chat });
+    world.settle();
+    assert!(world.errors(mina).contains(&"bad_device".to_string()));
+    assert!(world.texts(mina, chat).is_empty());
+    assert!(problems(&world, mina, chat).contains(&Problem::UnknownDevice));
+}
+
+#[test]
+fn logging_in_as_another_account_on_a_device_is_refused() {
+    let (mut world, omid, _, _) = pair();
+    world.fail_rest(
+        omid,
+        "POST /api/v1/key_packages",
+        RestFault::Answer(401, "unauthorized"),
+    );
+    world.cut(omid);
+    world.advance(2 * SECOND);
+    world.command(
+        omid,
+        Command::LogIn {
+            username: "mina".to_string(),
+            password: Secret("a long enough password".to_string()),
+            captcha: None,
+        },
+    );
+    world.settle();
+    assert!(world.errors(omid).contains(&"wrong_account".to_string()));
+    assert!(!world.phones[omid].wiped);
+    assert!(!world.phones[omid].up);
+}
+
+#[test]
+fn a_lowered_device_limit_stops_a_device_until_another_is_terminated() {
+    let mut world = World::new();
+    let first = world.person("omid", OMID_WORDS);
+    let second = world.log_in("omid");
+    world.restore(second, OMID_WORDS);
+    world.max_devices = Some(1);
+    world.cut(second);
+    world.advance(2 * SECOND);
+    assert!(has_limit(&world, second));
+    let connects = world.phones[second].connects;
+    world.advance(60 * SECOND);
+    assert_eq!(world.phones[second].connects, connects);
+    world.command(
+        second,
+        Command::Terminate {
+            device: world.device_of(first),
+            words: Secret(OMID_WORDS.to_string()),
+        },
+    );
+    world.settle();
+    assert!(world.phones[second].up);
+    assert!(world.phones[first].wiped);
+
+    // A request refused for the limit stops the device the same way.
+    let (mut world, omid, _, _) = pair();
+    world.fail_rest(
+        omid,
+        "POST /api/v1/key_packages",
+        RestFault::Answer(403, "device_limit"),
+    );
+    world.cut(omid);
+    world.advance(2 * SECOND);
+    assert!(has_limit(&world, omid));
+}
+
+#[test]
+fn small_refusals_say_what_failed_and_leave_the_rest_working() {
+    let (mut world, omid, mina, chat) = pair();
+    // A refused message fails with the server's code.
+    world.phones[omid]
+        .frame_faults
+        .push(("send", Fault::Refuse("too_large")));
+    let refused = tell(&mut world, omid, chat, "too much");
+    assert_eq!(world.failed(omid, refused).as_deref(), Some("too_large"));
+    // A refused chat start can be asked again.
+    world.fail_rest(
+        omid,
+        "POST /api/v1/chats",
+        RestFault::Answer(403, "forbidden"),
+    );
+    world.command(
+        omid,
+        Command::StartChat {
+            account: world.account(mina),
+        },
+    );
+    world.settle();
+    world.command(
+        omid,
+        Command::StartChat {
+            account: world.account(mina),
+        },
+    );
+    world.settle();
+    assert_eq!(world.asked(omid, "POST /api/v1/chats"), 3);
+    // Starting the self chat again finds it ready.
+    let own = world.self_chat(world.account(omid));
+    world.command(
+        omid,
+        Command::StartChat {
+            account: world.account(omid),
+        },
+    );
+    world.settle();
+    let mut ready = 0;
+    for event in &world.phones[omid].events {
+        if *event == (Event::ChatReady { chat: own }) {
+            ready += 1;
+        }
+    }
+    assert_eq!(ready, 2);
+    // A wrong password, the chat list, typing and the device list.
+    let stranger = world.phone(Auth::Token);
+    world.command(
+        stranger,
+        Command::LogIn {
+            username: "nobody".to_string(),
+            password: Secret("a long enough password".to_string()),
+            captcha: None,
+        },
+    );
+    world.command(mina, Command::ChatList);
+    world.command(mina, Command::Typing { chat, on: true });
+    world.command(omid, Command::Devices);
+    world.settle();
+    assert_eq!(world.errors(stranger), vec!["bad_login"]);
+    assert!(world.phones[omid].events.contains(&Event::Typing {
+        chat,
+        account: world.account(mina),
+        on: true,
+    }));
+    assert!(
+        world.phones[omid]
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::DeviceList { .. }))
+    );
+    assert_eq!(world.errors(omid), vec!["forbidden"]);
 }
