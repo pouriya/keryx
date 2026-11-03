@@ -2967,6 +2967,138 @@ fn problems(world: &World, phone: usize, chat: Ulid) -> Vec<Problem> {
 }
 
 #[test]
+fn a_registration_whose_answer_was_lost_is_picked_up_when_it_goes_again() {
+    let mut world = World::new();
+    let omid = world.sign_up("omid");
+    world.fail_rest(omid, "POST /api/v1/devices", RestFault::Lose);
+    world.command(
+        omid,
+        Command::SetWords {
+            words: Secret(OMID_WORDS.to_string()),
+        },
+    );
+    world.settle();
+    assert!(world.phones[omid].client.device().is_none());
+    world.advance(2 * SECOND);
+    let own = world.self_chat(world.account(omid));
+    assert!(world.ready(omid, own), "{:?}", world.errors(omid));
+    assert_eq!(world.asked(omid, "POST /api/v1/devices"), 2);
+    assert_eq!(world.live_devices(world.account(omid)), 1);
+    assert!(world.errors(omid).is_empty(), "{:?}", world.errors(omid));
+}
+
+#[test]
+fn a_device_id_that_expired_while_nothing_answered_is_replaced() {
+    let mut world = World::new();
+    let omid = world.sign_up("omid");
+    world.fail_rest(omid, "POST /api/v1/devices", RestFault::Answer(0, ""));
+    world.command(
+        omid,
+        Command::SetWords {
+            words: Secret(OMID_WORDS.to_string()),
+        },
+    );
+    world.settle();
+    world.issued.clear();
+    world.advance(2 * SECOND);
+    let own = world.self_chat(world.account(omid));
+    assert!(world.ready(omid, own), "{:?}", world.errors(omid));
+    assert_eq!(world.asked(omid, "POST /api/v1/devices/id"), 2);
+    assert!(world.errors(omid).is_empty(), "{:?}", world.errors(omid));
+}
+
+#[test]
+fn other_words_for_an_account_that_has_its_keys_are_refused() {
+    let mut world = World::new();
+    world.person("omid", OMID_WORDS);
+    let second = world.log_in("omid");
+    world.command(
+        second,
+        Command::SetWords {
+            words: Secret(MINA_WORDS.to_string()),
+        },
+    );
+    world.settle();
+    assert_eq!(world.errors(second), vec!["keys_set"]);
+    assert!(world.phones[second].client.device().is_none());
+    assert_eq!(world.asked(second, "POST /api/v1/devices/id"), 0);
+}
+
+#[test]
+fn a_chat_with_no_group_info_is_not_joined_and_what_waited_fails() {
+    let (mut world, omid, mina, _) = pair();
+    let account_list = vec![world.account(omid), world.account(mina)];
+    let empty = world.new_chat(ChatType::Direct, account_list);
+    world.cut(mina);
+    let local = world.say(mina, empty, "lost");
+    world.advance(2 * SECOND);
+    assert_eq!(world.failed(mina, local).as_deref(), Some("not_joined"));
+    assert!(!world.ready(mina, empty));
+    assert_eq!(
+        world.asked(mina, &format!("GET /api/v1/chats/{empty}/group_info")),
+        1
+    );
+}
+
+#[test]
+fn a_self_chat_with_no_group_info_is_started_again_by_a_new_device() {
+    let mut world = World::new();
+    let omid = world.person("omid", OMID_WORDS);
+    let own = world.self_chat(world.account(omid));
+    let index = world.chat_index(own).unwrap();
+    world.chats[index].group_info = None;
+    world.chats[index].epoch = None;
+    let second = world.log_in("omid");
+    world.restore(second, OMID_WORDS);
+    assert!(world.ready(second, own), "{:?}", world.errors(second));
+    assert!(world.hub_chat(own).group_info.is_some());
+}
+
+#[test]
+fn a_start_with_no_key_package_for_the_other_person_fails_and_can_be_tried_again() {
+    let mut world = World::new();
+    let omid = world.person("omid", OMID_WORDS);
+    let mina = world.person("mina", MINA_WORDS);
+    let mina_device = world.device_of(mina);
+    world.packages.retain(|(owner, _)| *owner != mina_device);
+    let account = world.account(mina);
+    world.command(omid, Command::StartChat { account });
+    world.settle();
+    assert_eq!(world.errors(omid), vec!["no_key_packages"]);
+    let chat = world.direct_chat(world.account(omid), account).unwrap();
+    assert!(!world.ready(omid, chat));
+    // Mina's next connection tops her packages up, and starting again works.
+    world.cut(mina);
+    world.advance(2 * SECOND);
+    world.command(omid, Command::StartChat { account });
+    world.settle();
+    assert!(world.ready(omid, chat), "{:?}", world.errors(omid));
+    assert!(world.ready(mina, chat), "{:?}", world.errors(mina));
+}
+
+#[test]
+fn a_start_goes_ahead_when_this_accounts_other_devices_have_no_key_package_left() {
+    let mut world = World::new();
+    let omid = world.person("omid", OMID_WORDS);
+    let second = world.log_in("omid");
+    world.restore(second, OMID_WORDS);
+    let mina = world.person("mina", MINA_WORDS);
+    let (first_device, second_device) = (world.device_of(omid), world.device_of(second));
+    world
+        .packages
+        .retain(|(owner, _)| *owner != first_device && *owner != second_device);
+    let chat = world.start(omid, mina);
+    assert!(!world.ready(second, chat));
+    // The other device joins by itself on its next connection.
+    world.cut(second);
+    world.advance(2 * SECOND);
+    assert!(world.ready(second, chat), "{:?}", world.errors(second));
+    tell(&mut world, mina, chat, "to both");
+    assert_eq!(world.texts(omid, chat), vec!["to both"]);
+    assert_eq!(world.texts(second, chat), vec!["to both"]);
+}
+
+#[test]
 fn a_refused_device_list_shows_what_waited_for_it_as_from_an_unknown_device() {
     let (mut world, _, mina, chat) = pair();
     world.fail_rest(
@@ -2979,4 +3111,35 @@ fn a_refused_device_list_shows_what_waited_for_it_as_from_an_unknown_device() {
     world.settle();
     assert_eq!(problems(&world, mina, chat), vec![Problem::UnknownDevice]);
     assert_eq!(world.errors(mina), vec!["not_member"]);
+}
+
+#[test]
+fn logging_in_again_on_a_device_ended_meanwhile_wipes_it_and_asks_for_the_words() {
+    let mut world = World::new();
+    let omid = world.person("omid", OMID_WORDS);
+    world.fail_rest(
+        omid,
+        "POST /api/v1/key_packages",
+        RestFault::Answer(401, "unauthorized"),
+    );
+    world.cut(omid);
+    world.advance(2 * SECOND);
+    assert!(has_login(&world, omid));
+    world.end_device(world.device_of(omid), vec![9; 64]);
+    world.command(
+        omid,
+        Command::LogIn {
+            username: "omid".to_string(),
+            password: Secret("a long enough password".to_string()),
+            captcha: None,
+        },
+    );
+    world.settle();
+    assert!(world.phones[omid].wiped);
+    assert!(
+        world.phones[omid]
+            .events
+            .contains(&Event::NeedWords { restore: true })
+    );
+    assert!(world.phones[omid].client.device().is_none());
 }
