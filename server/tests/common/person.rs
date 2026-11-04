@@ -3,7 +3,7 @@
 //! Apart from `mod.rs`, because a test file that has no use for it would fail clippy on dead code,
 //! and `#[allow]` is not used here.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
@@ -37,6 +37,49 @@ pub struct App {
     pub self_chat: Option<Ulid>,
     /// Shown and not yet waited for.
     pub events: VecDeque<Event>,
+    /// The files this app holds, by handle: what it sends, and what it downloads into.
+    pub files: HashMap<u64, Vec<u8>>,
+}
+
+/// One request with raw bytes each way, as file chunks go: the status and the reply's bytes.
+pub fn raw(
+    server: &Server,
+    method: &str,
+    route: &str,
+    token: &str,
+    body: Option<&[u8]>,
+) -> (u16, Vec<u8>) {
+    let agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .new_agent();
+    let url = format!("{}{route}", server.origin);
+    let authorization = format!("Bearer {token}");
+    let mut response = match body {
+        Some(body) => {
+            let request = match method {
+                "PUT" => agent.put(&url),
+                _ => agent.post(&url),
+            };
+            request
+                .header("Authorization", &authorization)
+                .send(body)
+                .unwrap()
+        }
+        None => agent
+            .get(&url)
+            .header("Authorization", &authorization)
+            .call()
+            .unwrap(),
+    };
+    let status = response.status().as_u16();
+    let reply = response
+        .body_mut()
+        .with_config()
+        .limit(4 * 1024 * 1024)
+        .read_to_vec()
+        .unwrap();
+    (status, reply)
 }
 
 impl App {
@@ -56,6 +99,7 @@ impl App {
             token: None,
             self_chat: None,
             events: VecDeque::new(),
+            files: HashMap::new(),
         }
     }
 
@@ -170,6 +214,54 @@ impl App {
                 }
                 Output::WakeAt { at } => {
                     self.wake_at = Some(at);
+                    None
+                }
+                Output::ReadChunk {
+                    handle,
+                    n,
+                    offset,
+                    length,
+                } => {
+                    let held = &self.files[&handle];
+                    let start = usize::try_from(offset).unwrap();
+                    let end = start + usize::try_from(length).unwrap();
+                    Some(Input::ChunkRead {
+                        handle,
+                        n,
+                        bytes: held[start..end].to_vec(),
+                    })
+                }
+                Output::PutChunk {
+                    id,
+                    path,
+                    bearer,
+                    bytes,
+                } => {
+                    let token = bearer.map(|bearer| bearer.0.clone()).unwrap_or_default();
+                    let (status, reply) = raw(server, "PUT", &path, &token, Some(&bytes));
+                    Some(Input::Reply {
+                        id,
+                        status,
+                        body: String::from_utf8(reply).unwrap(),
+                    })
+                }
+                Output::GetChunk { id, path, bearer } => {
+                    let token = bearer.map(|bearer| bearer.0.clone()).unwrap_or_default();
+                    let (status, bytes) = raw(server, "GET", &path, &token, None);
+                    Some(Input::Fetched { id, status, bytes })
+                }
+                Output::WriteChunk {
+                    handle,
+                    offset,
+                    bytes,
+                    ..
+                } => {
+                    let held = self.files.entry(handle).or_default();
+                    let start = usize::try_from(offset).unwrap();
+                    if held.len() < start + bytes.len() {
+                        held.resize(start + bytes.len(), 0);
+                    }
+                    held[start..start + bytes.len()].copy_from_slice(&bytes);
                     None
                 }
                 Output::Event { event } => {

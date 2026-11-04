@@ -288,6 +288,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "blurhash"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e79769241dcd44edf79a732545e8b5cec84c247ac060f5252cd51885d093a8fc"
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1611,6 +1617,7 @@ dependencies = [
  "aes-gcm",
  "base64ct",
  "bip39",
+ "blurhash",
  "ed25519-dalek",
  "getrandom 0.2.17",
  "getrandom 0.4.3",

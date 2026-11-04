@@ -7,7 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{OPERATOR_TOKEN, Server};
-use keryx_core::client::{Command, Event, Secret};
+use keryx_core::client::{Command, Event, FileSpec, Pointer, Secret, Thumbnail};
+use keryx_core::file;
 use keryx_core::mls::{AccountWrap, Commit, Device};
 use keryx_core::protocol::{
     Bytes, ChatType, ClientFrame, ContentKind, Header, Kind, MessageFrame, SendFrame, ServerFrame,
@@ -15,7 +16,7 @@ use keryx_core::protocol::{
 };
 use keryx_core::ulid::Ulid;
 use person::{
-    App, BABAK_WORDS, PASSWORD, Person, SARA_WORDS, add_device, log_in, sign_up, ulid_of,
+    App, BABAK_WORDS, PASSWORD, Person, SARA_WORDS, add_device, log_in, raw, sign_up, ulid_of,
 };
 use rustls::pki_types::pem::PemObject;
 use serde_json::{Value, json};
@@ -1862,6 +1863,8 @@ fn an_edit_or_delete_can_point_at_a_message_still_waiting() {
             chat,
             target: keryx_core::client::Pointer::Local(local),
             text: Secret("first".to_string()),
+            files: Vec::new(),
+            remove: Vec::new(),
         },
     );
     let Event::Sent { seq, .. } = sara.wait(&server, |event| matches!(event, Event::Sent { .. }))
@@ -1883,6 +1886,7 @@ fn an_edit_or_delete_can_point_at_a_message_still_waiting() {
         Command::Delete {
             chat,
             target: keryx_core::client::Pointer::Seq(seq),
+            remove: Vec::new(),
         },
     );
     let Event::Deleted { target_seq, .. } =
@@ -2345,47 +2349,6 @@ fn every_tcp_setting_is_taken() {
     assert!(!log.contains("Could not set a TCP option"), "{log}");
 }
 
-/// One request with raw bytes each way, as file chunks go: the status and the reply's bytes.
-fn raw(
-    server: &Server,
-    method: &str,
-    route: &str,
-    token: &str,
-    body: Option<&[u8]>,
-) -> (u16, Vec<u8>) {
-    let agent = ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .build()
-        .new_agent();
-    let url = format!("{}{route}", server.origin);
-    let authorization = format!("Bearer {token}");
-    let mut response = match body {
-        Some(body) => {
-            let request = match method {
-                "PUT" => agent.put(&url),
-                _ => agent.post(&url),
-            };
-            request
-                .header("Authorization", &authorization)
-                .send(body)
-                .unwrap()
-        }
-        None => agent
-            .get(&url)
-            .header("Authorization", &authorization)
-            .call()
-            .unwrap(),
-    };
-    let status = response.status().as_u16();
-    let reply = response
-        .body_mut()
-        .with_config()
-        .limit(4 * 1024 * 1024)
-        .read_to_vec()
-        .unwrap();
-    (status, reply)
-}
-
 /// Chunk `n` of a two-chunk file: a full one, then a short one, each with its tag.
 fn chunk_bytes(n: u8) -> Vec<u8> {
     if n == 0 {
@@ -2579,4 +2542,192 @@ fn files_go_up_in_order_are_kept_by_a_sent_message_and_go_with_its_delete() {
     assert_eq!(status, 404);
     let (status, _) = raw(&pair.server, "GET", "/api/v1/files/x/chunks/y", &sara, None);
     assert_eq!(status, 404);
+}
+
+fn spec(handle: u64, kind: ContentKind, size: usize) -> FileSpec {
+    FileSpec {
+        handle,
+        kind,
+        name: format!("file-{handle}"),
+        mime: "application/octet-stream".to_string(),
+        size: size as u64,
+        width: None,
+        height: None,
+        thumbnail: None,
+        description: None,
+    }
+}
+
+/// Bytes that differ from chunk to chunk, so a swapped chunk would show.
+fn pattern(size: usize, seed: u8) -> Vec<u8> {
+    (0..size).map(|at| (at % 251) as u8 ^ seed).collect()
+}
+
+#[test]
+fn a_file_and_a_bundle_go_up_encrypted_and_come_down_whole() {
+    let server = open_server();
+    let (mut sara, mut babak, chat) = apps_on(&server);
+
+    // A file of three chunks with a caption: it goes up chunk by chunk, then its message.
+    let video = pattern(2 * 1024 * 1024 + 300, 1);
+    sara.files.insert(1, video.clone());
+    sara.command(
+        &server,
+        Command::SendFiles {
+            chat,
+            files: vec![spec(1, ContentKind::Video, video.len())],
+            text: Some(Secret("watch this".to_string())),
+        },
+    );
+    sara.wait(&server, |event| {
+        matches!(
+            event,
+            Event::Progress {
+                handle: 1,
+                done: 3,
+                total: 3
+            }
+        )
+    });
+    let Event::Pending { local, handles, .. } =
+        sara.wait(&server, |event| matches!(event, Event::Pending { .. }))
+    else {
+        unreachable!();
+    };
+    assert_eq!(handles, vec![1]);
+    sara.wait(
+        &server,
+        |event| matches!(event, Event::Sent { local: sent, .. } if *sent == local),
+    );
+    let message = shown(babak.wait(&server, |event| {
+        matches!(event, Event::Message { message } if message.chat == chat && !message.files.is_empty())
+    }));
+    assert_eq!(message.content_kind, Some(ContentKind::Video));
+    assert_eq!(text_of(&message), Some("watch this"));
+    let info = message.files[0].clone();
+    assert_eq!((info.size, info.chunks), (video.len() as u64, 3));
+    assert_eq!(info.name, "file-1");
+
+    // It comes down chunk by chunk, each opened, into the same bytes.
+    babak.command(
+        &server,
+        Command::Download {
+            file: info.clone(),
+            handle: 7,
+        },
+    );
+    babak.wait(&server, |event| {
+        matches!(event, Event::Downloaded { handle: 7 })
+    });
+    assert_eq!(babak.files[&7], video);
+
+    // The server only ever held ciphertext.
+    let stored = std::fs::read(
+        server
+            .path("files")
+            .join(chat.to_string())
+            .join(info.id.to_string()),
+    )
+    .unwrap();
+    assert_eq!(stored.len(), video.len() + 3 * 16);
+    assert!(!stored.windows(64).any(|window| window == &video[..64]));
+
+    // A bundle of an image and a video, each with its own description, and the image's BlurHash.
+    let image = pattern(5000, 2);
+    let clip = pattern(10, 3);
+    sara.files.insert(2, image.clone());
+    sara.files.insert(3, clip.clone());
+    let mut first = spec(2, ContentKind::Image, image.len());
+    first.width = Some(640);
+    first.height = Some(480);
+    first.description = Some("the view".to_string());
+    first.thumbnail = Some(Thumbnail {
+        width: 4,
+        height: 4,
+        rgba: pattern(64, 9),
+    });
+    let mut second = spec(3, ContentKind::Video, clip.len());
+    second.description = Some("the sound".to_string());
+    sara.command(
+        &server,
+        Command::SendFiles {
+            chat,
+            files: vec![first, second],
+            text: None,
+        },
+    );
+    let bundle = shown(babak.wait(
+        &server,
+        |event| matches!(event, Event::Message { message } if message.files.len() == 2),
+    ));
+    assert_eq!(bundle.content_kind, Some(ContentKind::MediaBundle));
+    assert_eq!(bundle.text, None);
+    assert_eq!(bundle.files[0].description.as_deref(), Some("the view"));
+    assert_eq!(bundle.files[1].description.as_deref(), Some("the sound"));
+    assert_eq!(bundle.files[0].width, Some(640));
+    let hash = bundle.files[0].blurhash.clone().unwrap();
+    assert_eq!(file::blurhash_pixels(&hash, 4, 4).unwrap().len(), 64);
+    babak.command(
+        &server,
+        Command::Download {
+            file: bundle.files[1].clone(),
+            handle: 8,
+        },
+    );
+    babak.wait(&server, |event| {
+        matches!(event, Event::Downloaded { handle: 8 })
+    });
+    assert_eq!(babak.files[&8], clip);
+
+    // Deleting the bundle removes its files with it.
+    sara.command(
+        &server,
+        Command::Delete {
+            chat,
+            target: Pointer::Seq(bundle.seq),
+            remove: bundle.files.iter().map(|info| info.id).collect(),
+        },
+    );
+    babak.wait(
+        &server,
+        |event| matches!(event, Event::Deleted { target_seq, .. } if *target_seq == bundle.seq),
+    );
+    babak.command(
+        &server,
+        Command::Download {
+            file: bundle.files[0].clone(),
+            handle: 9,
+        },
+    );
+    let failed = babak.wait(&server, |event| {
+        matches!(event, Event::TransferFailed { handle: 9, .. })
+    });
+    assert!(matches!(failed, Event::TransferFailed { code, .. } if code == "no_such_file"));
+
+    // A message holds one file, or up to 20 images and videos.
+    sara.command(
+        &server,
+        Command::SendFiles {
+            chat,
+            files: vec![spec(4, ContentKind::Doc, 1), spec(5, ContentKind::Image, 1)],
+            text: None,
+        },
+    );
+    let refused = sara.wait(&server, |event| matches!(event, Event::Error { .. }));
+    assert!(matches!(refused, Event::Error { code, .. } if code == "bad_files"));
+
+    // An upload the server refuses tells every file of its message.
+    sara.files.insert(6, pattern(21 * 1024 * 1024, 4));
+    sara.command(
+        &server,
+        Command::SendFiles {
+            chat,
+            files: vec![spec(6, ContentKind::Image, 21 * 1024 * 1024)],
+            text: None,
+        },
+    );
+    let failed = sara.wait(&server, |event| {
+        matches!(event, Event::TransferFailed { handle: 6, .. })
+    });
+    assert!(matches!(failed, Event::TransferFailed { code, .. } if code == "file_too_large"));
 }

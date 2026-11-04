@@ -46,6 +46,11 @@ sha2 = "0.11.1"
 # rest stay off. Already in the tree.
 aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc"] }
 
+# A picture's preview in a file's message, chosen by the author: the standard BlurHash text, made
+# and read here so every client has one implementation. Pure Rust, with no image decoder: the
+# platform hands it small RGBA pixels.
+blurhash = { version = "0.2.3", default-features = false }
+
 # Random bytes for ULIDs, words and nonces, straight from the OS.
 getrandom = "0.4.3"
 

@@ -24,6 +24,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
+use crate::file::{self, FileInfo};
 use crate::mls::{
     AccountKey, Device, DeviceRecord, MlsError, sign_revocation, stamp_account_key, verify_logout,
     verify_message, verify_revocation,
@@ -32,10 +33,11 @@ use crate::protocol::{
     AccountBrief, AccountInfo, AccountKeysBody, AccountListReply, AccountReply, Bytes,
     CaptchaAnswer, CaptchaReply, ChallengeBody, ChallengeReply, ChatDevice, ChatDeviceListReply,
     ChatItem, ChatReply, ChatType, ClientFrame, ContentKind, CountReply, CreateChatBody,
-    DeviceProof, DeviceReply, DevicesReply, EmptyReply, FeaturesReply, GroupInfoReply, Header,
-    KeyPackageItem, KeyPackageListReply, KeyPackagesBody, Kind, LoginBody, LoginReply, MarkItem,
-    MessageFrame, RefusedReply, RegisterBody, RegisterDeviceBody, SendFrame, ServerFrame,
-    SetupBody, SetupReply, SignedBody, WelcomeItem, WrapEntry, WrapItem, WrapListReply,
+    CreateFileBody, DeviceProof, DeviceReply, DevicesReply, EmptyReply, FeaturesReply, FileReply,
+    GroupInfoReply, Header, KeyPackageItem, KeyPackageListReply, KeyPackagesBody, Kind, LoginBody,
+    LoginReply, MarkItem, MessageFrame, RefusedReply, RegisterBody, RegisterDeviceBody, SendFrame,
+    ServerFrame, SetupBody, SetupReply, SignedBody, WelcomeItem, WrapEntry, WrapItem,
+    WrapListReply,
 };
 use crate::queue::{Level, Queue, Target};
 use crate::seed::{self, AccountKeys};
@@ -103,6 +105,39 @@ pub enum Pointer {
     Local(u64),
 }
 
+/// A picture's small pixels, from which core makes its BlurHash.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Thumbnail {
+    pub width: u32,
+    pub height: u32,
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "wasm", tsify(type = "Uint8Array"))]
+    pub rgba: Vec<u8>,
+}
+
+/// One file to send. The platform holds its bytes as `handle`, its own number, and core asks for
+/// them chunk by chunk. `kind` is voice, image, video, doc or file, and `size` its real size.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileSpec {
+    pub handle: u64,
+    pub kind: ContentKind,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub mime: String,
+    pub size: u64,
+    #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
+    #[serde(default)]
+    pub thumbnail: Option<Thumbnail>,
+    /// An image's or video's own text, in a bundle.
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
 /// What the person does.
 #[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -164,14 +199,36 @@ pub enum Command {
         chat: Ulid,
         text: Secret,
     },
+    /// One file, or several images and videos as a bundle, with an optional caption. Each goes up
+    /// first, and the message joins the queue once all are up.
+    SendFiles {
+        chat: Ulid,
+        files: Vec<FileSpec>,
+        #[serde(default)]
+        text: Option<Secret>,
+    },
+    /// Fetches a file into the platform's `handle`, chunk by chunk, each opened here.
+    Download {
+        file: FileInfo,
+        handle: u64,
+    },
+    /// A file message's edit holds the files it keeps in `files`, and names those it drops in
+    /// `remove`.
     Edit {
         chat: Ulid,
         target: Pointer,
         text: Secret,
+        #[serde(default)]
+        files: Vec<FileInfo>,
+        #[serde(default)]
+        remove: Vec<Ulid>,
     },
+    /// Names the target's files in `remove`, so the server deletes them too.
     Delete {
         chat: Ulid,
         target: Pointer,
+        #[serde(default)]
+        remove: Vec<Ulid>,
     },
     Seen {
         chat: Ulid,
@@ -237,6 +294,22 @@ pub enum Input {
         body: String,
     },
     Timer,
+    /// The bytes [`Output::ReadChunk`] asked for.
+    ChunkRead {
+        handle: u64,
+        n: u64,
+        #[serde(with = "serde_bytes")]
+        #[cfg_attr(feature = "wasm", tsify(type = "Uint8Array"))]
+        bytes: Vec<u8>,
+    },
+    /// [`Output::GetChunk`]'s reply: its status, 0 when nothing answered, and its raw bytes.
+    Fetched {
+        id: u64,
+        status: u16,
+        #[serde(with = "serde_bytes")]
+        #[cfg_attr(feature = "wasm", tsify(type = "Uint8Array"))]
+        bytes: Vec<u8>,
+    },
 }
 
 /// Everything [`Client::step`] asks the platform to do, in order.
@@ -280,6 +353,38 @@ pub enum Output {
     Event {
         event: Event,
     },
+    /// Read `length` bytes at `offset` of the file the platform holds as `handle`, and answer with
+    /// [`Input::ChunkRead`].
+    ReadChunk {
+        handle: u64,
+        n: u64,
+        offset: u64,
+        length: u64,
+    },
+    /// A PUT of these raw bytes. Its reply comes back as [`Input::Reply`] with the same id.
+    PutChunk {
+        id: u64,
+        path: String,
+        bearer: Option<Secret>,
+        #[serde(with = "serde_bytes")]
+        #[cfg_attr(feature = "wasm", tsify(type = "Uint8Array"))]
+        bytes: Vec<u8>,
+    },
+    /// A GET whose reply is raw bytes. It comes back as [`Input::Fetched`] with the same id.
+    GetChunk {
+        id: u64,
+        path: String,
+        bearer: Option<Secret>,
+    },
+    /// Write these opened bytes at `offset` of the file the platform holds as `handle`.
+    WriteChunk {
+        handle: u64,
+        n: u64,
+        offset: u64,
+        #[serde(with = "serde_bytes")]
+        #[cfg_attr(feature = "wasm", tsify(type = "Uint8Array"))]
+        bytes: Vec<u8>,
+    },
 }
 
 /// Why a message cannot be shown as it is. It still appears, so the timeline has no hole.
@@ -310,8 +415,12 @@ pub struct Shown {
     pub sent_at: i64,
     pub saved_at: i64,
     /// `None` when this device holds no key for it: its key's wrap is missing, or, once groups
-    /// exist, it was sent while this account was out of the chat.
+    /// exist, it was sent while this account was out of the chat. A file message's caption, so
+    /// with files and no caption it is `None` too, and `files` says it was opened.
     pub text: Option<Secret>,
+    /// A file message's files, or a bundle's.
+    #[serde(default)]
+    pub files: Vec<FileInfo>,
     pub problem: Option<Problem>,
 }
 
@@ -401,6 +510,9 @@ pub enum Event {
         kind: Kind,
         target: Option<Pointer>,
         text: Option<Secret>,
+        /// A file message's files, by the platform's handles.
+        #[serde(default)]
+        handles: Vec<u64>,
     },
     Sent {
         chat: Ulid,
@@ -444,6 +556,21 @@ pub enum Event {
     Terminated {
         device: Ulid,
     },
+    /// `done` of `total` chunks of the platform's `handle`, going up or coming down.
+    Progress {
+        handle: u64,
+        done: u64,
+        total: u64,
+    },
+    /// All of `handle` is written.
+    Downloaded {
+        handle: u64,
+    },
+    /// An upload or download stopped for good. An upload's message is not sent.
+    TransferFailed {
+        handle: u64,
+        code: String,
+    },
     Online,
     Offline,
     LoggedOut,
@@ -456,11 +583,14 @@ pub enum Event {
 /// What a queued item does once it may go.
 #[derive(Clone)]
 enum Item {
-    /// A text, an edit or a delete.
+    /// A text, a file message, an edit or a delete.
     Content {
         chat: Ulid,
         kind: Kind,
+        content_kind: Option<ContentKind>,
         text: Option<Secret>,
+        files: Vec<FileInfo>,
+        remove: Vec<Ulid>,
     },
     Typing {
         chat: Ulid,
@@ -558,6 +688,17 @@ enum Asked {
         device: Ulid,
     },
     LogOut,
+    CreateFile {
+        upload: u64,
+    },
+    PutChunk {
+        upload: u64,
+        n: u64,
+    },
+    GetChunk {
+        handle: u64,
+        n: u64,
+    },
     Features,
 }
 
@@ -566,8 +707,46 @@ struct Request {
     method: String,
     path: String,
     body: Option<Secret>,
+    /// A chunk to PUT, as raw bytes.
+    bytes: Option<Vec<u8>>,
+    /// The reply is raw bytes: a chunk.
+    raw: bool,
     asked: Asked,
     attempt: usize,
+}
+
+/// What a content item carries, beside its chat, kind and target.
+#[derive(Default)]
+struct Content {
+    content_kind: Option<ContentKind>,
+    text: Option<Secret>,
+    files: Vec<FileInfo>,
+    remove: Vec<Ulid>,
+    /// The platform's handles for `files`, for its pending message.
+    handles: Vec<u64>,
+}
+
+/// A file message's files going up, one at a time, before the message joins the queue.
+struct Upload {
+    chat: Ulid,
+    content_kind: ContentKind,
+    text: Option<Secret>,
+    files: Vec<UpFile>,
+    /// The file going up now.
+    current: usize,
+}
+
+struct UpFile {
+    handle: u64,
+    info: FileInfo,
+    key: zeroize::Zeroizing<[u8; 16]>,
+    /// The next chunk to read and put.
+    next: u64,
+}
+
+/// A file coming down into the platform's handle.
+struct Download {
+    info: FileInfo,
 }
 
 #[derive(Clone, Copy)]
@@ -788,6 +967,9 @@ pub struct Client {
     devices: HashMap<Ulid, KnownDevice>,
     /// Ending statements waiting for their account's master key.
     revocations: Vec<(Ulid, Ulid, Vec<u8>)>,
+    uploads: HashMap<u64, Upload>,
+    next_upload: u64,
+    downloads: HashMap<u64, Download>,
     dirty: bool,
     now: i64,
     out: Vec<Output>,
@@ -845,14 +1027,18 @@ fn refused_for_safety(error: &MlsError) -> bool {
     )
 }
 
-fn text_of(plaintext: &[u8]) -> Option<Secret> {
+/// A message's text and files: `{"text": "...", "files": [...]}`, each optional.
+fn content_of(plaintext: &[u8]) -> (Option<Secret>, Vec<FileInfo>) {
     #[derive(Deserialize)]
     struct Plain {
-        text: String,
+        #[serde(default)]
+        text: Option<String>,
+        #[serde(default)]
+        files: Vec<FileInfo>,
     }
     match serde_json::from_slice::<Plain>(plaintext) {
-        Ok(plain) => Some(Secret(plain.text)),
-        Err(_) => None,
+        Ok(plain) => (plain.text.map(Secret), plain.files),
+        Err(_) => (None, Vec::new()),
     }
 }
 
@@ -876,7 +1062,12 @@ fn account_key(info: &AccountInfo) -> Option<AccountKey> {
     })
 }
 
-fn shown(message: &MessageFrame, account: Option<Ulid>, mine: bool, text: Option<Secret>) -> Shown {
+fn shown(
+    message: &MessageFrame,
+    account: Option<Ulid>,
+    mine: bool,
+    (text, files): (Option<Secret>, Vec<FileInfo>),
+) -> Shown {
     Shown {
         chat: message.chat,
         seq: message.seq,
@@ -888,6 +1079,7 @@ fn shown(message: &MessageFrame, account: Option<Ulid>, mine: bool, text: Option
         sent_at: message.client_sent_at.unwrap_or(0),
         saved_at: message.server_saved_at.unwrap_or(0),
         text,
+        files,
         problem: None,
     }
 }
@@ -932,6 +1124,9 @@ impl Client {
             asked_accounts: HashSet::new(),
             devices: HashMap::new(),
             revocations: Vec::new(),
+            uploads: HashMap::new(),
+            next_upload: 0,
+            downloads: HashMap::new(),
             dirty: false,
             now: 0,
             out: Vec::new(),
@@ -980,6 +1175,8 @@ impl Client {
             }
             Input::Reply { id, status, body } => self.replied(id, status, &body),
             Input::Timer => self.timer(),
+            Input::ChunkRead { handle, n, bytes } => self.chunk_read(handle, n, bytes),
+            Input::Fetched { id, status, bytes } => self.fetched(id, status, &bytes),
         }
         loop {
             self.run_plans();
@@ -1038,6 +1235,8 @@ impl Client {
             method: method.to_string(),
             path,
             body: text,
+            bytes: None,
+            raw: false,
             asked,
             attempt: 0,
         });
@@ -1047,12 +1246,22 @@ impl Client {
         let id = self.next_id;
         self.next_id += 1;
         let bearer = self.bearer();
-        self.out.push(Output::Request {
-            id,
-            method: request.method.clone(),
-            path: request.path.clone(),
-            body: request.body.clone(),
-            bearer,
+        let path = request.path.clone();
+        self.out.push(match (&request.bytes, request.raw) {
+            (Some(bytes), _) => Output::PutChunk {
+                id,
+                path,
+                bearer,
+                bytes: bytes.clone(),
+            },
+            (None, true) => Output::GetChunk { id, path, bearer },
+            (None, false) => Output::Request {
+                id,
+                method: request.method.clone(),
+                path,
+                body: request.body.clone(),
+                bearer,
+            },
         });
         self.asked.insert(id, request);
     }
@@ -1248,15 +1457,48 @@ impl Client {
                 }
                 self.get(format!("/api/v1/accounts?search={encoded}"), Asked::Search);
             }
-            Command::SendText { chat, text } => {
-                self.push_content(chat, Kind::Content, None, Some(text))
-            }
-            Command::Edit { chat, target, text } => {
-                self.push_content(chat, Kind::Edit, Some(target), Some(text));
-            }
-            Command::Delete { chat, target } => {
-                self.push_content(chat, Kind::Delete, Some(target), None)
-            }
+            Command::SendText { chat, text } => self.push_content(
+                chat,
+                Kind::Content,
+                None,
+                Content {
+                    content_kind: Some(ContentKind::Text),
+                    text: Some(text),
+                    ..Content::default()
+                },
+            ),
+            Command::SendFiles { chat, files, text } => self.send_files(chat, files, text),
+            Command::Download { file, handle } => self.download(file, handle),
+            Command::Edit {
+                chat,
+                target,
+                text,
+                files,
+                remove,
+            } => self.push_content(
+                chat,
+                Kind::Edit,
+                Some(target),
+                Content {
+                    text: Some(text),
+                    files,
+                    remove,
+                    ..Content::default()
+                },
+            ),
+            Command::Delete {
+                chat,
+                target,
+                remove,
+            } => self.push_content(
+                chat,
+                Kind::Delete,
+                Some(target),
+                Content {
+                    remove,
+                    ..Content::default()
+                },
+            ),
             Command::Seen { chat, up_to_seq } => {
                 let now = self.now;
                 let state = self.chat(chat);
@@ -1475,13 +1717,7 @@ impl Client {
         );
     }
 
-    fn push_content(
-        &mut self,
-        chat: Ulid,
-        kind: Kind,
-        target: Option<Pointer>,
-        text: Option<Secret>,
-    ) {
+    fn push_content(&mut self, chat: Ulid, kind: Kind, target: Option<Pointer>, content: Content) {
         if self.device.is_none() {
             return self.error("no_device", "This client has no device");
         }
@@ -1490,10 +1726,20 @@ impl Client {
             Some(Pointer::Local(local)) => Target::Pending(local),
             None => Target::None,
         };
+        let Content {
+            content_kind,
+            text,
+            files,
+            remove,
+            handles,
+        } = content;
         let item = Item::Content {
             chat,
             kind,
+            content_kind,
             text: text.clone(),
+            files,
+            remove,
         };
         let local = self.queue.push(Level::Content, item, queue_target);
         self.event(Event::Pending {
@@ -1502,7 +1748,322 @@ impl Client {
             kind,
             target,
             text,
+            handles,
         });
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Files
+    // ---------------------------------------------------------------------------------------------
+
+    /// One file, or a bundle of images and videos. Each file gets its own key, and goes up before
+    /// the message joins the queue, so text sent meanwhile is not held behind it.
+    fn send_files(&mut self, chat: Ulid, specs: Vec<FileSpec>, text: Option<Secret>) {
+        if self.device.is_none() {
+            return self.error("no_device", "This client has no device");
+        }
+        let bundle = specs.len() > 1;
+        let fits = match specs.as_slice() {
+            [] => false,
+            [one] => matches!(
+                one.kind,
+                ContentKind::Voice
+                    | ContentKind::Image
+                    | ContentKind::Video
+                    | ContentKind::Doc
+                    | ContentKind::File
+            ),
+            many => {
+                many.len() <= file::BUNDLE_FILES
+                    && many
+                        .iter()
+                        .all(|spec| matches!(spec.kind, ContentKind::Image | ContentKind::Video))
+            }
+        };
+        if !fits {
+            return self.error(
+                "bad_files",
+                "A message holds one file, or up to 20 images and videos",
+            );
+        }
+        let content_kind = match specs.first() {
+            Some(spec) if !bundle => spec.kind,
+            _ => ContentKind::MediaBundle,
+        };
+        let mut files = Vec::with_capacity(specs.len());
+        for spec in specs {
+            let key = match file::new_key() {
+                Ok(key) => key,
+                Err(error) => return self.error("internal", &error.to_string()),
+            };
+            let blurhash = match &spec.thumbnail {
+                Some(thumbnail) => {
+                    file::blurhash_of(thumbnail.width, thumbnail.height, &thumbnail.rgba).ok()
+                }
+                None => None,
+            };
+            files.push(UpFile {
+                handle: spec.handle,
+                info: FileInfo {
+                    id: Ulid::from_bytes([0; 16]),
+                    kind: spec.kind,
+                    name: spec.name,
+                    mime: spec.mime,
+                    size: spec.size,
+                    key: Bytes(key.to_vec()),
+                    chunks: file::chunks_for(spec.size),
+                    width: spec.width,
+                    height: spec.height,
+                    blurhash,
+                    description: spec.description,
+                },
+                key,
+                next: 0,
+            });
+        }
+        let upload = self.next_upload;
+        self.next_upload += 1;
+        self.uploads.insert(
+            upload,
+            Upload {
+                chat,
+                content_kind,
+                text,
+                files,
+                current: 0,
+            },
+        );
+        self.create_file(upload);
+    }
+
+    /// Asks the server for the current file's id.
+    fn create_file(&mut self, upload: u64) {
+        let Some(going) = self.uploads.get(&upload) else {
+            return;
+        };
+        let Some(current) = going.files.get(going.current) else {
+            return;
+        };
+        let body = CreateFileBody {
+            kind: current.info.kind,
+            size: file::sealed_size(current.info.size),
+            chunks: current.info.chunks,
+        };
+        let path = format!("/api/v1/chats/{}/files", going.chat);
+        self.request("POST", path, Some(&body), Asked::CreateFile { upload });
+    }
+
+    fn file_created(&mut self, upload: u64, id: Ulid) {
+        let Some(going) = self.uploads.get_mut(&upload) else {
+            return;
+        };
+        let Some(current) = going.files.get_mut(going.current) else {
+            return;
+        };
+        current.info.id = id;
+        let (handle, total) = (current.handle, current.info.chunks);
+        self.event(Event::Progress {
+            handle,
+            done: 0,
+            total,
+        });
+        self.read_next(upload);
+    }
+
+    /// Asks the platform for the current file's next chunk.
+    fn read_next(&mut self, upload: u64) {
+        let Some(going) = self.uploads.get(&upload) else {
+            return;
+        };
+        let Some(current) = going.files.get(going.current) else {
+            return;
+        };
+        let n = current.next;
+        self.out.push(Output::ReadChunk {
+            handle: current.handle,
+            n,
+            offset: n * file::CHUNK,
+            length: file::chunk_plain(current.info.size, n),
+        });
+    }
+
+    /// The platform read a chunk: it is sealed and put.
+    fn chunk_read(&mut self, handle: u64, n: u64, bytes: Vec<u8>) {
+        let bytes = zeroize::Zeroizing::new(bytes);
+        let mut found = None;
+        for (upload, going) in &self.uploads {
+            if let Some(current) = going.files.get(going.current)
+                && current.handle == handle
+                && current.next == n
+            {
+                found = Some(*upload);
+            }
+        }
+        let Some(upload) = found else {
+            return;
+        };
+        let Some(going) = self.uploads.get(&upload) else {
+            return;
+        };
+        let Some(current) = going.files.get(going.current) else {
+            return;
+        };
+        if bytes.len() as u64 != file::chunk_plain(current.info.size, n) {
+            return self.upload_stopped(upload, "read_failed");
+        }
+        let last = n + 1 == current.info.chunks;
+        let sealed = match file::seal_chunk(current.key.as_ref(), n, last, &bytes) {
+            Ok(sealed) => sealed,
+            Err(_) => return self.upload_stopped(upload, "seal_failed"),
+        };
+        let path = format!("/api/v1/files/{}/chunks/{n}", current.info.id);
+        self.issue(Request {
+            method: "PUT".to_string(),
+            path,
+            body: None,
+            bytes: Some(sealed),
+            raw: false,
+            asked: Asked::PutChunk { upload, n },
+            attempt: 0,
+        });
+    }
+
+    /// A chunk is up: the next one, the next file, or once all are up, the message.
+    fn chunk_put(&mut self, upload: u64, n: u64) {
+        let Some(going) = self.uploads.get_mut(&upload) else {
+            return;
+        };
+        let Some(current) = going.files.get_mut(going.current) else {
+            return;
+        };
+        current.next = n + 1;
+        let (handle, total, done) = (current.handle, current.info.chunks, current.next);
+        if done < total {
+            self.event(Event::Progress {
+                handle,
+                done,
+                total,
+            });
+            return self.read_next(upload);
+        }
+        going.current += 1;
+        let more = going.current < going.files.len();
+        self.event(Event::Progress {
+            handle,
+            done,
+            total,
+        });
+        if more {
+            return self.create_file(upload);
+        }
+        let Some(going) = self.uploads.remove(&upload) else {
+            return;
+        };
+        let handles = going.files.iter().map(|up| up.handle).collect();
+        let files = going.files.into_iter().map(|up| up.info).collect();
+        self.push_content(
+            going.chat,
+            Kind::Content,
+            None,
+            Content {
+                content_kind: Some(going.content_kind),
+                text: going.text,
+                files,
+                remove: Vec::new(),
+                handles,
+            },
+        );
+    }
+
+    /// An upload stopped for good: every file of its message is told, and the message is not sent.
+    fn upload_stopped(&mut self, upload: u64, code: &str) {
+        let Some(going) = self.uploads.remove(&upload) else {
+            return;
+        };
+        for up in going.files {
+            self.event(Event::TransferFailed {
+                handle: up.handle,
+                code: code.to_string(),
+            });
+        }
+    }
+
+    fn download(&mut self, info: FileInfo, handle: u64) {
+        let total = info.chunks;
+        self.downloads.insert(handle, Download { info });
+        self.event(Event::Progress {
+            handle,
+            done: 0,
+            total,
+        });
+        self.fetch(handle, 0);
+    }
+
+    fn fetch(&mut self, handle: u64, n: u64) {
+        let Some(coming) = self.downloads.get(&handle) else {
+            return;
+        };
+        let path = format!("/api/v1/files/{}/chunks/{n}", coming.info.id);
+        self.issue(Request {
+            method: "GET".to_string(),
+            path,
+            body: None,
+            bytes: None,
+            raw: true,
+            asked: Asked::GetChunk { handle, n },
+            attempt: 0,
+        });
+    }
+
+    /// A chunk came down: it is opened, handed to the platform to write, and the next is fetched.
+    fn chunk_got(&mut self, handle: u64, n: u64, sealed: &[u8]) {
+        let Some(coming) = self.downloads.get(&handle) else {
+            return;
+        };
+        let total = coming.info.chunks;
+        let last = n + 1 == total;
+        let plain = match file::open_chunk(&coming.info.key.0, n, last, sealed) {
+            Ok(plain) => plain,
+            Err(_) => return self.download_failed(handle, "bad_file"),
+        };
+        self.out.push(Output::WriteChunk {
+            handle,
+            n,
+            offset: n * file::CHUNK,
+            bytes: plain.to_vec(),
+        });
+        self.event(Event::Progress {
+            handle,
+            done: n + 1,
+            total,
+        });
+        if last {
+            self.downloads.remove(&handle);
+            return self.event(Event::Downloaded { handle });
+        }
+        self.fetch(handle, n + 1);
+    }
+
+    fn download_failed(&mut self, handle: u64, code: &str) {
+        if self.downloads.remove(&handle).is_some() {
+            self.event(Event::TransferFailed {
+                handle,
+                code: code.to_string(),
+            });
+        }
+    }
+
+    fn fetched(&mut self, id: u64, status: u16, bytes: &[u8]) {
+        let Some(request) = self.asked.get(&id) else {
+            return;
+        };
+        if let Asked::GetChunk { handle, n } = request.asked
+            && (200..300).contains(&status)
+        {
+            self.asked.remove(&id);
+            return self.chunk_got(handle, n, bytes);
+        }
+        self.replied(id, status, &String::from_utf8_lossy(bytes));
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -1653,6 +2214,8 @@ impl Client {
         self.in_flight.clear();
         self.chats.clear();
         self.later.clear();
+        self.uploads.clear();
+        self.downloads.clear();
         self.out.push(Output::Wipe);
         self.out.push(Output::Disconnect);
         self.socket = Socket::Down;
@@ -1904,9 +2467,23 @@ impl Client {
                 Item::Typing { chat, on } => {
                     self.send(&ClientFrame::Typing { chat, on });
                 }
-                Item::Content { chat, kind, text } => match self.can_seal(chat) {
+                Item::Content {
+                    chat,
+                    kind,
+                    content_kind,
+                    text,
+                    files,
+                    remove,
+                } => match self.can_seal(chat) {
                     Seal::Now => {
-                        self.send_content(outgoing.id, chat, kind, outgoing.pointer_seq, text);
+                        let content = Content {
+                            content_kind,
+                            text,
+                            files,
+                            remove,
+                            handles: Vec::new(),
+                        };
+                        self.send_content(outgoing.id, chat, kind, outgoing.pointer_seq, content);
                     }
                     Seal::Wait => {
                         self.queue.put_back(outgoing.id);
@@ -1956,8 +2533,15 @@ impl Client {
         chat: Ulid,
         kind: Kind,
         pointer_seq: Option<u64>,
-        text: Option<Secret>,
+        content: Content,
     ) {
+        let Content {
+            content_kind,
+            text,
+            files,
+            remove,
+            ..
+        } = content;
         let after = self.chat(chat).known.unwrap_or(0);
         let Some(device) = self.device.as_ref() else {
             return;
@@ -1967,7 +2551,7 @@ impl Client {
             Err(_) => return self.fail(chat, local, "not_joined"),
         };
         let content_kind = if kind == Kind::Content {
-            Some(ContentKind::Text)
+            content_kind.or(Some(ContentKind::Text))
         } else {
             None
         };
@@ -1982,15 +2566,33 @@ impl Client {
             call_seq: None,
             client_sent_at: self.now,
         };
-        let sealed = match text {
-            Some(text) => {
-                let plaintext = match serde_json::to_vec(&serde_json::json!({ "text": text.0 })) {
+        let persist = if kind == Kind::Content {
+            files.iter().map(|info| info.id).collect()
+        } else {
+            Vec::new()
+        };
+        let sealed = match (kind, text) {
+            (Kind::Content | Kind::Edit, text) => {
+                let mut plain = serde_json::Map::new();
+                if let Some(mut text) = text {
+                    let text = std::mem::take(&mut text.0);
+                    plain.insert("text".to_string(), serde_json::Value::String(text));
+                }
+                if !files.is_empty() {
+                    match serde_json::to_value(&files) {
+                        Ok(files) => {
+                            plain.insert("files".to_string(), files);
+                        }
+                        Err(_) => return self.fail(chat, local, "internal"),
+                    }
+                }
+                let plaintext = match serde_json::to_vec(&plain) {
                     Ok(plaintext) => zeroize::Zeroizing::new(plaintext),
                     Err(_) => return self.fail(chat, local, "internal"),
                 };
                 device.seal(&header, &plaintext)
             }
-            None => match device.sign(&header, b"") {
+            _ => match device.sign(&header, b"") {
                 Ok(signature) => Ok((Vec::new(), signature)),
                 Err(error) => Err(error),
             },
@@ -2015,8 +2617,8 @@ impl Client {
             wrap_list: Vec::new(),
             welcome_list: Vec::new(),
             group_info: None,
-            persist: Vec::new(),
-            remove: Vec::new(),
+            persist,
+            remove,
         };
         self.in_flight.insert(
             local,
@@ -3184,15 +3786,15 @@ impl Client {
                 }
                 continue;
             }
-            let text = if !header.encrypted {
-                text_of(&body)
+            let content = if !header.encrypted {
+                content_of(&body)
             } else {
                 let Some(own) = self.device.as_ref() else {
                     return;
                 };
                 let current = own.epoch(chat).ok();
                 match own.open(&header, &body, &signature, &known.public) {
-                    Ok(plaintext) => text_of(&plaintext),
+                    Ok(plaintext) => content_of(&plaintext),
                     Err(_) if wait_key && (restoring || (current.is_none() && joining)) => {
                         self.chat(chat).waiting.push(message);
                         continue;
@@ -3205,11 +3807,11 @@ impl Client {
                         self.chat(chat).waiting.push(message);
                         continue;
                     }
-                    Err(_) => None,
+                    Err(_) => (None, Vec::new()),
                 }
             };
             let mine = self.account == Some(known.account);
-            let shown = shown(&message, Some(known.account), mine, text);
+            let shown = shown(&message, Some(known.account), mine, content);
             match (kind, message.pointer_seq) {
                 (Kind::Edit, Some(target_seq)) => self.event(Event::Edited {
                     message: shown,
@@ -3235,7 +3837,7 @@ impl Client {
 
     fn problem(&mut self, message: &MessageFrame, account: Option<Ulid>, problem: Problem) {
         let mine = account.is_some() && account == self.account;
-        let mut shown = shown(message, account, mine, None);
+        let mut shown = shown(message, account, mine, (None, Vec::new()));
         shown.problem = Some(problem);
         self.event(Event::Message { message: shown });
     }
@@ -3391,6 +3993,14 @@ impl Client {
 
     fn reply(&mut self, asked: Asked, body: &str) {
         match asked {
+            Asked::CreateFile { upload } => {
+                if let Some(FileReply { file }) = self.data(body) {
+                    self.file_created(upload, file);
+                }
+            }
+            Asked::PutChunk { upload, n } => self.chunk_put(upload, n),
+            // A chunk's reply arrives as `Fetched`, so only a refusal's text reaches here.
+            Asked::GetChunk { handle, .. } => self.download_failed(handle, "bad_reply"),
             Asked::Register {
                 username,
                 password,
@@ -3847,6 +4457,10 @@ impl Client {
                 self.starting.remove(&account);
                 self.error(code, message);
             }
+            Asked::CreateFile { upload } | Asked::PutChunk { upload, .. } => {
+                self.upload_stopped(upload, code)
+            }
+            Asked::GetChunk { handle, .. } => self.download_failed(handle, code),
             Asked::StartInfo { chat } if code == "no_group_info" => {
                 let Some(me) = self.account else {
                     return;

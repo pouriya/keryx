@@ -1,11 +1,13 @@
 //! The client fed by hand: replies, frames, closes and the timer, including what a real server never
 //! sends. The server's tests drive the same client against a real `keryx serve`.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use keryx_core::client::{
-    Auth, Client, Command, Event, Input, Output, Platform, Pointer, Problem, Secret,
+    Auth, Client, Command, Event, FileSpec, Input, Output, Platform, Pointer, Problem, Secret,
+    Thumbnail,
 };
+use keryx_core::file::{self, FileInfo};
 use keryx_core::mls::{AccountKey, Device, sign_revocation, stamp_account_key};
 use keryx_core::protocol::{
     AccountKeysBody, Bytes, CaptchaAnswer, ChatItem, ChatMode, ChatType, ClientFrame, ContentKind,
@@ -913,6 +915,7 @@ fn seen_typing_and_pointers_go_out_as_frames() {
         Command::Delete {
             chat,
             target: Pointer::Seq(3),
+            remove: Vec::new(),
         },
     );
     assert!(matches!(
@@ -959,6 +962,16 @@ struct HubChat {
     group_info: Option<(u64, Vec<u8>)>,
     wrap_list: Vec<WrapEntry>,
     position_list: Vec<MarkItem>,
+}
+
+struct HubFile {
+    id: Ulid,
+    chat: Ulid,
+    account: Ulid,
+    chunks: u64,
+    held: Vec<Vec<u8>>,
+    used: bool,
+    removed: bool,
 }
 
 /// What happens to the next frame of a kind a phone sends.
@@ -1012,6 +1025,13 @@ struct Phone {
     frame_list: Vec<&'static str>,
     connects: usize,
     wiped: bool,
+    /// The files the platform holds, by handle: what it uploads and what it downloads into.
+    held: HashMap<u64, Vec<u8>>,
+    reads: VecDeque<(u64, u64, u64, u64)>,
+    puts: VecDeque<(u64, String, Vec<u8>)>,
+    gets: VecDeque<(u64, String)>,
+    /// The next reads come back one byte short.
+    short_reads: usize,
 }
 
 struct World {
@@ -1030,6 +1050,9 @@ struct World {
     garble_wraps_for: Option<Ulid>,
     /// The chat list leaves out each chat's epoch, as the field is optional.
     hide_epoch: bool,
+    files: Vec<HubFile>,
+    /// Every chunk handed out has its first byte changed.
+    garble_chunks: bool,
 }
 
 fn reply_ok(data: Value) -> (u16, String) {
@@ -1117,6 +1140,8 @@ impl World {
             garble_welcomes: false,
             garble_wraps_for: None,
             hide_epoch: false,
+            files: Vec::new(),
+            garble_chunks: false,
         }
     }
 
@@ -1145,6 +1170,11 @@ impl World {
             frame_list: Vec::new(),
             connects: 0,
             wiped: false,
+            held: HashMap::new(),
+            reads: VecDeque::new(),
+            puts: VecDeque::new(),
+            gets: VecDeque::new(),
+            short_reads: 0,
         });
         self.phones.len() - 1
     }
@@ -1185,6 +1215,29 @@ impl World {
                 }
                 Output::WakeAt { at } => phone.wake = Some(at),
                 Output::Event { event } => phone.events.push(event),
+                Output::ReadChunk {
+                    handle,
+                    n,
+                    offset,
+                    length,
+                } => phone.reads.push_back((handle, n, offset, length)),
+                Output::PutChunk {
+                    id, path, bytes, ..
+                } => phone.puts.push_back((id, path, bytes)),
+                Output::GetChunk { id, path, .. } => phone.gets.push_back((id, path)),
+                Output::WriteChunk {
+                    handle,
+                    offset,
+                    bytes,
+                    ..
+                } => {
+                    let held = phone.held.entry(handle).or_default();
+                    let start = usize::try_from(offset).unwrap();
+                    if held.len() < start + bytes.len() {
+                        held.resize(start + bytes.len(), 0);
+                    }
+                    held[start..start + bytes.len()].copy_from_slice(&bytes);
+                }
             }
         }
     }
@@ -1265,6 +1318,28 @@ impl World {
         if let Some((id, method, path, body)) = self.phones[p].requests.pop_front() {
             let (status, body) = self.answer(p, &method, &path, body.as_deref());
             self.input(p, Input::Reply { id, status, body });
+            return true;
+        }
+        if let Some((handle, n, offset, length)) = self.phones[p].reads.pop_front() {
+            let phone = &mut self.phones[p];
+            let start = usize::try_from(offset).unwrap();
+            let mut end = start + usize::try_from(length).unwrap();
+            if phone.short_reads > 0 {
+                phone.short_reads -= 1;
+                end -= 1;
+            }
+            let bytes = phone.held[&handle][start..end].to_vec();
+            self.input(p, Input::ChunkRead { handle, n, bytes });
+            return true;
+        }
+        if let Some((id, path, bytes)) = self.phones[p].puts.pop_front() {
+            let (status, body) = self.put_chunk(p, &path, bytes);
+            self.input(p, Input::Reply { id, status, body });
+            return true;
+        }
+        if let Some((id, path)) = self.phones[p].gets.pop_front() {
+            let (status, bytes) = self.get_chunk(p, &path);
+            self.input(p, Input::Fetched { id, status, bytes });
             return true;
         }
         if let Some(frame) = self.phones[p].sent.pop_front() {
@@ -1783,21 +1858,30 @@ impl World {
         );
     }
 
-    fn answer(&mut self, p: usize, method: &str, path: &str, body: Option<&str>) -> (u16, String) {
+    /// Records a request, and takes the fault waiting for it. A fault's request ending in `*`
+    /// matches every request it begins. With the network down, nothing answers.
+    fn take_fault(&mut self, p: usize, method: &str, path: &str) -> Option<RestFault> {
         let request = format!("{method} {path}");
         self.phones[p].asked_list.push(request.clone());
         if !self.phones[p].network {
-            return (0, String::new());
+            return Some(RestFault::Answer(0, ""));
         }
-        let mut fault = None;
         let phone = &mut self.phones[p];
         for index in 0..phone.rest_faults.len() {
-            if phone.rest_faults[index].0 == request {
-                fault = Some(phone.rest_faults.remove(index).1);
-                break;
+            let key = &phone.rest_faults[index].0;
+            let matches = match key.strip_suffix('*') {
+                Some(prefix) => request.starts_with(prefix),
+                None => *key == request,
+            };
+            if matches {
+                return Some(phone.rest_faults.remove(index).1);
             }
         }
-        match fault {
+        None
+    }
+
+    fn answer(&mut self, p: usize, method: &str, path: &str, body: Option<&str>) -> (u16, String) {
+        match self.take_fault(p, method, path) {
             Some(RestFault::Answer(0, _)) => (0, String::new()),
             Some(RestFault::Answer(status, code)) => reply_no(status, code),
             Some(RestFault::Lose) => {
@@ -1807,6 +1891,67 @@ impl World {
             Some(RestFault::Unreadable) => (200, "{}".to_string()),
             None => self.route(p, method, path, body),
         }
+    }
+
+    fn file_at(&self, path: &str) -> (usize, usize) {
+        let route = path.strip_prefix("/api/v1/files/").unwrap();
+        let (file, n) = route.split_once("/chunks/").unwrap();
+        let file = parse(file);
+        let index = self.files.iter().position(|item| item.id == file).unwrap();
+        (index, n.parse().unwrap())
+    }
+
+    /// A chunk goes up in order: the next one, or the last one again.
+    fn store_chunk(&mut self, p: usize, path: &str, bytes: Vec<u8>) -> (u16, String) {
+        let (index, n) = self.file_at(path);
+        let me = self.phones[p].account;
+        let item = &mut self.files[index];
+        if Some(item.account) != me {
+            return reply_no(403, "not_yours");
+        }
+        if n == item.held.len() && (n as u64) < item.chunks {
+            item.held.push(bytes);
+        } else if n + 1 == item.held.len() {
+            item.held[n] = bytes;
+        } else {
+            return reply_no(409, "chunk_out_of_order");
+        }
+        reply_ok(json!({ "received": item.held.len() }))
+    }
+
+    fn put_chunk(&mut self, p: usize, path: &str, bytes: Vec<u8>) -> (u16, String) {
+        match self.take_fault(p, "PUT", path) {
+            Some(RestFault::Answer(0, _)) => (0, String::new()),
+            Some(RestFault::Answer(status, code)) => reply_no(status, code),
+            Some(RestFault::Lose) => {
+                self.store_chunk(p, path, bytes);
+                (0, String::new())
+            }
+            Some(RestFault::Unreadable) => (200, "{}".to_string()),
+            None => self.store_chunk(p, path, bytes),
+        }
+    }
+
+    /// A chunk comes down only once a sent message kept its file, except to its uploader.
+    fn get_chunk(&mut self, p: usize, path: &str) -> (u16, Vec<u8>) {
+        match self.take_fault(p, "GET", path) {
+            Some(RestFault::Answer(0, _) | RestFault::Lose) => return (0, Vec::new()),
+            Some(RestFault::Answer(status, code)) => {
+                return (status, reply_no(status, code).1.into_bytes());
+            }
+            Some(RestFault::Unreadable) => return (200, b"{}".to_vec()),
+            None => {}
+        }
+        let (index, n) = self.file_at(path);
+        let item = &self.files[index];
+        if item.removed || !(item.used || Some(item.account) == self.phones[p].account) {
+            return (404, reply_no(404, "no_such_file").1.into_bytes());
+        }
+        let mut bytes = item.held[n].clone();
+        if self.garble_chunks {
+            bytes[0] ^= 1;
+        }
+        (200, bytes)
     }
 
     fn route(&mut self, p: usize, method: &str, path: &str, body: Option<&str>) -> (u16, String) {
@@ -1827,6 +1972,19 @@ impl World {
         }
         let parts: Vec<&str> = route.split('/').collect();
         match (method, parts.as_slice()) {
+            ("POST", ["chats", chat, "files"]) => {
+                let file = id();
+                self.files.push(HubFile {
+                    id: file,
+                    chat: parse(chat),
+                    account: me.unwrap(),
+                    chunks: body["chunks"].as_u64().unwrap(),
+                    held: Vec::new(),
+                    used: false,
+                    removed: false,
+                });
+                reply_ok(json!({ "file": file }))
+            }
             ("POST", ["register"]) => {
                 let account = id();
                 self.accounts.push(HubAccount {
@@ -2258,6 +2416,14 @@ impl World {
                 {
                     *message = wiped(message.chat, message.seq);
                 }
+            }
+        }
+        for item in &mut self.files {
+            if item.chat == send.chat && send.persist.contains(&item.id) {
+                item.used = true;
+            }
+            if item.chat == send.chat && send.remove.contains(&item.id) {
+                item.removed = true;
             }
         }
         let seq = self.append(MessageFrame {
@@ -3508,6 +3674,8 @@ fn edits_and_deletes_reach_the_other_side_and_a_deleted_message_stays_removed() 
             chat,
             target: Pointer::Local(first),
             text: Secret("uno".to_string()),
+            files: Vec::new(),
+            remove: Vec::new(),
         },
     );
     world.settle();
@@ -3530,6 +3698,7 @@ fn edits_and_deletes_reach_the_other_side_and_a_deleted_message_stays_removed() 
         Command::Delete {
             chat,
             target: Pointer::Seq(seq),
+            remove: Vec::new(),
         },
     );
     world.settle();
@@ -4123,4 +4292,420 @@ fn messages_from_this_account_are_marked_as_its_own_after_a_reload() {
             ("from mina".to_string(), false)
         ]
     );
+}
+
+fn spec(handle: u64, kind: ContentKind, size: u64) -> FileSpec {
+    FileSpec {
+        handle,
+        kind,
+        name: format!("file {handle}"),
+        mime: "application/octet-stream".to_string(),
+        size,
+        width: None,
+        height: None,
+        thumbnail: None,
+        description: None,
+    }
+}
+
+/// The files `p` was shown in a chat, by sequence id, the latest event for each winning.
+fn shown_files(
+    world: &World,
+    p: usize,
+    chat: Ulid,
+) -> BTreeMap<u64, (Option<String>, Vec<FileInfo>)> {
+    let mut by_seq = BTreeMap::new();
+    for event in &world.phones[p].events {
+        // An edit replaces what its target shows.
+        let (message, seq) = match event {
+            Event::Message { message } => (message, message.seq),
+            Event::Edited {
+                message,
+                target_seq,
+            } => (message, *target_seq),
+            _ => continue,
+        };
+        if message.chat == chat && !message.files.is_empty() {
+            let text = message.text.as_ref().map(|text| text.0.clone());
+            by_seq.insert(seq, (text, message.files.clone()));
+        }
+    }
+    by_seq
+}
+
+fn progress(world: &World, p: usize, handle: u64) -> Vec<(u64, u64)> {
+    let mut list = Vec::new();
+    for event in &world.phones[p].events {
+        if let Event::Progress {
+            handle: of,
+            done,
+            total,
+        } = event
+            && *of == handle
+        {
+            list.push((*done, *total));
+        }
+    }
+    list
+}
+
+fn transfer_failed(world: &World, p: usize, handle: u64) -> Option<String> {
+    let mut found = None;
+    for event in &world.phones[p].events {
+        if let Event::TransferFailed { handle: of, code } = event
+            && *of == handle
+        {
+            found = Some(code.clone());
+        }
+    }
+    found
+}
+
+fn downloaded(world: &World, p: usize, handle: u64) -> bool {
+    world.phones[p]
+        .events
+        .contains(&Event::Downloaded { handle })
+}
+
+#[test]
+fn a_file_goes_up_in_chunks_after_text_sent_meanwhile_and_comes_down_whole() {
+    let (mut world, omid, mina, chat) = pair();
+    let bytes: Vec<u8> = (0..file::CHUNK + 10).map(|at| (at % 251) as u8).collect();
+    world.phones[omid].held.insert(1, bytes.clone());
+    // Nothing answers the first put, and the second's answer is lost after it was stored, so
+    // the same chunk goes again and is taken as the last one sent again.
+    world.fail_rest(omid, "PUT /api/v1/files/*", RestFault::Answer(0, ""));
+    world.fail_rest(omid, "PUT /api/v1/files/*", RestFault::Lose);
+    let mut picture = spec(1, ContentKind::Image, bytes.len() as u64);
+    picture.width = Some(640);
+    picture.height = Some(480);
+    picture.thumbnail = Some(Thumbnail {
+        width: 4,
+        height: 4,
+        rgba: vec![120; 4 * 4 * 4],
+    });
+    world.command(
+        omid,
+        Command::SendFiles {
+            chat,
+            files: vec![picture],
+            text: Some(Secret("look".to_string())),
+        },
+    );
+    tell(&mut world, omid, chat, "while it goes up");
+    world.advance(120_000);
+    world.settle();
+    assert_eq!(progress(&world, omid, 1), vec![(0, 2), (1, 2), (2, 2)]);
+    assert!(world.errors(omid).is_empty(), "{:?}", world.errors(omid));
+    // The text was not held behind the upload, and the caption comes after it.
+    assert_eq!(
+        world.texts(mina, chat),
+        vec!["while it goes up".to_string(), "look".to_string()]
+    );
+    let files = shown_files(&world, mina, chat);
+    let (seq, (caption, list)) = files.iter().next().unwrap();
+    assert!(*seq > 1);
+    assert_eq!(caption.as_deref(), Some("look"));
+    let info = list[0].clone();
+    assert_eq!(
+        (info.kind, info.size, info.chunks, info.width, info.height),
+        (
+            ContentKind::Image,
+            bytes.len() as u64,
+            2,
+            Some(640),
+            Some(480)
+        )
+    );
+    assert!(info.blurhash.is_some());
+    // Mina's first fetch finds nothing answering, and is retried.
+    world.fail_rest(mina, "GET /api/v1/files/*", RestFault::Answer(0, ""));
+    world.command(
+        mina,
+        Command::Download {
+            file: info,
+            handle: 7,
+        },
+    );
+    world.settle();
+    world.advance(120_000);
+    assert!(downloaded(&world, mina, 7));
+    assert_eq!(progress(&world, mina, 7), vec![(0, 2), (1, 2), (2, 2)]);
+    assert_eq!(world.phones[mina].held[&7], bytes);
+}
+
+#[test]
+fn a_bundle_holds_images_and_videos_and_an_edit_and_a_delete_name_the_files_they_drop() {
+    let (mut world, omid, mina, chat) = pair();
+    for handle in [1, 2] {
+        world.phones[omid].held.insert(handle, Vec::new());
+    }
+    let mut first = spec(1, ContentKind::Image, 0);
+    first.description = Some("the first".to_string());
+    // Pixels that do not match their size make no BlurHash, and the file still goes.
+    first.thumbnail = Some(Thumbnail {
+        width: 4,
+        height: 4,
+        rgba: vec![1, 2, 3],
+    });
+    let second = spec(2, ContentKind::Video, 0);
+    world.command(
+        omid,
+        Command::SendFiles {
+            chat,
+            files: vec![first, second],
+            text: None,
+        },
+    );
+    world.settle();
+    let files = shown_files(&world, mina, chat);
+    let (&seq, (caption, list)) = files.iter().next().unwrap();
+    assert_eq!(*caption, None);
+    assert_eq!(list.len(), 2);
+    assert_eq!(list[0].description.as_deref(), Some("the first"));
+    assert_eq!(list[0].blurhash, None);
+    let mut shown_kind = None;
+    for event in &world.phones[mina].events {
+        if let Event::Message { message } = event
+            && message.seq == seq
+            && message.chat == chat
+        {
+            shown_kind = message.content_kind;
+        }
+    }
+    assert_eq!(shown_kind, Some(ContentKind::MediaBundle));
+    let (kept, dropped) = (list[0].clone(), list[1].id);
+    // The edit keeps the first and drops the second, which the server then removes.
+    world.command(
+        omid,
+        Command::Edit {
+            chat,
+            target: Pointer::Seq(seq),
+            text: Secret("one left".to_string()),
+            files: vec![kept.clone()],
+            remove: vec![dropped],
+        },
+    );
+    world.settle();
+    let files = shown_files(&world, mina, chat);
+    assert_eq!(files[&seq].1, vec![kept.clone()]);
+    assert!(
+        world
+            .files
+            .iter()
+            .any(|item| item.id == dropped && item.removed)
+    );
+    world.command(
+        mina,
+        Command::Download {
+            file: list[1].clone(),
+            handle: 9,
+        },
+    );
+    world.settle();
+    assert_eq!(
+        transfer_failed(&world, mina, 9).as_deref(),
+        Some("no_such_file")
+    );
+    world.command(
+        omid,
+        Command::Delete {
+            chat,
+            target: Pointer::Seq(seq),
+            remove: vec![kept.id],
+        },
+    );
+    world.settle();
+    assert!(world.files.iter().all(|item| item.removed));
+    assert!(world.errors(omid).is_empty(), "{:?}", world.errors(omid));
+}
+
+#[test]
+fn a_message_holds_one_file_or_a_bundle_and_a_client_with_no_device_sends_none() {
+    let mut client = Client::new(Auth::Cookie, platform());
+    let out = command(
+        &mut client,
+        Command::SendFiles {
+            chat: id(),
+            files: vec![spec(1, ContentKind::File, 1)],
+            text: None,
+        },
+    );
+    assert!(matches!(&events(&out)[0], Event::Error { code, .. } if code == "no_device"));
+    let (mut world, omid, _, chat) = pair();
+    let image = |handle| spec(handle, ContentKind::Image, 1);
+    for files in [
+        Vec::new(),
+        vec![spec(1, ContentKind::Reaction, 1)],
+        vec![image(1), spec(2, ContentKind::Doc, 1)],
+        (0..21).map(image).collect(),
+    ] {
+        let before = world.errors(omid).len();
+        world.command(
+            omid,
+            Command::SendFiles {
+                chat,
+                files,
+                text: None,
+            },
+        );
+        assert_eq!(world.errors(omid)[before..], ["bad_files".to_string()]);
+    }
+    world.settle();
+    assert_eq!(
+        world.asked(omid, &format!("POST /api/v1/chats/{chat}/files")),
+        0
+    );
+}
+
+#[test]
+fn an_upload_that_is_refused_or_read_short_stops_and_its_message_is_never_sent() {
+    let (mut world, omid, mina, chat) = pair();
+    for handle in 1..=4 {
+        world.phones[omid].held.insert(handle, vec![5; 10]);
+    }
+    let send = |world: &mut World, files: Vec<FileSpec>| {
+        world.command(
+            omid,
+            Command::SendFiles {
+                chat,
+                files,
+                text: None,
+            },
+        );
+        world.settle();
+    };
+    // Every file of a refused bundle is told.
+    let create = format!("POST /api/v1/chats/{chat}/files");
+    world.fail_rest(omid, &create, RestFault::Answer(403, "forbidden"));
+    send(
+        &mut world,
+        vec![
+            spec(1, ContentKind::Image, 10),
+            spec(2, ContentKind::Image, 10),
+        ],
+    );
+    assert_eq!(
+        transfer_failed(&world, omid, 1).as_deref(),
+        Some("forbidden")
+    );
+    assert_eq!(
+        transfer_failed(&world, omid, 2).as_deref(),
+        Some("forbidden")
+    );
+    world.fail_rest(
+        omid,
+        "PUT /api/v1/files/*",
+        RestFault::Answer(409, "chunk_out_of_order"),
+    );
+    send(&mut world, vec![spec(3, ContentKind::Doc, 10)]);
+    assert_eq!(
+        transfer_failed(&world, omid, 3).as_deref(),
+        Some("chunk_out_of_order")
+    );
+    world.phones[omid].short_reads = 1;
+    send(&mut world, vec![spec(4, ContentKind::Voice, 10)]);
+    assert_eq!(
+        transfer_failed(&world, omid, 4).as_deref(),
+        Some("read_failed")
+    );
+    assert!(shown_files(&world, mina, chat).is_empty());
+    assert!(world.files.iter().all(|item| !item.used));
+    // What answers nothing that was asked is ignored.
+    world.input(
+        omid,
+        Input::ChunkRead {
+            handle: 99,
+            n: 0,
+            bytes: Vec::new(),
+        },
+    );
+    world.input(
+        omid,
+        Input::Fetched {
+            id: 99_999,
+            status: 200,
+            bytes: Vec::new(),
+        },
+    );
+    assert!(world.errors(omid).is_empty(), "{:?}", world.errors(omid));
+}
+
+#[test]
+fn a_download_that_is_changed_cut_or_unreadable_stops_with_its_reason() {
+    let (mut world, omid, mina, chat) = pair();
+    world.phones[omid].held.insert(1, vec![5; 10]);
+    world.command(
+        omid,
+        Command::SendFiles {
+            chat,
+            files: vec![spec(1, ContentKind::File, 10)],
+            text: None,
+        },
+    );
+    world.settle();
+    let info = shown_files(&world, mina, chat)
+        .into_values()
+        .next()
+        .unwrap()
+        .1
+        .remove(0);
+    let download = |world: &mut World, handle: u64| {
+        world.command(
+            mina,
+            Command::Download {
+                file: info.clone(),
+                handle,
+            },
+        );
+        world.settle();
+    };
+    world.garble_chunks = true;
+    download(&mut world, 1);
+    assert_eq!(
+        transfer_failed(&world, mina, 1).as_deref(),
+        Some("bad_file")
+    );
+    world.garble_chunks = false;
+    world.fail_rest(mina, "GET /api/v1/files/*", RestFault::Unreadable);
+    download(&mut world, 2);
+    assert_eq!(
+        transfer_failed(&world, mina, 2).as_deref(),
+        Some("bad_file")
+    );
+    world.fail_rest(
+        mina,
+        "GET /api/v1/files/*",
+        RestFault::Answer(404, "no_such_file"),
+    );
+    download(&mut world, 3);
+    assert_eq!(
+        transfer_failed(&world, mina, 3).as_deref(),
+        Some("no_such_file")
+    );
+    // A chunk's answer handed back as a plain reply cannot be its bytes.
+    world.command(
+        mina,
+        Command::Download {
+            file: info.clone(),
+            handle: 4,
+        },
+    );
+    let (asked, _) = world.phones[mina].gets.pop_front().unwrap();
+    world.input(
+        mina,
+        Input::Reply {
+            id: asked,
+            status: 200,
+            body: "{}".to_string(),
+        },
+    );
+    assert_eq!(
+        transfer_failed(&world, mina, 4).as_deref(),
+        Some("bad_reply")
+    );
+    // The one that is whole still comes down.
+    download(&mut world, 5);
+    assert!(downloaded(&world, mina, 5));
+    assert_eq!(world.phones[mina].held[&5], vec![5; 10]);
 }
