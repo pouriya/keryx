@@ -20,9 +20,9 @@ code is looked at again when calls are built.
 | Part | Decision |
 |------|----------|
 | Stack | **Kotlin and Jetpack Compose**, chosen by the author: state in, screen out, as the web's React, and right-to-left for Persian built in |
-| Oldest Android | **Android 8, API 26**, chosen by the author, so older phones still in use run it |
+| Oldest Android | **Android 10, API 29**, chosen by the author for calls: Android's MediaCodec encodes Opus only from there, so no codec library is bundled. It was Android 8, API 26 |
 | Package id | **`io.github.pouriya.keryx`**, chosen by the author: tied to the repository, so it cannot clash. It can never change once installed |
-| Binding | **Hand-written JNI, chosen by the author**, in `ffi/`, a workspace crate beside `web/wasm/` holding only the glue around `keryx-core`'s `client.rs`. No UniFFI or other generator. It uses the `jni` crate's safe wrappers, not raw `jni-sys` |
+| Binding | **Hand-written JNI, chosen by the author**, in `ffi/`, a workspace crate beside `web/wasm/` holding only the glue around `keryx-core`'s `client.rs` and, for calls, `keryx-moq`'s MoQ client. No UniFFI or other generator. It uses the `jni` crate's safe wrappers, not raw `jni-sys` |
 | What crosses JNI | **JSON text, chosen by the author.** One `Client` with `step(input, now)`, as on the web: the input goes in as JSON text and the outputs come back as JSON text, in core's own serde shapes, the same the web sees. Kotlin keeps its own data classes for them, read with kotlinx.serialization, and they are kept in step with core by hand |
 | Threads | **One background thread holds core's `Client`, the WebSocket and the timer**, like the web's worker. Sockets and timers stay on the platform side, as the root AGENTS.md says |
 | Lifetime | **The connection lives while the app is open, for now, chosen by the author.** When the app is closed nothing runs yet. Checking for messages while it is closed is open below |
@@ -38,7 +38,7 @@ code is looked at again when calls are built.
 | Texts | **Android string resources, chosen by the author:** `values/` for English and `values-fa/` for Persian, with Android's plurals, and lint catches one missing. They are copied from the web's `en.json` and `fa.json` by hand |
 | Navigation | **Our own state switch, chosen by the author:** one value says which screen shows, and the system back button pops it. No library, as the web has its own router |
 | Icon | The approved logo from `web/public/favicon.svg` as an adaptive icon: ink on white, as the web's home-screen icons keep their white background |
-| `make check` | **ktlint, Android lint with warnings as errors, and clippy with `-D warnings` and `cargo fmt --check` on `ffi/`**, chosen by the author |
+| `make check` | **ktlint, Android lint with warnings as errors, and clippy with `-D warnings` and `cargo fmt --check` on `ffi/` and `../moq/`**, chosen by the author |
 | Testing | **On the author's own phone over adb, chosen by the author.** Taps and typing through adb, the screen read through uiautomator's layout dump, and screenshots. No test framework for now |
 | Order | **Files and calls first, chosen by the author.** The bare screen that logs in and sends an encrypted message works on the author's phone, checked against the web client. It stays bare and grows only what testing text, files and calls needs: no standard screens until then. A full redesign comes after, and the account screens, the chat list, the chat screen, directory search and the device list follow [web/AGENTS.md](../web/AGENTS.md) then |
 

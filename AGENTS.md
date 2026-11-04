@@ -40,8 +40,9 @@ error paths, are still to do:** see [core/tests/AGENTS.md](core/tests/AGENTS.md)
   the account screens and the chat list, all checked in the author's Chromium.
 - **Done on Android:** `android/ffi/` and a bare screen that signed up, set its words, started a chat
   with a web account and sent it encrypted text, read on the web, on the author's phone.
-- **Next, chosen by the author: files, then calls.** Both clients stay as they are and grow only what
-  testing needs; standard screens and a full redesign come after. Starting files begins with its QA.
+- **Files are done in core and the server.** Their Android screen waits until calls are built.
+- **Next, chosen by the author: calls, then Android for files and calls.** Both clients stay as they
+  are and grow only what testing needs; standard screens and a full redesign come after.
 
 Delete this section when it stops being true.
 
@@ -64,6 +65,7 @@ web/            The browser client: the account screens and the chat list, on ho
 android/        The Android client, in Kotlin and Jetpack Compose
   AGENTS.md     The Android client's decisions and rules
   ffi/          A workspace crate holding only the hand-written JNI glue around keryx-core
+moq/            A workspace crate, keryx-moq: only the native MoQ client for calls, over WebSocket
 ```
 
 **`server/` and `core/` follow the strict rules.** The file lists are closed, code
@@ -71,6 +73,9 @@ style and logging are fixed, everything goes through `make`, and all tests are
 integration tests. **`web/` is loose for now, by the author's choice:** see
 [web/AGENTS.md](web/AGENTS.md). **`android/` is loose the same way, by the author's choice**, except
 `android/ffi/`, which follows core's strict Rust rules: see [android/AGENTS.md](android/AGENTS.md).
+**`moq/` follows core's strict Rust rules the same way, chosen by the author**, and is checked by clippy
+and fmt. The server's integration tests use it as their call client, so it has no tests or coverage
+table of its own.
 
 **`web/wasm/` is its own crate, not a module in `core/`**, so `core/` holds no JavaScript glue and
 its native coverage is not pulled down by code its tests cannot run. **`android/ffi/` is its sibling
@@ -95,10 +100,10 @@ the WASM build, because there is one `Cargo.lock`. Make targets stay inside
 | Chat transport | WebSocket, with a REST fallback |
 | Wire format | JSON envelopes with ciphertext as base64, the same on WebSocket, REST and MCP. Readable in logs and devtools, at about 33% overhead on ciphertext. Large attachments go separately as binary |
 | Versioning | REST under `/api/v1`, and WebSocket negotiates a `keryx.v1` subprotocol. New optional fields do not bump the version, breaking changes do. A mismatch fails at connect time, with a clear message |
-| Calls | MoQ, embedded in the server binary. Not a separate server |
-| Call fallback | MoQ over `qmux` on a secure WebSocket when UDP is blocked. REST carries no media |
+| Calls | MoQ, embedded in the server binary. Not a separate server. See Calls |
+| Call transport | **MoQ over `qmux` on a WebSocket only for now, with no QUIC, chosen by the author.** REST carries no media |
 | Clients | CLI and TUI in the server binary, web, Android |
-| TLS | Optional `[tls]` certificate and key paths in `server.toml`, handled by rustls in the binary through `axum-server`, with the ring provider, which is what borhan's rustls uses. Without them it serves plain HTTP, for local development or behind a reverse proxy. The same certificate setup covers QUIC for calls |
+| TLS | Optional `[tls]` certificate and key paths in `server.toml`, handled by rustls in the binary through `axum-server`, with the ring provider, which is what borhan's rustls uses. Without them it serves plain HTTP, for local development or behind a reverse proxy. Calls run over the same WebSocket port, so the same certificate covers them |
 | Shutdown | On SIGINT or SIGTERM the server stops accepting connections, closes each WebSocket with code 1001, lets each chat's task finish what it already received, closes open device log rows, then exits. **The wait is at most 8 seconds, fixed in code**, under Docker's default 10 before SIGKILL. A client only counts a message as sent once it has its sequence id, so one cut off here is resent |
 | Passwords | Argon2id through `argon2` 0.6.0, at 19 MiB, 2 passes and 1 lane: the crate's defaults and OWASP's minimum. The settings are stored with each hash, so they can be raised later |
 | Retention | How long the server keeps ciphertext is configured in `server.toml`. **Unset means unlimited.** It can also be set per chat, where the client offers that. **The shortest limit wins:** a chat can shorten the server's limit but never exceed it, and setting it is a permission. Deleting removes the server's copy only |
@@ -106,7 +111,7 @@ the WASM build, because there is one `Cargo.lock`. Make targets stay inside
 | Web delivery | Built on its own, copied into the server's Docker image, and served from `[www] directory = "..."` in `server.toml` through `tower-http`'s ServeDir, so keryx does not own a path check. A path with no file gets `index.html`, so `/setup#token` works. Not embedded in the binary |
 | No production yet | **No migrations, no backward compatibility and no `ALTER`s until there is a production server, chosen by the author.** The schema, the wire and stored formats change in place, and a change means deleting the database and the clients' stored state |
 | Database | SQLite in **one `.db` file, with no `.wal`**, using its classic `DELETE` journal: a `-journal` file exists only during a write, so a crash mid-write rolls back. One writer and one reader connection, each behind a lock, which take turns. If that becomes too slow, the answer is Postgres |
-| v1 scope | Direct and group chats, channels, 1:1 calls, encrypted attachments, local message search, all four MCP roles |
+| v1 scope | Direct and group chats, channels, calls in all three, encrypted attachments, local message search, all four MCP roles |
 | Web stack | React, Vite and TypeScript, with all crypto done by `keryx-core` compiled to WASM. The rest is in [web/AGENTS.md](web/AGENTS.md) |
 
 ### RBAC
@@ -165,19 +170,12 @@ the WASM build, because there is one `Cargo.lock`. Make targets stay inside
   the message it is on.
 - **A reply is a property of a message, not a kind:** a content message with a pointer.
 - **Every content message has a `content_kind`:** text, voice, reaction, image, video, doc,
-  file, `video_call` and `voice_call` (saved, and can be replied to), and `text_call` (a
-  simulated call: a quick text chat, then hang up), and `media_bundle` (several images and videos in
-  one message, built with files, chosen by the author). The server can read `content_kind`, so roles
-  can allow or refuse each one.
+  file, `call` (one per call, saved, and can be replied to: see Calls), and `media_bundle` (several
+  images and videos in one message, built with files, chosen by the author). The server can read
+  `content_kind`, so roles can allow or refuse each one.
 - **A reaction is content.** It does not affect the unread count, but it brings the chat up in
   the sorted list and shows as the preview, like "Sara reacted 👍", until the next message.
-- **A `text_call`'s messages are saved, belong to that call, travel through the MoQ call,
-  and are encrypted.** They do not count as unread and do not move the preview, because it
-  was a call.
-- **A saved call is one of three things:** a missed call; a call with no contents, showing only
-  how long it was, its type and which devices; or a call with its contents.
-- **Whether a call has contents is chosen before it starts:** each has its own initiate button.
-- **The contents of a voice or video call are a recording, saved at the lowest quality for now:**
+- **A recording, when it is built, is saved at the lowest quality for now:**
   360p and 12 fps, with a voice codec every device supports. The server cannot decode encrypted
   media, so clients produce it. **Both ways exist:** each participant records their own stream,
   or one device records everyone.
@@ -194,8 +192,7 @@ the WASM build, because there is one `Cargo.lock`. Make targets stay inside
   of them.** This is the one case where someone can remove what another device uploaded.
 - **The ringing screen says the call will be recorded**, and the person can answer or decline.
 - **A call's outcome (missed or answered) is readable**, because a missed call counts as unread
-  and an answered one does not. Its length, devices and any recording's file key stay in the
-  encrypted body.
+  and an answered one does not. Any recording's file key stays encrypted.
 - **The server can read delete and edit pointers only**, because it removes targets,
   updates conversation state and checks ownership. Reply and reaction pointers stay
   encrypted, so neither the server nor a stolen database holds the reply and reaction
@@ -346,6 +343,71 @@ chosen by the author**, fixed in code: long enough for a slow upload of a large 
 - **Testing, chosen by the author:** the server's integration tests drive core as a real client, and the
   bare Android screen picks a file with Android's picker, sends it, and another account opens it.
 
+### Calls
+
+**A call is one room where each person chooses what they send, chosen by the author.** Anyone in it may
+have video and voice on, turn either off, or only watch and listen and answer in text. Calls are for
+direct chats, groups and channels. **The first build is direct chats only, with no recording**, designed
+so groups and channels fit later; recording comes after the phone test.
+
+- **A call is one chat message with one sequence id, chosen by the author:** content kind `call`, which
+  replaced `voice_call`, `video_call` and `text_call`, since what each person sends is their own choice.
+  Its body limit is `[limits.body] call`, and sending one needs `message.send.call`. **Everything else
+  about the call lives inside it, never as chat rows:** joins, leaves, declines, its end and the text
+  typed in it, kept with the call and shown in its replay. Like a call's own messages before, none of
+  them count as unread or move the preview.
+- **Starting a call sends that message, and its delivery over the chat's WebSocket is the ring.** Joining
+  needs membership only, like `seen`. **Its encrypted body says what the caller has on, chosen by the
+  author:** `{"video": true|false, "voice": true|false}`, so the ring can say video or voice call.
+- **The server saves what happens inside a call as it goes, chosen by the author**, in a `call_event`
+  table: chat, `call_seq`, `n` (1, 2, 3 inside the call), device, kind, and for client events the body
+  and client time, and always the server time. A replay reads them from
+  `GET /api/v1/chats/{id}/calls/{seq}/events`. **Client events use the normal message encryption**, with
+  the call's sequence id as `call_seq` in the signed header, so a new device with only the words reads
+  them too.
+- **Join and leave are written by the server**, as readable events with device and time, because it
+  admits every connection to the call's MoQ and sees it leave. They hold nothing it did not already
+  know, a modified client cannot skip them, and a phone that dies still leaves.
+- **Declining is a `call_event` frame over the chat's WebSocket**, answered with `done`, since the person
+  has not joined the call's MoQ. The server saves it inside the call and sends it as `call_event` to the
+  chat's online devices.
+- **Text typed in a call travels through MoQ, chosen by the author.** Each device sends it on its own
+  `text` track. The relay, in the same binary, hands it to the chat's task, which saves it with the next
+  `n` inside the call and republishes it on the `server` broadcast's `events` track, which everyone in
+  the call reads, so all see one order. Joins, leaves and the end go out on that track too.
+- **A call ends when its last device leaves, and an ended call cannot be joined again**; a new call is
+  started instead. **If nobody else joins within 60 seconds, fixed in code, the server ends it as
+  missed.** The server writes the readable outcome on the call's message row, `call_outcome` missed or
+  answered, with `call_ended_at`, and an `end` event inside the call.
+- **Turning video or voice on or off is live only**, never saved: each device's encrypted `state` track
+  says what it has on.
+
+**How a call's media travels, chosen by the author:**
+
+- **The relay is keryx's own, in `server/src/moq.rs`**, on `moq-net` for the fan-out and `moq-tokio`
+  for the connection, with the `ring` provider. `moq-relay` was rejected: it forces `aws-lc-rs` beside
+  `ring` and brings clustering, `reqwest` and its own config, which one server does not need.
+- **WebSocket only for now, with no QUIC**: MoQ over `qmux` on a WebSocket, on the same port as the API at
+  `GET /api/v1/calls/{chat}/{call_seq}/moq`, with the same cookie or Bearer token as the chat's
+  WebSocket. A device is admitted only if it is a member of the chat and the call has not ended. It may
+  publish only under its own device id, and may read everyone in that call.
+- **keryx's own layout on MoQ, not `hang`'s:** each device's broadcast, named by its device id, has
+  `state`, `audio`, `video` and `text` tracks, and the server's broadcast `server` has `events`. Every
+  media frame is SFrame-encrypted with its timestamp inside, and a video keyframe starts a new MoQ
+  group. Only track names are in the clear; `hang`'s catalog would show codecs and sizes.
+- **SFrame is the `sframe` crate 2.1 on its RustCrypto backend**, with AES-128-GCM and its MLS key
+  scheme, keyed from the chat's MLS exporter per epoch. It carries the RFC's test vectors, and its
+  backend is the `aes-gcm` and `hkdf` core already uses, so it builds to WASM.
+- **Live video for the phone test is 640x360 at 15 fps and 500 kbps, chosen by the author**, fixed in the
+  Android client for now.
+- **Live calls are H.264 video and Opus audio**, the same as recordings. Android encodes both through
+  MediaCodec, which has Opus from Android 10, so the Android client starts at API 29.
+- **The code, chosen by the author:** `core/src/call.rs` has no I/O and holds SFrame sealing and
+  opening, the media frame layout, the `state` track and call events, driven by `client.rs`. A new
+  workspace crate `moq/` (`keryx-moq`) holds only the native MoQ client over `moq-tokio`'s WebSocket,
+  used by `android/ffi/` and by the server's tests. On Android it lives inside keryx's own bridge, so
+  Kotlin only captures, encodes and decodes.
+
 ### Sending a message
 
 1. **The client sends the message, with a new ULID as the request's `ref`.**
@@ -402,8 +464,8 @@ holds it in memory only for that request and sends it back in its answer, so req
 match over one socket: a `send` gets its sequence id this way, and a history request its page. **The
 server never stores a client's ULID, and it is not in the signed header.** What is saved goes by
 its sequence id, from 1. REST carries the same bodies. A client sends `send`,
-`seen`, `received`, `typing`, `sync`, `history`, `group_info`, `wraps` and `ping`. The server sends `features`, `sent`, `done`,
-`refused`, `message`, `chats`, `page`, `welcome`, `typing`, `marks` and `revoked`. `group_info` and `wraps` are not
+`seen`, `received`, `typing`, `sync`, `history`, `group_info`, `wraps`, `call_event` and `ping`. The server sends `features`, `sent`, `done`,
+`refused`, `message`, `chats`, `page`, `welcome`, `typing`, `marks`, `revoked` and `call_event`. `group_info` and `wraps` are not
 messages, so they take no sequence id and stay out of history, and what has no sequence id is
 answered with `done`. Binary fields are standard base64 with padding, through `base64ct`, which is
 already in the tree and constant-time. Kinds and modes are the schema's numbers. **A commit is a `send` with kind 3 plus its wraps, welcomes,
@@ -657,7 +719,9 @@ POST /api/v1/chats/{id}/files       member: kind, size, chunks -> file
 PUT  /api/v1/files/{id}/chunks/{n}  its uploader: the encrypted chunk's raw bytes
 GET  /api/v1/files/{id}             member -> size, chunks, received
 GET  /api/v1/files/{id}/chunks/{n}  member, once a sent message keeps it -> the raw bytes
+GET  /api/v1/chats/{id}/calls/{seq}/events  member -> event_list, what happened inside a call
 GET  /api/v1/ws                     cookie or Bearer, subprotocol keryx.v1
+GET  /api/v1/calls/{chat}/{call_seq}/moq  member, until the call ends: MoQ over qmux
 ```
 
 **The guide sits at the API's root, as in borhan**, so whoever arrives at REST can read it from REST.
@@ -800,9 +864,7 @@ accepts the first for each step. The loser gets a rejection, catches up and retr
   video = "16KiB"
   doc = "16KiB"
   file = "16KiB"
-  video_call = "16KiB"
-  voice_call = "16KiB"
-  text_call = "64KiB"
+  call = "16KiB"
   media_bundle = "64KiB"
 
   [limits.upload]           # one file's encrypted bytes, by the type its uploader declares
@@ -1144,9 +1206,6 @@ another device still holding the key.
 - Profiles: who may see and change them, image size and format limits, limits on bios and
   links, and where an account's folder lives
 - Files: quotas, by the author's choice none for now
-- Calls: how a `text_call`'s MoQ messages reach the message table. The relay is in the same
-  binary, so it could pass them to the chat's task. They need the normal message encryption
-  rather than SFrame, so a new device can read them
 - A call chosen as recorded when neither device can encode H.264: the client should say so
   before it starts
 - Mute and pin
@@ -1157,10 +1216,10 @@ another device still holding the key.
 
 **Calls**
 
-- Which MoQ crates (`moq-net`, `moq-tokio`, `hang`, `qmux`) and versions
-- Codecs for live calls, as only recordings are decided; the SFrame cipher variant
-- UDP port, TLS certificates, how a call is set up over WebSocket
-- Group calls: **not supported for now and not decided.** Nothing here is designed for them
+- QUIC for calls: its UDP port and certificates, when WebSocket alone is not enough
+- Calls in groups and channels: who may start one, and who may send video or voice in a channel
+- Recording: how it is chosen now that each person picks what they send, and who records
+- Video size, frame rate and bitrate for live calls beyond the phone test
 
 **Attachments and search**
 

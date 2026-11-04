@@ -68,7 +68,7 @@ src/captcha.rs    The captcha: drawn, stored with its answer, checked, swept
 src/chat.rs       Chat logic: the per-chat task that serializes a chat's events
 src/file.rs       Files' bytes on disk under [files] directory: chunk writes and reads, removing unused uploads
 src/mcp.rs        Admin MCP on the server, and the local client MCP
-src/moq.rs        The embedded relay: QUIC, and qmux over a secure WebSocket
+src/moq.rs        The embedded relay: MoQ over qmux on a WebSocket, admitting each device to its call
 src/storage.rs    The storage trait: accounts, conversations, messages, wrapped keys
 src/storage/sqlite.rs  Its SQLite implementation, and the only place SQL lives
 src/storage/sqlite.sql The schema, compiled in with include_str!, since SQLite takes text. Every
