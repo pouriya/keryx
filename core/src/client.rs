@@ -211,6 +211,10 @@ pub enum Input {
         #[cfg_attr(feature = "wasm", tsify(type = "Uint8Array | null"))]
         second: Option<Vec<u8>>,
         resume: bool,
+        /// What the last [`Event::Token`] handed out, for a token client. A cookie client has
+        /// none, as the browser keeps its cookie.
+        #[serde(default)]
+        token: Option<Secret>,
     },
     Saved {
         id: u64,
@@ -343,6 +347,11 @@ pub enum Event {
         account: Ulid,
         username: String,
         device: Option<Ulid>,
+    },
+    /// A token client's login, to keep locked and hand back in [`Input::Loaded`], or `None` once
+    /// the session is gone and what was kept must go. A cookie client never gets one.
+    Token {
+        token: Option<Secret>,
     },
     /// This account has as many devices as it may: list them and terminate some.
     DeviceLimit {
@@ -952,7 +961,8 @@ impl Client {
                 first,
                 second,
                 resume,
-            } => self.loaded(first, second, resume),
+                token,
+            } => self.loaded(first, second, resume, token),
             Input::Saved { id } => self.saved(id),
             Input::SaveFailed { id } => self.save_failed(id),
             Input::Connected => self.connected(),
@@ -1620,6 +1630,7 @@ impl Client {
     /// The session is gone: nothing reconnects or retries until the person logs in again.
     fn session_gone(&mut self) {
         self.stopped = true;
+        self.forget_token();
         self.later.clear();
         if self.socket != Socket::Down {
             self.socket = Socket::Down;
@@ -1634,6 +1645,7 @@ impl Client {
     /// This device is gone: its keys are wiped, and it can never be used again.
     fn ended(&mut self) {
         self.stopped = true;
+        self.forget_token();
         self.device = None;
         self.keys = None;
         self.dirty = false;
@@ -1646,6 +1658,13 @@ impl Client {
         self.socket = Socket::Down;
         self.event(Event::LoggedOut);
         self.public_features();
+    }
+
+    /// A token that no longer logs in, so the platform drops what it kept.
+    fn forget_token(&mut self) {
+        if self.token.take().is_some() {
+            self.event(Event::Token { token: None });
+        }
     }
 
     /// The account screen is up, so ask what anyone can read before an account exists.
@@ -1721,7 +1740,16 @@ impl Client {
     // Saving
     // ---------------------------------------------------------------------------------------------
 
-    fn loaded(&mut self, first: Option<Vec<u8>>, second: Option<Vec<u8>>, resume: bool) {
+    fn loaded(
+        &mut self,
+        first: Option<Vec<u8>>,
+        second: Option<Vec<u8>>,
+        resume: bool,
+        token: Option<Secret>,
+    ) {
+        if self.auth == Auth::Token {
+            self.token = token;
+        }
         if first.is_none() && second.is_none() {
             return self.show_login();
         }
@@ -3422,8 +3450,9 @@ impl Client {
                 {
                     return self.error("wrong_account", "This device belongs to another account");
                 }
-                if let Some(token) = token {
-                    self.token = Some(Secret(token));
+                let kept = token.map(Secret);
+                if kept.is_some() {
+                    self.token = kept.clone();
                 }
                 self.account = Some(account);
                 self.username = Some(username.clone());
@@ -3435,6 +3464,9 @@ impl Client {
                     username,
                     device,
                 });
+                if kept.is_some() {
+                    self.event(Event::Token { token: kept });
+                }
                 self.asked_accounts.insert(account);
                 self.get(format!("/api/v1/accounts/{account}"), Asked::Me);
             }

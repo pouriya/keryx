@@ -1666,6 +1666,7 @@ fn a_welcome_waits_for_an_offline_device() {
             first,
             second,
             resume: true,
+            token: None,
         },
     );
     back.wait(&server, |event| matches!(event, Event::NeedLogin));
@@ -1903,6 +1904,7 @@ fn a_device_comes_back_from_its_saved_state_and_logging_out_wipes_it() {
             first,
             second,
             resume: true,
+            token: None,
         },
     );
     back.wait(&server, |event| matches!(event, Event::NeedLogin));

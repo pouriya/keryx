@@ -139,6 +139,12 @@ fn ready() -> (Client, Ulid, Ulid) {
         events(&out)[0],
         Event::SignedIn { device: None, .. }
     ));
+    assert_eq!(
+        events(&out)[1],
+        Event::Token {
+            token: Some(Secret("t".to_string()))
+        }
+    );
     let (asked, _, path, _) = request(&out);
     assert_eq!(path, format!("/api/v1/accounts/{account}"));
     let out = ok(
@@ -593,6 +599,7 @@ fn the_login_screen_reads_what_the_server_allows() {
             first: None,
             second: None,
             resume: true,
+            token: None,
         },
         NOW,
     );
@@ -669,6 +676,7 @@ fn loading_saved_state_comes_back_or_asks_to_log_in() {
             first: None,
             second: None,
             resume: true,
+            token: None,
         },
         NOW,
     );
@@ -678,6 +686,7 @@ fn loading_saved_state_comes_back_or_asks_to_log_in() {
             first: Some(vec![1, 2, 3]),
             second: None,
             resume: true,
+            token: None,
         },
         NOW,
     );
@@ -698,6 +707,7 @@ fn loading_saved_state_comes_back_or_asks_to_log_in() {
             first: Some(saved.clone()),
             second: None,
             resume: true,
+            token: None,
         },
         NOW,
     );
@@ -708,13 +718,14 @@ fn loading_saved_state_comes_back_or_asks_to_log_in() {
             first: Some(saved),
             second: None,
             resume: true,
+            token: None,
         },
         NOW,
     );
     assert_eq!(
         events(&out),
         vec![Event::NeedLogin],
-        "a token is never saved"
+        "with no token handed back, it logs in again"
     );
 
     // Logging in again proves the device with a signed challenge.
@@ -741,6 +752,53 @@ fn loading_saved_state_comes_back_or_asks_to_log_in() {
 }
 
 #[test]
+fn a_token_client_hands_out_its_token_takes_it_back_and_drops_it_when_the_session_goes() {
+    let (client, _, _) = ready();
+    let saved = client
+        .into_device()
+        .unwrap()
+        .export()
+        .unwrap()
+        .bytes
+        .to_vec();
+    let mut app = Client::new(Auth::Token, platform());
+    let out = app.step(
+        Input::Loaded {
+            first: Some(saved.clone()),
+            second: None,
+            resume: true,
+            token: Some(Secret("kept".to_string())),
+        },
+        NOW,
+    );
+    assert!(
+        matches!(&out[0], Output::Connect { bearer: Some(bearer) } if bearer.0 == "kept"),
+        "{out:?}"
+    );
+    let out = app.step(
+        Input::Closed {
+            code: 4403,
+            reason: "no_session".to_string(),
+        },
+        NOW,
+    );
+    assert_eq!(events(&out)[0], Event::Token { token: None });
+    assert!(events(&out).contains(&Event::NeedLogin));
+
+    let mut browser = Client::new(Auth::Cookie, platform());
+    let out = browser.step(
+        Input::Loaded {
+            first: Some(saved),
+            second: None,
+            resume: true,
+            token: Some(Secret("ignored".to_string())),
+        },
+        NOW,
+    );
+    assert!(matches!(out[0], Output::Connect { bearer: None }));
+}
+
+#[test]
 fn loading_one_username_does_not_connect_until_that_login() {
     let (saver, _, _) = ready();
     let saved = saver
@@ -756,6 +814,7 @@ fn loading_one_username_does_not_connect_until_that_login() {
             first: Some(saved),
             second: None,
             resume: false,
+            token: None,
         },
         NOW,
     );
@@ -801,6 +860,7 @@ fn a_logout_waits_for_the_server_and_a_terminate_signs_with_the_words() {
     let out = command(&mut client, Command::LogOut);
     let out = ok(&mut client, request(&out).0, json!({}));
     assert!(out.iter().any(|output| matches!(output, Output::Wipe)));
+    assert!(events(&out).contains(&Event::Token { token: None }));
     assert!(events(&out).contains(&Event::LoggedOut));
     let (_, method, path, _) = request(&out);
     assert_eq!(
@@ -1291,6 +1351,7 @@ impl World {
                 first,
                 second,
                 resume: true,
+                token: None,
             },
         );
         q
