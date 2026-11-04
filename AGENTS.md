@@ -38,9 +38,10 @@ error paths, are still to do:** see [core/tests/AGENTS.md](core/tests/AGENTS.md)
   commit, and all three members exporting the same key. It now runs in Chromium too, through the bare page.
 - **Done on the web:** `core/src/client.rs` driven by the server's tests, `web/wasm/` and the bare worker,
   the account screens and the chat list, all checked in the author's Chromium.
-- **Next, chosen by the author: the Android client, with the web client on hold.** Android follows the
-  web client's design decisions in [web/AGENTS.md](web/AGENTS.md); the chat screen, directory search and
-  the device list are decided there and built in neither yet. Starting Android begins with its QA.
+- **Done on Android:** `android/ffi/` and a bare screen that signed up, set its words, started a chat
+  with a web account and sent it encrypted text, read on the web, on the author's phone.
+- **Next, chosen by the author: files, then calls.** Both clients stay as they are and grow only what
+  testing needs; standard screens and a full redesign come after. Starting files begins with its QA.
 
 Delete this section when it stops being true.
 
