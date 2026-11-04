@@ -57,20 +57,23 @@ core/           Rust shared by every client: wire types, words, MLS, key wrappin
   AGENTS.md     Binding rules for core/
   tests/        Integration tests
     AGENTS.md   The rule about the coverage table, and the table
-web/            The browser client: a bare page for now
+web/            The browser client: the account screens and the chat list, on hold
   AGENTS.md     The web client's decisions and rules
   wasm/         A workspace crate holding only the wasm-bindgen glue around keryx-core
-android/        The Android client. Not created yet
+android/        The Android client, in Kotlin and Jetpack Compose
+  AGENTS.md     The Android client's decisions and rules
+  ffi/          A workspace crate holding only the hand-written JNI glue around keryx-core
 ```
 
 **`server/` and `core/` follow the strict rules.** The file lists are closed, code
 style and logging are fixed, everything goes through `make`, and all tests are
 integration tests. **`web/` is loose for now, by the author's choice:** see
-[web/AGENTS.md](web/AGENTS.md). Code style in `android/` is undecided.
+[web/AGENTS.md](web/AGENTS.md). **`android/` is loose the same way, by the author's choice**, except
+`android/ffi/`, which follows core's strict Rust rules: see [android/AGENTS.md](android/AGENTS.md).
 
 **`web/wasm/` is its own crate, not a module in `core/`**, so `core/` holds no JavaScript glue and
-its native coverage is not pulled down by code its tests cannot run. Android gets a sibling crate
-the same way. It shares the workspace's one `Cargo.lock`.
+its native coverage is not pulled down by code its tests cannot run. **`android/ffi/` is its sibling
+for Android, the same way.** It shares the workspace's one `Cargo.lock`.
 
 **`core/` exists because keys must come out byte-identical everywhere.** The CLI,
 the browser (WASM) and Android (FFI) all turn the same words into the same keys
@@ -635,7 +638,7 @@ operation is one unit of work**, a `run_*` function, so adapting all of them lat
 ### First phase
 
 The web client, then the Android client. **The web client is on hold while Android starts, chosen by
-the author**, and Android follows the web client's design decisions. `android/` is not created yet.
+the author**, and Android follows the web client's design decisions. See [android/AGENTS.md](android/AGENTS.md).
 
 **The first working thing is 1:1 encrypted text:** two browsers sign up, generate
 their words, and send encrypted text over WebSocket, under keys from MLS. This comes first because
@@ -1050,10 +1053,8 @@ another device still holding the key.
 
 **Whole repository**
 
-- Android, when its phase comes: whether anything moves in from `/p/test/android`,
-  and its stack
-- Android code style and its own AGENTS.md. The web client's open questions are in
-  [web/AGENTS.md](web/AGENTS.md)
+- The web client's open questions are in [web/AGENTS.md](web/AGENTS.md), and Android's in
+  [android/AGENTS.md](android/AGENTS.md)
 - CI, release targets and installers
 - Docker: Dockerfile location, base images, and how the web build reaches the image
 
