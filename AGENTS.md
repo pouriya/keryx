@@ -384,9 +384,13 @@ so groups and channels fit later; recording comes after the phone test.
 
 **How a call's media travels, chosen by the author:**
 
-- **The relay is keryx's own, in `server/src/moq.rs`**, on `moq-net` for the fan-out and `moq-tokio`
-  for the connection, with the `ring` provider. `moq-relay` was rejected: it forces `aws-lc-rs` beside
-  `ring` and brings clustering, `reqwest` and its own config, which one server does not need.
+- **The relay is keryx's own, in `server/src/moq.rs`**, on `moq-net` 0.3 for the fan-out, driven on
+  tokio by its own `time::run`, and `qmux` 0.5 for MoQ over the WebSocket: its `Upgraded` takes over a
+  WebSocket axum already accepted, and `keryx-moq` uses its `ws::Client`. `qmux` stays on 0.5 because
+  `moq-net` 0.3 speaks `web-transport-trait` 0.4. `moq-relay` was rejected: it forces `aws-lc-rs` beside
+  `ring` and brings clustering, `reqwest` and its own config, which one server does not need. **So was
+  `moq-tokio`, chosen by the author**: it brings `aws-lc-rs` back through its certificates, and
+  `tracing-subscriber`, `notify`, `x509-parser` and its own config, none of which WebSocket alone needs.
 - **WebSocket only for now, with no QUIC**: MoQ over `qmux` on a WebSocket, on the same port as the API at
   `GET /api/v1/calls/{chat}/{call_seq}/moq`, with the same cookie or Bearer token as the chat's
   WebSocket. A device is admitted only if it is a member of the chat and the call has not ended. It may
@@ -404,7 +408,7 @@ so groups and channels fit later; recording comes after the phone test.
   MediaCodec, which has Opus from Android 10, so the Android client starts at API 29.
 - **The code, chosen by the author:** `core/src/call.rs` has no I/O and holds SFrame sealing and
   opening, the media frame layout, the `state` track and call events, driven by `client.rs`. A new
-  workspace crate `moq/` (`keryx-moq`) holds only the native MoQ client over `moq-tokio`'s WebSocket,
+  workspace crate `moq/` (`keryx-moq`) holds only the native MoQ client over `qmux`'s WebSocket,
   used by `android/ffi/` and by the server's tests. On Android it lives inside keryx's own bridge, so
   Kotlin only captures, encodes and decodes.
 
