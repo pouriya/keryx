@@ -467,35 +467,3 @@ async fn a_setup_link_says_whether_it_is_unknown_used_or_expired() {
             .unwrap()
     );
 }
-
-#[test]
-fn opening_the_first_database_keeps_a_used_link() {
-    let directory = TempDir::new().unwrap();
-    let path = directory.path().join("keryx.db");
-    let connection = Connection::open(&path).unwrap();
-    connection
-        .execute_batch(
-            "CREATE TABLE account_setup (
-                 token_hash BLOB PRIMARY KEY,
-                 account_id BLOB NOT NULL,
-                 expires_at INTEGER NOT NULL
-             ) WITHOUT ROWID, STRICT;
-             PRAGMA user_version = 1;",
-        )
-        .unwrap();
-    drop(connection);
-    Sqlite::open(&path).unwrap();
-    let check = Connection::open(&path).unwrap();
-    let version: i64 = check
-        .query_row("PRAGMA user_version", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(version, 2);
-    let names: Vec<String> = check
-        .prepare("PRAGMA table_info(account_setup)")
-        .unwrap()
-        .query_map([], |row| row.get(1))
-        .unwrap()
-        .map(|name| name.unwrap())
-        .collect();
-    assert!(names.contains(&"used_at".to_string()));
-}

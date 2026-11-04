@@ -52,21 +52,14 @@ impl Sqlite {
         let Some(writer) = connections.pop() else {
             return Err(Error::Database(rusqlite::Error::InvalidQuery));
         };
+        // No migrations until there is a production server, chosen by the author: a schema change
+        // means deleting the database.
         let version: i64 = writer.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version == 0 {
             writer.execute_batch(&format!(
-                "BEGIN IMMEDIATE;\n{}\nPRAGMA user_version = 2;\nCOMMIT;",
+                "BEGIN IMMEDIATE;\n{}\nPRAGMA user_version = 1;\nCOMMIT;",
                 include_str!("sqlite.sql")
             ))?;
-        } else if version == 1 {
-            // The first build deleted a used link, so a second try looked like one that was never
-            // issued. The row now stays, and this column is what says it was used.
-            writer.execute_batch(
-                "BEGIN IMMEDIATE;
-                 ALTER TABLE account_setup ADD COLUMN used_at INTEGER;
-                 PRAGMA user_version = 2;
-                 COMMIT;",
-            )?;
         }
         Ok(Self {
             writer: Arc::new(Mutex::new(writer)),
