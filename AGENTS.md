@@ -569,9 +569,13 @@ stay on the platform side and call into it.
   get it. So anything pointing at a pending message waits for that message's reply, and
   **an encrypted reply or reaction can only be encrypted when it leaves the queue**,
   since its pointer is inside the ciphertext.
-- **The queue is memory only.** It is lost when the tab closes, so a client must show a
+- **The queue is memory only, for now.** It is lost when the tab closes, so a client must show a
   message as pending until the sequence id arrives, never as sent. A message sent just
-  before closing or crashing can vanish.
+  before closing or crashing can vanish. **A queue kept on disk is wanted later, chosen by the
+  author**, so messages not yet sent are retried after the app restarts; it is on the Open list.
+- **A file's message joins the queue only once its bytes are all up, chosen by the author.** Text
+  sent while a large file uploads goes at once, and the file's message lands after it, at its own
+  sequence id. One big upload never blocks a chat.
 
 ### Unencrypted messages and chats
 
@@ -1146,6 +1150,8 @@ another device still holding the key.
 - A call chosen as recorded when neither device can encode H.264: the client should say so
   before it starts
 - Mute and pin
+- The client queue on disk, so unsent messages and unfinished uploads survive a restart: where it is
+  kept on each platform and how it is locked
 - Whether a group or channel can be found and joined from outside, and how
 - What a channel is compared with a group
 
