@@ -645,6 +645,16 @@ and calls come after it.
 back. Files, profiles, retention, MCP and calls come after it, so `mcp.rs` and `moq.rs` do not exist
 yet.
 
+**To do after files and calls, chosen by the author: remove the password.** It unlocks almost nothing
+the words or a device key do not already cover: a new device still needs the words to register, and a
+returning one already signs a challenge with its own key. It is also a hole, since "lost words: set up
+new words" would let a stolen password replace the words and then add any device. Without it the
+server stores no password hashes, only public keys, and there is nothing to guess. A new device would
+log in by signing with the words, and a returning one by signing with its own key. Until then the
+password rules below stand. **Ask the details when it starts:** what sign-up and the setup link become,
+whether the captcha stays on sign-up, and how lost words are replaced, by a still-registered device's
+signature or by the operator.
+
 **`keryx` has server commands only in this phase:** `serve` and `user add`,
 with no terminal chat. Integration tests drive `keryx-core` directly as their client.
 
