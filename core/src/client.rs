@@ -305,7 +305,8 @@ pub struct Shown {
     pub encrypted: bool,
     pub sent_at: i64,
     pub saved_at: i64,
-    /// `None` when this device holds no key for it, such as from before it joined.
+    /// `None` when this device holds no key for it: its key's wrap is missing, or, once groups
+    /// exist, it was sent while this account was out of the chat.
     pub text: Option<Secret>,
     pub problem: Option<Problem>,
 }
@@ -411,6 +412,12 @@ pub enum Event {
         chat: Ulid,
         account: Ulid,
         on: bool,
+    },
+    /// The chat a `StartChat` asked for, with its id, so the platform can open it. It may not be
+    /// ready yet: `ChatReady` follows once this device is in it.
+    Started {
+        chat: Ulid,
+        account: Ulid,
     },
     /// This device is in the chat and can send.
     ChatReady {
@@ -3535,6 +3542,7 @@ impl Client {
                 let Some(me) = self.account else {
                     return;
                 };
+                self.event(Event::Started { chat, account });
                 let joined = self.joined(chat);
                 let state = self.chat(chat);
                 state.member_list = vec![me];

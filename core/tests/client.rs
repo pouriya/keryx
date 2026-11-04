@@ -1390,6 +1390,11 @@ impl World {
         self.command(p, Command::StartChat { account });
         self.settle();
         let chat = self.direct_chat(self.account(p), account).unwrap();
+        assert!(
+            self.phones[p]
+                .events
+                .contains(&Event::Started { chat, account })
+        );
         assert!(self.ready(p, chat), "{:?}", self.phones[p].events);
         assert!(self.ready(q, chat), "{:?}", self.phones[q].events);
         chat
