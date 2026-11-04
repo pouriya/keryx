@@ -384,10 +384,11 @@ so groups and channels fit later; recording comes after the phone test.
 
 **How a call's media travels, chosen by the author:**
 
-- **The relay is keryx's own, in `server/src/moq.rs`**, on `moq-net` 0.3 for the fan-out, driven on
-  tokio by its own `time::run`, and `qmux` 0.5 for MoQ over the WebSocket: its `Upgraded` takes over a
-  WebSocket axum already accepted, and `keryx-moq` uses its `ws::Client`. `qmux` stays on 0.5 because
-  `moq-net` 0.3 speaks `web-transport-trait` 0.4. `moq-relay` was rejected: it forces `aws-lc-rs` beside
+- **The relay is keryx's own, in `server/src/moq.rs`**, on `moq-net` 0.2.22 for the fan-out and `qmux`
+  0.5 for MoQ over the WebSocket: its `Upgraded` takes over a WebSocket axum already accepted, and
+  `keryx-moq` uses its `ws::Client`. **`moq-net` stays on 0.2, chosen by the author**, because it takes
+  `qmux` 0.5's session directly; 0.3 takes only a lower-level interface, whose adapter lives in
+  `moq-tokio`. Moving to 0.3 means writing or taking that adapter. `moq-relay` was rejected: it forces `aws-lc-rs` beside
   `ring` and brings clustering, `reqwest` and its own config, which one server does not need. **So was
   `moq-tokio`, chosen by the author**: it brings `aws-lc-rs` back through its certificates, and
   `tracing-subscriber`, `notify`, `x509-parser` and its own config, none of which WebSocket alone needs.
