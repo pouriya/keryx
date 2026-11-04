@@ -1,0 +1,23 @@
+[package]
+name = "keryx-ffi"
+version = "0.1.0"
+edition = "2024"
+description = "The hand-written JNI glue around keryx-core's client, for Android"
+authors = ["Pouriya Jahanbakhsh <pouriya.jahanbakhsh@gmail.com>"]
+rust-version = "1.91"
+license = "MIT"
+repository = "https://github.com/pouriya/keryx"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+keryx-core = { path = "../../core" }
+
+# The JNI calls, through its safe wrappers for strings, exceptions and references, chosen by the
+# author over raw jni-sys. See android/AGENTS.md.
+jni = "0.22.4"
+
+# Core's inputs and outputs cross JNI as JSON text, in core's own serde shapes. Already in the tree.
+serde_json = { version = "1.0.154", default-features = false, features = ["std"] }

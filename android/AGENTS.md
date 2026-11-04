@@ -31,6 +31,8 @@ code is looked at again when calls are built.
 | Device state | **Two snapshot slots in the app's private files, encrypted with an AES key in the Android Keystore, chosen by the author.** The key never leaves the phone's secure hardware, so a copied backup or a file dump cannot be read. The web cannot do this, which the root AGENTS.md lists as a cost. The token is kept the same way. As on the web, each username has its own, and the one left behind is kept |
 | Server | **The first screen asks for the server's address, chosen by the author**, such as `https://chat.example.com`, checks it with `GET /api/v1/public/features`, and remembers it. The web never asks, since the server serves it. While developing, the phone reaches this machine's `keryx serve` through `adb reverse tcp:7777 tcp:7777`, at `http://127.0.0.1:7777` |
 | Build | **`android/Makefile`, wrapping a committed Gradle wrapper and `cargo-ndk`, chosen by the author.** `ffi/` is built for `arm64-v8a`, almost every phone in use, and `x86_64`, so it also runs in an emulator. Everything goes through `make`, as elsewhere |
+| Toolchain | **What the moq experiment in `/p/test/android` already built with on this machine, as the author pointed to:** Gradle 8.9 from its cache, the Android Gradle plugin 8.7.3, Kotlin 2.0.21 and Android 15 (API 35). The NDK is r30. `dl.google.com` refuses this network, so Google's Maven and the SDK come through `redirector.gvt1.com`, as the experiment found |
+| Icon | The approved logo from `web/public/favicon.svg` as an adaptive icon: ink on white, as the web's home-screen icons keep their white background |
 | `make check` | **ktlint, Android lint with warnings as errors, and clippy with `-D warnings` and `cargo fmt --check` on `ffi/`**, chosen by the author |
 | Testing | **On the author's own phone over adb, chosen by the author.** Taps and typing through adb, the screen read through uiautomator's layout dump, and screenshots. No test framework for now |
 | Order | **The web's order, chosen by the author.** First `ffi/` and a bare screen that logs in and sends one encrypted message on the phone, checked against the web client. Then the account screens, then the chat list, each stopping for the author to see it on the phone. Then the chat screen, directory search and the device list, as decided in [web/AGENTS.md](../web/AGENTS.md) |
@@ -46,5 +48,9 @@ code is looked at again when calls are built.
   scheduler, WorkManager, runs periodic work at most every 15 minutes, not 5. The usual low-battery
   way is a push service that wakes the app: Google's FCM, which tells Google when a message arrives,
   or a self-hosted one such as UnifiedPush
+- **Plain HTTP and backups, done for now and not decided.** The app allows plain HTTP, so it can
+  reach a server without TLS such as the one on this machine, and turns Android's backups off, since
+  the locked files could not be opened anywhere else anyway. Whether a release keeps plain HTTP is
+  to ask
 - The folder layout and code style, once the first slice works
 - Release signing, the store, and how the app reaches people

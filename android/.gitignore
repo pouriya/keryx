@@ -1,0 +1,5 @@
+.gradle/
+build/
+local.properties
+# Built by `make ffi` from ffi/, never committed.
+app/src/main/jniLibs/

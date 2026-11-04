@@ -1,7 +1,7 @@
 # One Cargo.lock and one target/ for both crates, which is what keeps the crypto versions
 # identical between the CLI and the WASM build. Make targets stay inside server/, core/ and web/.
 [workspace]
-members = ["server", "core", "web/wasm"]
+members = ["server", "core", "web/wasm", "android/ffi"]
 resolver = "3"
 
 # Here and not in server/, because Cargo ignores profiles outside the workspace root.

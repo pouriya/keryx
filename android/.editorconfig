@@ -1,0 +1,3 @@
+[*.{kt,kts}]
+# Compose's screens are functions named like classes, as Compose itself names them.
+ktlint_function_naming_ignore_when_annotated_with = Composable
