@@ -401,8 +401,20 @@ so groups and channels fit later; recording comes after the phone test.
   media frame is SFrame-encrypted with its timestamp inside, and a video keyframe starts a new MoQ
   group. Only track names are in the clear; `hang`'s catalog would show codecs and sizes.
 - **SFrame is the `sframe` crate 2.1 on its RustCrypto backend**, with AES-128-GCM and its MLS key
-  scheme, keyed from the chat's MLS exporter per epoch. It carries the RFC's test vectors, and its
-  backend is the `aes-gcm` and `hkdf` core already uses, so it builds to WASM.
+  scheme, keyed from the chat's MLS exporter per epoch. It carries the RFC's test vectors and builds to
+  WASM. Its backend is `aes-gcm` 0.11, beside the 0.10 openmls and core use, and core's `hkdf`.
+- **A frame's key id is 16 bits of sender index and 8 bits of epoch, with context 0, chosen by the
+  author**: room for 65,536 members, and frames from up to 255 key changes back are recognised. A
+  receiver checks that the sender index belongs to the device whose broadcast the frame came on.
+- **A media frame's plaintext is `[timestamp, 8 bytes big-endian microseconds][codec bytes]`, chosen by
+  the author.** The `state` track's is JSON `{"video": bool, "voice": bool, "width"?, "height"?,
+  "rotation"?: 0|90|180|270}`, sealed the same way.
+- **Every call event is the same JSON, chosen by the author**, on the `events` track, in the WebSocket's
+  `call_event` and in the replay route: `{chat, call_seq, n, kind, device, server_at, client_at?,
+  epoch?, signature?, body?}`, with kind `join`, `leave`, `decline`, `text` or `end`. **A decline has no
+  body**, since the server sees who sent it anyway. **Text is encrypted and signed like a message**, with
+  header kind content, content kind text and `call_seq` set, so it can never pass for a chat message. A
+  device sends text on its `text` track as `{client_at, epoch, signature, body}`.
 - **Live video for the phone test is 640x360 at 15 fps and 500 kbps, chosen by the author**, fixed in the
   Android client for now.
 - **Live calls are H.264 video and Opus audio**, the same as recordings. Android encodes both through
