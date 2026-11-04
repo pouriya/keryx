@@ -66,6 +66,7 @@ src/lib.rs        The modules, as a library so that tests/ can reach them
 src/api.rs        Every operation, and the axum router: REST and WebSocket
 src/captcha.rs    The captcha: drawn, stored with its answer, checked, swept
 src/chat.rs       Chat logic: the per-chat task that serializes a chat's events
+src/file.rs       Files' bytes on disk under [files] directory: chunk writes and reads, removing unused uploads
 src/mcp.rs        Admin MCP on the server, and the local client MCP
 src/moq.rs        The embedded relay: QUIC, and qmux over a secure WebSocket
 src/storage.rs    The storage trait: accounts, conversations, messages, wrapped keys

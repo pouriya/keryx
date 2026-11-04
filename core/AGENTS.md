@@ -36,6 +36,7 @@ src/protocol.rs   Wire types: what WebSocket and REST carry
 src/seed.rs       Words to keys
 src/mls.rs        Groups, and the per-epoch keys exported for messages, files and calls
 src/wrap.rs       Wrapping epoch keys to accounts and unwrapping them with the words
+src/file.rs       Files: sealing and opening chunks, a file's description in a message, BlurHash
 src/queue.rs      The client's outgoing priority queue, the same for every client
 src/ulid.rs       Ulid, the primary key everywhere. The server uses this one too
 src/client.rs     A device's whole flow, the same for every client

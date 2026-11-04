@@ -165,9 +165,9 @@ the WASM build, because there is one `Cargo.lock`. Make targets stay inside
 - **A reply is a property of a message, not a kind:** a content message with a pointer.
 - **Every content message has a `content_kind`:** text, voice, reaction, image, video, doc,
   file, `video_call` and `voice_call` (saved, and can be replied to), and `text_call` (a
-  simulated call: a quick text chat, then hang up). **`media_bundle` is reserved as the last
-  value and is not built:** it is in no code, and the schema refuses it for now. The server
-  can read `content_kind`, so roles can allow or refuse each one.
+  simulated call: a quick text chat, then hang up), and `media_bundle` (several images and videos in
+  one message, built with files, chosen by the author). The server can read `content_kind`, so roles
+  can allow or refuse each one.
 - **A reaction is content.** It does not affect the unread count, but it brings the chat up in
   the sorted list and shows as the preview, like "Sara reacted 👍", until the next message.
 - **A `text_call`'s messages are saved, belong to that call, travel through the MoQ call,
@@ -298,12 +298,52 @@ would break the other.
 **An upload stays only once a saved message says so.** A message can be lost on a bad connection after
 its file went up, and the file would otherwise be kept forever. So the message a client sends carries a
 `persist` list of its file ids, and the chat's task marks those files to stay in the same step that saves
-the message and gives it its sequence id. If the message never lands, the file stays unmarked. The name
-`persist` is the author's; its exact shape and the rest of the upload are still to ask when files are built.
+the message and gives it its sequence id. If the message never lands, the file stays unmarked. **It is an
+optional list of file ids, chosen by the author:** `persist: ["01J..."]`. The chat's task refuses the send
+unless each file belongs to this chat, was uploaded by this account's device, is complete and is not yet
+used. **A delete or edit names the files it drops in `remove: [...]`, chosen by the author**, beside
+`persist`.
 
 **Files uploaded but never marked are removed when the chat's task loads, and at startup.** There
 is no job running on a timer. Only unmarked files older than a set age go, so an upload in progress is
-safe. An idle chat's unmarked files stay until it next loads or the server restarts.
+safe. An idle chat's unmarked files stay until it next loads or the server restarts. **That age is 1 day,
+chosen by the author**, fixed in code: long enough for a slow upload of a large video on a bad network.
+
+**How a file is built, chosen by the author:**
+
+- **Chunks are 1 MiB of plaintext**, each AES-128-GCM under the file's own random 16-byte key, the same
+  strength as messages. A phone or browser holds a few in memory, and a 2 GiB video is 2048 chunks.
+- **A chunk's nonce is its number, and its associated data says whether it is the last.** The key
+  encrypts one file only, so counting is safe, and a server that reorders, swaps or cuts chunks makes
+  the file fail to open. Each chunk is its ciphertext and 16-byte tag, with no nonce stored.
+- **One request per chunk, in order.** Chunk n is accepted only after 0 to n-1, and sending the last
+  one again is fine. The server keeps one count, so after a dropped connection the client asks how many
+  arrived and goes on from there.
+- **The upload's `size` is the encrypted bytes**, what the server stores, so it checks every chunk's
+  length and the limits apply to what it holds. The real size is inside the encrypted message for
+  other clients.
+- **Chunks can be read only once a sent message has marked the file to stay.** Nobody fetches a
+  half-upload.
+- **Limits are per declared type under `[limits.upload]`, chosen by the author:** voice 50 MiB, image
+  20 MiB, video 2 GiB, doc 100 MiB and file 2 GiB, each changeable. A file's real type is encrypted, so
+  the server trusts what a client declares, and a client that lies gets the largest limit.
+- **There are no quotas for now**, only the per-file limits. They stay open, as rate limits do.
+- **The bytes live under `[files] directory` in `server.toml`**, an absolute path like `[www]`, with a
+  folder per chat named by its id and a file per upload named by its id.
+- **The encrypted message describes its file:** its id, name, type, real size, key and chunk count, and
+  for images and videos the width, height and a BlurHash in its standard text, so a chat draws the
+  right space before downloading. **BlurHash is made and read by core with the `blurhash` crate**, the
+  platform handing it small RGBA pixels, so there is one implementation. **A file message may carry an
+  optional caption.**
+- **`media_bundle` holds images and videos only, at most 20, fixed in core**, each with its own upload
+  limit by its type. **Each image and video may carry its own optional description, chosen by the
+  author**, and the bundle one optional caption. Its body limit is 64 KiB, which holds all of them. **An edit may remove files from
+  a bundle**, naming them in `remove`, and never adds any, so an edit never uploads.
+- **The code lives in two new files, chosen by the author:** `core/src/file.rs` seals and opens chunks
+  and describes a file inside a message; `server/src/file.rs` keeps the bytes on disk, writes and reads
+  chunks, and removes unused uploads. Routes stay in `api.rs` and rows in storage.
+- **Testing, chosen by the author:** the server's integration tests drive core as a real client, and the
+  bare Android screen picks a file with Android's picker, sends it, and another account opens it.
 
 ### Sending a message
 
@@ -608,6 +648,10 @@ POST /api/v1/chats                  chat.create_direct: account -> chat, created
 GET  /api/v1/chats/{id}/group_info  member -> epoch, group_info
 GET  /api/v1/chats/{id}/devices     member -> device_list, with ended devices and their statements
 GET  /api/v1/chats/{id}/wraps       member -> wrap_list{epoch, account, wrapped}
+POST /api/v1/chats/{id}/files       member: kind, size, chunks -> file
+PUT  /api/v1/files/{id}/chunks/{n}  its uploader: the encrypted chunk's raw bytes
+GET  /api/v1/files/{id}             member -> size, chunks, received
+GET  /api/v1/files/{id}/chunks/{n}  member, once a sent message keeps it -> the raw bytes
 GET  /api/v1/ws                     cookie or Bearer, subprotocol keryx.v1
 ```
 
@@ -730,6 +774,9 @@ accepts the first for each step. The loser gets a rejection, catches up and retr
   [www]
   directory = "/var/lib/keryx/www"
 
+  [files]
+  directory = "/var/lib/keryx/files"   # a folder per chat, a file per upload
+
   [limits]
   websocket_frame = "1MiB"
   rest_body = "1MiB"        # not file uploads
@@ -751,6 +798,14 @@ accepts the first for each step. The loser gets a rejection, catches up and retr
   video_call = "16KiB"
   voice_call = "16KiB"
   text_call = "64KiB"
+  media_bundle = "64KiB"
+
+  [limits.upload]           # one file's encrypted bytes, by the type its uploader declares
+  voice = "50MiB"
+  image = "20MiB"
+  video = "2GiB"
+  doc = "100MiB"
+  file = "2GiB"
 
   [tcp]
   send_timeout = "15s"      # no byte taken for this long: the connection closes. WebSocket and REST
@@ -1083,10 +1138,7 @@ another device still holding the key.
 - What the REST fallback looks like: how a client receives without a socket
 - Profiles: who may see and change them, image size and format limits, limits on bios and
   links, and where an account's folder lives
-- Files: chunk size, quotas, and how old an unused upload must be before it goes. Upload limits are
-  to be per declared type under `[limits.upload]`, such as voice 50 MiB, image 20 MiB, video 2 GiB,
-  doc 100 MiB and file 2 GiB. A file's real type is encrypted, so the server can only trust what a
-  client declares, and a client that lies gets the largest limit
+- Files: quotas, by the author's choice none for now
 - Calls: how a `text_call`'s MoQ messages reach the message table. The relay is in the same
   binary, so it could pass them to the chat's task. They need the normal message encryption
   rather than SFrame, so a new device can read them
@@ -1105,7 +1157,7 @@ another device still holding the key.
 
 **Attachments and search**
 
-- Quotas, retention and size limits for attachments
+- Quotas and retention for attachments
 - Local search: engine, whether borhan's normalizer is reused, and where it lives.
   **No module in the closed lists holds it yet**, and tantivy on WASM is unproven
 
