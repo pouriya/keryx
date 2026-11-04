@@ -108,6 +108,17 @@ account's device is not sent with the password.
 state, each chat's last sequence id, the queue and the MLS state. Each opened message, edit or delete
 goes out as an event, and the platform keeps the timeline, so the text sits in memory once.
 
+**It drives files, chosen by the author.** The platform holds the file's bytes, and core runs the
+loop: it asks for chunk n as an output, the platform reads those bytes and feeds them in, core seals
+them and asks for the PUT, and after a drop it resumes from the server's count. Downloads go the same
+way outward, each chunk opened and handed to the platform to write. So resuming and ordering are written
+once for every client. **It reports progress as events**, chunks done of the total for each upload and
+download, so every client can show it.
+
+**Chunk bytes cross beside the JSON, chosen by the author.** On Android, `step` takes an optional
+`byte[]` for a chunk, and an output carrying one hands its bytes back the same way, so a 1 MiB chunk is
+not 3.5 MB of JSON numbers. The web needs nothing new, since a `Uint8Array` already crosses as it is.
+
 **It asks to be woken, chosen by the author.** One of its outputs is "call me again at time T", and
 the platform keeps one timer and calls `step` with a timer input when it fires. So the `ping` frame,
 topping up key packages and retrying a rejected commit are timed the same way on every platform.
