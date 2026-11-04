@@ -228,13 +228,21 @@ class Engine(
         asked: Output.Request,
     ) {
         val meant = generation
-        val builder =
-            Request
-                .Builder()
-                .url(base + asked.path)
-                .method(asked.method, asked.body?.toRequestBody("application/json".toMediaType()))
-        asked.bearer?.let { builder.header("Authorization", "Bearer $it") }
-        http.newCall(builder.build()).enqueue(
+        // OkHttp refuses a POST or PUT with no body, which core sends where there is nothing to say.
+        val body = asked.body ?: if (asked.method == "GET" || asked.method == "DELETE") null else ""
+        val built =
+            try {
+                val builder =
+                    Request
+                        .Builder()
+                        .url(base + asked.path)
+                        .method(asked.method, body?.toRequestBody("application/json".toMediaType()))
+                asked.bearer?.let { builder.header("Authorization", "Bearer $it") }
+                builder.build()
+            } catch (_: IllegalArgumentException) {
+                return later(meant) { Input.Reply(asked.id, 0, "") }
+            }
+        http.newCall(built).enqueue(
             object : Callback {
                 override fun onFailure(
                     call: Call,
