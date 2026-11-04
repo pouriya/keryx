@@ -968,6 +968,8 @@ struct World {
     garble_welcomes: bool,
     /// Every wrap a commit carries for this account is stored as garbage.
     garble_wraps_for: Option<Ulid>,
+    /// The chat list leaves out each chat's epoch, as the field is optional.
+    hide_epoch: bool,
 }
 
 fn reply_ok(data: Value) -> (u16, String) {
@@ -1054,6 +1056,7 @@ impl World {
             max_devices: None,
             garble_welcomes: false,
             garble_wraps_for: None,
+            hide_epoch: false,
         }
     }
 
@@ -1476,6 +1479,22 @@ impl World {
             }
         }
         count
+    }
+
+    /// Marks everything stored in this chat as seen by this account's other device, so this one
+    /// never handled it.
+    fn seen_elsewhere(&mut self, p: usize, chat: Ulid) {
+        let me = self.account(p);
+        let up_to = self.hub_chat(chat).message_list.len() as u64;
+        self.position(me, Ulid::new().unwrap(), chat, up_to, false);
+        self.settle();
+    }
+
+    /// Marks everything stored in this chat as seen, as a person reading it would.
+    fn see_all(&mut self, p: usize, chat: Ulid) {
+        let up_to_seq = self.hub_chat(chat).message_list.len() as u64;
+        self.command(p, Command::Seen { chat, up_to_seq });
+        self.settle();
     }
 
     fn sent_frames(&self, p: usize, kind: &str) -> usize {
@@ -2294,6 +2313,13 @@ impl World {
                 }
                 mark_list.push(mark);
             }
+            // As the real server does: this member's own seen position, 0 before any `seen`.
+            let mut seen_seq = 0;
+            for item in &chat.position_list {
+                if item.account == me {
+                    seen_seq = item.seen_seq.unwrap_or(0);
+                }
+            }
             chat_list.push(ChatItem {
                 chat: chat.id,
                 chat_type: chat.chat_type,
@@ -2302,10 +2328,10 @@ impl World {
                 last_kind: None,
                 last_at: None,
                 last_content_seq: None,
-                epoch: chat.epoch,
+                epoch: if self.hide_epoch { None } else { chat.epoch },
                 last_content,
                 mark_list,
-                seen_seq: None,
+                seen_seq: Some(seen_seq),
             });
         }
         chat_list
@@ -2317,6 +2343,11 @@ fn pair() -> (World, usize, usize, Ulid) {
     let omid = world.person("omid", OMID_WORDS);
     let mina = world.person("mina", MINA_WORDS);
     let chat = world.start(omid, mina);
+    // A reload pages the self chat's new-device notice until it is seen. Seeing it here keeps
+    // the tests about the chat they are on.
+    for phone in [omid, mina] {
+        world.see_all(phone, world.self_chat(world.account(phone)));
+    }
     (world, omid, mina, chat)
 }
 
@@ -2374,7 +2405,8 @@ fn has_login(world: &World, phone: usize) -> bool {
 }
 
 #[test]
-fn messages_missed_while_away_are_fetched_on_reconnect_and_a_reload_starts_fresh() {
+fn messages_missed_while_away_are_fetched_on_reconnect_and_a_reload_fetches_from_the_seen_position()
+{
     let (mut world, omid, mina, chat) = pair();
     world.offline(mina);
     tell(&mut world, omid, chat, "one");
@@ -2396,15 +2428,23 @@ fn messages_missed_while_away_are_fetched_on_reconnect_and_a_reload_starts_fresh
 
     world.offline(mina);
     tell(&mut world, omid, chat, "three");
+    // Nothing was marked seen, so a reload fetches and opens everything after the start.
     let restarted = world.reload(mina);
     world.settle();
-    // The list's preview is shown. Nothing older is fetched until the chat is opened.
-    assert_eq!(world.texts(restarted, chat), vec!["three".to_string()]);
-    world.command(restarted, Command::OpenChat { chat });
+    assert_eq!(world.texts(restarted, chat), vec!["one", "two", "three"]);
+
+    world.see_all(restarted, chat);
+    world.offline(restarted);
+    tell(&mut world, omid, chat, "four");
+    let again = world.reload(restarted);
+    world.settle();
+    // Only what came after the seen position. Nothing older is fetched until the chat is opened.
+    assert_eq!(world.texts(again, chat), vec!["four"]);
+    world.command(again, Command::OpenChat { chat });
     world.settle();
     assert_eq!(
-        world.texts(restarted, chat),
-        vec!["one".to_string(), "two".to_string(), "three".to_string()]
+        world.texts(again, chat),
+        vec!["one", "two", "three", "four"]
     );
 }
 
@@ -2481,16 +2521,21 @@ fn what_needs_the_socket_is_kept_and_typing_is_not() {
     let (mut world, omid, mina, chat) = pair();
     tell(&mut world, omid, chat, "there");
     world.offline(mina);
+    let (seen, pages) = (
+        world.sent_frames(mina, "seen"),
+        world.sent_frames(mina, "history"),
+    );
     world.command(mina, Command::Seen { chat, up_to_seq: 1 });
     world.command(mina, Command::OpenChat { chat });
     world.command(mina, Command::Typing { chat, on: true });
     world.settle();
-    assert_eq!(world.sent_frames(mina, "seen"), 0);
-    assert_eq!(world.sent_frames(mina, "history"), 0);
+    assert_eq!(world.sent_frames(mina, "seen"), seen);
+    assert_eq!(world.sent_frames(mina, "history"), pages);
     assert_eq!(world.sent_frames(mina, "typing"), 0);
     world.online(mina);
-    assert_eq!(world.sent_frames(mina, "seen"), 1);
-    assert_eq!(world.sent_frames(mina, "history"), 1);
+    assert_eq!(world.sent_frames(mina, "seen"), seen + 1);
+    // The opened chat's page, and the self chat's notice, which this device has not handled yet.
+    assert_eq!(world.sent_frames(mina, "history"), pages + 2);
     assert_eq!(world.sent_frames(mina, "typing"), 0);
 
     // A key change carries its group info, so nothing else goes up for it.
@@ -2946,6 +2991,9 @@ fn two_people_starting_the_same_chat_at_once_end_in_one_group() {
 #[test]
 fn many_missed_messages_are_fetched_page_by_page_in_order() {
     let (mut world, omid, mina, chat) = pair();
+    // A first reconnect pages the self chat's notice, so the pages below are this chat's alone.
+    world.cut(mina);
+    world.advance(2 * SECOND);
     world.offline(mina);
     let mut expected = Vec::new();
     for n in 0..120 {
@@ -2978,6 +3026,9 @@ fn a_live_message_that_skips_ahead_fetches_the_gap_and_keeps_what_comes_meanwhil
 #[test]
 fn a_refused_fill_is_reported_and_runs_again_on_the_next_connection() {
     let (mut world, omid, mina, chat) = pair();
+    // A first reconnect pages the self chat's notice, so the pages below are this chat's alone.
+    world.cut(mina);
+    world.advance(2 * SECOND);
     world.offline(mina);
     tell(&mut world, omid, chat, "one");
     tell(&mut world, omid, chat, "two");
@@ -3005,6 +3056,8 @@ fn a_reloaded_device_behind_on_keys_catches_up_through_older_pages() {
         tell(&mut world, omid, chat, &text);
         expected.push(text);
     }
+    // Read on her other device, so this one starts at the newest and has to look back.
+    world.seen_elsewhere(mina, chat);
     let mina = world.reload(mina);
     world.settle();
     // The commit sits under more than one page of messages.
@@ -3023,6 +3076,7 @@ fn a_refused_catch_up_is_reported_and_runs_again_on_the_next_connection() {
     world.offline(mina);
     world.advance(8 * DAY);
     tell(&mut world, omid, chat, "rotated");
+    world.seen_elsewhere(mina, chat);
     let mina = world.reload(mina);
     world.phones[mina]
         .frame_faults
@@ -3354,6 +3408,7 @@ fn older_pages_load_until_the_first_message_even_when_asked_offline() {
         tell(&mut world, omid, chat, &text);
         expected.push(text);
     }
+    world.see_all(mina, chat);
     let mina = world.reload(mina);
     world.settle();
     world.command(mina, Command::OpenChat { chat });
@@ -3419,6 +3474,7 @@ fn edits_and_deletes_reach_the_other_side_and_a_deleted_message_stays_removed() 
         }
     }
     assert_eq!(deleted, vec![seq]);
+    world.see_all(mina, chat);
     let mina = world.reload(mina);
     world.settle();
     world.command(mina, Command::OpenChat { chat });
@@ -3493,7 +3549,8 @@ fn a_restore_whose_wraps_are_refused_or_unreadable_shows_what_waited_and_lets_th
         world.restore(second, OMID_WORDS);
         assert!(world.ready(second, chat), "{:?}", world.errors(second));
         assert_eq!(world.errors(second).len(), 1, "{:?}", world.errors(second));
-        // The key from before this device joined never came, so the preview shows with no text.
+        // The key from before this device joined never came, so the preview shows with no text,
+        // and so does the same message again, fetched from the account's seen position.
         let mut shown = Vec::new();
         for event in &world.phones[second].events {
             if let Event::Message { message } = event
@@ -3502,7 +3559,7 @@ fn a_restore_whose_wraps_are_refused_or_unreadable_shows_what_waited_and_lets_th
                 shown.push(message.text.is_some());
             }
         }
-        assert_eq!(shown, vec![false]);
+        assert_eq!(shown, vec![false, false]);
         // Nothing else is waiting on the words: a later chat is not restored with them.
         assert_eq!(
             world.asked(second, &format!("GET /api/v1/chats/{chat}/wraps")),
@@ -3571,6 +3628,9 @@ fn a_reload_after_a_key_change_whose_answer_never_came_rejoins_and_carries_on() 
 #[test]
 fn live_messages_arriving_during_a_fill_are_kept_and_shown_after_it() {
     let (mut world, omid, mina, chat) = pair();
+    // A first reconnect pages the self chat's notice, so the pages below are this chat's alone.
+    world.cut(mina);
+    world.advance(2 * SECOND);
     world.offline(mina);
     tell(&mut world, omid, chat, "one");
     world.phones[mina].network = true;
@@ -3602,6 +3662,7 @@ fn pages_on_their_way_when_the_connection_drops_are_asked_again() {
     for n in 0..60 {
         tell(&mut world, omid, chat, &format!("p{n}"));
     }
+    world.see_all(mina, chat);
     let mina = world.reload(mina);
     world.settle();
     world.phones[mina]
@@ -3770,4 +3831,137 @@ fn small_refusals_say_what_failed_and_leave_the_rest_working() {
             .any(|event| matches!(event, Event::DeviceList { .. }))
     );
     assert_eq!(world.errors(omid), vec!["forbidden"]);
+}
+
+#[test]
+fn a_welcome_from_someone_whose_master_key_changed_is_refused() {
+    let (mut world, omid, mina, chat) = pair();
+    // Someone claiming Omid's account under other words starts a chat with one of Mina's packages.
+    let omid_account = world.account(omid);
+    let mina_account = world.account(mina);
+    let forged = derive(WORDS).unwrap();
+    let mina_keys = derive(MINA_WORDS).unwrap();
+    let account_list = vec![
+        AccountKey {
+            account: omid_account,
+            account_public: *forged.account_public(),
+            master_public: *forged.master_public(),
+            stamp: stamp_account_key(&forged, &omid_account),
+        },
+        AccountKey {
+            account: mina_account,
+            account_public: *mina_keys.account_public(),
+            master_public: *mina_keys.master_public(),
+            stamp: stamp_account_key(&mina_keys, &mina_account),
+        },
+    ];
+    let mut forger = Device::create(&forged, omid_account, Ulid::new().unwrap()).unwrap();
+    let other = Ulid::new().unwrap();
+    forger.create_chat(other, world.now, &account_list).unwrap();
+    let mina_device = world.device_of(mina);
+    let mut package = None;
+    for (owner, body) in &world.packages {
+        if *owner == mina_device {
+            package = Some(body.clone());
+        }
+    }
+    let commit = forger
+        .add_devices(other, &[package.unwrap()], &account_list)
+        .unwrap();
+    world.push(
+        mina,
+        ServerFrame::Welcome {
+            chat: other,
+            body: Bytes(commit.welcome.unwrap()),
+        },
+    );
+    world.settle();
+    assert_eq!(world.errors(mina), vec!["bad_welcome"]);
+    assert!(!world.ready(mina, other));
+    tell(&mut world, mina, chat, "still here");
+    assert_eq!(world.texts(omid, chat), vec!["still here"]);
+}
+
+#[test]
+fn a_device_whose_saved_state_fell_behind_catches_up_when_a_newer_key_change_arrives() {
+    let (mut world, omid, mina, chat) = pair();
+    tell(&mut world, omid, chat, "before");
+    let old = world.phones[mina].slots.clone();
+    // Two new devices of Omid's join: two key changes with no message after them.
+    for _ in 0..2 {
+        let more = world.log_in("omid");
+        world.restore(more, OMID_WORDS);
+        assert!(world.ready(more, chat), "{:?}", world.errors(more));
+    }
+    world.see_all(mina, chat);
+    // Both slots hold the state from before those joins, the preview is older than them, and the
+    // list does not say how far the chat has moved, so nothing looks behind until the next commit.
+    world.phones[mina].slots = old;
+    world.hide_epoch = true;
+    let mina = world.reload(mina);
+    world.settle();
+    assert_eq!(world.texts(mina, chat), vec!["before"]);
+    let pages = world.sent_frames(mina, "history");
+    world.advance(8 * DAY);
+    tell(&mut world, omid, chat, "after");
+    assert!(world.sent_frames(mina, "history") > pages);
+    assert!(world.errors(mina).is_empty(), "{:?}", world.errors(mina));
+    assert_eq!(world.texts(mina, chat), vec!["before", "after"]);
+    tell(&mut world, mina, chat, "caught up");
+    assert_eq!(world.texts(omid, chat), vec!["caught up"]);
+}
+
+#[test]
+fn an_unencrypted_message_shows_as_such_and_one_with_no_device_is_malformed() {
+    let (mut world, omid, mina, chat) = pair();
+    let [first, second] = world.phones[omid].slots.clone();
+    let device = Device::import(first.as_deref(), second.as_deref())
+        .unwrap()
+        .device;
+    let mut message = MessageFrame {
+        chat,
+        seq: 0,
+        device: Some(world.device_of(omid)),
+        kind: Some(Kind::Content),
+        content_kind: Some(ContentKind::Text),
+        encrypted: Some(false),
+        epoch: world.hub_chat(chat).epoch,
+        pointer_seq: None,
+        call_seq: None,
+        client_sent_at: Some(world.now),
+        server_saved_at: Some(world.now),
+        body: Some(Bytes(br#"{"text":"in the clear"}"#.to_vec())),
+        signature: None,
+    };
+    let signature = device
+        .sign(
+            &message.header().unwrap(),
+            &message.body.as_ref().unwrap().0,
+        )
+        .unwrap();
+    message.signature = Some(Bytes(signature.to_vec()));
+    let clear = world.append(message.clone());
+    message.device = None;
+    let malformed = world.append(message);
+    world.settle();
+    let mut shown = Vec::new();
+    for event in &world.phones[mina].events {
+        if let Event::Message { message } = event
+            && message.chat == chat
+        {
+            shown.push((
+                message.seq,
+                message.encrypted,
+                message.text.as_ref().map(|text| text.0.clone()),
+                message.problem,
+            ));
+        }
+    }
+    assert_eq!(
+        shown,
+        vec![
+            (clear, false, Some("in the clear".to_string()), None),
+            (malformed, false, None, Some(Problem::Malformed)),
+        ]
+    );
 }
