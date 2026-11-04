@@ -36,11 +36,11 @@ error paths, are still to do:** see [core/tests/AGENTS.md](core/tests/AGENTS.md)
 
 - **Proven:** `openmls` 0.9.2 runs in WASM under Node: adding a member, a message, an external
   commit, and all three members exporting the same key. It now runs in Chromium too, through the bare page.
-- **Next:** the web client, designed in [web/AGENTS.md](web/AGENTS.md), built in the author's order:
-  first `core/src/client.rs`, with the server's tests driving it and `received` and `marks` added to the
-  server, all passing `make all`; then `web/wasm/` and a bare worker that logs in and sends a message in
-  the author's Chromium, both done; then the account screens (sign up, log in, the setup link and the words), checked in the author's Chromium. The chat list is next. Running `core/`'s tests in WASM waits until after it starts:
-  see [core/tests/AGENTS.md](core/tests/AGENTS.md).
+- **Done on the web:** `core/src/client.rs` driven by the server's tests, `web/wasm/` and the bare worker,
+  the account screens and the chat list, all checked in the author's Chromium.
+- **Next, chosen by the author: the Android client, with the web client on hold.** Android follows the
+  web client's design decisions in [web/AGENTS.md](web/AGENTS.md); the chat screen, directory search and
+  the device list are decided there and built in neither yet. Starting Android begins with its QA.
 
 Delete this section when it stops being true.
 
@@ -634,7 +634,8 @@ operation is one unit of work**, a `run_*` function, so adapting all of them lat
 
 ### First phase
 
-The web client. **No Android work in this phase**, and `android/` is not created yet.
+The web client, then the Android client. **The web client is on hold while Android starts, chosen by
+the author**, and Android follows the web client's design decisions. `android/` is not created yet.
 
 **The first working thing is 1:1 encrypted text:** two browsers sign up, generate
 their words, and send encrypted text over WebSocket, under keys from MLS. This comes first because
