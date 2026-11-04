@@ -89,8 +89,8 @@ numbered!(
 );
 
 numbered!(
-    /// The numbers are the `message.content_kind` column's. `MediaBundle` is several images and
-    /// videos in one message.
+    /// The numbers are the `message.content_kind` column's. `Call` is one call, with everything
+    /// inside it kept beside it. `MediaBundle` is several images and videos in one message.
     ContentKind {
         Text = 0,
         Voice = 1,
@@ -99,10 +99,8 @@ numbered!(
         Video = 4,
         Doc = 5,
         File = 6,
-        VideoCall = 7,
-        VoiceCall = 8,
-        TextCall = 9,
-        MediaBundle = 10,
+        Call = 7,
+        MediaBundle = 8,
     }
 );
 

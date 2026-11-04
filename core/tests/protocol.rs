@@ -109,9 +109,8 @@ fn kinds_match_the_schema() {
         ContentKind::Video,
         ContentKind::Doc,
         ContentKind::File,
-        ContentKind::VideoCall,
-        ContentKind::VoiceCall,
-        ContentKind::TextCall,
+        ContentKind::Call,
+        ContentKind::MediaBundle,
     ];
     for (number, content_kind) in content_kinds.iter().enumerate() {
         assert_eq!(*content_kind as usize, number);

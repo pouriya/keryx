@@ -86,9 +86,7 @@ pub const PERMISSION_LIST: &[&str] = &[
     "message.send.video",
     "message.send.doc",
     "message.send.file",
-    "message.send.video_call",
-    "message.send.voice_call",
-    "message.send.text_call",
+    "message.send.call",
     "message.send.media_bundle",
     SEND_UNENCRYPTED,
     MESSAGE_COMMIT,
@@ -109,9 +107,7 @@ pub fn send_permission(content_kind: ContentKind) -> &'static str {
         ContentKind::Video => "message.send.video",
         ContentKind::Doc => "message.send.doc",
         ContentKind::File => "message.send.file",
-        ContentKind::VideoCall => "message.send.video_call",
-        ContentKind::VoiceCall => "message.send.voice_call",
-        ContentKind::TextCall => "message.send.text_call",
+        ContentKind::Call => "message.send.call",
         ContentKind::MediaBundle => "message.send.media_bundle",
     }
 }
@@ -275,9 +271,7 @@ pub struct BodyLimits {
     pub video: u64,
     pub doc: u64,
     pub file: u64,
-    pub video_call: u64,
-    pub voice_call: u64,
-    pub text_call: u64,
+    pub call: u64,
     pub media_bundle: u64,
 }
 
@@ -291,9 +285,7 @@ impl Default for BodyLimits {
             video: 16 * 1024,
             doc: 16 * 1024,
             file: 16 * 1024,
-            video_call: 16 * 1024,
-            voice_call: 16 * 1024,
-            text_call: 64 * 1024,
+            call: 16 * 1024,
             media_bundle: 64 * 1024,
         }
     }
@@ -309,9 +301,7 @@ impl BodyLimits {
             ContentKind::Video => self.video,
             ContentKind::Doc => self.doc,
             ContentKind::File => self.file,
-            ContentKind::VideoCall => self.video_call,
-            ContentKind::VoiceCall => self.voice_call,
-            ContentKind::TextCall => self.text_call,
+            ContentKind::Call => self.call,
             ContentKind::MediaBundle => self.media_bundle,
         }
     }

@@ -64,9 +64,7 @@ image = "16KiB"
 video = "16KiB"
 doc = "16KiB"
 file = "16KiB"
-video_call = "16KiB"
-voice_call = "16KiB"
-text_call = "64KiB"
+call = "16KiB"
 media_bundle = "64KiB"
 
 [limits.upload]           # one file's encrypted bytes, by the type its uploader declares

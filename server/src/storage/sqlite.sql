@@ -430,10 +430,9 @@ CREATE TABLE message (
     -- [RBAC, Chat list, Calls] what a content message is, and NULL for every other kind. Readable
     -- by the server even in an encrypted chat, so roles can allow or refuse each one:
     -- 0 text, 1 voice, 2 reaction, 3 image, 4 video, 5 doc, 6 file,
-    -- 7 video_call, 8 voice_call (saved, and can be replied to),
-    -- 9 text_call (a simulated call: a quick text chat, then hang up),
-    -- 10 media_bundle (several images and videos in one message).
-    content_kind       INTEGER CHECK (content_kind BETWEEN 0 AND 10),
+    -- 7 call (one per call, saved, and can be replied to; what happens inside it is in
+    -- call_event), 8 media_bundle (several images and videos in one message).
+    content_kind       INTEGER CHECK (content_kind BETWEEN 0 AND 8),
     -- [Unencrypted messages] the flag that tells a client how to read the body.
     encrypted          INTEGER CHECK (encrypted IN (0, 1)),
     -- [Restore, Commit order] the key this was encrypted under, and for a commit, the step it
@@ -466,7 +465,7 @@ CREATE TABLE message (
     CHECK (encrypted = 0 OR epoch IS NOT NULL),
     CHECK ((kind = 0) = (content_kind IS NOT NULL)),
     CHECK (call_seq IS NULL OR kind = 0),
-    CHECK (call_outcome IS NULL OR content_kind IN (7, 8, 9)),
+    CHECK (call_outcome IS NULL OR content_kind = 7),
     CHECK (kind <> 3 OR epoch IS NOT NULL),
     CHECK (kind NOT IN (1, 2) OR pointer_seq IS NOT NULL),
     CHECK (content_kind IS NOT 2 OR encrypted = 1 OR pointer_seq IS NOT NULL),
