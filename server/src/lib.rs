@@ -3,4 +3,5 @@
 pub mod api;
 pub mod captcha;
 pub mod chat;
+pub mod file;
 pub mod storage;

@@ -237,8 +237,8 @@ fn a_message_is_whole_or_only_its_sequence_id() {
 #[test]
 fn kinds_and_their_fields_go_together() {
     let connection = world();
-    // 10 is media_bundle, which is not built, and 11 does not exist.
-    assert!(message(&connection, 30, 1, 11, 0, Some(10), Some(1)).is_err());
+    // 10 is media_bundle, and 11 does not exist.
+    assert!(message(&connection, 30, 1, 11, 0, Some(11), Some(1)).is_err());
     assert!(message(&connection, 30, 1, 11, 5, None, Some(1)).is_err());
     assert!(message(&connection, 30, 1, 11, 0, None, Some(1)).is_err());
     assert!(message(&connection, 30, 1, 11, 1, Some(0), Some(1)).is_err());

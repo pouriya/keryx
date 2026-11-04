@@ -89,8 +89,8 @@ numbered!(
 );
 
 numbered!(
-    /// The numbers are the `message.content_kind` column's. 10 is reserved for `media_bundle`,
-    /// which is not built.
+    /// The numbers are the `message.content_kind` column's. `MediaBundle` is several images and
+    /// videos in one message.
     ContentKind {
         Text = 0,
         Voice = 1,
@@ -102,6 +102,7 @@ numbered!(
         VideoCall = 7,
         VoiceCall = 8,
         TextCall = 9,
+        MediaBundle = 10,
     }
 );
 
@@ -210,6 +211,12 @@ pub struct SendFrame {
     /// A commit's: the chat's group info at the epoch it moves to, which the server keeps with it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_info: Option<Bytes>,
+    /// A content message's files, which the server keeps from now on. See the root AGENTS.md.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub persist: Vec<Ulid>,
+    /// An edit's or delete's files, which the server removes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remove: Vec<Ulid>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -729,6 +736,28 @@ pub struct CreateChatBody {
 pub struct ChatReply {
     pub chat: Ulid,
     pub created: bool,
+}
+
+/// A new upload into a chat. `kind` is the declared type that picks the limit: voice, image,
+/// video, doc or file. `size` is the encrypted bytes, and `chunks` how many.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateFileBody {
+    pub kind: ContentKind,
+    pub size: u64,
+    pub chunks: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileReply {
+    pub file: Ulid,
+}
+
+/// How far an upload got: `received` chunks of `chunks`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileStatusReply {
+    pub size: u64,
+    pub chunks: u64,
+    pub received: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

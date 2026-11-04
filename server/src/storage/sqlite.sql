@@ -431,10 +431,9 @@ CREATE TABLE message (
     -- by the server even in an encrypted chat, so roles can allow or refuse each one:
     -- 0 text, 1 voice, 2 reaction, 3 image, 4 video, 5 doc, 6 file,
     -- 7 video_call, 8 voice_call (saved, and can be replied to),
-    -- 9 text_call (a simulated call: a quick text chat, then hang up).
-    -- 10 is reserved for media_bundle (several images and videos in one message), which is
-    -- not built, so the CHECK refuses it for now.
-    content_kind       INTEGER CHECK (content_kind BETWEEN 0 AND 9),
+    -- 9 text_call (a simulated call: a quick text chat, then hang up),
+    -- 10 media_bundle (several images and videos in one message).
+    content_kind       INTEGER CHECK (content_kind BETWEEN 0 AND 10),
     -- [Unencrypted messages] the flag that tells a client how to read the body.
     encrypted          INTEGER CHECK (encrypted IN (0, 1)),
     -- [Restore, Commit order] the key this was encrypted under, and for a commit, the step it
@@ -558,8 +557,15 @@ CREATE TABLE file (
     account_id       BLOB REFERENCES account (id) ON DELETE CASCADE,
     -- [Unencrypted messages] 0 only for files in an unencrypted chat.
     encrypted        INTEGER NOT NULL CHECK (encrypted IN (0, 1)),
-    -- [Quotas] the exact size in bytes.
+    -- [Upload limits] the type its uploader declared, which picks the limit: 1 voice, 3 image,
+    -- 4 video, 5 doc, 6 file, as message.content_kind. The real type is encrypted.
+    kind             INTEGER NOT NULL CHECK (kind IN (1, 3, 4, 5, 6)),
+    -- [Quotas, Upload limits] the exact encrypted size in bytes.
     size             INTEGER NOT NULL CHECK (size >= 0),
+    -- [Files] how many chunks it is uploaded in.
+    chunks           INTEGER NOT NULL CHECK (chunks >= 1),
+    -- [Files] how many chunks arrived, in order, so an upload resumes from there.
+    received         INTEGER NOT NULL DEFAULT 0 CHECK (received BETWEEN 0 AND chunks),
     -- [Quotas, Signatures, Delete] which device uploaded it. Its account may remove the file, and
     -- so may a role permitted to in that chat, and either person for a call's recording.
     uploaded_by      BLOB NOT NULL REFERENCES device (id),

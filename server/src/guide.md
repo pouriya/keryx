@@ -72,10 +72,21 @@ good.
     GET  /chats/{id}/devices              -> device_list{account, device, public_key, stamp,
                                              master_public, statement?}
     GET  /chats/{id}/wraps                -> wrap_list{epoch, account, wrapped}
+    POST /chats/{id}/files                kind, size, chunks -> file
+    PUT  /files/{id}/chunks/{n}           the encrypted chunk's raw bytes -> size, chunks, received
+    GET  /files/{id}                      -> size, chunks, received
+    GET  /files/{id}/chunks/{n}           -> the encrypted chunk's raw bytes
 
 Claiming hands out one package per device and deletes it. `POST /chats` gives the pair's chat, and your
 own account id gives your self chat. The `/chats/{id}` routes need you to be in that chat. In
 `device_list`, a device with a `statement` has ended, and that is its signed revocation or logout.
+
+A file is encrypted by its sender in chunks of 1 MiB, each followed by its 16-byte tag. `kind` is the
+type that picks the upload limit (1 voice, 3 image, 4 video, 5 doc, 6 file), and `size` counts the
+encrypted bytes. Chunks go up in order, and sending the last one again is fine, so after a drop, ask
+`GET /files/{id}` and go on from `received`. Only the uploader's account puts chunks. A `send` keeps
+its files by listing them in `persist`, and until then only the uploader reads them. An edit or delete
+lists the files it drops in `remove`. An upload no sent message keeps is removed after a day.
 
 ## The WebSocket
 

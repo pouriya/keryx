@@ -89,7 +89,14 @@ fn read_configuration(path: &Path) -> anyhow::Result<Settings> {
         .optional("file", ByteSize::new())
         .optional("video_call", ByteSize::new())
         .optional("voice_call", ByteSize::new())
-        .optional("text_call", ByteSize::new());
+        .optional("text_call", ByteSize::new())
+        .optional("media_bundle", ByteSize::new());
+    let upload = StaticMap::new()
+        .optional("voice", ByteSize::new())
+        .optional("image", ByteSize::new())
+        .optional("video", ByteSize::new())
+        .optional("doc", ByteSize::new())
+        .optional("file", ByteSize::new());
     let schema = StaticMap::new()
         .required_any("listen")
         .required_any("public_url")
@@ -115,6 +122,7 @@ fn read_configuration(path: &Path) -> anyhow::Result<Settings> {
             StaticMap::new().optional("idle_after", DurationValue::new().to_int()),
         )
         .required("www", StaticMap::new().required_any("directory"))
+        .required("files", StaticMap::new().required_any("directory"))
         .optional(
             "limits",
             StaticMap::new()
@@ -126,7 +134,8 @@ fn read_configuration(path: &Path) -> anyhow::Result<Settings> {
                 .optional("ping_every", DurationValue::new().to_int())
                 .optional("ping_timeout", DurationValue::new().to_int())
                 .optional_any("key_packages")
-                .optional("body", body),
+                .optional("body", body)
+                .optional("upload", upload),
         )
         .optional(
             "tcp",
@@ -195,6 +204,7 @@ fn read_configuration(path: &Path) -> anyhow::Result<Settings> {
     let mut path_list = vec![
         ("database.path", &settings.database.path),
         ("www.directory", &settings.www.directory),
+        ("files.directory", &settings.files.directory),
     ];
     if let Some(tls) = &settings.tls {
         path_list.push(("tls.certificate", &tls.certificate));

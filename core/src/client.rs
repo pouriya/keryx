@@ -2015,6 +2015,8 @@ impl Client {
             wrap_list: Vec::new(),
             welcome_list: Vec::new(),
             group_info: None,
+            persist: Vec::new(),
+            remove: Vec::new(),
         };
         self.in_flight.insert(
             local,
@@ -2203,6 +2205,8 @@ impl Client {
             wrap_list,
             welcome_list,
             group_info: Some(Bytes(commit.group_info)),
+            persist: Vec::new(),
+            remove: Vec::new(),
         };
         let snapshot = match device.export() {
             Ok(snapshot) => snapshot,

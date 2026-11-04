@@ -37,12 +37,12 @@ use keryx_core::mls::{
 };
 use keryx_core::protocol::{
     AccountInfo, AccountKeysBody, AccountListReply, AccountReply, Bytes, ChallengeBody,
-    ChallengeReply, ChatDeviceListReply, ChatReply, ClientFrame, ContentKind, CountReply,
-    CreateAccountBody, CreateChatBody, CreatedAccountReply, DeviceListReply, DeviceReply,
-    DevicesReply, EmptyReply, FeaturesReply, GroupInfoReply, KeyPackageListReply, KeyPackagesBody,
-    LoginBody, LoginReply, ReducedDeviceItem, ReducedDeviceListReply, RegisterBody,
-    RegisterDeviceBody, ResetBody, SelfChatReply, ServerFrame, SessionListReply, SetupBody,
-    SetupReply, SignedBody, WrapListReply,
+    ChallengeReply, ChatDeviceListReply, ChatMode, ChatReply, ClientFrame, ContentKind, CountReply,
+    CreateAccountBody, CreateChatBody, CreateFileBody, CreatedAccountReply, DeviceListReply,
+    DeviceReply, DevicesReply, EmptyReply, FeaturesReply, FileReply, FileStatusReply,
+    GroupInfoReply, KeyPackageListReply, KeyPackagesBody, LoginBody, LoginReply, ReducedDeviceItem,
+    ReducedDeviceListReply, RegisterBody, RegisterDeviceBody, ResetBody, SelfChatReply,
+    ServerFrame, SessionListReply, SetupBody, SetupReply, SignedBody, WrapListReply,
 };
 use keryx_core::ulid::Ulid;
 use serde::de::DeserializeOwned;
@@ -58,9 +58,11 @@ use tracing::Instrument;
 
 use crate::captcha;
 use crate::chat::{Hub, Job, Out, answer_of, encode, hand_welcomes, push};
+use crate::file;
 use crate::storage::sqlite::Sqlite;
 use crate::storage::{
-    self, BuiltInRole, NewAccount, NewDevice, NewSession, Registered, Session, Storage,
+    self, BuiltInRole, NewAccount, NewDevice, NewFile, NewSession, Registered, Session, Storage,
+    StoredFile,
 };
 
 pub const CHAT_CREATE_DIRECT: &str = "chat.create_direct";
@@ -87,6 +89,7 @@ pub const PERMISSION_LIST: &[&str] = &[
     "message.send.video_call",
     "message.send.voice_call",
     "message.send.text_call",
+    "message.send.media_bundle",
     SEND_UNENCRYPTED,
     MESSAGE_COMMIT,
     EDIT_OWN,
@@ -109,6 +112,7 @@ pub fn send_permission(content_kind: ContentKind) -> &'static str {
         ContentKind::VideoCall => "message.send.video_call",
         ContentKind::VoiceCall => "message.send.voice_call",
         ContentKind::TextCall => "message.send.text_call",
+        ContentKind::MediaBundle => "message.send.media_bundle",
     }
 }
 
@@ -151,6 +155,7 @@ pub struct Settings {
     #[serde(default)]
     pub chat: ChatSettings,
     pub www: WwwSettings,
+    pub files: FilesSettings,
     #[serde(default)]
     pub limits: Limits,
     #[serde(default)]
@@ -222,6 +227,12 @@ pub struct WwwSettings {
     pub directory: PathBuf,
 }
 
+/// `[files]`: where uploads' bytes live, a folder per chat.
+#[derive(Deserialize)]
+pub struct FilesSettings {
+    pub directory: PathBuf,
+}
+
 #[derive(Deserialize)]
 #[serde(default)]
 pub struct Limits {
@@ -234,6 +245,7 @@ pub struct Limits {
     pub ping_timeout: u64,
     pub key_packages: u64,
     pub body: BodyLimits,
+    pub upload: UploadLimits,
 }
 
 impl Default for Limits {
@@ -248,6 +260,7 @@ impl Default for Limits {
             ping_timeout: 5,
             key_packages: 100,
             body: BodyLimits::default(),
+            upload: UploadLimits::default(),
         }
     }
 }
@@ -265,6 +278,7 @@ pub struct BodyLimits {
     pub video_call: u64,
     pub voice_call: u64,
     pub text_call: u64,
+    pub media_bundle: u64,
 }
 
 impl Default for BodyLimits {
@@ -280,6 +294,7 @@ impl Default for BodyLimits {
             video_call: 16 * 1024,
             voice_call: 16 * 1024,
             text_call: 64 * 1024,
+            media_bundle: 64 * 1024,
         }
     }
 }
@@ -297,6 +312,45 @@ impl BodyLimits {
             ContentKind::VideoCall => self.video_call,
             ContentKind::VoiceCall => self.voice_call,
             ContentKind::TextCall => self.text_call,
+            ContentKind::MediaBundle => self.media_bundle,
+        }
+    }
+}
+
+/// `[limits.upload]`: one file's encrypted bytes, by the type its uploader declares.
+#[derive(Deserialize)]
+#[serde(default)]
+pub struct UploadLimits {
+    pub voice: u64,
+    pub image: u64,
+    pub video: u64,
+    pub doc: u64,
+    pub file: u64,
+}
+
+impl Default for UploadLimits {
+    fn default() -> Self {
+        const MIB: u64 = 1024 * 1024;
+        Self {
+            voice: 50 * MIB,
+            image: 20 * MIB,
+            video: 2048 * MIB,
+            doc: 100 * MIB,
+            file: 2048 * MIB,
+        }
+    }
+}
+
+impl UploadLimits {
+    /// `None` for a type that is not uploaded.
+    pub fn of(&self, kind: ContentKind) -> Option<u64> {
+        match kind {
+            ContentKind::Voice => Some(self.voice),
+            ContentKind::Image => Some(self.image),
+            ContentKind::Video => Some(self.video),
+            ContentKind::Doc => Some(self.doc),
+            ContentKind::File => Some(self.file),
+            _ => None,
         }
     }
 }
@@ -1403,6 +1457,137 @@ pub async fn run_chat_wraps(
     Ok(WrapListReply { wrap_list })
 }
 
+/// A new upload into a chat. Its declared type picks the limit and the permission to send it, and
+/// its size must be one a sealed file of that many chunks can have.
+pub async fn run_create_file(
+    app: &App,
+    caller: &Caller,
+    chat: Ulid,
+    input: CreateFileBody,
+) -> Result<FileReply, Refused> {
+    check(app, caller, Need::Device).await?;
+    check(
+        app,
+        caller,
+        Need::MemberWith(chat, send_permission(input.kind)),
+    )
+    .await?;
+    let session = caller.session()?;
+    let Some(limit) = app.settings.limits.upload.of(input.kind) else {
+        return Err(refused(400, "bad_body", "That type is not uploaded"));
+    };
+    if input.size > limit {
+        return Err(refused(413, "file_too_large", "That file is too large"));
+    }
+    if !file::fits(input.size, input.chunks) {
+        return Err(refused(
+            400,
+            "bad_body",
+            "That size does not fit those chunks",
+        ));
+    }
+    let Some(access) = app.storage.chat_access(chat, session.account).await? else {
+        return Err(refused(404, "not_member", "You are not in that chat"));
+    };
+    let id = new_id()?;
+    app.storage
+        .create_file(NewFile {
+            id,
+            chat,
+            encrypted: access.mode != ChatMode::Open,
+            kind: input.kind,
+            size: input.size,
+            chunks: input.chunks,
+            device: session.device()?,
+            now: Ulid::now(),
+        })
+        .await?;
+    Ok(FileReply { file: id })
+}
+
+/// A chat's file the caller may see: they are in its chat, and it is not removed.
+async fn visible_file(app: &App, caller: &Caller, id: Ulid) -> Result<StoredFile, Refused> {
+    check(app, caller, Need::Device).await?;
+    let missing = || refused(404, "no_such_file", "That file does not exist");
+    let Some(stored) = app.storage.file(id).await? else {
+        return Err(missing());
+    };
+    check(app, caller, Need::Member(stored.chat)).await?;
+    if stored.removed {
+        return Err(missing());
+    }
+    Ok(stored)
+}
+
+/// Chunk `n` of an upload, from its uploader's account, in order: the next one, or the last one
+/// again.
+pub async fn run_put_chunk(
+    app: &App,
+    caller: &Caller,
+    id: Ulid,
+    n: u64,
+    bytes: Vec<u8>,
+) -> Result<FileStatusReply, Refused> {
+    let stored = visible_file(app, caller, id).await?;
+    let session = caller.session()?;
+    if stored.account != session.account {
+        return Err(refused(403, "not_yours", "That file is someone else's"));
+    }
+    if stored.used {
+        return Err(refused(409, "file_sent", "That file is already sent"));
+    }
+    if n >= stored.chunks || n > stored.received || n + 1 < stored.received {
+        return Err(refused(
+            409,
+            "chunk_out_of_order",
+            "That chunk is not the next one",
+        ));
+    }
+    if bytes.len() as u64 != file::chunk_length(stored.size, stored.chunks, n) {
+        return Err(refused(400, "bad_chunk", "That chunk is not its length"));
+    }
+    file::write_chunk(app, stored.chat, id, n, &bytes).await?;
+    app.storage.file_received(id, n).await?;
+    Ok(FileStatusReply {
+        size: stored.size,
+        chunks: stored.chunks,
+        received: stored.received.max(n + 1),
+    })
+}
+
+/// How far an upload got, so it resumes from there.
+pub async fn run_file_status(
+    app: &App,
+    caller: &Caller,
+    id: Ulid,
+) -> Result<FileStatusReply, Refused> {
+    let stored = visible_file(app, caller, id).await?;
+    Ok(FileStatusReply {
+        size: stored.size,
+        chunks: stored.chunks,
+        received: stored.received,
+    })
+}
+
+/// Chunk `n`, once a sent message keeps the file. Its uploader may read it before.
+pub async fn run_get_chunk(
+    app: &App,
+    caller: &Caller,
+    id: Ulid,
+    n: u64,
+) -> Result<Vec<u8>, Refused> {
+    let stored = visible_file(app, caller, id).await?;
+    let session = caller.session()?;
+    if !stored.used && stored.account != session.account {
+        return Err(refused(404, "no_such_file", "That file does not exist"));
+    }
+    if n >= stored.received {
+        return Err(refused(404, "no_such_chunk", "That chunk is not there"));
+    }
+    let length = file::chunk_length(stored.size, stored.chunks, n);
+    file::read_chunk(app, stored.chat, id, n, length).await
+}
+
 /// What a device's frames do: reads answer here, and everything else goes through the chat's task.
 pub async fn run_frame(
     app: &Arc<App>,
@@ -1863,6 +2048,71 @@ async fn chat_wraps(State(app): Shared, headers: HeaderMap, Path(id): Path<Strin
     }))
 }
 
+async fn create_file(
+    State(app): Shared,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Body,
+) -> Response {
+    respond(operation!("CreateFile", "create_file", async {
+        let caller = caller_of(&app, &headers).await?;
+        run_create_file(&app, &caller, path_id(&id)?, parse(body)?).await
+    }))
+}
+
+fn chunk_number(text: &str) -> Result<u64, Refused> {
+    match text.parse() {
+        Ok(n) => Ok(n),
+        Err(_) => Err(refused(404, "not_found", "There is nothing there")),
+    }
+}
+
+async fn put_chunk(
+    State(app): Shared,
+    headers: HeaderMap,
+    Path((id, n)): Path<(String, String)>,
+    body: Body,
+) -> Response {
+    respond(operation!("PutChunk", "put_chunk", async {
+        let caller = caller_of(&app, &headers).await?;
+        let bytes = match body {
+            Ok(bytes) => bytes.to_vec(),
+            Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+                return Err(refused(413, "body_too_large", "That body is too large"));
+            }
+            Err(_) => return Err(refused(400, "bad_body", "That body could not be read")),
+        };
+        run_put_chunk(&app, &caller, path_id(&id)?, chunk_number(&n)?, bytes).await
+    }))
+}
+
+async fn file_status(State(app): Shared, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    respond(operation!("FileStatus", "file_status", async {
+        let caller = caller_of(&app, &headers).await?;
+        run_file_status(&app, &caller, path_id(&id)?).await
+    }))
+}
+
+async fn get_chunk(
+    State(app): Shared,
+    headers: HeaderMap,
+    Path((id, n)): Path<(String, String)>,
+) -> Response {
+    let result = operation!("GetChunk", "get_chunk", async {
+        let caller = caller_of(&app, &headers).await?;
+        run_get_chunk(&app, &caller, path_id(&id)?, chunk_number(&n)?).await
+    });
+    match result {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [(CONTENT_TYPE, "application/octet-stream")],
+            bytes,
+        )
+            .into_response(),
+        Err(refusal) => refusal.into_response(),
+    }
+}
+
 async fn nothing_here() -> Response {
     refused(404, "not_found", "There is nothing there").into_response()
 }
@@ -2188,6 +2438,7 @@ fn content_length(headers: &HeaderMap) -> u64 {
 
 fn router(app: Arc<App>, www: &FilePath) -> Router {
     let rest_body = app.settings.limits.rest_body;
+    let chunk_body = usize::try_from(file::CHUNK + file::TAG).unwrap_or(usize::MAX);
     let files = ServeDir::new(www).fallback(ServeFile::new(www.join("index.html")));
     Router::new()
         .route("/api/v1", get(guide))
@@ -2218,6 +2469,14 @@ fn router(app: Arc<App>, www: &FilePath) -> Router {
         .route("/api/v1/chats/{id}/group_info", get(group_info))
         .route("/api/v1/chats/{id}/devices", get(chat_devices))
         .route("/api/v1/chats/{id}/wraps", get(chat_wraps))
+        .route("/api/v1/chats/{id}/files", post(create_file))
+        .route("/api/v1/files/{id}", get(file_status))
+        .route(
+            "/api/v1/files/{id}/chunks/{n}",
+            put(put_chunk)
+                .layer(DefaultBodyLimit::max(chunk_body))
+                .get(get_chunk),
+        )
         .route("/api/v1/{*rest}", any(nothing_here))
         .method_not_allowed_fallback(wrong_method)
         .fallback_service(files)
@@ -2480,6 +2739,9 @@ pub async fn serve(settings: Settings) -> Result<(), ServeError> {
         stopping,
     });
     captcha::start_sweep(Arc::clone(&app));
+    if let Err(refusal) = file::sweep(&app, None).await {
+        tracing::error!(msg = "Could not remove unused uploads", code = refusal.code);
+    }
 
     let handle = axum_server::Handle::new();
     let waiter = {

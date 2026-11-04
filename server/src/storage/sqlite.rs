@@ -17,8 +17,8 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
 use super::{
     Account, Appended, BuiltInRole, ChatAccess, DeviceKey, DeviceUsage, Error, GroupInfoPut,
-    MessageBrief, NewAccount, NewDevice, NewMessage, NewSession, NewWrap, Position, PositionReport,
-    Registered, Result, Session, SetupLink, Storage,
+    MessageBrief, NewAccount, NewDevice, NewFile, NewMessage, NewSession, NewWrap, Position,
+    PositionReport, Registered, Result, Session, SetupLink, Storage, StoredFile,
 };
 
 /// How long a connection waits for a lock another process holds, such as a backup.
@@ -1256,6 +1256,18 @@ impl Storage for Sqlite {
                     message.body
                 ],
             )?;
+            for file in &message.persist {
+                connection.execute(
+                    "UPDATE file SET used_at = ?2 WHERE id = ?1",
+                    params![file.bytes(), message.now],
+                )?;
+            }
+            for file in &message.remove {
+                connection.execute(
+                    "UPDATE file SET removed_at = ?2 WHERE id = ?1 AND removed_at IS NULL",
+                    params![file.bytes(), message.now],
+                )?;
+            }
             match message.kind {
                 Kind::Content if message.call_seq.is_none() => {
                     connection.execute(
@@ -1551,6 +1563,98 @@ impl Storage for Sqlite {
                 welcome_list.push(welcome?);
             }
             Ok(welcome_list)
+        })
+        .await
+    }
+
+    async fn create_file(&self, file: NewFile) -> Result<()> {
+        self.write(move |connection| {
+            connection.execute(
+                "INSERT INTO file (id, conversation_id, encrypted, kind, size, chunks,
+                 uploaded_by, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    file.id.bytes(),
+                    file.chat.bytes(),
+                    file.encrypted,
+                    file.kind as u8,
+                    int(file.size),
+                    int(file.chunks),
+                    file.device.bytes(),
+                    file.now
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn file(&self, id: Ulid) -> Result<Option<StoredFile>> {
+        self.read(move |connection| {
+            connection
+                .query_row(
+                    "SELECT f.conversation_id, d.account_id, f.size, f.chunks, f.received,
+                     f.used_at IS NOT NULL, f.removed_at IS NOT NULL
+                     FROM file f JOIN device d ON d.id = f.uploaded_by
+                     WHERE f.id = ?1 AND f.conversation_id IS NOT NULL",
+                    params![id.bytes()],
+                    |row| {
+                        Ok(StoredFile {
+                            chat: Ulid::from_bytes(row.get(0)?),
+                            account: Ulid::from_bytes(row.get(1)?),
+                            size: unsigned(row.get(2)?),
+                            chunks: unsigned(row.get(3)?),
+                            received: unsigned(row.get(4)?),
+                            used: row.get(5)?,
+                            removed: row.get(6)?,
+                        })
+                    },
+                )
+                .optional()
+        })
+        .await
+    }
+
+    async fn file_received(&self, id: Ulid, n: u64) -> Result<()> {
+        self.write(move |connection| {
+            connection.execute(
+                "UPDATE file SET received = ?2 + 1 WHERE id = ?1 AND received = ?2",
+                params![id.bytes(), int(n)],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn take_unused_files(
+        &self,
+        chat: Option<Ulid>,
+        before: i64,
+    ) -> Result<Vec<(Ulid, Ulid)>> {
+        self.write(move |connection| {
+            let chat = chat.map(|chat| chat.bytes().to_vec());
+            let mut gone = Vec::new();
+            let mut statement = connection.prepare(
+                "DELETE FROM file WHERE used_at IS NULL AND created_at < ?2
+                 AND conversation_id IS NOT NULL AND (?1 IS NULL OR conversation_id = ?1)
+                 RETURNING conversation_id, id",
+            )?;
+            let rows = statement.query_map(params![chat, before], |row| {
+                Ok((Ulid::from_bytes(row.get(0)?), Ulid::from_bytes(row.get(1)?)))
+            })?;
+            for row in rows {
+                gone.push(row?);
+            }
+            let mut statement = connection.prepare(
+                "SELECT conversation_id, id FROM file WHERE removed_at IS NOT NULL
+                 AND conversation_id IS NOT NULL AND (?1 IS NULL OR conversation_id = ?1)",
+            )?;
+            let rows = statement.query_map(params![chat], |row| {
+                Ok((Ulid::from_bytes(row.get(0)?), Ulid::from_bytes(row.get(1)?)))
+            })?;
+            for row in rows {
+                gone.push(row?);
+            }
+            Ok(gone)
         })
         .await
     }

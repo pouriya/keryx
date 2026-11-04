@@ -22,3 +22,6 @@ idle_after = "5m"
 
 [www]
 directory = "@ROOT@/web/dist"
+
+[files]
+directory = "@ROOT@/tmp/dev/files"

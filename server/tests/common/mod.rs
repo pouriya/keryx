@@ -64,9 +64,10 @@ impl Server {
         };
         let configuration = format!(
             "listen = \"127.0.0.1:{port}\"\npublic_url = \"{origin}\"\n{top}\n\
-             [database]\ntype = \"sqlite\"\npath = {:?}\n[www]\ndirectory = {:?}\n{operator}{tls}{sections}\n",
+             [database]\ntype = \"sqlite\"\npath = {:?}\n[www]\ndirectory = {:?}\n[files]\ndirectory = {:?}\n{operator}{tls}{sections}\n",
             directory.path().join("keryx.db"),
             www,
+            directory.path().join("files"),
         );
         let config = directory.path().join("server.toml");
         fs::write(&config, configuration).unwrap();

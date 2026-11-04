@@ -31,6 +31,8 @@ fn send_frame() -> SendFrame {
         wrap_list: Vec::new(),
         welcome_list: Vec::new(),
         group_info: None,
+        persist: Vec::new(),
+        remove: Vec::new(),
     }
 }
 
@@ -409,7 +411,7 @@ fn bad_frames_are_refused() {
     let good = to_value(ClientFrame::Send(Box::new(send_frame()))).unwrap();
     for (field, value) in [
         ("kind", json!(99)),
-        ("content_kind", json!(10)),
+        ("content_kind", json!(11)),
         ("body", json!("not base64!")),
         ("chat", json!("not a ulid")),
         ("type", json!("no_such_type")),

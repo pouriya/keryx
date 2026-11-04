@@ -42,6 +42,10 @@ idle_after = "5m"
 # The web client's files. A path with no file gets index.html.
 directory = "/var/lib/keryx/www"
 
+[files]
+# Uploads' encrypted bytes: a folder per chat, a file per upload.
+directory = "/var/lib/keryx/files"
+
 [limits]
 websocket_frame = "1MiB"
 rest_body = "1MiB"        # not file uploads
@@ -63,6 +67,14 @@ file = "16KiB"
 video_call = "16KiB"
 voice_call = "16KiB"
 text_call = "64KiB"
+media_bundle = "64KiB"
+
+[limits.upload]           # one file's encrypted bytes, by the type its uploader declares
+voice = "50MiB"
+image = "20MiB"
+video = "2GiB"
+doc = "100MiB"
+file = "2GiB"
 
 # Without this section the server speaks plain HTTP, for local use or behind a reverse proxy.
 [tcp]

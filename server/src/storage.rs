@@ -153,6 +153,29 @@ pub struct MessageBrief {
     pub saved_at: i64,
 }
 
+/// An upload as it starts.
+pub struct NewFile {
+    pub id: Ulid,
+    pub chat: Ulid,
+    pub encrypted: bool,
+    pub kind: ContentKind,
+    pub size: u64,
+    pub chunks: u64,
+    pub device: Ulid,
+    pub now: i64,
+}
+
+/// A chat's stored file. `account` is its uploader's.
+pub struct StoredFile {
+    pub chat: Ulid,
+    pub account: Ulid,
+    pub size: u64,
+    pub chunks: u64,
+    pub received: u64,
+    pub used: bool,
+    pub removed: bool,
+}
+
 pub struct NewWrap {
     pub account: Ulid,
     pub wrapped: Vec<u8>,
@@ -183,6 +206,10 @@ pub struct NewMessage {
     /// A commit's group info at its epoch, saved in the same step so it is never left behind.
     /// `None` otherwise.
     pub group_info: Option<Vec<u8>>,
+    /// Files a content message names, kept from now on. Checked before.
+    pub persist: Vec<Ulid>,
+    /// Files an edit or delete drops, marked removed. Checked before; their bytes go after.
+    pub remove: Vec<Ulid>,
 }
 
 pub enum Appended {
@@ -419,4 +446,17 @@ pub trait Storage: Send + Sync + 'static {
         &self,
         device: Ulid,
     ) -> impl Future<Output = Result<Vec<(Ulid, Vec<u8>)>>> + Send;
+
+    fn create_file(&self, file: NewFile) -> impl Future<Output = Result<()>> + Send;
+    /// A chat's file, removed or not. `None` for an account's file or none at all.
+    fn file(&self, id: Ulid) -> impl Future<Output = Result<Option<StoredFile>>> + Send;
+    /// Chunk `n` arrived: the count moves to `n + 1` if it stood at `n`.
+    fn file_received(&self, id: Ulid, n: u64) -> impl Future<Output = Result<()>> + Send;
+    /// Deletes the rows of uploads never used and created before `before`, in one chat or all,
+    /// and lists them with the removed files, whose bytes may be left, as (chat, file).
+    fn take_unused_files(
+        &self,
+        chat: Option<Ulid>,
+        before: i64,
+    ) -> impl Future<Output = Result<Vec<(Ulid, Ulid)>>> + Send;
 }

@@ -50,7 +50,7 @@ fn a_bad_configuration_stops_startup_and_says_where() {
     let www = directory.path().join("www");
     let good = format!(
         "listen = \"127.0.0.1:1\"\npublic_url = \"http://127.0.0.1:1\"\n\
-         [database]\ntype = \"sqlite\"\npath = {database:?}\n[www]\ndirectory = {www:?}\n"
+         [database]\ntype = \"sqlite\"\npath = {database:?}\n[www]\ndirectory = {www:?}\n[files]\ndirectory = {www:?}\n"
     );
     let bad_list = [
         (good.replace("sqlite", "postgres"), "database.type"),
@@ -58,7 +58,17 @@ fn a_bad_configuration_stops_startup_and_says_where() {
             good.replace(database.to_str().unwrap(), "relative/keryx.db"),
             "database.path",
         ),
-        (good.replace(www.to_str().unwrap(), "www"), "www.directory"),
+        (
+            good.replacen(www.to_str().unwrap(), "www", 1),
+            "www.directory",
+        ),
+        (
+            good.replace(
+                &format!("[files]\ndirectory = {www:?}"),
+                "[files]\ndirectory = \"files\"",
+            ),
+            "files.directory",
+        ),
         (good.replace("http://127.0.0.1:1", "ftp://x"), "public_url"),
         (
             format!("{good}\n[tls]\ncertificate = \"cert.pem\"\nkey = \"/key.pem\"\n"),
@@ -135,7 +145,7 @@ fn a_database_that_cannot_open_or_a_taken_port_stops_startup() {
         &path,
         format!(
             "listen = \"127.0.0.1:{port}\"\npublic_url = \"http://127.0.0.1:1\"\n\
-             [database]\ntype = \"sqlite\"\npath = \"/nothing/here/keryx.db\"\n[www]\ndirectory = {www:?}\n"
+             [database]\ntype = \"sqlite\"\npath = \"/nothing/here/keryx.db\"\n[www]\ndirectory = {www:?}\n[files]\ndirectory = {www:?}\n"
         ),
     )
     .unwrap();
@@ -148,7 +158,7 @@ fn a_database_that_cannot_open_or_a_taken_port_stops_startup() {
         &path,
         format!(
             "listen = \"127.0.0.1:{port}\"\npublic_url = \"http://127.0.0.1:1\"\n\
-             [database]\ntype = \"sqlite\"\npath = {database:?}\n[www]\ndirectory = {www:?}\n"
+             [database]\ntype = \"sqlite\"\npath = {database:?}\n[www]\ndirectory = {www:?}\n[files]\ndirectory = {www:?}\n"
         ),
     )
     .unwrap();
@@ -161,7 +171,7 @@ fn a_database_that_cannot_open_or_a_taken_port_stops_startup() {
         &path,
         format!(
             "listen = \"127.0.0.1:{port}\"\npublic_url = \"https://127.0.0.1:1\"\n\
-             [database]\ntype = \"sqlite\"\npath = {database:?}\n[www]\ndirectory = {www:?}\n\
+             [database]\ntype = \"sqlite\"\npath = {database:?}\n[www]\ndirectory = {www:?}\n[files]\ndirectory = {www:?}\n\
              [tls]\ncertificate = \"/nothing/cert.pem\"\nkey = \"/nothing/key.pem\"\n"
         ),
     )

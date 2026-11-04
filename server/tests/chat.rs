@@ -18,7 +18,7 @@ use person::{
     App, BABAK_WORDS, PASSWORD, Person, SARA_WORDS, add_device, log_in, sign_up, ulid_of,
 };
 use rustls::pki_types::pem::PemObject;
-use serde_json::json;
+use serde_json::{Value, json};
 use tungstenite::protocol::frame::coding::CloseCode;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{ClientRequestBuilder, Message, WebSocket};
@@ -223,6 +223,8 @@ fn sealed_as(
         wrap_list: Vec::new(),
         welcome_list: Vec::new(),
         group_info: None,
+        persist: Vec::new(),
+        remove: Vec::new(),
     }
 }
 
@@ -265,6 +267,8 @@ fn commit_frame(
         wrap_list: wrap_items(&commit.wrap_list),
         welcome_list,
         group_info: Some(Bytes(commit.group_info.clone())),
+        persist: Vec::new(),
+        remove: Vec::new(),
     }
 }
 
@@ -649,6 +653,8 @@ fn a_new_device_cannot_remove_its_notice_but_an_older_one_can() {
             wrap_list: Vec::new(),
             welcome_list: Vec::new(),
             group_info: None,
+            persist: Vec::new(),
+            remove: Vec::new(),
         }
     };
 
@@ -2337,4 +2343,240 @@ fn every_tcp_setting_is_taken() {
     );
     let log = std::fs::read_to_string(pair.server.path("server.log")).unwrap();
     assert!(!log.contains("Could not set a TCP option"), "{log}");
+}
+
+/// One request with raw bytes each way, as file chunks go: the status and the reply's bytes.
+fn raw(
+    server: &Server,
+    method: &str,
+    route: &str,
+    token: &str,
+    body: Option<&[u8]>,
+) -> (u16, Vec<u8>) {
+    let agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .new_agent();
+    let url = format!("{}{route}", server.origin);
+    let authorization = format!("Bearer {token}");
+    let mut response = match body {
+        Some(body) => {
+            let request = match method {
+                "PUT" => agent.put(&url),
+                _ => agent.post(&url),
+            };
+            request
+                .header("Authorization", &authorization)
+                .send(body)
+                .unwrap()
+        }
+        None => agent
+            .get(&url)
+            .header("Authorization", &authorization)
+            .call()
+            .unwrap(),
+    };
+    let status = response.status().as_u16();
+    let reply = response
+        .body_mut()
+        .with_config()
+        .limit(4 * 1024 * 1024)
+        .read_to_vec()
+        .unwrap();
+    (status, reply)
+}
+
+/// Chunk `n` of a two-chunk file: a full one, then a short one, each with its tag.
+fn chunk_bytes(n: u8) -> Vec<u8> {
+    if n == 0 {
+        vec![7; 1024 * 1024 + 16]
+    } else {
+        vec![9; 116]
+    }
+}
+
+fn create_file(pair: &Pair, token: &str, kind: u8, size: u64, chunks: u64) -> (u16, Value) {
+    pair.server.call(
+        "POST",
+        &format!("/api/v1/chats/{}/files", pair.chat),
+        Some(token),
+        Some(&json!({"kind": kind, "size": size, "chunks": chunks})),
+    )
+}
+
+fn put_chunk(pair: &Pair, token: &str, file: &str, n: u8, bytes: &[u8]) -> (u16, Vec<u8>) {
+    raw(
+        &pair.server,
+        "PUT",
+        &format!("/api/v1/files/{file}/chunks/{n}"),
+        token,
+        Some(bytes),
+    )
+}
+
+fn code_of(reply: &[u8]) -> String {
+    let value: Value = serde_json::from_slice(reply).unwrap();
+    value["code"].as_str().unwrap().to_string()
+}
+
+fn with_files(mut frame: SendFrame, persist: &[Ulid], remove: &[Ulid]) -> SendFrame {
+    frame.persist = persist.to_vec();
+    frame.remove = remove.to_vec();
+    frame
+}
+
+#[test]
+fn files_go_up_in_order_are_kept_by_a_sent_message_and_go_with_its_delete() {
+    let mut pair = pair();
+    let size = 1024 * 1024 + 16 + 116;
+    let sara = pair.sara.token.clone();
+    let babak = pair.babak.token.clone();
+
+    // The declared type picks the limit, and the size must fit the chunks.
+    assert_eq!(create_file(&pair, &sara, 0, size, 2).1["code"], "bad_body");
+    assert_eq!(create_file(&pair, &sara, 3, size, 1).1["code"], "bad_body");
+    assert_eq!(create_file(&pair, &sara, 3, 15, 1).1["code"], "bad_body");
+    assert_eq!(create_file(&pair, &sara, 3, size, 0).1["code"], "bad_body");
+    let huge = 21 * (1024 * 1024 + 16);
+    assert_eq!(
+        create_file(&pair, &sara, 3, huge, 21).1["code"],
+        "file_too_large"
+    );
+    let (status, reply) = create_file(&pair, &sara, 3, size, 2);
+    assert_eq!(status, 200);
+    let file = reply["data"]["file"].as_str().unwrap().to_string();
+    let file_id = Ulid::parse(&file).unwrap();
+
+    // Chunks go up in order, at their length, from the uploader's account only.
+    let (status, reply) = put_chunk(&pair, &sara, &file, 1, &chunk_bytes(1));
+    assert_eq!(
+        (status, code_of(&reply).as_str()),
+        (409, "chunk_out_of_order")
+    );
+    let (status, reply) = put_chunk(&pair, &sara, &file, 0, &chunk_bytes(1));
+    assert_eq!((status, code_of(&reply).as_str()), (400, "bad_chunk"));
+    let (status, reply) = put_chunk(&pair, &babak, &file, 0, &chunk_bytes(0));
+    assert_eq!((status, code_of(&reply).as_str()), (403, "not_yours"));
+    let (status, reply) = put_chunk(&pair, &sara, &file, 0, &chunk_bytes(0));
+    assert_eq!(status, 200);
+    let reply: Value = serde_json::from_slice(&reply).unwrap();
+    assert_eq!(reply["data"]["received"], 1);
+    assert_eq!(put_chunk(&pair, &sara, &file, 0, &chunk_bytes(0)).0, 200);
+    let (status, reply) =
+        pair.server
+            .call("GET", &format!("/api/v1/files/{file}"), Some(&babak), None);
+    assert_eq!(status, 200);
+    assert_eq!(
+        reply["data"],
+        json!({"size": size, "chunks": 2, "received": 1})
+    );
+
+    // An incomplete file cannot be sent.
+    let image = |pair: &Pair| {
+        let epoch = pair.sara.device.epoch(pair.chat).unwrap();
+        sealed_as(
+            &pair.sara,
+            pair.chat,
+            Kind::Content,
+            Some(ContentKind::Image),
+            epoch,
+            None,
+            b"an image",
+        )
+    };
+    let frame = with_files(image(&pair), &[file_id], &[]);
+    assert_refused(post(&mut pair.sara_socket, frame), "file_incomplete");
+    assert_eq!(put_chunk(&pair, &sara, &file, 1, &chunk_bytes(1)).0, 200);
+    let (status, reply) = put_chunk(&pair, &sara, &file, 2, &chunk_bytes(1));
+    assert_eq!(
+        (status, code_of(&reply).as_str()),
+        (409, "chunk_out_of_order")
+    );
+
+    // Until a sent message keeps it, only its uploader reads it.
+    let route = format!("/api/v1/files/{file}/chunks/0");
+    assert_eq!(
+        raw(&pair.server, "GET", &route, &sara, None),
+        (200, chunk_bytes(0))
+    );
+    let (status, reply) = raw(&pair.server, "GET", &route, &babak, None);
+    assert_eq!((status, code_of(&reply).as_str()), (404, "no_such_file"));
+
+    // Text keeps no file, nor does a message keep another account's, nor the same one twice.
+    let text = with_files(
+        sealed(&pair.sara, pair.chat, Kind::Content, None, b"hi"),
+        &[file_id],
+        &[],
+    );
+    assert_refused(post(&mut pair.sara_socket, text), "bad_message");
+    let twice = with_files(image(&pair), &[file_id, file_id], &[]);
+    assert_refused(post(&mut pair.sara_socket, twice), "bad_message");
+    let stranger = with_files(image(&pair), &[Ulid::new().unwrap()], &[]);
+    assert_refused(post(&mut pair.sara_socket, stranger), "no_such_file");
+    let epoch = pair.babak.device.epoch(pair.chat).unwrap();
+    let theirs = with_files(
+        sealed_as(
+            &pair.babak,
+            pair.chat,
+            Kind::Content,
+            Some(ContentKind::Image),
+            epoch,
+            None,
+            b"not mine",
+        ),
+        &[file_id],
+        &[],
+    );
+    assert_refused(post(&mut pair.babak_socket, theirs), "not_yours");
+    let removing = with_files(image(&pair), &[], &[file_id]);
+    assert_refused(post(&mut pair.sara_socket, removing), "bad_message");
+
+    let keeping = with_files(image(&pair), &[file_id], &[]);
+    let kept = seq_of(post(&mut pair.sara_socket, keeping));
+    assert_eq!(
+        raw(&pair.server, "GET", &route, &babak, None),
+        (200, chunk_bytes(0))
+    );
+    let last = format!("/api/v1/files/{file}/chunks/1");
+    assert_eq!(
+        raw(&pair.server, "GET", &last, &babak, None),
+        (200, chunk_bytes(1))
+    );
+    let beyond = format!("/api/v1/files/{file}/chunks/2");
+    let (status, reply) = raw(&pair.server, "GET", &beyond, &babak, None);
+    assert_eq!((status, code_of(&reply).as_str()), (404, "no_such_chunk"));
+    let (status, reply) = put_chunk(&pair, &sara, &file, 1, &chunk_bytes(1));
+    assert_eq!((status, code_of(&reply).as_str()), (409, "file_sent"));
+    let again = with_files(image(&pair), &[file_id], &[]);
+    assert_refused(post(&mut pair.sara_socket, again), "file_sent");
+
+    // Its delete removes it, and its bytes leave the disk.
+    let on_disk = pair
+        .server
+        .path("files")
+        .join(pair.chat.to_string())
+        .join(&file);
+    assert!(on_disk.exists());
+    let delete = with_files(
+        sealed(&pair.sara, pair.chat, Kind::Delete, Some(kept), b""),
+        &[],
+        &[file_id],
+    );
+    seq_of(post(&mut pair.sara_socket, delete));
+    assert!(!on_disk.exists());
+    let (status, reply) = raw(&pair.server, "GET", &route, &babak, None);
+    assert_eq!((status, code_of(&reply).as_str()), (404, "no_such_file"));
+    let (status, _) = pair
+        .server
+        .call("GET", &format!("/api/v1/files/{file}"), Some(&sara), None);
+    assert_eq!(status, 404);
+    let (status, _) = pair.server.call(
+        "GET",
+        &format!("/api/v1/files/{}", Ulid::new().unwrap()),
+        Some(&sara),
+        None,
+    );
+    assert_eq!(status, 404);
+    let (status, _) = raw(&pair.server, "GET", "/api/v1/files/x/chunks/y", &sara, None);
+    assert_eq!(status, 404);
 }

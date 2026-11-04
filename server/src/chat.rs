@@ -23,6 +23,7 @@ use crate::api::{
     App, Caller, DELETE_OWN, EDIT_OWN, MESSAGE_COMMIT, Need, Refused, SEND_UNENCRYPTED, TRACE,
     check, new_id, operation, refused, send_permission,
 };
+use crate::file;
 use crate::storage::{
     Appended, GroupInfoPut, NewMessage, NewWelcome, NewWrap, Position, PositionReport, Session,
     Storage,
@@ -245,6 +246,9 @@ async fn run_chat(
             tracing::error!(msg = "A chat's task failed", error = %error);
         }
     }
+    if let Err(refusal) = file::sweep(&app, Some(chat)).await {
+        tracing::error!(msg = "Could not remove unused uploads", code = refusal.code);
+    }
     let idle_after = Duration::from_secs(app.settings.chat.idle_after.max(1));
     loop {
         match tokio::time::timeout(idle_after, queue.recv()).await {
@@ -438,6 +442,8 @@ async fn run_send(
         return Err(bad("Only a commit carries wraps, welcomes and group info"));
     }
 
+    check_files(app, session, &frame).await?;
+
     let mut body_limit = None;
     match frame.kind {
         Kind::Content => {
@@ -593,6 +599,8 @@ async fn run_send(
             wrap_list,
             welcome_list,
             group_info: frame.group_info.map(|group_info| group_info.0),
+            persist: frame.persist,
+            remove: frame.remove.clone(),
         })
         .await?;
     let seq = match appended {
@@ -624,6 +632,9 @@ async fn run_send(
             signature: Some(frame.signature),
         })),
     );
+    for file in frame.remove {
+        file::remove(app, chat, file).await;
+    }
     for (account, device) in welcome_devices {
         hand_welcomes(app, account, device).await?;
     }
@@ -632,6 +643,66 @@ async fn run_send(
         seq,
         server_saved_at: now,
     })
+}
+
+/// The most files one bundle holds, fixed by the author.
+const BUNDLE_FILES: usize = 20;
+
+/// A content message keeps its own complete, unsent uploads in this chat: one for a file kind and up
+/// to 20 for a bundle. An edit or delete removes this account's files in this chat.
+async fn check_files(app: &App, session: Session, frame: &SendFrame) -> Result<(), Refused> {
+    let most = match (frame.kind, frame.content_kind) {
+        (Kind::Content, Some(ContentKind::MediaBundle)) => BUNDLE_FILES,
+        (
+            Kind::Content,
+            Some(
+                ContentKind::Voice
+                | ContentKind::Image
+                | ContentKind::Video
+                | ContentKind::Doc
+                | ContentKind::File,
+            ),
+        ) => 1,
+        _ => 0,
+    };
+    if frame.persist.len() > most {
+        return Err(bad("This message cannot keep that many files"));
+    }
+    if !frame.remove.is_empty() && !matches!(frame.kind, Kind::Edit | Kind::Delete) {
+        return Err(bad("Only an edit or delete removes files"));
+    }
+    let mut seen = Vec::with_capacity(frame.persist.len() + frame.remove.len());
+    for (file, keeping) in frame
+        .persist
+        .iter()
+        .map(|file| (file, true))
+        .chain(frame.remove.iter().map(|file| (file, false)))
+    {
+        if seen.contains(file) {
+            return Err(bad("A file is named twice"));
+        }
+        seen.push(*file);
+        let Some(stored) = app.storage.file(*file).await? else {
+            return Err(refused(404, "no_such_file", "That file does not exist"));
+        };
+        if stored.chat != frame.chat || stored.removed {
+            return Err(refused(404, "no_such_file", "That file does not exist"));
+        }
+        if stored.account != session.account {
+            return Err(refused(403, "not_yours", "That file is someone else's"));
+        }
+        if keeping && stored.used {
+            return Err(refused(409, "file_sent", "That file is already sent"));
+        }
+        if keeping && stored.received < stored.chunks {
+            return Err(refused(
+                409,
+                "file_incomplete",
+                "That file is not all uploaded",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// A wrap can only be for one of the chat's accounts.
