@@ -298,6 +298,8 @@ pub struct Shown {
     pub chat: Ulid,
     pub seq: u64,
     pub account: Option<Ulid>,
+    /// Sent by this account, from any of its devices, so it never counts as unread.
+    pub mine: bool,
     pub device: Option<Ulid>,
     pub content_kind: Option<ContentKind>,
     pub encrypted: bool,
@@ -858,11 +860,12 @@ fn account_key(info: &AccountInfo) -> Option<AccountKey> {
     })
 }
 
-fn shown(message: &MessageFrame, account: Option<Ulid>, text: Option<Secret>) -> Shown {
+fn shown(message: &MessageFrame, account: Option<Ulid>, mine: bool, text: Option<Secret>) -> Shown {
     Shown {
         chat: message.chat,
         seq: message.seq,
         account,
+        mine,
         device: message.device,
         content_kind: message.content_kind,
         encrypted: message.encrypted == Some(true),
@@ -3166,7 +3169,8 @@ impl Client {
                     Err(_) => None,
                 }
             };
-            let shown = shown(&message, Some(known.account), text);
+            let mine = self.account == Some(known.account);
+            let shown = shown(&message, Some(known.account), mine, text);
             match (kind, message.pointer_seq) {
                 (Kind::Edit, Some(target_seq)) => self.event(Event::Edited {
                     message: shown,
@@ -3191,7 +3195,8 @@ impl Client {
     }
 
     fn problem(&mut self, message: &MessageFrame, account: Option<Ulid>, problem: Problem) {
-        let mut shown = shown(message, account, None);
+        let mine = account.is_some() && account == self.account;
+        let mut shown = shown(message, account, mine, None);
         shown.problem = Some(problem);
         self.event(Event::Message { message: shown });
     }

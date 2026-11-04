@@ -239,6 +239,7 @@ export const useStore = create<State>((set, get) => {
           if (
             content &&
             message.content_kind !== 2 &&
+            !message.mine &&
             message.seq > row.seenSeq &&
             !held.counted.includes(message.seq)
           ) {

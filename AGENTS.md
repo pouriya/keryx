@@ -202,7 +202,8 @@ the WASM build, because there is one `Cargo.lock`. Make targets stay inside
   knew is paged forward with `after_seq` from the last sequence id it handled, commits applied in
   order and content opened. After a reload there is no last id. The list carries this member's seen
   position, and updating fetches from there, so the unread count is the content messages decrypted
-  in that fetch. A reaction does not count. A chat still opens on its newest page. See [core/AGENTS.md](core/AGENTS.md).
+  in that fetch. A reaction does not count, and neither does one of this account's own messages, which
+  core marks `mine`. A chat still opens on its newest page. See [core/AGENTS.md](core/AGENTS.md).
 
 ### Removal
 
@@ -386,6 +387,8 @@ Whatever is saved to show later gets the next number. Whatever is not saved gets
 - **A `seen` carries "seen up to N", and the server keeps the highest.** Without it, a
   message stored just before the `seen` arrives would be marked seen though nobody saw
   it, and a late `seen` from another device would do the same.
+- **Only a `seen` moves the seen position, chosen by the author.** Sending does not: a reply from a
+  notification, or an agent sending for a person, is not reading the chat.
 - **Every chat type keeps one position per member**: `member(chat, user, joined_seq,
   seen_seq)`, instead of a row per message per member. Since a `seen` always clears
   everything up to a point, one number holds the same information. Who has not seen

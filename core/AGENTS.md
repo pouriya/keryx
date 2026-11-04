@@ -154,7 +154,9 @@ forward with `after_seq` from there to the latest, commits applied in order and 
 live frame that skips ahead starts the same fill. Live frames arriving during a fill are kept and
 handled after it, in order. After a reload there is no last id. The list carries this member's seen
 position, and updating fetches from there, so the content messages they have not seen are opened
-again. The unread count is those messages, and a reaction does not count. The device is still there
+again. The unread count is those messages. A reaction does not count, and neither does a message
+from this account, sent from any of its devices: core marks it `mine`, chosen by the author, so every
+client counts the same way. The device is still there
 and the name is not, so the page hears `signed_in`
 when this account's name comes back.
 
@@ -190,6 +192,13 @@ a stamp that does not verify, a changed master key, or a credential that cannot 
 would take the server's group info, which already includes that commit, so the device would accept
 what it just refused. It shows `bad_commit` or `bad_welcome` and stays where it is. Chosen by the
 author.
+
+**A commit that removes this device keeps what it could read and stops, chosen by the author.** keryx
+only ever removes an ended device, or a whole person from a group, so a running device sees this when
+its person was removed, or when a broken or hostile member removed it alone. The device drops the
+group and keeps every epoch key, so a later rejoin shows what it had before, and emits `ChatLeft`. It
+does not rejoin by itself. If its account is still in the chat, the next chat list joins it again, as
+for any chat it holds no group for. Hiding the chat and rejoining a group are decided with groups.
 
 **A send waits rather than fails** while its chat is being joined or rejoined, or a key change for it
 is pending, including a rotation falling due while it waits. It goes under the new key, and fails

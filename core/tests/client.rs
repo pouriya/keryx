@@ -3965,3 +3965,96 @@ fn an_unencrypted_message_shows_as_such_and_one_with_no_device_is_malformed() {
         ]
     );
 }
+
+#[test]
+fn a_device_removed_by_a_commit_keeps_what_it_could_read_stops_and_rejoins_on_reconnect() {
+    let (mut world, omid, mina, chat) = pair();
+    tell(&mut world, omid, chat, "before");
+    // Another device of Omid's removes Mina's device alone, which keryx itself never does.
+    let more = world.log_in("omid");
+    world.restore(more, OMID_WORDS);
+    assert!(world.ready(more, chat), "{:?}", world.errors(more));
+    let [first, second] = world.phones[more].slots.clone();
+    let mut device = Device::import(first.as_deref(), second.as_deref())
+        .unwrap()
+        .device;
+    let mut account_list = Vec::new();
+    for (phone, words) in [(omid, OMID_WORDS), (mina, MINA_WORDS)] {
+        let keys = derive(words).unwrap();
+        account_list.push(AccountKey {
+            account: world.account(phone),
+            account_public: *keys.account_public(),
+            master_public: *keys.master_public(),
+            stamp: stamp_account_key(&keys, &world.account(phone)),
+        });
+    }
+    let removal = device
+        .remove_devices(chat, &[world.device_of(mina)], &account_list)
+        .unwrap();
+    let index = world.chat_index(chat).unwrap();
+    world.chats[index].epoch = Some(removal.epoch);
+    world.chats[index].group_info = Some((removal.epoch, removal.group_info));
+    let commits = world.sent_frames(mina, "commit");
+    let join_info = format!("GET /api/v1/chats/{chat}/group_info");
+    let asked = world.asked(mina, &join_info);
+    world.append(MessageFrame {
+        chat,
+        seq: 0,
+        device: Some(world.device_of(more)),
+        kind: Some(Kind::Commit),
+        content_kind: None,
+        encrypted: Some(true),
+        epoch: Some(removal.epoch),
+        pointer_seq: None,
+        call_seq: None,
+        client_sent_at: Some(world.now),
+        server_saved_at: Some(world.now),
+        body: Some(Bytes(removal.commit)),
+        signature: None,
+    });
+    world.settle();
+    assert!(
+        world.phones[mina]
+            .events
+            .contains(&Event::ChatLeft { chat })
+    );
+    // It stops: no join until the next connection.
+    assert_eq!(world.sent_frames(mina, "commit"), commits);
+    assert_eq!(world.asked(mina, &join_info), asked);
+    assert!(world.errors(mina).is_empty(), "{:?}", world.errors(mina));
+    // The keys it had stay, so what it could read still opens.
+    let mina = world.reload(mina);
+    world.settle();
+    world.command(mina, Command::OpenChat { chat });
+    world.settle();
+    assert!(world.texts(mina, chat).contains(&"before".to_string()));
+    // Its account is still in the chat, so it joins again.
+    assert!(world.ready(mina, chat), "{:?}", world.errors(mina));
+    assert_eq!(world.asked(mina, &join_info), 1);
+}
+
+#[test]
+fn messages_from_this_account_are_marked_as_its_own_after_a_reload() {
+    let (mut world, omid, mina, chat) = pair();
+    tell(&mut world, omid, chat, "from omid");
+    tell(&mut world, mina, chat, "from mina");
+    // Omid never sent a seen, so after the list's preview a reload fetches both, his own included.
+    let omid = world.reload(omid);
+    world.settle();
+    let mut shown = Vec::new();
+    for event in &world.phones[omid].events {
+        if let Event::Message { message } = event
+            && message.chat == chat
+        {
+            shown.push((message.text.as_ref().unwrap().0.clone(), message.mine));
+        }
+    }
+    assert_eq!(
+        shown,
+        vec![
+            ("from mina".to_string(), false),
+            ("from omid".to_string(), true),
+            ("from mina".to_string(), false)
+        ]
+    );
+}
