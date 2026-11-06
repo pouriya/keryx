@@ -794,6 +794,21 @@ private fun nanoseconds(value: Long): ByteBuffer =
         flip()
     }
 
+/**
+ * A SurfaceView for a call. It makes its surface only in a draw pass after it has a size, and Compose
+ * lays it out after the pass that added it. On a screen where nothing else changed no pass came, so the
+ * surface never did and their video stayed dark. So once it is laid out, it asks for one more pass.
+ */
+private fun callSurface(
+    context: Context,
+    callback: SurfaceHolder.Callback,
+    overlay: Boolean,
+) = SurfaceView(context).apply {
+    setZOrderMediaOverlay(overlay)
+    holder.addCallback(callback)
+    addOnLayoutChangeListener { view, _, _, _, _, _, _, _, _ -> view.post { view.rootView.invalidate() } }
+}
+
 /** The call screen: their video, my preview in a corner, the call's text, mute, video and hang up. */
 @Composable
 fun CallScreen(
@@ -806,7 +821,7 @@ fun CallScreen(
     Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
         if (session.remoteVideo.value) {
             AndroidView(
-                { SurfaceView(it).apply { holder.addCallback(session.remoteHolder) } },
+                { callSurface(it, session.remoteHolder, false) },
                 Modifier.align(Alignment.Center).fillMaxWidth().aspectRatio(session.remoteAspect.value),
             )
         } else {
@@ -814,12 +829,7 @@ fun CallScreen(
         }
         if (session.videoOn.value) {
             AndroidView(
-                {
-                    SurfaceView(it).apply {
-                        setZOrderMediaOverlay(true)
-                        holder.addCallback(session.previewHolder)
-                    }
-                },
+                { callSurface(it, session.previewHolder, true) },
                 Modifier.align(Alignment.TopEnd).safeDrawingPadding().padding(12.dp).size(96.dp, 170.dp),
             )
         }
