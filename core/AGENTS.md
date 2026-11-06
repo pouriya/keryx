@@ -139,9 +139,8 @@ breaks both sides at compile time.
 they reach JavaScript as a `Uint8Array` rather than an array of numbers. It was already in
 `Cargo.lock`, and JSON comes out the same.
 
-**A history page is 50 messages, chosen by the author**, fixed as `PAGE` in `client.rs`: about two
-screens of bubbles, so a chat opens fast and scrolling up loads the rest. The server's `history_page`
-is the most it allows.
+**History pages are gone, chosen by the author:** `sync` is the one read path, with pages of the
+server's `history_page` rows, and scrolling reads the platform's archive. See the root AGENTS.md.
 
 **The self chat is started like any other chat, chosen by the author:** the client claims its own
 account's key packages, which uses up one of this device's, and the next connect's top-up replaces
@@ -161,13 +160,26 @@ does not count, so the second mark means the text really reached a device of tha
 
 ### Messaging flows and failures, chosen by the author
 
-**Missed messages are fetched forward.** Each chat keeps the last sequence id the client handled
-with nothing missing below it. On every reconnect, each chat this session already knew is paged
-forward with `after_seq` from there to the latest, commits applied in order and content opened. A
-live frame that skips ahead starts the same fill. Live frames arriving during a fill are kept and
-handled after it, in order. After a reload there is no last id. The list carries this member's seen
-position, and updating fetches from there, so the content messages they have not seen are opened
-again. The unread count is those messages. A reaction does not count, and neither does a message
+**Missed messages and call rows are fetched by server time, chosen by the author.** On every
+reconnect core sends one `sync` with `since`, the server time of the last row it saved, and the server
+answers from 1 second before it, in pages. **Core hands each page to the platform to save, and asks for
+the next only once the platform confirms**, and only then moves `since`, which lives in the snapshot.
+No `since` syncs everything from 0. Each chat still keeps the last sequence id it holds with nothing
+missing below it, and applies commits in order. A live frame that skips ahead starts a `sync` for that
+chat alone, and live frames arriving meanwhile are kept and handled after it, in order. The unread
+count is the content messages after this member's seen position in the archive.
+
+**Core and the archive talk through outputs, chosen by the author.** Core outputs `SaveRows {id,
+message_list, call_list}` for each sync page and each live row, and the platform writes them in one
+transaction, a removed row replacing its copy, then answers `RowsSaved {id}` or `RowsSaveFailed {id}`.
+`OpenChat` and `LoadOlder` stay commands: core outputs `ReadRows {id, chat, before_seq, limit}`, the
+platform answers `RowsRead {id, message_list, call_list}`, and core opens them into the same `Message`
+and `PageLoaded` events, so screens do not change. **`since` moves with every row saved, sync pages
+and live rows alike, chosen by the author:** it is the last thing received. A live row from one chat
+can arrive before an older one from another, and the 1 second step back covers that, unless the socket
+also drops in that gap. **The platform counts unread, by SQL, chosen by the author:** core hands it this
+account's device ids and each chat's seen position, and it counts content after that position, not
+reactions and not this account's own, with a call counting only if its `end` row says missed. A reaction does not count, and neither does a message
 from this account, sent from any of its devices: core marks it `mine`, chosen by the author, so every
 client counts the same way. The device is still there
 and the name is not, so the page hears `signed_in`

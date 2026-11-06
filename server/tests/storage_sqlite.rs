@@ -1,7 +1,8 @@
 //! The schema's rules, and the storage trait's own promises.
 
 use keryx::storage::sqlite::Sqlite;
-use keryx::storage::{BuiltInRole, NewAccount, SetupLink, Storage};
+use keryx::storage::{BuiltInRole, NewAccount, SetupLink, Storage, SyncFrom};
+use keryx_core::protocol::{CallEventKind, CallOutcome};
 use keryx_core::ulid::Ulid;
 use rusqlite::{Connection, params};
 use tempfile::TempDir;
@@ -210,7 +211,6 @@ fn a_message_is_whole_or_only_its_sequence_id() {
         "device_id",
         "encrypted",
         "client_sent_at",
-        "server_saved_at",
         "signature",
         "body",
     ] {
@@ -227,11 +227,20 @@ fn a_message_is_whole_or_only_its_sequence_id() {
     connection
         .execute(
             "UPDATE message SET device_id = NULL, kind = NULL, content_kind = NULL, encrypted = NULL,
-             epoch = NULL, client_sent_at = NULL, server_saved_at = NULL, signature = NULL, body = NULL
+             epoch = NULL, client_sent_at = NULL, server_saved_at = 9, signature = NULL, body = NULL
              WHERE seq = 1",
             [],
         )
         .unwrap();
+    // A wiped row keeps the time it was wiped, so sync hands it on.
+    assert!(
+        connection
+            .execute(
+                "UPDATE message SET server_saved_at = NULL WHERE seq = 1",
+                []
+            )
+            .is_err()
+    );
 }
 
 #[test]
@@ -489,49 +498,58 @@ async fn calls_still_open_at_startup_end_and_keep_an_answer() {
     message(&connection, 30, 4, 11, 0, Some(0), Some(1)).unwrap();
     connection
         .execute(
-            "UPDATE message SET call_outcome = 1 WHERE conversation_id = ?1 AND seq = 2",
-            params![id(30)],
-        )
-        .unwrap();
-    connection
-        .execute(
-            "UPDATE message SET call_outcome = 0, call_ended_at = 7
-             WHERE conversation_id = ?1 AND seq = 3",
-            params![id(30)],
-        )
-        .unwrap();
-    connection
-        .execute(
-            "INSERT INTO call_event (conversation_id, call_seq, n, kind, device_id, server_at)
-             VALUES (?1, 2, 1, 0, ?2, 5)",
-            params![id(30), id(12)],
+            "INSERT INTO call (conversation_id, call_seq, n, kind, device_id, server_at, outcome)
+             VALUES (?1, 2, 1, ?3, ?2, 5, NULL), (?1, 3, 1, ?4, ?5, 7, 0)",
+            params![
+                id(30),
+                id(12),
+                CallEventKind::Join as u8,
+                CallEventKind::End as u8,
+                id(11)
+            ],
         )
         .unwrap();
 
     storage.end_open_calls(500).await.unwrap();
 
     let chat = Ulid::from_bytes(id(30));
-    let state = |seq: i64| -> (Option<i64>, Option<i64>) {
-        connection
-            .query_row(
-                "SELECT call_outcome, call_ended_at FROM message
-                 WHERE conversation_id = ?1 AND seq = ?2",
-                params![id(30), seq],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap()
+    let page = storage
+        .sync(Ulid::from_bytes(id(1)), Some(chat), SyncFrom::Since(0), 100)
+        .await
+        .unwrap();
+    assert!(!page.more);
+    let rows = |call_seq: u64| -> Vec<(u64, CallEventKind, i64, Option<CallOutcome>)> {
+        let mut row_list = Vec::new();
+        for event in &page.call_list {
+            if event.call_seq == call_seq {
+                row_list.push((event.n, event.kind, event.server_at, event.outcome));
+            }
+        }
+        row_list
     };
-    assert_eq!(state(1), (Some(0), Some(500)));
-    assert_eq!(state(2), (Some(1), Some(500)));
-    assert_eq!(state(3), (Some(0), Some(7)));
-    assert_eq!(state(4), (None, None));
-
-    let rang = storage.call_events(chat, 1).await.unwrap();
-    assert_eq!(rang.len(), 1);
-    assert_eq!((rang[0].n, rang[0].server_at), (1, 500));
-    assert_eq!(rang[0].device, Ulid::from_bytes(id(11)));
-    let answered = storage.call_events(chat, 2).await.unwrap();
-    assert_eq!(answered.len(), 2);
-    assert_eq!(answered[1].n, 2);
-    assert!(storage.call_events(chat, 3).await.unwrap().is_empty());
+    // The one ringing ends as missed, by its caller's device, now.
+    assert_eq!(
+        rows(1),
+        vec![(1, CallEventKind::End, 500, Some(CallOutcome::Missed))]
+    );
+    let rang = page
+        .call_list
+        .iter()
+        .find(|event| event.call_seq == 1)
+        .unwrap();
+    assert_eq!(rang.device, Ulid::from_bytes(id(11)));
+    // The answered one keeps its answer.
+    assert_eq!(
+        rows(2),
+        vec![
+            (1, CallEventKind::Join, 5, None),
+            (2, CallEventKind::End, 500, Some(CallOutcome::Answered))
+        ]
+    );
+    // One already ended is left as it was, and text is not a call.
+    assert_eq!(
+        rows(3),
+        vec![(1, CallEventKind::End, 7, Some(CallOutcome::Missed))]
+    );
+    assert!(rows(4).is_empty());
 }

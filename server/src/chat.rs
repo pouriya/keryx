@@ -29,8 +29,8 @@ use crate::api::{
 use crate::file;
 use crate::moq::{self, Closer, Joined};
 use crate::storage::{
-    Appended, CallChange, GroupInfoPut, NewMessage, NewWelcome, NewWrap, Position, PositionReport,
-    Session, Storage,
+    Appended, GroupInfoPut, NewMessage, NewWelcome, NewWrap, Position, PositionReport, Session,
+    Storage,
 };
 
 /// How many events may wait for a chat's task before their senders wait in turn.
@@ -304,7 +304,7 @@ struct Socket {
 }
 
 /// Publishes call events on the call's `events` track, each its own group. A failed write only means
-/// the track ended, and the replay still has them.
+/// the track ended, and `sync` still has them.
 fn publish(events: &mut moq_net::track::Producer, event_list: &[CallEvent]) {
     for event in event_list {
         match serde_json::to_vec(event) {
@@ -334,6 +334,7 @@ impl OpenCall {
                 epoch: None,
                 signature: None,
                 body: None,
+                outcome: None,
             });
         }
         event_list
@@ -599,12 +600,12 @@ async fn handle(app: &Arc<App>, state: &mut ChatState, job: Job) {
                     );
                     Some(answer_of(reference, result))
                 }
-                ClientFrame::Sync { reference }
-                | ClientFrame::History { reference, .. }
-                | ClientFrame::Ping { reference } => Some(answer_of(
-                    reference,
-                    Err(refused(500, "internal", "This event has no chat's task")),
-                )),
+                ClientFrame::Sync { reference, .. } | ClientFrame::Ping { reference } => {
+                    Some(answer_of(
+                        reference,
+                        Err(refused(500, "internal", "This event has no chat's task")),
+                    ))
+                }
             }
         })
         .await;
@@ -845,7 +846,7 @@ async fn run_send(
         end_call(app, chat, state, None, device).await?;
     }
 
-    let now = Ulid::now();
+    let now = app.storage.saved_now();
     let appended = app
         .storage
         .append_message(NewMessage {
@@ -934,8 +935,6 @@ async fn run_send(
             server_saved_at: Some(now),
             body: Some(frame.body),
             signature: Some(frame.signature),
-            call_outcome: None,
-            call_ended_at: None,
         })),
     );
     for file in frame.remove {
@@ -1045,21 +1044,12 @@ async fn run_join(
         return Ok(joined);
     }
     let answers = session.account != call.caller && !call.answered;
-    let event_list = call.events(chat, &[(CallEventKind::Join, device)], Ulid::now());
-    let saved = app
-        .storage
-        .save_call(CallChange {
-            chat,
-            call_seq,
-            event_list: event_list.clone(),
-            outcome: if answers {
-                Some(CallOutcome::Answered)
-            } else {
-                None
-            },
-            ended_at: None,
-        })
-        .await;
+    let event_list = call.events(
+        chat,
+        &[(CallEventKind::Join, device)],
+        app.storage.saved_now(),
+    );
+    let saved = app.storage.save_call(event_list.clone()).await;
     if let Err(error) = saved {
         call.room.sockets.remove(&device);
         return Err(error.into());
@@ -1133,16 +1123,12 @@ async fn leave(
         )
         .await;
     }
-    let event_list = call.events(chat, &[(CallEventKind::Leave, device)], Ulid::now());
-    app.storage
-        .save_call(CallChange {
-            chat,
-            call_seq: call.seq,
-            event_list: event_list.clone(),
-            outcome: None,
-            ended_at: None,
-        })
-        .await?;
+    let event_list = call.events(
+        chat,
+        &[(CallEventKind::Leave, device)],
+        app.storage.saved_now(),
+    );
+    app.storage.save_call(event_list.clone()).await?;
     call.next_n += 1;
     publish(&mut call.room.events, &event_list);
     let member_list = app.storage.member_accounts(chat).await?;
@@ -1178,22 +1164,18 @@ async fn run_call_text(
         Some(socket) if socket.connection == connection => {}
         _ => return Err(refused(409, "call_ended", "That socket left the call")),
     }
-    let mut event_list = call.events(chat, &[(CallEventKind::Text, device)], Ulid::now());
+    let mut event_list = call.events(
+        chat,
+        &[(CallEventKind::Text, device)],
+        app.storage.saved_now(),
+    );
     for event in &mut event_list {
         event.client_at = Some(text.client_at);
         event.epoch = Some(text.epoch);
         event.signature = Some(text.signature.clone());
         event.body = Some(text.body.clone());
     }
-    app.storage
-        .save_call(CallChange {
-            chat,
-            call_seq,
-            event_list: event_list.clone(),
-            outcome: None,
-            ended_at: None,
-        })
-        .await?;
+    app.storage.save_call(event_list.clone()).await?;
     call.next_n += 1;
     publish(&mut call.room.events, &event_list);
     Ok(())
@@ -1212,20 +1194,21 @@ async fn end_call(
     let Some(call) = &state.call else {
         return Ok(());
     };
-    let now = Ulid::now();
     let mut kind_list = Vec::with_capacity(2);
     kind_list.extend(first);
     kind_list.push((CallEventKind::End, ender));
-    let event_list = call.events(chat, &kind_list, now);
-    app.storage
-        .save_call(CallChange {
-            chat,
-            call_seq: call.seq,
-            event_list: event_list.clone(),
-            outcome: Some(CallOutcome::Missed),
-            ended_at: Some(now),
-        })
-        .await?;
+    let mut event_list = call.events(chat, &kind_list, app.storage.saved_now());
+    // The end carries the outcome, so the call's rows hold everything about it.
+    for event in &mut event_list {
+        if event.kind == CallEventKind::End {
+            event.outcome = Some(if call.answered {
+                CallOutcome::Answered
+            } else {
+                CallOutcome::Missed
+            });
+        }
+    }
+    app.storage.save_call(event_list.clone()).await?;
     let Some(mut call) = state.call.take() else {
         return Ok(());
     };

@@ -11,6 +11,11 @@ fixed rules. The folders, the file layout and the code style are settled after t
 and the device list are decided below and not built. The Android client follows the same design
 decisions.
 
+**Its worker is stale since sync by time, chosen by the author:** core now hands `sync` pages to the
+platform to save in a local archive, and only Android builds one for now. The web builds but its chats
+do not sync until it comes off hold. **Its archive will be an object store in the account's IndexedDB
+database, chosen by the author**, holding rows as the server sent them, as on Android.
+
 **Telegram Web A is the inspiration, for ideas only.** A clone is in `tmp/telegram-tt`. It is
 GPL-3.0 and keryx is MIT, so none of its code, styles or assets are copied.
 

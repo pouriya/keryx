@@ -248,6 +248,9 @@ pub struct Device {
     pins: HashMap<Ulid, [u8; 32]>,
     epoch_keys: HashMap<(Ulid, u64), Zeroizing<[u8; 16]>>,
     chats: HashMap<Ulid, Chat>,
+    /// The server time of the last row the platform saved, where the next `sync` starts. Kept here
+    /// so it never runs ahead of the commits this state has applied.
+    since: Option<i64>,
 }
 
 /// The master key's stamp on this account's public key, published once when the words are set up.
@@ -557,11 +560,22 @@ impl Device {
             pins,
             epoch_keys: HashMap::new(),
             chats: HashMap::new(),
+            since: None,
         })
     }
 
     pub fn record(&self) -> &DeviceRecord {
         &self.record
+    }
+
+    /// Where the next `sync` starts: the server time of the last row the platform saved.
+    pub fn since(&self) -> Option<i64> {
+        self.since
+    }
+
+    /// Moves where the next `sync` starts, never back. Saved with the next snapshot.
+    pub fn set_since(&mut self, since: i64) {
+        self.since = Some(self.since.map_or(since, |old| old.max(since)));
     }
 
     /// Verify another device against its account's pinned master key, before trusting its
@@ -1227,6 +1241,13 @@ impl Device {
         out.extend_from_slice(&self.record.device_public);
         out.extend_from_slice(&self.record.master_public);
         out.extend_from_slice(&self.record.stamp);
+        match self.since {
+            Some(since) => {
+                out.push(1);
+                out.extend_from_slice(&since.to_be_bytes());
+            }
+            None => out.push(0),
+        }
 
         out.extend_from_slice(&(self.pins.len() as u32).to_be_bytes());
         for (account, master) in &self.pins {
@@ -1329,6 +1350,11 @@ impl Device {
         let device_public: [u8; 32] = read_array(&mut reader)?;
         let master_public: [u8; 32] = read_array(&mut reader)?;
         let stamp: [u8; 64] = read_array(&mut reader)?;
+        let [has_since]: [u8; 1] = read_array(&mut reader)?;
+        let since = match has_since {
+            1 => Some(i64::from_be_bytes(read_array(&mut reader)?)),
+            _ => None,
+        };
 
         let mut pins = HashMap::new();
         let count = u32::from_be_bytes(read_array(&mut reader)?);
@@ -1410,6 +1436,7 @@ impl Device {
             pins,
             epoch_keys,
             chats,
+            since,
         })
     }
 

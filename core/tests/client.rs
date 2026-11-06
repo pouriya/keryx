@@ -12,7 +12,7 @@ use keryx_core::mls::{AccountKey, Device, sign_revocation, stamp_account_key};
 use keryx_core::protocol::{
     AccountKeysBody, Bytes, CallBody, CallEvent, CallEventKind, CaptchaAnswer, ChatItem, ChatMode,
     ChatType, ClientFrame, ContentKind, Kind, MarkItem, MessageFrame, SendFrame, ServerFrame,
-    WrapEntry,
+    SyncPosition, WrapEntry,
 };
 use keryx_core::seed::derive;
 use keryx_core::ulid::Ulid;
@@ -1035,6 +1035,13 @@ struct Phone {
     short_reads: usize,
     /// What the client handed its call code: joins, keys, leaves and text.
     call_outputs: Vec<Output>,
+    /// The archive the platform keeps on disk, which a reload keeps.
+    archive: BTreeMap<(Ulid, u64), MessageFrame>,
+    archive_calls: BTreeMap<(Ulid, u64, u64), CallEvent>,
+    /// `SaveRows` and `ReadRows` waiting for the platform.
+    archive_work: VecDeque<Output>,
+    /// The next archive writes fail.
+    failing_rows: usize,
 }
 
 struct World {
@@ -1092,7 +1099,6 @@ fn kind_of(frame: &ClientFrame) -> &'static str {
         ClientFrame::Received { .. } => "received",
         ClientFrame::Typing { .. } => "typing",
         ClientFrame::Sync { .. } => "sync",
-        ClientFrame::History { .. } => "history",
         ClientFrame::GroupInfo { .. } => "group_info",
         ClientFrame::Ping { .. } => "ping",
         ClientFrame::Wraps { .. } => "wraps",
@@ -1105,8 +1111,7 @@ fn reference_of(frame: &ClientFrame) -> Ulid {
         ClientFrame::Send(send) => send.reference,
         ClientFrame::Seen { reference, .. }
         | ClientFrame::Received { reference, .. }
-        | ClientFrame::Sync { reference }
-        | ClientFrame::History { reference, .. }
+        | ClientFrame::Sync { reference, .. }
         | ClientFrame::GroupInfo { reference, .. }
         | ClientFrame::Ping { reference }
         | ClientFrame::Wraps { reference, .. }
@@ -1115,7 +1120,7 @@ fn reference_of(frame: &ClientFrame) -> Ulid {
     }
 }
 
-fn wiped(chat: Ulid, seq: u64) -> MessageFrame {
+fn wiped(chat: Ulid, seq: u64, at: i64) -> MessageFrame {
     MessageFrame {
         chat,
         seq,
@@ -1126,11 +1131,94 @@ fn wiped(chat: Ulid, seq: u64) -> MessageFrame {
         epoch: None,
         pointer_seq: None,
         client_sent_at: None,
-        server_saved_at: None,
+        server_saved_at: Some(at),
         body: None,
         signature: None,
-        call_outcome: None,
-        call_ended_at: None,
+    }
+}
+
+/// How many rows the fake server puts in one `sync` page, small so tests reach a second page.
+const SYNC_PAGE: usize = 20;
+
+fn message_position(message: &MessageFrame) -> SyncPosition {
+    SyncPosition {
+        at: message.server_saved_at.unwrap_or(0),
+        chat: message.chat,
+        seq: message.seq,
+        n: 0,
+    }
+}
+
+fn call_position(event: &CallEvent) -> SyncPosition {
+    SyncPosition {
+        at: event.server_at,
+        chat: event.chat,
+        seq: event.call_seq,
+        n: event.n,
+    }
+}
+
+impl Phone {
+    /// What the platform does with an archive output, and its answer.
+    fn archive_do(&mut self, work: Output) -> Input {
+        match work {
+            Output::SaveRows {
+                id,
+                message_list,
+                call_list,
+            } => {
+                if self.failing_rows > 0 {
+                    self.failing_rows -= 1;
+                    return Input::RowsSaveFailed { id };
+                }
+                for message in message_list {
+                    let key = (message.chat, message.seq);
+                    if message.kind.is_none() {
+                        self.archive_calls
+                            .retain(|(chat, call_seq, _), _| (*chat, *call_seq) != key);
+                        self.archive.insert(key, message);
+                    } else {
+                        self.archive.entry(key).or_insert(message);
+                    }
+                }
+                for event in call_list {
+                    self.archive_calls
+                        .entry((event.chat, event.call_seq, event.n))
+                        .or_insert(event);
+                }
+                Input::RowsSaved { id }
+            }
+            Output::ReadRows {
+                id,
+                chat,
+                before_seq,
+                limit,
+            } => {
+                let before = before_seq.unwrap_or(u64::MAX);
+                let mut message_list: Vec<MessageFrame> = self
+                    .archive
+                    .range((chat, 0)..(chat, before))
+                    .rev()
+                    .take(usize::try_from(limit).unwrap())
+                    .map(|(_, message)| message.clone())
+                    .collect();
+                message_list.reverse();
+                let call_list = self
+                    .archive_calls
+                    .iter()
+                    .filter(|((c, call_seq, _), _)| {
+                        *c == chat && message_list.iter().any(|message| message.seq == *call_seq)
+                    })
+                    .map(|(_, event)| event.clone())
+                    .collect();
+                Input::RowsRead {
+                    id,
+                    message_list,
+                    call_list,
+                }
+            }
+            _ => unreachable!("not archive work"),
+        }
     }
 }
 
@@ -1186,6 +1274,10 @@ impl World {
             gets: VecDeque::new(),
             short_reads: 0,
             call_outputs: Vec::new(),
+            archive: BTreeMap::new(),
+            archive_calls: BTreeMap::new(),
+            archive_work: VecDeque::new(),
+            failing_rows: 0,
         });
         self.phones.len() - 1
     }
@@ -1240,6 +1332,9 @@ impl World {
                 | Output::CallKey { .. }
                 | Output::LeaveCall { .. }
                 | Output::CallText { .. } => phone.call_outputs.push(output),
+                Output::SaveRows { .. } | Output::ReadRows { .. } => {
+                    phone.archive_work.push_back(output)
+                }
                 Output::WriteChunk {
                     handle,
                     offset,
@@ -1328,6 +1423,11 @@ impl World {
                 phone.slots[usize::from(slot)] = Some(bytes);
                 self.input(p, Input::Saved { id });
             }
+            return true;
+        }
+        if let Some(work) = self.phones[p].archive_work.pop_front() {
+            let input = self.phones[p].archive_do(work);
+            self.input(p, input);
             return true;
         }
         if let Some((id, method, path, body)) = self.phones[p].requests.pop_front() {
@@ -1431,9 +1531,13 @@ impl World {
         let phone = &mut self.phones[p];
         phone.gone = true;
         phone.up = false;
+        let archive = std::mem::take(&mut phone.archive);
+        let archive_calls = std::mem::take(&mut phone.archive_calls);
         let q = self.phone(Auth::Cookie);
         self.phones[q].account = account;
         self.phones[q].device = device;
+        self.phones[q].archive = archive;
+        self.phones[q].archive_calls = archive_calls;
         self.phones[q].slots = [first.clone(), second.clone()];
         self.input(
             q,
@@ -1790,6 +1894,7 @@ impl World {
             epoch: text.as_ref().map(|text| text.epoch),
             signature: text.as_ref().map(|text| text.signature.clone()),
             body: text.map(|text| text.body),
+            outcome: None,
         };
         list.push(event.clone());
         event
@@ -2263,8 +2368,6 @@ impl World {
             server_saved_at: Some(self.now),
             body: Some(Bytes(Vec::new())),
             signature: Some(stamp),
-            call_outcome: None,
-            call_ended_at: None,
         });
         reply_ok(json!({ "device": device }))
     }
@@ -2342,42 +2445,62 @@ impl World {
                 );
                 Some(ServerFrame::Done { reference })
             }
-            ClientFrame::Sync { reference } => Some(ServerFrame::Chats {
+            ClientFrame::Sync {
                 reference,
-                chat_list: self.chat_list(me),
-            }),
-            ClientFrame::History {
-                reference,
+                since,
+                after,
                 chat,
-                after_seq,
-                before_seq,
-                limit,
             } => {
-                let all = &self.hub_chat(chat).message_list;
-                let mut message_list = Vec::new();
-                match before_seq {
-                    Some(before) => {
-                        for message in all.iter().rev() {
-                            if message.seq > after_seq
-                                && message.seq < before
-                                && message_list.len() < limit as usize
-                            {
-                                message_list.push(message.clone());
-                            }
-                        }
-                        message_list.reverse();
+                let from = since.map_or(0, |since| since - 1000);
+                let wanted = |position: SyncPosition| match after {
+                    Some(after) => position > after,
+                    None => position.at >= from,
+                };
+                let mut rows: Vec<(SyncPosition, Result<MessageFrame, CallEvent>)> = Vec::new();
+                for hub_chat in &self.chats {
+                    if !hub_chat.member_list.contains(&me)
+                        || chat.is_some_and(|only| only != hub_chat.id)
+                    {
+                        continue;
                     }
-                    None => {
-                        for message in all {
-                            if message.seq > after_seq && message_list.len() < limit as usize {
-                                message_list.push(message.clone());
+                    for message in &hub_chat.message_list {
+                        let position = message_position(message);
+                        if wanted(position) {
+                            rows.push((position, Ok(message.clone())));
+                        }
+                    }
+                    for ((call_chat, _), event_list) in &self.call_events {
+                        if *call_chat != hub_chat.id {
+                            continue;
+                        }
+                        for event in event_list {
+                            let position = call_position(event);
+                            if wanted(position) {
+                                rows.push((position, Err(event.clone())));
                             }
                         }
                     }
                 }
-                Some(ServerFrame::Page {
+                rows.sort_by_key(|(position, _)| *position);
+                let more = rows.len() > SYNC_PAGE;
+                rows.truncate(SYNC_PAGE);
+                let mut message_list = Vec::new();
+                let mut call_list = Vec::new();
+                for (_, row) in rows {
+                    match row {
+                        Ok(message) => message_list.push(message),
+                        Err(event) => call_list.push(event),
+                    }
+                }
+                Some(ServerFrame::Chats {
                     reference,
+                    chat_list: match after {
+                        Some(_) => Vec::new(),
+                        None => self.chat_list(me),
+                    },
                     message_list,
+                    call_list,
+                    more,
                 })
             }
             ClientFrame::GroupInfo {
@@ -2472,12 +2595,13 @@ impl World {
         if send.kind == Kind::Delete
             && let Some(target) = send.pointer_seq
         {
+            let now = self.now;
             let chat = &mut self.chats[index];
             for message in &mut chat.message_list {
                 if message.seq == target
                     || (message.kind == Some(Kind::Edit) && message.pointer_seq == Some(target))
                 {
-                    *message = wiped(message.chat, message.seq);
+                    *message = wiped(message.chat, message.seq, now);
                 }
             }
         }
@@ -2502,8 +2626,6 @@ impl World {
             server_saved_at: Some(self.now),
             body: Some(send.body),
             signature: Some(send.signature),
-            call_outcome: None,
-            call_ended_at: None,
         });
         let mut handed = Vec::new();
         for welcome in send.welcome_list {
@@ -2701,8 +2823,7 @@ fn has_login(world: &World, phone: usize) -> bool {
 }
 
 #[test]
-fn messages_missed_while_away_are_fetched_on_reconnect_and_a_reload_fetches_from_the_seen_position()
-{
+fn messages_missed_while_away_are_fetched_on_reconnect_and_a_reload_syncs_from_its_last_kept_row() {
     let (mut world, omid, mina, chat) = pair();
     world.offline(mina);
     tell(&mut world, omid, chat, "one");
@@ -2723,19 +2844,22 @@ fn messages_missed_while_away_are_fetched_on_reconnect_and_a_reload_fetches_from
     assert_eq!(received, Some(3));
 
     world.offline(mina);
+    world.advance(2 * SECOND);
     tell(&mut world, omid, chat, "three");
-    // Nothing was marked seen, so a reload fetches and opens everything after the start.
+    // A reload syncs from the last row it kept, a second back: "two" and what shares its moment come
+    // again, and the archive drops them as copies.
     let restarted = world.reload(mina);
     world.settle();
     assert_eq!(world.texts(restarted, chat), vec!["one", "two", "three"]);
 
-    world.see_all(restarted, chat);
     world.offline(restarted);
+    world.advance(2 * SECOND);
     tell(&mut world, omid, chat, "four");
     let again = world.reload(restarted);
     world.settle();
-    // Only what came after the seen position. Nothing older is fetched until the chat is opened.
-    assert_eq!(world.texts(again, chat), vec!["four"]);
+    // Only the second before "three" comes again. Nothing older is shown until the chat is opened,
+    // from the archive.
+    assert_eq!(world.texts(again, chat), vec!["three", "four"]);
     world.command(again, Command::OpenChat { chat });
     world.settle();
     assert_eq!(
@@ -2817,21 +2941,25 @@ fn what_needs_the_socket_is_kept_and_typing_is_not() {
     let (mut world, omid, mina, chat) = pair();
     tell(&mut world, omid, chat, "there");
     world.offline(mina);
-    let (seen, pages) = (
+    let (seen, syncs) = (
         world.sent_frames(mina, "seen"),
-        world.sent_frames(mina, "history"),
+        world.sent_frames(mina, "sync"),
     );
     world.command(mina, Command::Seen { chat, up_to_seq: 1 });
-    world.command(mina, Command::OpenChat { chat });
     world.command(mina, Command::Typing { chat, on: true });
     world.settle();
     assert_eq!(world.sent_frames(mina, "seen"), seen);
-    assert_eq!(world.sent_frames(mina, "history"), pages);
     assert_eq!(world.sent_frames(mina, "typing"), 0);
+    // Opening a chat reads the archive, so it needs no socket.
+    world.phones[mina].events.clear();
+    world.command(mina, Command::OpenChat { chat });
+    world.settle();
+    assert_eq!(world.texts(mina, chat), vec!["there"]);
+    assert_eq!(world.sent_frames(mina, "sync"), syncs);
     world.online(mina);
     assert_eq!(world.sent_frames(mina, "seen"), seen + 1);
-    // The opened chat's page, and the self chat's notice, which this device has not handled yet.
-    assert_eq!(world.sent_frames(mina, "history"), pages + 2);
+    // One `sync` for every chat.
+    assert_eq!(world.sent_frames(mina, "sync"), syncs + 1);
     assert_eq!(world.sent_frames(mina, "typing"), 0);
 
     // A key change carries its group info, so nothing else goes up for it.
@@ -2899,8 +3027,6 @@ fn a_message_that_cannot_be_shown_still_appears_with_its_problem() {
         server_saved_at: Some(world.now),
         body: Some(Bytes(vec![1, 2, 3])),
         signature: Some(Bytes(vec![4; 64])),
-        call_outcome: None,
-        call_ended_at: None,
     });
     world.online(mina);
     let mut found = Vec::new();
@@ -3005,8 +3131,6 @@ fn a_failed_commit_or_welcome_rejoins_and_one_refused_for_what_it_is_does_not() 
         server_saved_at: Some(world.now),
         body: Some(Bytes(join.commit)),
         signature: None,
-        call_outcome: None,
-        call_ended_at: None,
     });
     world.settle();
     assert!(error_count(&world, omid, "bad_commit") >= 1);
@@ -3055,8 +3179,6 @@ fn a_new_device_notice_is_checked() {
         server_saved_at: Some(world.now),
         body: Some(Bytes(Vec::new())),
         signature: Some(Bytes(vec![1; 64])),
-        call_outcome: None,
-        call_ended_at: None,
     });
     world.settle();
     assert!(has_notice(&world, first, Some(Problem::BadSignature)));
@@ -3300,10 +3422,12 @@ fn many_missed_messages_are_fetched_page_by_page_in_order() {
         tell(&mut world, omid, chat, &text);
         expected.push(text);
     }
-    let pages = world.sent_frames(mina, "history");
+    let pages = world.sent_frames(mina, "sync");
     world.online(mina);
     assert_eq!(world.texts(mina, chat), expected);
-    assert_eq!(world.sent_frames(mina, "history"), pages + 3);
+    // 120 rows, and the chat's first rows from the second before the last one kept, at the fake
+    // server's 20 a page, each page asked for once the one before was kept.
+    assert_eq!(world.sent_frames(mina, "sync"), pages + 7);
     assert!(world.errors(mina).is_empty(), "{:?}", world.errors(mina));
 }
 
@@ -3313,17 +3437,18 @@ fn a_live_message_that_skips_ahead_fetches_the_gap_and_keeps_what_comes_meanwhil
     world.phones[mina].lost_list.push("message");
     tell(&mut world, omid, chat, "one");
     assert!(world.texts(mina, chat).is_empty());
-    let pages = world.sent_frames(mina, "history");
+    let pages = world.sent_frames(mina, "sync");
     world.say(omid, chat, "two");
     world.say(omid, chat, "three");
     world.settle();
     assert_eq!(world.texts(mina, chat), vec!["one", "two", "three"]);
-    assert_eq!(world.sent_frames(mina, "history"), pages + 1);
+    // One `sync` of this chat alone, from its last row.
+    assert_eq!(world.sent_frames(mina, "sync"), pages + 1);
     assert!(world.errors(mina).is_empty(), "{:?}", world.errors(mina));
 }
 
 #[test]
-fn a_refused_fill_is_reported_and_runs_again_on_the_next_connection() {
+fn a_refused_sync_is_reported_and_runs_again_on_the_next_connection() {
     let (mut world, omid, mina, chat) = pair();
     // A first reconnect pages the self chat's notice, so the pages below are this chat's alone.
     world.cut(mina);
@@ -3333,11 +3458,11 @@ fn a_refused_fill_is_reported_and_runs_again_on_the_next_connection() {
     tell(&mut world, omid, chat, "two");
     world.phones[mina]
         .frame_faults
-        .push(("history", Fault::Refuse("internal")));
+        .push(("sync", Fault::Refuse("internal")));
     world.online(mina);
     assert_eq!(error_count(&world, mina, "internal"), 1);
-    // Only the chat list's preview came.
-    assert_eq!(world.texts(mina, chat), vec!["two"]);
+    // Nothing came, not even the chat list.
+    assert!(world.texts(mina, chat).is_empty());
     world.cut(mina);
     world.advance(2 * SECOND);
     assert_eq!(world.texts(mina, chat), vec!["one", "two"]);
@@ -3345,7 +3470,7 @@ fn a_refused_fill_is_reported_and_runs_again_on_the_next_connection() {
 }
 
 #[test]
-fn a_reloaded_device_behind_on_keys_catches_up_through_older_pages() {
+fn a_reloaded_device_behind_on_keys_catches_up_through_its_sync() {
     let (mut world, omid, mina, chat) = pair();
     world.offline(mina);
     world.advance(8 * DAY);
@@ -3359,18 +3484,17 @@ fn a_reloaded_device_behind_on_keys_catches_up_through_older_pages() {
     world.seen_elsewhere(mina, chat);
     let mina = world.reload(mina);
     world.settle();
-    // The commit sits under more than one page of messages.
-    assert!(world.sent_frames(mina, "history") >= 2);
+    // The commit and the messages after it span more than one page.
+    assert!(world.sent_frames(mina, "sync") >= 2);
     assert!(world.errors(mina).is_empty(), "{:?}", world.errors(mina));
-    world.command(mina, Command::OpenChat { chat });
-    world.settle();
-    assert_eq!(world.texts(mina, chat), expected[10..].to_vec());
+    // The `sync` opened all of them on its way.
+    assert_eq!(world.texts(mina, chat), expected);
     tell(&mut world, mina, chat, "caught up");
     assert_eq!(world.texts(omid, chat), vec!["caught up"]);
 }
 
 #[test]
-fn a_refused_catch_up_is_reported_and_runs_again_on_the_next_connection() {
+fn a_refused_sync_after_a_reload_is_reported_and_runs_again_on_the_next_connection() {
     let (mut world, omid, mina, chat) = pair();
     world.offline(mina);
     world.advance(8 * DAY);
@@ -3379,10 +3503,10 @@ fn a_refused_catch_up_is_reported_and_runs_again_on_the_next_connection() {
     let mina = world.reload(mina);
     world.phones[mina]
         .frame_faults
-        .push(("history", Fault::Refuse("internal")));
+        .push(("sync", Fault::Refuse("internal")));
     world.settle();
     assert_eq!(error_count(&world, mina, "internal"), 1);
-    // Behind on keys, the preview cannot be read yet.
+    // Nothing came, so the key change and the text wait.
     assert!(world.texts(mina, chat).is_empty());
     world.cut(mina);
     world.advance(2 * SECOND);
@@ -3406,8 +3530,6 @@ fn unknown_message(world: &World, chat: Ulid) -> MessageFrame {
         server_saved_at: Some(world.now),
         body: Some(Bytes(vec![1, 2, 3])),
         signature: Some(Bytes(vec![4; 64])),
-        call_outcome: None,
-        call_ended_at: None,
     }
 }
 
@@ -3700,7 +3822,7 @@ fn a_refused_seen_is_reported_once_and_not_sent_again() {
 }
 
 #[test]
-fn older_pages_load_until_the_first_message_even_when_asked_offline() {
+fn older_pages_load_from_the_archive_until_the_first_message_even_offline() {
     let (mut world, omid, mina, chat) = pair();
     let mut expected = Vec::new();
     for n in 0..70 {
@@ -3708,16 +3830,22 @@ fn older_pages_load_until_the_first_message_even_when_asked_offline() {
         tell(&mut world, omid, chat, &text);
         expected.push(text);
     }
+    world.advance(2 * SECOND);
+    tell(&mut world, omid, chat, "later");
+    expected.push("later".to_string());
     world.see_all(mina, chat);
     let mina = world.reload(mina);
     world.settle();
+    // The reload's `sync` brought only the second before its last kept row.
+    assert_eq!(world.texts(mina, chat), vec!["later"]);
     world.command(mina, Command::OpenChat { chat });
     world.settle();
-    assert_eq!(world.texts(mina, chat), expected[20..].to_vec());
+    assert_eq!(world.texts(mina, chat), expected[21..].to_vec());
     world.offline(mina);
     world.command(mina, Command::LoadOlder { chat });
-    world.online(mina);
+    world.settle();
     assert_eq!(world.texts(mina, chat), expected);
+    world.online(mina);
     world.command(mina, Command::LoadOlder { chat });
     world.settle();
     let mut loaded = Vec::new();
@@ -3788,6 +3916,9 @@ fn edits_and_deletes_reach_the_other_side_and_a_deleted_message_stays_removed() 
             removed.push(*seq);
         }
     }
+    // Shown by the reload's `sync`, then again when the chat opened from the archive.
+    removed.sort_unstable();
+    removed.dedup();
     assert_eq!(removed, vec![seq, seq + 1]);
     assert!(world.texts(mina, chat).is_empty());
 }
@@ -3929,9 +4060,9 @@ fn a_reload_after_a_key_change_whose_answer_never_came_rejoins_and_carries_on() 
 }
 
 #[test]
-fn live_messages_arriving_during_a_fill_are_kept_and_shown_after_it() {
+fn live_messages_arriving_during_a_sync_are_kept_and_shown_after_it() {
     let (mut world, omid, mina, chat) = pair();
-    // A first reconnect pages the self chat's notice, so the pages below are this chat's alone.
+    // A first reconnect syncs the self chat's notice, so the sync below brings this chat's alone.
     world.cut(mina);
     world.advance(2 * SECOND);
     world.offline(mina);
@@ -3942,8 +4073,8 @@ fn live_messages_arriving_during_a_fill_are_kept_and_shown_after_it() {
     while !filling {
         assert!(world.step_one(mina));
         for frame in &world.phones[mina].sent {
-            if let ClientFrame::History { after_seq, .. } = frame
-                && *after_seq > 0
+            if let ClientFrame::Sync { since, .. } = frame
+                && since.is_some()
             {
                 filling = true;
             }
@@ -3953,37 +4084,27 @@ fn live_messages_arriving_during_a_fill_are_kept_and_shown_after_it() {
     while world.phones[mina].inbox.is_empty() {
         assert!(world.step_one(omid));
     }
-    let pages = world.sent_frames(mina, "history");
+    let pages = world.sent_frames(mina, "sync");
     world.settle();
     assert_eq!(world.texts(mina, chat), vec!["one", "two"]);
-    assert_eq!(world.sent_frames(mina, "history"), pages + 1);
+    // The live one followed what the sync brought, so it needed no sync of its own.
+    assert_eq!(world.sent_frames(mina, "sync"), pages + 1);
 }
 
 #[test]
-fn pages_on_their_way_when_the_connection_drops_are_asked_again() {
+fn a_sync_lost_with_the_connection_is_asked_again() {
     let (mut world, omid, mina, chat) = pair();
+    world.offline(mina);
     for n in 0..60 {
         tell(&mut world, omid, chat, &format!("p{n}"));
     }
-    world.see_all(mina, chat);
-    let mina = world.reload(mina);
-    world.settle();
-    world.phones[mina]
-        .frame_faults
-        .push(("history", Fault::Drop));
-    world.command(mina, Command::OpenChat { chat });
-    world.settle();
-    world.cut(mina);
-    world.advance(2 * SECOND);
-    assert_eq!(world.texts(mina, chat).len(), 50);
-    world.phones[mina]
-        .frame_faults
-        .push(("history", Fault::Drop));
-    world.command(mina, Command::LoadOlder { chat });
-    world.settle();
+    world.phones[mina].frame_faults.push(("sync", Fault::Drop));
+    world.online(mina);
+    assert!(world.texts(mina, chat).is_empty());
     world.cut(mina);
     world.advance(2 * SECOND);
     assert_eq!(world.texts(mina, chat).len(), 60);
+    assert!(world.errors(mina).is_empty(), "{:?}", world.errors(mina));
 }
 
 #[test]
@@ -4197,17 +4318,15 @@ fn a_device_whose_saved_state_fell_behind_catches_up_when_a_newer_key_change_arr
         assert!(world.ready(more, chat), "{:?}", world.errors(more));
     }
     world.see_all(mina, chat);
-    // Both slots hold the state from before those joins, the preview is older than them, and the
-    // list does not say how far the chat has moved, so nothing looks behind until the next commit.
+    // Both slots hold the state from before those joins, and the list does not say how far the
+    // chat has moved. The old state's `since` is older too, so its `sync` brings the key changes.
     world.phones[mina].slots = old;
     world.hide_epoch = true;
     let mina = world.reload(mina);
     world.settle();
     assert_eq!(world.texts(mina, chat), vec!["before"]);
-    let pages = world.sent_frames(mina, "history");
     world.advance(8 * DAY);
     tell(&mut world, omid, chat, "after");
-    assert!(world.sent_frames(mina, "history") > pages);
     assert!(world.errors(mina).is_empty(), "{:?}", world.errors(mina));
     assert_eq!(world.texts(mina, chat), vec!["before", "after"]);
     tell(&mut world, mina, chat, "caught up");
@@ -4234,8 +4353,6 @@ fn an_unencrypted_message_shows_as_such_and_one_with_no_device_is_malformed() {
         server_saved_at: Some(world.now),
         body: Some(Bytes(br#"{"text":"in the clear"}"#.to_vec())),
         signature: None,
-        call_outcome: None,
-        call_ended_at: None,
     };
     let signature = device
         .sign(
@@ -4314,8 +4431,6 @@ fn a_device_removed_by_a_commit_keeps_what_it_could_read_stops_and_rejoins_on_re
         server_saved_at: Some(world.now),
         body: Some(Bytes(removal.commit)),
         signature: None,
-        call_outcome: None,
-        call_ended_at: None,
     });
     world.settle();
     assert!(
@@ -4985,10 +5100,10 @@ fn a_call_rings_is_declined_joined_written_in_and_replayed() {
             .any(|text| text.contains("in the call"))
     );
 
-    // The app restarts and replays the call from the server.
+    // The app restarts and replays the call from its archive, which kept every row of it.
     let reader = world.reload(mina);
     world.settle();
-    world.command(reader, Command::CallEvents { chat, call_seq });
+    world.command(reader, Command::OpenChat { chat });
     world.settle();
     let replay = call_events(&world, reader);
     assert_eq!(replay.len(), 2);

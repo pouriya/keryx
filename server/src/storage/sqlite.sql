@@ -430,8 +430,8 @@ CREATE TABLE message (
     -- [RBAC, Chat list, Calls] what a content message is, and NULL for every other kind. Readable
     -- by the server even in an encrypted chat, so roles can allow or refuse each one:
     -- 0 text, 1 voice, 2 reaction, 3 image, 4 music (an MP3), 5 video, 6 doc, 7 file,
-    -- 8 call (one per call, saved, and can be replied to; what happens inside it is in
-    -- call_event), 9 media_bundle (several images and videos in one message).
+    -- 8 call (one per call, saved, and can be replied to; everything about it is in the call
+    -- table, and this row holds nothing more), 9 media_bundle (several images and videos in one message).
     content_kind       INTEGER CHECK (content_kind BETWEEN 0 AND 9),
     -- [Unencrypted messages] the flag that tells a client how to read the body.
     encrypted          INTEGER CHECK (encrypted IN (0, 1)),
@@ -441,15 +441,11 @@ CREATE TABLE message (
     -- [Actions, Replies] the target's seq. In an encrypted chat only delete and edit fill it,
     -- because the server acts on those. Reply and reaction pointers stay inside the ciphertext.
     pointer_seq        INTEGER,
-    -- [Calls, Chat list] for a call: 0 missed, 1 answered, NULL while it is ringing. Written by the
-    -- server. Readable because a missed call counts as unread and an answered one does not.
-    call_outcome       INTEGER CHECK (call_outcome IN (0, 1)),
-    -- [Calls] when a call ended, written by the server. NULL while it can still be joined.
-    call_ended_at      INTEGER,
     -- [Resend check] the client's clock.
     client_sent_at     INTEGER,
-    -- [Chat list, Retention] the server's clock.
-    server_saved_at    INTEGER,
+    -- [Chat list, Retention, Sync] the server's clock, which never goes back. A removed message keeps
+    -- the time it was removed instead, so sync hands it out and every device drops its copy.
+    server_saved_at    INTEGER NOT NULL,
     -- [Retention] NULL means never. Always NULL for a device_notice, which retention never touches.
     expires_at         INTEGER,
     -- [Signatures, New-device notice] by device_id, encrypted or not, so clients detect forgery
@@ -462,8 +458,6 @@ CREATE TABLE message (
     PRIMARY KEY (conversation_id, seq),
     CHECK (encrypted = 0 OR epoch IS NOT NULL),
     CHECK ((kind = 0) = (content_kind IS NOT NULL)),
-    CHECK (call_outcome IS NULL OR content_kind = 8),
-    CHECK (call_ended_at IS NULL OR content_kind = 8),
     CHECK (kind <> 3 OR epoch IS NOT NULL),
     CHECK (kind NOT IN (1, 2) OR pointer_seq IS NOT NULL),
     CHECK (content_kind IS NOT 2 OR encrypted = 1 OR pointer_seq IS NOT NULL),
@@ -473,31 +467,29 @@ CREATE TABLE message (
     CHECK ((kind IS NULL) = (device_id IS NULL)),
     CHECK ((kind IS NULL) = (encrypted IS NULL)),
     CHECK ((kind IS NULL) = (client_sent_at IS NULL)),
-    CHECK ((kind IS NULL) = (server_saved_at IS NULL)),
     CHECK ((kind IS NULL) = (signature IS NULL)),
     CHECK ((kind IS NULL) = (body IS NULL)),
-    CHECK (kind IS NOT NULL OR (epoch IS NULL AND pointer_seq IS NULL AND call_outcome IS NULL AND call_ended_at IS NULL AND expires_at IS NULL))
+    CHECK (kind IS NOT NULL OR (epoch IS NULL AND pointer_seq IS NULL AND expires_at IS NULL))
 ) STRICT;
 
 -- [Chat list] finds the preview after the last message is removed.
 CREATE INDEX message_preview ON message (conversation_id, seq) WHERE kind = 0;
--- [Chat list] counts unread. A reaction does not count, nor an answered call. A missed call does.
-CREATE INDEX message_unread ON message (conversation_id, seq)
-    WHERE kind = 0 AND content_kind <> 2 AND (call_outcome IS NULL OR call_outcome = 0);
 -- [Commit order] the first commit for an epoch wins, and a second cannot be stored.
 CREATE UNIQUE INDEX message_commit ON message (conversation_id, epoch) WHERE kind = 3;
 -- [Delete] an edit holds a message's newer text, so deleting the message must find and remove
 -- its edits too. Edit pointers are readable, which is what makes this possible.
 CREATE INDEX message_edit ON message (conversation_id, pointer_seq) WHERE kind = 1;
--- [Calls] calls still open, ended at startup since nobody can be in them after a restart.
-CREATE INDEX message_open_call ON message (conversation_id, seq)
-    WHERE content_kind = 8 AND call_ended_at IS NULL;
+-- [Calls] the calls, to end those still open at startup, since nobody can be in them after a restart.
+CREATE INDEX message_call ON message (conversation_id, seq) WHERE content_kind = 8;
+-- [Sync] what was saved or removed after a time, in one chat or several.
+CREATE INDEX message_sync ON message (conversation_id, server_saved_at);
 -- [Retention] the sweep.
 CREATE INDEX message_expiry ON message (expires_at) WHERE expires_at IS NOT NULL;
 
--- [Call replay] what happened inside a call, never chat rows: joins, leaves and the end written by
--- the server, and declines and text from clients.
-CREATE TABLE call_event (
+-- [Calls, Sync] everything about a call, many rows per call and never chat rows: joins, leaves and
+-- the end written by the server, and declines and text from clients. The call's message holds nothing
+-- more. A call with no end row is still open.
+CREATE TABLE call (
     -- [Calls] the call's chat.
     conversation_id    BLOB NOT NULL,
     -- [Calls] the sequence id of the call's message.
@@ -509,7 +501,7 @@ CREATE TABLE call_event (
     -- [Calls] whose. For an end, the device whose leaving or decline ended it, or the caller's if it
     -- rang out or was still open at startup.
     device_id          BLOB NOT NULL REFERENCES device (id),
-    -- [Calls] the server's clock.
+    -- [Calls, Sync] the server's clock, which never goes back. An end's is when the call ended.
     server_at          INTEGER NOT NULL,
     -- [Calls, Signatures] text only: the client's clock, the key it is sealed under, its signature
     -- over the header and body, and the ciphertext. The header names call_seq, so it can never
@@ -518,14 +510,21 @@ CREATE TABLE call_event (
     epoch              INTEGER,
     signature          BLOB,
     body               BLOB,
+    -- [Calls, Chat list] an end's only: 0 missed, 1 answered. Readable because a missed call counts as
+    -- unread and an answered one does not.
+    outcome            INTEGER CHECK (outcome IN (0, 1)),
     PRIMARY KEY (conversation_id, call_seq, n),
     FOREIGN KEY (conversation_id, call_seq) REFERENCES message (conversation_id, seq)
         ON DELETE CASCADE,
     CHECK ((kind = 3) = (body IS NOT NULL)),
     CHECK ((kind = 3) = (signature IS NOT NULL)),
     CHECK ((kind = 3) = (epoch IS NOT NULL)),
-    CHECK ((kind = 3) = (client_at IS NOT NULL))
+    CHECK ((kind = 3) = (client_at IS NOT NULL)),
+    CHECK ((kind = 4) = (outcome IS NOT NULL))
 ) WITHOUT ROWID, STRICT;
+
+-- [Sync] call rows saved after a time, in one chat or several.
+CREATE INDEX call_sync ON call (conversation_id, server_at);
 
 -- [Seen times] one row per `seen`, with one time for many messages. A member saw message N
 -- at the time on their first row reaching N. Deleted once the messages it covers expire.

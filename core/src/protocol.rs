@@ -107,8 +107,8 @@ numbered!(
 );
 
 numbered!(
-    /// The numbers are the `message.call_outcome` column's. Readable, because a missed call counts
-    /// as unread and an answered one does not.
+    /// The numbers are the `call.outcome` column's, on a call's `end` row only. Readable, because a
+    /// missed call counts as unread and an answered one does not.
     CallOutcome {
         Missed = 0,
         Answered = 1,
@@ -116,7 +116,7 @@ numbered!(
 );
 
 numbered!(
-    /// The numbers are the `call_event.kind` column's. The server writes join, leave and end, and
+    /// The numbers are the `call.kind` column's. The server writes join, leave and end, and
     /// clients send decline and text.
     CallEventKind {
         Join = 0,
@@ -263,22 +263,20 @@ pub enum ClientFrame {
         chat: Ulid,
         on: bool,
     },
-    /// The server works out which chats, and the client never sends a list.
+    /// The chats list, and the messages and call rows saved after a time, in pages. The server
+    /// works out which chats, and the client never sends a list. `since` is the server time of the
+    /// last row the client saved, and the server starts 1 second before it, or from the beginning
+    /// without one. `after` continues a page that said `more`, exactly after its last row, with no
+    /// step back. `chat` asks for that one chat only.
     Sync {
         #[serde(rename = "ref")]
         reference: Ulid,
-    },
-    /// Up to `limit` messages after `after_seq`, oldest first. With `before_seq`, the newest `limit`
-    /// of those below it instead, still oldest first, so one past the last sequence id gives the
-    /// newest page and scrolling up asks below the oldest one shown.
-    History {
-        #[serde(rename = "ref")]
-        reference: Ulid,
-        chat: Ulid,
-        after_seq: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        before_seq: Option<u64>,
-        limit: u32,
+        since: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<SyncPosition>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chat: Option<Ulid>,
     },
     GroupInfo {
         #[serde(rename = "ref")]
@@ -312,9 +310,10 @@ pub enum ClientFrame {
     },
 }
 
-/// What happened inside a call, numbered from 1 within it. The same JSON on the `events` track, in
-/// the WebSocket's `call_event` and in the replay route. Only text has a body, encrypted and signed
-/// like a message, with `call_seq` in its header so it can never pass for a chat message.
+/// What happened inside a call, numbered from 1 within it: one row of the `call` table. The same JSON
+/// on the `events` track, in the WebSocket's `call_event` and in `sync`'s `call_list`. Only text has a
+/// body, encrypted and signed like a message, with `call_seq` in its header so it can never pass for a
+/// chat message. Only `end` has an `outcome`.
 #[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallEvent {
@@ -332,6 +331,8 @@ pub struct CallEvent {
     pub signature: Option<Bytes>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<Bytes>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<CallOutcome>,
 }
 
 impl CallEvent {
@@ -389,8 +390,9 @@ pub struct CallBody {
     pub voice: bool,
 }
 
-/// A stored message. **A removed one has only `chat` and `seq`**, so pages have no gaps, and a
-/// client knows something was there, not what.
+/// A stored message. **A removed one has only `chat`, `seq` and `server_saved_at`**, the time it was
+/// removed, so `sync` hands it out and every device drops its copy, and a client knows something was
+/// there, not what. A call's message holds nothing about the call: that is in its `call` rows.
 #[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageFrame {
@@ -412,12 +414,6 @@ pub struct MessageFrame {
     pub client_sent_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_saved_at: Option<i64>,
-    /// A call's readable outcome, set by the server once it is missed or answered.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub call_outcome: Option<CallOutcome>,
-    /// When a call ended, set by the server with its end.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub call_ended_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<Bytes>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -519,15 +515,16 @@ pub enum ServerFrame {
         call_seq: Option<u64>,
     },
     Message(Box<MessageFrame>),
+    /// A `sync`'s answer: the chats list on its first page only, then up to `[limits] history_page`
+    /// messages and call rows, ordered by server time, chat, sequence id and `n`, where a message's
+    /// `n` is 0. `more` says another page follows: ask again with `after` at this one's last row.
     Chats {
         #[serde(rename = "ref")]
         reference: Ulid,
         chat_list: Vec<ChatItem>,
-    },
-    Page {
-        #[serde(rename = "ref")]
-        reference: Ulid,
         message_list: Vec<MessageFrame>,
+        call_list: Vec<CallEvent>,
+        more: bool,
     },
     Welcome {
         chat: Ulid,
@@ -921,8 +918,13 @@ pub struct RefusedReply {
     pub call_seq: Option<u64>,
 }
 
-/// What happened inside one call, oldest first, for its replay.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CallEventListReply {
-    pub event_list: Vec<CallEvent>,
+/// Where a `sync` page ended: its last row's server time, chat, sequence id, and `n`, which is 0 for a
+/// message and the call row's own for a call row.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SyncPosition {
+    pub at: i64,
+    pub chat: Ulid,
+    pub seq: u64,
+    pub n: u64,
 }

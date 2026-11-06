@@ -32,14 +32,13 @@ use crate::mls::{
 };
 use crate::protocol::{
     AccountBrief, AccountInfo, AccountKeysBody, AccountListReply, AccountReply, Bytes, CallBody,
-    CallEvent, CallEventKind, CallEventListReply, CallOutcome, CallText, CaptchaAnswer,
-    CaptchaReply, ChallengeBody, ChallengeReply, ChatDevice, ChatDeviceListReply, ChatItem,
-    ChatReply, ChatType, ClientFrame, ContentKind, CountReply, CreateChatBody, CreateFileBody,
-    DeviceProof, DeviceReply, DevicesReply, EmptyReply, FeaturesReply, FileReply, GroupInfoReply,
-    Header, KeyPackageItem, KeyPackageListReply, KeyPackagesBody, Kind, LoginBody, LoginReply,
-    MarkItem, MessageFrame, RefusedReply, RegisterBody, RegisterDeviceBody, SendFrame, ServerFrame,
-    SetupBody, SetupReply, SignedBody, WelcomeItem, WrapEntry, WrapItem, WrapListReply,
-    call_text_header,
+    CallEvent, CallEventKind, CallOutcome, CallText, CaptchaAnswer, CaptchaReply, ChallengeBody,
+    ChallengeReply, ChatDevice, ChatDeviceListReply, ChatItem, ChatReply, ChatType, ClientFrame,
+    ContentKind, CountReply, CreateChatBody, CreateFileBody, DeviceProof, DeviceReply,
+    DevicesReply, EmptyReply, FeaturesReply, FileReply, GroupInfoReply, Header, KeyPackageItem,
+    KeyPackageListReply, KeyPackagesBody, Kind, LoginBody, LoginReply, MarkItem, MessageFrame,
+    RefusedReply, RegisterBody, RegisterDeviceBody, SendFrame, ServerFrame, SetupBody, SetupReply,
+    SignedBody, SyncPosition, WelcomeItem, WrapEntry, WrapItem, WrapListReply, call_text_header,
 };
 use crate::queue::{Level, Queue, Target};
 use crate::seed::{self, AccountKeys};
@@ -50,10 +49,8 @@ const KEY_PACKAGES: u64 = 10;
 /// The waits before each retry, the last repeating: the connection, background requests, a lost
 /// join and a failing save.
 const RETRY_MS: [i64; 6] = [1_000, 2_000, 4_000, 8_000, 16_000, 30_000];
-/// How many messages one page asks for.
+/// How many messages one read of the archive asks for, when a chat opens or scrolls up.
 const PAGE: u32 = 50;
-/// Before this, everything: the newest page.
-const NEWEST: u64 = i64::MAX as u64;
 
 /// Text that must never be printed: a password, the words, a token or a message. Wiped when
 /// dropped, and its `Debug` shows nothing of it.
@@ -283,11 +280,6 @@ pub enum Command {
         call_seq: u64,
         text: Secret,
     },
-    /// What happened inside a call, for its replay.
-    CallEvents {
-        chat: Ulid,
-        call_seq: u64,
-    },
 }
 
 /// Everything that goes into [`Client::step`].
@@ -354,6 +346,21 @@ pub enum Input {
     /// A frame from the joined call's `events` track.
     CallEvent {
         event: CallEvent,
+    },
+    /// [`Output::SaveRows`] wrote all of its rows.
+    RowsSaved {
+        id: u64,
+    },
+    /// [`Output::SaveRows`] could not write them. Nothing of it may stay.
+    RowsSaveFailed {
+        id: u64,
+    },
+    /// [`Output::ReadRows`]'s answer: the chat's messages, oldest first, and the rows of every call
+    /// among them.
+    RowsRead {
+        id: u64,
+        message_list: Vec<MessageFrame>,
+        call_list: Vec<CallEvent>,
     },
 }
 
@@ -457,6 +464,23 @@ pub enum Output {
         call_seq: u64,
         frame: CallText,
     },
+    /// Keep these rows in the archive, exactly as they are, in one transaction, then answer with
+    /// [`Input::RowsSaved`] or [`Input::RowsSaveFailed`]. A row already kept stays, except that a
+    /// removed message, with only `chat`, `seq` and `server_saved_at`, replaces its copy, and a
+    /// removed call message takes that call's rows with it.
+    SaveRows {
+        id: u64,
+        message_list: Vec<MessageFrame>,
+        call_list: Vec<CallEvent>,
+    },
+    /// Read up to `limit` of the chat's newest messages from the archive, below `before_seq` if
+    /// given, with the rows of every call among them, and answer with [`Input::RowsRead`].
+    ReadRows {
+        id: u64,
+        chat: Ulid,
+        before_seq: Option<u64>,
+        limit: u32,
+    },
 }
 
 /// Why a message cannot be shown as it is. It still appears, so the timeline has no hole.
@@ -496,9 +520,10 @@ pub struct Shown {
     /// A call's start: what the caller had on.
     #[serde(default)]
     pub call: Option<CallBody>,
-    /// Missed or answered, once the server knows.
+    /// Missed or answered, from the call's `end` row, once this client has it.
     #[serde(default)]
     pub call_outcome: Option<CallOutcome>,
+    /// The `end` row's time.
     #[serde(default)]
     pub call_ended_at: Option<i64>,
     pub problem: Option<Problem>,
@@ -570,6 +595,11 @@ pub enum Event {
     /// The list, newest first. Previews follow as messages.
     Chats {
         chat_list: Vec<ChatItem>,
+    },
+    /// This account's devices known so far, so the platform counts unread without its own
+    /// messages. Sent again whenever one more is known.
+    OwnDevices {
+        device_list: Vec<Ulid>,
     },
     Message {
         message: Shown,
@@ -803,7 +833,6 @@ enum Asked {
         n: u64,
     },
     Features,
-    CallEvents,
 }
 
 /// A REST request, kept until it is answered, to go again if nothing answered.
@@ -879,10 +908,9 @@ enum Waiting {
         local: u64,
         plan: Plan,
     },
-    Sync,
-    Page {
-        chat: Ulid,
-        purpose: Purpose,
+    /// A `sync` page, of every chat or only `chat`.
+    Sync {
+        chat: Option<Ulid>,
     },
     GroupInfo {
         chat: Ulid,
@@ -900,16 +928,25 @@ enum Waiting {
     Done,
 }
 
-/// Why a page was asked for.
-enum Purpose {
-    Open,
-    Older,
-    /// What was missed, forward from the last sequence id handled.
-    Fill,
-    /// Collecting commits missed from before the last sequence id was known, newest first.
-    CatchUp {
-        found: Vec<MessageFrame>,
-    },
+/// A `sync` under way: one at a time, of every chat or only `chat`.
+struct SyncRun {
+    chat: Option<Ulid>,
+    /// Its first page carries the chats list.
+    first: bool,
+}
+
+/// Rows handed to the platform to keep. Once kept, `since` moves to `last`, and a `sync` page goes
+/// on to its next one or ends.
+struct RowsSave {
+    last: Option<SyncPosition>,
+    page: Option<PageSaved>,
+}
+
+/// What follows a kept `sync` page, if the connection it came on is still the current one.
+struct PageSaved {
+    chat: Option<Ulid>,
+    more: bool,
+    generation: u64,
 }
 
 /// What a save is for.
@@ -929,8 +966,8 @@ struct Flight {
     frame: SendFrame,
     /// A commit's, to retry if it loses.
     plan: Option<Plan>,
-    /// The chat's last sequence id handled when it went, so a fill from there finds it.
-    after: u64,
+    /// Where a `sync` started when it went, so the one after a reconnect finds it.
+    since: Option<i64>,
 }
 
 /// A device whose stamp has been checked.
@@ -945,8 +982,8 @@ struct KnownDevice {
 enum Busy {
     #[default]
     Idle,
-    Filling,
-    CatchingUp,
+    /// A `sync` covering this chat runs, and live frames wait for it.
+    Syncing,
 }
 
 /// How far this device has received or seen a chat, and what the server has confirmed.
@@ -971,8 +1008,6 @@ enum Seal {
 enum Applied {
     Nothing,
     Changed,
-    /// Commits are missing below this one: a catch-up has started, and this waits for it.
-    CatchUp,
 }
 
 #[derive(Default)]
@@ -982,20 +1017,20 @@ struct ChatState {
     member_list: Vec<Ulid>,
     /// The last sequence id handled with nothing missing below it, once known.
     known: Option<u64>,
-    /// The highest sequence id heard of.
-    top: u64,
+    /// The server time of `known`'s message, where a `sync` of this chat alone starts.
+    known_at: Option<i64>,
     oldest_seq: Option<u64>,
     busy: Busy,
-    /// Fill, then match what was in flight before resending it.
+    /// Sync, then match what was in flight before resending it.
     verify: bool,
-    /// A commit lost while a fill ran: catch up once it ends.
-    catch_up_next: bool,
     /// Live frames kept while busy, handled in order after.
     buffer: Vec<MessageFrame>,
     /// Messages waiting for their epoch or for the chat to be joined.
     waiting: Vec<MessageFrame>,
     /// Messages waiting for their device's key, oldest first.
     unknown: Vec<MessageFrame>,
+    /// Call text waiting for its device's key, the same way.
+    unknown_calls: Vec<CallEvent>,
     fetching_devices: bool,
     /// Plans waiting for the members' keys.
     plan_list: Vec<Plan>,
@@ -1009,8 +1044,6 @@ struct ChatState {
     join_at: Option<i64>,
     received: Position,
     seen: Position,
-    want_open: bool,
-    want_older: bool,
     group_info_out: Option<(u64, Vec<u8>)>,
     wraps_out: Option<(u64, Vec<WrapItem>)>,
     /// A group info or wraps frame is waiting for its answer.
@@ -1086,6 +1119,22 @@ pub struct Client {
     call: Option<ActiveCall>,
     /// Call events already shown, since one can come over the WebSocket and on the call's track.
     call_events_shown: HashSet<(Ulid, u64, u64)>,
+    /// Each call's outcome and end time, from its `end` row, by chat and call.
+    call_ends: HashMap<(Ulid, u64), (CallOutcome, i64)>,
+    /// Where the next `sync` starts, as the device's snapshot keeps it.
+    since: Option<i64>,
+    sync_run: Option<SyncRun>,
+    /// `sync`s asked for while one ran, by chat or `None` for every chat.
+    sync_next: Vec<Option<Ulid>>,
+    /// Counts connections, so a page kept after its connection closed asks for nothing more.
+    sync_generation: u64,
+    /// Chats the list said were at a newer epoch than this device, checked once a `sync` ends.
+    behind: Vec<(Ulid, u64)>,
+    rows_saving: HashMap<u64, RowsSave>,
+    /// Archive reads under way: the chat, and whether it is older messages.
+    reading: HashMap<u64, Ulid>,
+    /// This account's devices, as handed to the platform.
+    own_devices: Vec<Ulid>,
     dirty: bool,
     now: i64,
     out: Vec<Output>,
@@ -1198,7 +1247,14 @@ fn account_key(info: &AccountInfo) -> Option<AccountKey> {
     })
 }
 
-fn shown(message: &MessageFrame, account: Option<Ulid>, mine: bool, opened: Opened) -> Shown {
+/// `end` is the call's outcome and end time, for a call's message whose `end` row this client has.
+fn shown(
+    message: &MessageFrame,
+    account: Option<Ulid>,
+    mine: bool,
+    opened: Opened,
+    end: Option<(CallOutcome, i64)>,
+) -> Shown {
     let Opened { text, files, call } = opened;
     Shown {
         chat: message.chat,
@@ -1213,8 +1269,8 @@ fn shown(message: &MessageFrame, account: Option<Ulid>, mine: bool, opened: Open
         text,
         files,
         call,
-        call_outcome: message.call_outcome,
-        call_ended_at: message.call_ended_at,
+        call_outcome: end.map(|(outcome, _)| outcome),
+        call_ended_at: end.map(|(_, at)| at),
         problem: None,
     }
 }
@@ -1264,6 +1320,15 @@ impl Client {
             downloads: HashMap::new(),
             call: None,
             call_events_shown: HashSet::new(),
+            call_ends: HashMap::new(),
+            since: None,
+            sync_run: None,
+            sync_next: Vec::new(),
+            sync_generation: 0,
+            behind: Vec::new(),
+            rows_saving: HashMap::new(),
+            reading: HashMap::new(),
+            own_devices: Vec::new(),
             dirty: false,
             now: 0,
             out: Vec::new(),
@@ -1314,7 +1379,14 @@ impl Client {
             Input::Timer => self.timer(),
             Input::ChunkRead { handle, n, bytes } => self.chunk_read(handle, n, bytes),
             Input::Fetched { id, status, bytes } => self.fetched(id, status, &bytes),
-            Input::CallEvent { event } => self.call_event(event),
+            Input::CallEvent { event } => self.call_row(event, true),
+            Input::RowsSaved { id } => self.rows_saved(id),
+            Input::RowsSaveFailed { id } => self.rows_save_failed(id),
+            Input::RowsRead {
+                id,
+                message_list,
+                call_list,
+            } => self.rows_read(id, message_list, call_list),
         }
         loop {
             self.run_plans();
@@ -1561,10 +1633,7 @@ impl Client {
             },
             Command::SetWords { words } => self.set_words(&words, false),
             Command::Restore { words } => self.set_words(&words, true),
-            Command::ChatList => {
-                let reference = reference();
-                self.ask(ClientFrame::Sync { reference }, reference, Waiting::Sync);
-            }
+            Command::ChatList => self.start_sync(None, self.since),
             Command::OpenChat { chat } => {
                 self.open_chat(chat);
                 self.devices_of(chat);
@@ -1689,10 +1758,6 @@ impl Client {
                 call_seq,
                 text,
             } => self.call_text(chat, call_seq, text),
-            Command::CallEvents { chat, call_seq } => self.get(
-                format!("/api/v1/chats/{chat}/calls/{call_seq}/events"),
-                Asked::CallEvents,
-            ),
             Command::Terminate { device, words } => {
                 let Some(account) = self.account else {
                     return self.error("not_logged_in", "Log in first");
@@ -1845,38 +1910,56 @@ impl Client {
         }
     }
 
-    fn page(&mut self, chat: Ulid, after: u64, before: Option<u64>, purpose: Purpose) -> bool {
-        let reference = reference();
-        let frame = ClientFrame::History {
-            reference,
+    /// Reads the chat's newest messages from the archive, below `before` if given.
+    fn read_rows(&mut self, chat: Ulid, before: Option<u64>) {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.reading.insert(id, chat);
+        self.out.push(Output::ReadRows {
+            id,
             chat,
-            after_seq: after,
             before_seq: before,
             limit: PAGE,
-        };
-        self.ask(frame, reference, Waiting::Page { chat, purpose })
+        });
     }
 
     fn open_chat(&mut self, chat: Ulid) {
-        if !self.page(chat, 0, Some(NEWEST), Purpose::Open) {
-            self.chat(chat).want_open = true;
-        }
+        self.chat(chat).oldest_seq = None;
+        self.read_rows(chat, None);
     }
 
     fn load_older(&mut self, chat: Ulid) {
-        let before = match self.chat(chat).oldest_seq {
-            Some(oldest) => oldest,
-            None => NEWEST,
-        };
-        if before <= 1 {
+        let before = self.chat(chat).oldest_seq;
+        if matches!(before, Some(before) if before <= 1) {
             return self.event(Event::PageLoaded {
                 chat,
                 has_older: false,
             });
         }
-        if !self.page(chat, 0, Some(before), Purpose::Older) {
-            self.chat(chat).want_older = true;
+        self.read_rows(chat, before);
+    }
+
+    /// The archive's answer to `read_rows`: call rows first, so their messages show their ends.
+    fn rows_read(&mut self, id: u64, message_list: Vec<MessageFrame>, call_list: Vec<CallEvent>) {
+        let Some(chat) = self.reading.remove(&id) else {
+            return;
+        };
+        for event in call_list {
+            self.call_row(event, false);
         }
+        let state = self.chat(chat);
+        if let Some(first) = message_list.first() {
+            state.oldest_seq = Some(match state.oldest_seq {
+                Some(oldest) => oldest.min(first.seq),
+                None => first.seq,
+            });
+        }
+        let has_older = match message_list.first() {
+            Some(first) => first.seq > 1,
+            None => false,
+        };
+        self.open_list(chat, message_list, true, true);
+        self.event(Event::PageLoaded { chat, has_older });
     }
 
     /// Fetches the chat's device list, unless one is already coming. It decides every message
@@ -2275,8 +2358,6 @@ impl Client {
         self.last_heard = self.now;
         self.ping_sent_at = None;
         self.event(Event::Online);
-        let reference = reference();
-        self.ask(ClientFrame::Sync { reference }, reference, Waiting::Sync);
         let body = KeyPackagesBody {
             body_list: Vec::new(),
         };
@@ -2286,43 +2367,28 @@ impl Client {
             Some(&body),
             Asked::KeyPackageCount,
         );
-        // What went out before the connection dropped is looked for before anything new goes.
-        let mut verify_list: Vec<(Ulid, u64)> = Vec::new();
+        // What went out before the connection dropped is looked for before anything new goes, in
+        // one `sync` from where it started when the oldest of it went.
+        let mut since = self.since;
+        let mut verify_list: Vec<Ulid> = Vec::new();
         for flight in self.in_flight.values() {
-            let mut seen = false;
-            for entry in &mut verify_list {
-                if entry.0 == flight.chat {
-                    entry.1 = entry.1.min(flight.after);
-                    seen = true;
-                }
-            }
-            if !seen {
-                verify_list.push((flight.chat, flight.after));
+            since = match (since, flight.since) {
+                (Some(since), Some(flight)) => Some(since.min(flight)),
+                _ => None,
+            };
+            if !verify_list.contains(&flight.chat) {
+                verify_list.push(flight.chat);
             }
         }
-        verify_list.sort();
-        for (chat, after) in verify_list {
-            let state = self.chat(chat);
-            state.verify = true;
-            if state.known.is_none() {
-                state.known = Some(after);
-            }
+        for chat in verify_list {
+            self.chat(chat).verify = true;
             self.verifying += 1;
-            self.fill(chat);
         }
+        self.sync_next.clear();
+        self.start_sync(None, since);
         let mut chat_list: Vec<Ulid> = self.chats.keys().copied().collect();
         chat_list.sort();
         for chat in chat_list {
-            let state = self.chat(chat);
-            let (open, older) = (state.want_open, state.want_older);
-            state.want_open = false;
-            state.want_older = false;
-            if open {
-                self.open_chat(chat);
-            }
-            if older {
-                self.load_older(chat);
-            }
             self.send_outs(chat);
             self.report(chat);
         }
@@ -2333,25 +2399,17 @@ impl Client {
         self.socket = Socket::Down;
         self.verifying = 0;
         self.ping = None;
-        let mut reopen = Vec::new();
-        for (_, waiting) in self.waiting.drain() {
-            if let Waiting::Page { chat, purpose } = waiting {
-                reopen.push((chat, purpose));
-            }
-        }
-        for (chat, purpose) in reopen {
-            match purpose {
-                Purpose::Open => self.chat(chat).want_open = true,
-                Purpose::Older => self.chat(chat).want_older = true,
-                Purpose::Fill | Purpose::CatchUp { .. } => {}
-            }
-        }
+        self.waiting.clear();
+        // A `sync` starts again on the next connection, so what it kept goes, and a page still being
+        // kept asks for nothing more.
+        self.sync_run = None;
+        self.sync_next.clear();
+        self.sync_generation += 1;
+        self.behind.clear();
         for state in self.chats.values_mut() {
-            // A fill or catch-up starts again from what was handled, so what it kept goes.
             state.busy = Busy::Idle;
             state.buffer.clear();
             state.verify = false;
-            state.catch_up_next = false;
             state.uploading = false;
             state.received.asked = false;
             state.seen.asked = false;
@@ -2515,6 +2573,7 @@ impl Client {
                     Err(error) => self.error("load_failed", &error.to_string()),
                 }
                 self.account = Some(imported.device.record().account);
+                self.since = imported.device.since();
                 self.device = Some(imported.device);
                 if self.auth == Auth::Token && self.token.is_none() {
                     return self.show_login();
@@ -2539,14 +2598,13 @@ impl Client {
                 plan,
             }) => {
                 let reference = frame.reference;
-                let after = self.chat(chat).known.unwrap_or(0);
                 self.in_flight.insert(
                     local,
                     Flight {
                         chat,
                         frame: (*frame).clone(),
                         plan: Some(plan.clone()),
-                        after,
+                        since: self.since,
                     },
                 );
                 self.ask(
@@ -2736,7 +2794,6 @@ impl Client {
             call,
             ..
         } = content;
-        let after = self.chat(chat).known.unwrap_or(0);
         let Some(device) = self.device.as_ref() else {
             return;
         };
@@ -2826,7 +2883,7 @@ impl Client {
                 chat,
                 frame: frame.clone(),
                 plan: None,
-                after,
+                since: self.since,
             },
         );
         self.ask(
@@ -3240,8 +3297,24 @@ impl Client {
         });
     }
 
-    /// Shows one thing that happened inside a call, once, opening text with the chat's keys.
+    /// Shows one thing that happened inside a call, once, opening text with the chat's keys. Text
+    /// from a device not yet known waits for one fresh device list, as messages do.
     fn call_event(&mut self, event: CallEvent) {
+        self.call_event_with(event, true);
+    }
+
+    fn call_event_with(&mut self, event: CallEvent, wait_device: bool) {
+        if wait_device
+            && event.kind == CallEventKind::Text
+            && !self.devices.contains_key(&event.device)
+            && !self
+                .call_events_shown
+                .contains(&(event.chat, event.call_seq, event.n))
+        {
+            let chat = event.chat;
+            self.chat(chat).unknown_calls.push(event);
+            return self.devices_of(chat);
+        }
         if !self
             .call_events_shown
             .insert((event.chat, event.call_seq, event.n))
@@ -3349,18 +3422,10 @@ impl Client {
             ServerFrame::Chats {
                 reference,
                 chat_list,
-            } => {
-                self.waiting.remove(&reference);
-                self.chats_listed(chat_list);
-            }
-            ServerFrame::Page {
-                reference,
                 message_list,
-            } => {
-                if let Some(Waiting::Page { chat, purpose }) = self.waiting.remove(&reference) {
-                    self.paged(chat, purpose, message_list);
-                }
-            }
+                call_list,
+                more,
+            } => self.synced(reference, chat_list, message_list, call_list, more),
             ServerFrame::Welcome { chat, body } => self.welcome(chat, &body.0),
             ServerFrame::Typing { chat, account, on } => {
                 self.event(Event::Typing { chat, account, on })
@@ -3371,7 +3436,7 @@ impl Client {
                 device,
                 statement,
             } => self.revoked(account, device, &statement.0),
-            ServerFrame::CallEvent(event) => self.call_event(*event),
+            ServerFrame::CallEvent(event) => self.call_row(*event, true),
         }
     }
 
@@ -3401,13 +3466,13 @@ impl Client {
         }
     }
 
-    /// What was sent got its sequence id, from the server's answer or found in a page.
+    /// What was sent got its sequence id, from the server's answer or found in a `sync` page.
     fn stored(&mut self, waiting: Waiting, seq: u64, saved_at: i64) {
         match waiting {
             Waiting::Content { chat, local } => {
-                self.in_flight.remove(&local);
+                self.keep_own(local, seq, saved_at);
                 self.queue.confirm(local, seq);
-                self.advance(chat, seq);
+                self.advance(chat, seq, saved_at);
                 self.event(Event::Sent {
                     chat,
                     local,
@@ -3415,28 +3480,69 @@ impl Client {
                     saved_at,
                 });
             }
-            Waiting::Commit { chat, local, plan } => self.commit_stored(chat, local, plan, seq),
+            Waiting::Commit { chat, local, plan } => {
+                self.commit_stored(chat, local, plan, seq, saved_at)
+            }
             _ => {}
         }
     }
 
+    /// This device's own message, stored: the server never sends it back, so it is kept here as
+    /// the row others receive.
+    fn keep_own(&mut self, local: u64, seq: u64, saved_at: i64) {
+        let Some(flight) = self.in_flight.remove(&local) else {
+            return;
+        };
+        let device = self.device.as_ref().map(|device| device.record().device);
+        let frame = flight.frame;
+        let row = MessageFrame {
+            chat: frame.chat,
+            seq,
+            device,
+            kind: Some(frame.kind),
+            content_kind: frame.content_kind,
+            encrypted: Some(frame.encrypted),
+            epoch: frame.epoch,
+            pointer_seq: frame.pointer_seq,
+            client_sent_at: Some(frame.client_sent_at),
+            server_saved_at: Some(saved_at),
+            body: Some(frame.body),
+            signature: Some(frame.signature),
+        };
+        let last = SyncPosition {
+            at: saved_at,
+            chat: frame.chat,
+            seq,
+            n: 0,
+        };
+        self.save_rows(vec![row], Vec::new(), Some(last), None);
+    }
+
     /// This client's own message took `seq`: it is handled, or shows that something was missed.
-    fn advance(&mut self, chat: Ulid, seq: u64) {
+    fn advance(&mut self, chat: Ulid, seq: u64, saved_at: i64) {
         let state = self.chat(chat);
-        state.top = state.top.max(seq);
         match state.known {
-            None => state.known = Some(seq),
-            Some(known) if seq == known + 1 => state.known = Some(seq),
-            Some(known) if seq > known + 1 => self.fill(chat),
+            None => {
+                state.known = Some(seq);
+                state.known_at = Some(saved_at);
+            }
+            Some(known) if seq == known + 1 => {
+                state.known = Some(seq);
+                state.known_at = Some(saved_at);
+            }
+            Some(known) if seq > known + 1 => {
+                let since = state.known_at.or(self.since);
+                self.start_sync(Some(chat), since);
+            }
             Some(_) => {}
         }
     }
 
-    fn commit_stored(&mut self, chat: Ulid, local: u64, plan: Plan, seq: u64) {
-        self.in_flight.remove(&local);
+    fn commit_stored(&mut self, chat: Ulid, local: u64, plan: Plan, seq: u64, saved_at: i64) {
+        self.keep_own(local, seq, saved_at);
         self.queue.confirm(local, seq);
         self.commit_busy = false;
-        self.advance(chat, seq);
+        self.advance(chat, seq, saved_at);
         let now = self.now;
         let Some(device) = self.device.as_mut() else {
             return;
@@ -3555,32 +3661,22 @@ impl Client {
                         state.join_attempt += 1;
                     }
                     plan => {
+                        // The winning commit is fetched, then this plan runs again on top of it.
                         self.chat(chat).retry = Some(plan);
-                        self.catch_up(chat);
+                        let since = self.chat(chat).known_at.or(self.since);
+                        self.start_sync(Some(chat), since);
                     }
                 }
             }
-            Waiting::Page {
-                chat,
-                purpose: Purpose::Fill,
-            } => {
-                let state = self.chat(chat);
-                state.busy = Busy::Idle;
-                state.top = state.known.unwrap_or(0);
+            Waiting::Sync { chat } => {
+                if let Some(chat) = chat {
+                    let state = self.chat(chat);
+                    state.retry = None;
+                    state.rotating = false;
+                    self.fail_chat(chat, code);
+                }
                 self.error(code, message);
-                self.settle(chat);
-            }
-            Waiting::Page {
-                chat,
-                purpose: Purpose::CatchUp { .. },
-            } => {
-                let state = self.chat(chat);
-                state.busy = Busy::Idle;
-                state.retry = None;
-                state.rotating = false;
-                self.fail_chat(chat, code);
-                self.error(code, message);
-                self.settle(chat);
+                self.sync_ended();
             }
             Waiting::GroupInfo { chat, epoch } => {
                 let state = self.chat(chat);
@@ -3621,7 +3717,7 @@ impl Client {
                 self.error(code, message);
                 self.position_done(chat, which, up_to);
             }
-            Waiting::Page { .. } | Waiting::Sync | Waiting::Done => self.error(code, message),
+            Waiting::Done => self.error(code, message),
         }
     }
 
@@ -3670,7 +3766,6 @@ impl Client {
         let mut shown = Vec::with_capacity(chat_list.len());
         let mut preview_list = Vec::new();
         let mut join_list = Vec::new();
-        let mut todo = Vec::new();
         for mut item in chat_list {
             let own_epoch = match self.device.as_ref() {
                 Some(device) => device.epoch(item.chat).ok(),
@@ -3678,14 +3773,6 @@ impl Client {
             };
             let state = self.chats.entry(item.chat).or_default();
             state.chat_type = Some(item.chat_type);
-            let last_seq = item.last_seq.unwrap_or(0);
-            state.top = state.top.max(last_seq);
-            if state.known.is_none() {
-                // A reload has no handled id. Updating starts at this member's seen position when
-                // the list carries one, so what they have not seen is fetched and opened. Without
-                // it, handling starts at the latest.
-                state.known = Some(item.seen_seq.unwrap_or(last_seq));
-            }
             let mut member_list = vec![me];
             for mark in &item.mark_list {
                 if !member_list.contains(&mark.account) {
@@ -3698,13 +3785,13 @@ impl Client {
             if let Some(message) = item.last_content.take() {
                 preview_list.push(*message);
             }
-            match own_epoch {
-                Some(own) => {
-                    let behind = matches!(item.epoch, Some(epoch) if epoch > own);
-                    todo.push((item.chat, behind));
-                }
-                None if !state.joining => join_list.push(item.chat),
-                None => {}
+            match (own_epoch, item.epoch) {
+                // The `sync` this list came with brings the commits; any still missing once it
+                // ends mean this device rejoins.
+                (Some(own), Some(epoch)) if epoch > own => self.behind.push((item.chat, epoch)),
+                (Some(_), _) => {}
+                (None, _) if !state.joining => join_list.push(item.chat),
+                (None, _) => {}
             }
             for account in member_list {
                 if !self.accounts.contains_key(&account) {
@@ -3734,53 +3821,237 @@ impl Client {
             let chat = message.chat;
             self.open_list(chat, vec![message], true, true);
         }
-        for (chat, behind) in todo {
-            let state = self.chat(chat);
-            if state.busy != Busy::Idle {
-                continue;
+    }
+
+    /// Asks for the messages and call rows saved after `since`, of every chat or only `chat`, unless
+    /// a `sync` already runs, in which case this one follows it. Live frames of the chats it covers
+    /// wait for it.
+    fn start_sync(&mut self, chat: Option<Ulid>, since: Option<i64>) {
+        if self.sync_run.is_some() {
+            if !self.sync_next.contains(&chat) {
+                self.sync_next.push(chat);
             }
-            if state.known.unwrap_or(0) < state.top {
-                self.fill(chat);
-            } else if behind {
-                self.catch_up(chat);
-            } else {
-                self.settle(chat);
+            return;
+        }
+        let reference = reference();
+        let frame = ClientFrame::Sync {
+            reference,
+            since,
+            after: None,
+            chat,
+        };
+        if !self.ask(frame, reference, Waiting::Sync { chat }) {
+            return;
+        }
+        self.sync_run = Some(SyncRun { chat, first: true });
+        match chat {
+            Some(chat) => self.chat(chat).busy = Busy::Syncing,
+            None => {
+                for state in self.chats.values_mut() {
+                    state.busy = Busy::Syncing;
+                }
             }
         }
     }
 
-    /// Pages forward from the last sequence id handled.
-    fn fill(&mut self, chat: Ulid) {
-        let state = self.chat(chat);
-        if state.busy != Busy::Idle {
-            return;
+    /// Whether a `sync` covering this chat runs.
+    fn syncing(&self, chat: Ulid) -> bool {
+        match &self.sync_run {
+            Some(run) => run.chat.is_none_or(|only| only == chat),
+            None => false,
         }
-        let Some(after) = state.known else {
+    }
+
+    /// A `sync` page: its call rows are noted, its messages handled chat by chat in order, then all
+    /// of it goes to the platform to keep, and the next page waits for that.
+    fn synced(
+        &mut self,
+        reference: Ulid,
+        chat_list: Vec<ChatItem>,
+        message_list: Vec<MessageFrame>,
+        call_list: Vec<CallEvent>,
+        more: bool,
+    ) {
+        let Some(Waiting::Sync { chat: scope }) = self.waiting.remove(&reference) else {
             return;
         };
-        if self.page(chat, after, None, Purpose::Fill) {
-            self.chat(chat).busy = Busy::Filling;
+        let first = match self.sync_run.as_mut() {
+            Some(run) => std::mem::replace(&mut run.first, false),
+            None => return,
+        };
+        if first && scope.is_none() {
+            self.chats_listed(chat_list);
+            // Chats first heard of in the list wait for this `sync` too.
+            for state in self.chats.values_mut() {
+                state.busy = Busy::Syncing;
+            }
+        }
+        let mut last: Option<SyncPosition> = None;
+        for message in &message_list {
+            let position = SyncPosition {
+                at: message.server_saved_at.unwrap_or(0),
+                chat: message.chat,
+                seq: message.seq,
+                n: 0,
+            };
+            last = last.max(Some(position));
+        }
+        for event in &call_list {
+            let position = SyncPosition {
+                at: event.server_at,
+                chat: event.chat,
+                seq: event.call_seq,
+                n: event.n,
+            };
+            last = last.max(Some(position));
+        }
+        for event in &call_list {
+            self.call_row(event.clone(), false);
+        }
+        let mut by_chat: Vec<(Ulid, Vec<MessageFrame>)> = Vec::new();
+        for message in &message_list {
+            match by_chat.iter_mut().find(|(chat, _)| *chat == message.chat) {
+                Some((_, list)) => list.push(message.clone()),
+                None => by_chat.push((message.chat, vec![message.clone()])),
+            }
+        }
+        for (chat, mut list) in by_chat {
+            list.sort_by_key(|message| message.seq);
+            self.handle(chat, list);
+        }
+        if last.is_none() {
+            return self.sync_ended();
+        }
+        let page = PageSaved {
+            chat: scope,
+            more,
+            generation: self.sync_generation,
+        };
+        self.save_rows(message_list, call_list, last, Some(page));
+    }
+
+    /// Hands rows to the platform to keep.
+    fn save_rows(
+        &mut self,
+        message_list: Vec<MessageFrame>,
+        call_list: Vec<CallEvent>,
+        last: Option<SyncPosition>,
+        page: Option<PageSaved>,
+    ) {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.rows_saving.insert(id, RowsSave { last, page });
+        self.out.push(Output::SaveRows {
+            id,
+            message_list,
+            call_list,
+        });
+    }
+
+    /// The platform kept rows: `since` moves, and a `sync` page goes on to its next one or ends.
+    fn rows_saved(&mut self, id: u64) {
+        let Some(save) = self.rows_saving.remove(&id) else {
+            return;
+        };
+        if let Some(last) = save.last
+            && self.since.is_none_or(|since| since < last.at)
+        {
+            self.since = Some(last.at);
+            if let Some(device) = self.device.as_mut() {
+                device.set_since(last.at);
+                self.dirty = true;
+            }
+        }
+        let Some(page) = save.page else {
+            return;
+        };
+        if page.generation != self.sync_generation || self.sync_run.is_none() {
+            return;
+        }
+        if !page.more {
+            return self.sync_ended();
+        }
+        let Some(after) = save.last else {
+            return self.sync_ended();
+        };
+        let reference = reference();
+        let frame = ClientFrame::Sync {
+            reference,
+            since: None,
+            after: Some(after),
+            chat: page.chat,
+        };
+        if !self.ask(frame, reference, Waiting::Sync { chat: page.chat }) {
+            self.sync_ended();
         }
     }
 
-    /// Scans back from the newest message for the commits this device missed.
-    fn catch_up(&mut self, chat: Ulid) {
-        let state = self.chat(chat);
-        match state.busy {
-            Busy::CatchingUp => return,
-            Busy::Filling => {
-                state.catch_up_next = true;
-                return;
-            }
-            Busy::Idle => {}
+    /// The platform could not keep rows. `since` stays, so the next `sync` brings them again.
+    fn rows_save_failed(&mut self, id: u64) {
+        let Some(save) = self.rows_saving.remove(&id) else {
+            return;
+        };
+        self.error(
+            "archive_failed",
+            "These messages could not be kept on this device",
+        );
+        if let Some(page) = save.page
+            && page.generation == self.sync_generation
+        {
+            self.sync_ended();
         }
-        if self.page(
-            chat,
-            0,
-            Some(NEWEST),
-            Purpose::CatchUp { found: Vec::new() },
-        ) {
-            self.chat(chat).busy = Busy::CatchingUp;
+    }
+
+    /// The `sync` ended: its chats settle, a chat still behind its listed epoch rejoins, and a
+    /// `sync` asked for meanwhile starts.
+    fn sync_ended(&mut self) {
+        let Some(run) = self.sync_run.take() else {
+            return;
+        };
+        let mut chat_list: Vec<Ulid> = match run.chat {
+            Some(chat) => vec![chat],
+            None => self.chats.keys().copied().collect(),
+        };
+        chat_list.sort();
+        for chat in &chat_list {
+            self.chat(*chat).busy = Busy::Idle;
+        }
+        for chat in chat_list {
+            self.settle(chat);
+            // Messages still waiting for a newer epoch than this device holds have no commit
+            // left to bring it.
+            let current = match self.device.as_ref() {
+                Some(device) => device.epoch(chat).ok(),
+                None => None,
+            };
+            if let Some(current) = current
+                && self
+                    .chat(chat)
+                    .waiting
+                    .iter()
+                    .any(|message| message.epoch.unwrap_or(0) > current)
+            {
+                self.rejoin(chat);
+            }
+        }
+        if run.chat.is_none() {
+            for (chat, epoch) in std::mem::take(&mut self.behind) {
+                let current = match self.device.as_ref() {
+                    Some(device) => device.epoch(chat).ok(),
+                    None => None,
+                };
+                if matches!(current, Some(current) if current < epoch) {
+                    self.rejoin(chat);
+                }
+            }
+        }
+        if !self.sync_next.is_empty() {
+            let next = self.sync_next.remove(0);
+            let since = match next {
+                Some(chat) => self.chat(chat).known_at.or(self.since),
+                None => self.since,
+            };
+            self.start_sync(next, since);
         }
     }
 
@@ -3812,22 +4083,17 @@ impl Client {
             self.verifying = self.verifying.saturating_sub(1);
             self.resend(chat);
         }
-        let state = self.chat(chat);
-        if state.known.unwrap_or(0) < state.top {
-            self.fill(chat);
-        }
     }
 
-    /// A message pushed live. Handled at once if it is the next one, and otherwise kept while what
-    /// is missing below it is fetched.
+    /// A message pushed live. Handled and kept at once if it is the next one, and otherwise held
+    /// while a `sync` of its chat brings what is missing below it.
     fn live(&mut self, message: MessageFrame) {
         let chat = message.chat;
-        let state = self.chat(chat);
-        state.top = state.top.max(message.seq);
-        if state.busy != Busy::Idle {
-            state.buffer.push(message);
+        if self.syncing(chat) {
+            self.chat(chat).buffer.push(message);
             return;
         }
+        let state = self.chat(chat);
         let known = match state.known {
             Some(known) => known,
             None => message.seq.saturating_sub(1),
@@ -3838,9 +4104,47 @@ impl Client {
         }
         if message.seq > known + 1 {
             state.buffer.push(message);
-            return self.fill(chat);
+            let since = state.known_at.or(self.since);
+            return self.start_sync(Some(chat), since);
         }
-        self.handle(chat, vec![message]);
+        let last = SyncPosition {
+            at: message.server_saved_at.unwrap_or(0),
+            chat,
+            seq: message.seq,
+            n: 0,
+        };
+        self.handle(chat, vec![message.clone()]);
+        self.save_rows(vec![message], Vec::new(), Some(last), None);
+    }
+
+    /// A device whose stamp checked out: if it is this account's, the platform hears of it, so it
+    /// counts unread without this account's own messages.
+    fn own_device(&mut self, account: Ulid, device: Ulid) {
+        if self.account == Some(account) && !self.own_devices.contains(&device) {
+            self.own_devices.push(device);
+            self.event(Event::OwnDevices {
+                device_list: self.own_devices.clone(),
+            });
+        }
+    }
+
+    /// One row of a call: its end noted, shown once, and, when it came live, kept.
+    fn call_row(&mut self, event: CallEvent, live: bool) {
+        if event.kind == CallEventKind::End {
+            let outcome = event.outcome.unwrap_or(CallOutcome::Missed);
+            self.call_ends
+                .insert((event.chat, event.call_seq), (outcome, event.server_at));
+        }
+        self.call_event(event.clone());
+        if live {
+            let last = SyncPosition {
+                at: event.server_at,
+                chat: event.chat,
+                seq: event.call_seq,
+                n: event.n,
+            };
+            self.save_rows(Vec::new(), vec![event], Some(last), None);
+        }
     }
 
     /// Handles messages in order from the next one: commits applied, what was in flight matched,
@@ -3848,32 +4152,25 @@ impl Client {
     fn handle(&mut self, chat: Ulid, message_list: Vec<MessageFrame>) {
         let mut opened = Vec::new();
         let mut changed = false;
-        let mut rest = message_list.into_iter();
-        while let Some(message) = rest.next() {
+        for message in message_list {
             if let Some(known) = self.chat(chat).known
                 && message.seq <= known
             {
                 continue;
             }
+            let state = self.chat(chat);
+            state.known = Some(message.seq);
+            state.known_at = message.server_saved_at.or(state.known_at);
             if self.match_flight(chat, &message) {
-                self.chat(chat).known = Some(message.seq);
                 continue;
             }
             if message.kind == Some(Kind::Commit) {
-                match self.apply_commit(chat, &message, false) {
-                    Applied::Nothing => {}
-                    Applied::Changed => changed = true,
-                    Applied::CatchUp => {
-                        let state = self.chat(chat);
-                        state.buffer.push(message);
-                        state.buffer.extend(rest);
-                        break;
-                    }
+                if let Applied::Changed = self.apply_commit(chat, &message) {
+                    changed = true;
                 }
             } else {
-                opened.push(message.clone());
+                opened.push(message);
             }
-            self.chat(chat).known = Some(message.seq);
         }
         self.open_list(chat, opened, true, true);
         if changed {
@@ -3910,7 +4207,7 @@ impl Client {
 
     /// Applies one commit in order. One this device cannot process makes it rejoin, unless the
     /// commit is refused for what it brings in.
-    fn apply_commit(&mut self, chat: Ulid, message: &MessageFrame, catching_up: bool) -> Applied {
+    fn apply_commit(&mut self, chat: Ulid, message: &MessageFrame) -> Applied {
         let now = self.now;
         let Some(device) = self.device.as_mut() else {
             return Applied::Nothing;
@@ -3925,13 +4222,11 @@ impl Client {
         if epoch <= current {
             return Applied::Nothing;
         }
+        // Commits are missing below this one, though rows come in order: this device's state is
+        // behind what it has kept, so it rejoins.
         if epoch > current + 1 {
-            if catching_up {
-                self.rejoin(chat);
-                return Applied::Nothing;
-            }
-            self.catch_up(chat);
-            return Applied::CatchUp;
+            self.rejoin(chat);
+            return Applied::Nothing;
         }
         let mine = message.device == Some(device.record().device);
         let body = match &message.body {
@@ -3974,106 +4269,6 @@ impl Client {
     fn release(&mut self, chat: Ulid) {
         let waiting = std::mem::take(&mut self.chat(chat).waiting);
         self.open_list(chat, waiting, false, false);
-    }
-
-    fn paged(&mut self, chat: Ulid, purpose: Purpose, message_list: Vec<MessageFrame>) {
-        match purpose {
-            Purpose::Open | Purpose::Older => {
-                let state = self.chat(chat);
-                if let Some(first) = message_list.first() {
-                    state.oldest_seq = Some(match state.oldest_seq {
-                        Some(oldest) => oldest.min(first.seq),
-                        None => first.seq,
-                    });
-                }
-                let has_older = match message_list.first() {
-                    Some(first) => first.seq > 1,
-                    None => false,
-                };
-                self.open_list(chat, message_list, true, true);
-                self.event(Event::PageLoaded { chat, has_older });
-            }
-            Purpose::Fill => {
-                let count = message_list.len();
-                let state = self.chat(chat);
-                state.busy = Busy::Idle;
-                for message in &message_list {
-                    state.top = state.top.max(message.seq);
-                }
-                self.handle(chat, message_list);
-                let state = self.chat(chat);
-                if state.busy != Busy::Idle {
-                    return;
-                }
-                if state.catch_up_next {
-                    state.catch_up_next = false;
-                    return self.catch_up(chat);
-                }
-                let known = state.known.unwrap_or(0);
-                if count == 0 {
-                    // Nothing more is stored.
-                    state.top = known;
-                } else if known < state.top || count as u64 >= u64::from(PAGE) {
-                    return self.fill(chat);
-                }
-                self.settle(chat);
-            }
-            Purpose::CatchUp { mut found } => {
-                let current = match self.device.as_ref() {
-                    Some(device) => device.epoch(chat).ok(),
-                    None => None,
-                };
-                let Some(current) = current else {
-                    self.chat(chat).busy = Busy::Idle;
-                    return self.settle(chat);
-                };
-                let mut reached = message_list.is_empty();
-                for message in message_list.iter().rev() {
-                    if message.kind != Some(Kind::Commit) {
-                        continue;
-                    }
-                    let Some(epoch) = message.epoch else {
-                        continue;
-                    };
-                    if epoch <= current {
-                        reached = true;
-                        break;
-                    }
-                    found.push(message.clone());
-                    if epoch == current + 1 {
-                        reached = true;
-                        break;
-                    }
-                }
-                if let Some(first) = message_list.first()
-                    && first.seq <= 1
-                {
-                    reached = true;
-                }
-                if !reached && let Some(first) = message_list.first() {
-                    let before = first.seq;
-                    if !self.page(chat, 0, Some(before), Purpose::CatchUp { found }) {
-                        self.chat(chat).busy = Busy::Idle;
-                    }
-                    return;
-                }
-                self.chat(chat).busy = Busy::Idle;
-                found.reverse();
-                let mut changed = false;
-                for message in found {
-                    if self.match_flight(chat, &message) {
-                        continue;
-                    }
-                    if let Applied::Changed = self.apply_commit(chat, &message, true) {
-                        changed = true;
-                    }
-                }
-                if changed {
-                    self.after_commits(chat);
-                }
-                self.settle(chat);
-            }
-        }
     }
 
     /// Opens what it can. With `wait_device`, holds what comes from a device not yet known for one
@@ -4172,7 +4367,8 @@ impl Client {
                 }
             };
             let mine = self.account == Some(known.account);
-            let shown = shown(&message, Some(known.account), mine, content);
+            let end = self.call_ends.get(&(chat, message.seq)).copied();
+            let shown = shown(&message, Some(known.account), mine, content, end);
             match (kind, message.pointer_seq) {
                 (Kind::Edit, Some(target_seq)) => self.event(Event::Edited {
                     message: shown,
@@ -4185,7 +4381,8 @@ impl Client {
             self.devices_of(chat);
         }
         if need_catch_up {
-            self.catch_up(chat);
+            let since = self.chat(chat).known_at.or(self.since);
+            self.start_sync(Some(chat), since);
         }
         let now = self.now;
         let state = self.chat(chat);
@@ -4198,7 +4395,7 @@ impl Client {
 
     fn problem(&mut self, message: &MessageFrame, account: Option<Ulid>, problem: Problem) {
         let mine = account.is_some() && account == self.account;
-        let mut shown = shown(message, account, mine, Opened::default());
+        let mut shown = shown(message, account, mine, Opened::default(), None);
         shown.problem = Some(problem);
         self.event(Event::Message { message: shown });
     }
@@ -4614,13 +4811,6 @@ impl Client {
                 };
                 self.wraps(chat, wrap_list);
             }
-            Asked::CallEvents => {
-                if let Some(CallEventListReply { event_list }) = self.data(body) {
-                    for event in event_list {
-                        self.call_event(event);
-                    }
-                }
-            }
             Asked::Search => {
                 if let Some(AccountListReply { account_list }) = self.data(body) {
                     self.event(Event::SearchResults { account_list });
@@ -4699,6 +4889,7 @@ impl Client {
             },
         );
         self.device = Some(device);
+        self.own_device(account, id);
         self.dirty = true;
         if !restore {
             // New words: there is no history to unwrap, so their keys go at once.
@@ -4879,7 +5070,11 @@ impl Client {
                 let state = self.chat(chat);
                 state.fetching_devices = false;
                 let waiting = std::mem::take(&mut state.unknown);
+                let calls = std::mem::take(&mut state.unknown_calls);
                 self.open_list(chat, waiting, false, true);
+                for event in calls {
+                    self.call_event_with(event, false);
+                }
                 self.error(code, message);
             }
             Asked::Wraps { chat } => {
@@ -4956,6 +5151,7 @@ impl Client {
                     master,
                 },
             );
+            self.own_device(item.account, item.device);
             if let Some(statement) = item.statement {
                 ended_list.push((item.account, item.device, statement));
             }
@@ -4979,8 +5175,12 @@ impl Client {
         let judged = judged.min(state.unknown.len());
         let later = state.unknown.split_off(judged);
         let decided = std::mem::take(&mut state.unknown);
+        let calls = std::mem::take(&mut state.unknown_calls);
         self.open_list(chat, decided, false, true);
         self.open_list(chat, later, true, true);
+        for event in calls {
+            self.call_event_with(event, false);
+        }
     }
 
     /// Unwraps this account's keys while restoring, and repairs any wrap that is wrong.

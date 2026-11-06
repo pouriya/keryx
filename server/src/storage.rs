@@ -4,8 +4,8 @@
 use std::future::Future;
 
 use keryx_core::protocol::{
-    AccountBrief, CallEvent, CallOutcome, ChatDevice, ChatItem, ChatMode, ChatType, ContentKind,
-    DeviceItem, KeyPackageItem, Kind, MarkItem, MessageFrame, SessionItem, WrapEntry,
+    AccountBrief, CallEvent, ChatDevice, ChatItem, ChatMode, ChatType, ContentKind, DeviceItem,
+    KeyPackageItem, Kind, MarkItem, MessageFrame, SessionItem, SyncPosition, WrapEntry,
 };
 use keryx_core::ulid::Ulid;
 
@@ -217,14 +217,19 @@ pub enum Appended {
     CommitLost,
 }
 
-/// What happened inside a call, saved in one step: its events, and the readable outcome and end on
-/// the call's message. An outcome already written stays, so a call answered never becomes missed.
-pub struct CallChange {
-    pub chat: Ulid,
-    pub call_seq: u64,
-    pub event_list: Vec<CallEvent>,
-    pub outcome: Option<CallOutcome>,
-    pub ended_at: Option<i64>,
+/// Where a `sync` starts: from a server time, already stepped back, or exactly after a page's last
+/// row.
+#[derive(Debug, Clone, Copy)]
+pub enum SyncFrom {
+    Since(i64),
+    After(SyncPosition),
+}
+
+/// One `sync` page: messages and call rows in their order, and whether more follow.
+pub struct SyncPage {
+    pub message_list: Vec<MessageFrame>,
+    pub call_list: Vec<CallEvent>,
+    pub more: bool,
 }
 
 pub enum GroupInfoPut {
@@ -417,14 +422,18 @@ pub trait Storage: Send + Sync + 'static {
     /// wipes its target and the target's edits and walks the preview back, and a commit stores its
     /// wraps and welcomes and moves the epoch on.
     fn append_message(&self, message: NewMessage) -> impl Future<Output = Result<Appended>> + Send;
-    /// Oldest first. With `before_seq`, the newest `limit` below it.
-    fn history(
+    /// Up to `limit` messages and call rows from `from` on, in the account's chats or only `chat`,
+    /// ordered by server time, chat, sequence id and `n`, a message's `n` being 0.
+    fn sync(
         &self,
-        chat: Ulid,
-        after_seq: u64,
-        before_seq: Option<u64>,
+        account: Ulid,
+        chat: Option<Ulid>,
+        from: SyncFrom,
         limit: u32,
-    ) -> impl Future<Output = Result<Vec<MessageFrame>>> + Send;
+    ) -> impl Future<Output = Result<SyncPage>> + Send;
+    /// The server time for a message or call row: the clock, but never before the last one handed
+    /// out, server-wide, so a clock that steps back cannot hide a row from a `sync`.
+    fn saved_now(&self) -> i64;
     /// Keeps the highest, with a row of times for each rise. A lower or equal one changes nothing
     /// and gives `None`, and a rise gives the member's positions after it.
     fn record_position(
@@ -456,15 +465,10 @@ pub trait Storage: Send + Sync + 'static {
         device: Ulid,
     ) -> impl Future<Output = Result<Vec<(Ulid, Vec<u8>)>>> + Send;
 
-    fn save_call(&self, change: CallChange) -> impl Future<Output = Result<()>> + Send;
-    /// What happened inside one call, oldest first.
-    fn call_events(
-        &self,
-        chat: Ulid,
-        call_seq: u64,
-    ) -> impl Future<Output = Result<Vec<CallEvent>>> + Send;
-    /// Ends every call still open, as missed unless it was answered, with an `end` from the
-    /// caller's device. Nobody can be in one after a restart.
+    /// Call rows, saved in one step.
+    fn save_call(&self, event_list: Vec<CallEvent>) -> impl Future<Output = Result<()>> + Send;
+    /// Ends every call still open, one with no `end` row, as missed unless the other account joined,
+    /// with an `end` from the caller's device. Nobody can be in one after a restart.
     fn end_open_calls(&self, now: i64) -> impl Future<Output = Result<()>> + Send;
 
     fn create_file(&self, file: NewFile) -> impl Future<Output = Result<()>> + Send;

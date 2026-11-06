@@ -76,7 +76,6 @@ good.
     PUT  /files/{id}/chunks/{n}           the encrypted chunk's raw bytes -> size, chunks, received
     GET  /files/{id}                      -> size, chunks, received
     GET  /files/{id}/chunks/{n}           -> the encrypted chunk's raw bytes
-    GET  /chats/{id}/calls/{seq}/events   -> event_list, what happened inside a call
     GET  /calls/{chat}/{seq}/moq          a WebSocket: the call's MoQ, while the call is open
 
 Claiming hands out one package per device and deletes it. `POST /chats` gives the pair's chat, and your
@@ -104,10 +103,9 @@ itself. To check the server yourself, send a WebSocket ping, or a `ping` frame, 
 
 Every frame is JSON with a `type`. A request's `ref` is a ULID you make, which comes back in its answer.
 
-You send: `send`, `seen`, `received`, `typing`, `sync`, `history`, `group_info`, `wraps`, `call_event`,
-`ping`.
+You send: `send`, `seen`, `received`, `typing`, `sync`, `group_info`, `wraps`, `call_event`, `ping`.
 
-The server sends: `features`, `sent`, `done`, `refused`, `message`, `chats`, `page`, `welcome`, `typing`,
+The server sends: `features`, `sent`, `done`, `refused`, `message`, `chats`, `welcome`, `typing`,
 `marks`, `revoked`, `call_event`.
 
 `received` and `seen` each carry `chat` and `up_to_seq`, and the server keeps the highest of each. When
@@ -115,8 +113,14 @@ one rises, the other members' online devices get `marks` with the `account`, its
 `seen_seq`. Each `chats` entry carries the same positions in `mark_list`, and its newest content
 message in `last_content`. Neither goes out in a channel.
 
-`history` returns up to `limit` messages after `after_seq`, oldest first. With `before_seq`, it
-returns the newest `limit` below it instead, still oldest first.
+`sync` answers with `chats`: your chats in `chat_list`, then every message in `message_list` and call
+row in `call_list` saved since `since`, the server time in milliseconds of the newest row you hold,
+less 1 second. With no `since` it starts from the beginning, and with `chat` it reads that chat
+only. A page holds at most `history_page` rows, in order of server time, chat, `seq` and `n`, and
+`more` says another follows: ask again with `after`, the last row's `{at, chat, seq, n}`, and it
+starts right after that row. Only the first page carries `chat_list`. Drop what you already hold by
+`(chat, seq)` and `(chat, call_seq, n)`. A removed message comes again with only its `seq` and the
+time it was removed.
 
 A commit is a `send` with kind 3, carrying `epoch`, `wrap_list`, `welcome_list` and `group_info`, the
 chat's group info at that epoch, which is saved with it. The first commit for each epoch wins, and a
@@ -126,7 +130,7 @@ Welcome. The same epoch 0 bytes sent again are accepted, as a resend whose answe
 
 ## Calls
 
-A call is one `send` with content kind 7, in a direct chat only, and its delivery is the ring. A chat
+A call is one `send` with content kind 8, in a direct chat only, and its delivery is the ring. A chat
 has one open call at a time: starting another is refused with `call_open`, and the refusal carries the
 open call's `call_seq`, so join that one instead. Calls elsewhere are refused with `call_not_allowed`.
 
@@ -134,8 +138,9 @@ The other account declines with a `call_event` frame of `kind` 2 and the call's 
 with `done`, and in a direct chat that ends the call as missed. A call nobody answers ends as missed
 after 60 seconds. Every `join`, `leave`, `decline` and `end` reaches the chat's online devices as
 `call_event`: `{chat, call_seq, n, kind, device, server_at}`, with `kind` 0 join, 1 leave, 2 decline,
-3 text and 4 end. The call's message then carries `call_outcome`, 0 missed or 1 answered, and
-`call_ended_at`. An ended call cannot be joined again.
+3 text and 4 end. The `end` carries `outcome`, 0 missed or 1 answered, and its `server_at` is when the
+call ended. `sync` hands every one of them, text included, in `call_list`. A call with no `end` is still
+open, and an ended call cannot be joined again.
 
 Joining is a WebSocket to `/api/v1/calls/{chat}/{seq}/moq`, with the same cookie or Bearer token as
 `/api/v1/ws` and the subprotocol `qmux-02.moq-lite-05`: MoQ over qmux, moq-lite 05 only. A refusal

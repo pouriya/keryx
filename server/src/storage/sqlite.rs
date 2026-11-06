@@ -5,28 +5,33 @@
 //! blocking pool. If that becomes too slow, the answer is Postgres.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use keryx_core::protocol::{
-    AccountBrief, Bytes, CallEvent, ChatDevice, ChatItem, ChatMode, ChatType, DeviceItem,
-    DeviceLogItem, KeyPackageItem, Kind, MarkItem, MessageFrame, SessionItem, WrapEntry,
+    AccountBrief, Bytes, CallEvent, CallEventKind, ChatDevice, ChatItem, ChatMode, ChatType,
+    DeviceItem, DeviceLogItem, KeyPackageItem, Kind, MarkItem, MessageFrame, SessionItem,
+    SyncPosition, WrapEntry,
 };
 use keryx_core::ulid::Ulid;
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
 use super::{
-    Account, Appended, BuiltInRole, CallChange, ChatAccess, DeviceKey, DeviceUsage, Error,
-    GroupInfoPut, MessageBrief, NewAccount, NewDevice, NewFile, NewMessage, NewSession, NewWrap,
-    Position, PositionReport, Registered, Result, Session, SetupLink, Storage, StoredFile,
+    Account, Appended, BuiltInRole, ChatAccess, DeviceKey, DeviceUsage, Error, GroupInfoPut,
+    MessageBrief, NewAccount, NewDevice, NewFile, NewMessage, NewSession, NewWrap, Position,
+    PositionReport, Registered, Result, Session, SetupLink, Storage, StoredFile, SyncFrom,
+    SyncPage,
 };
 
 /// How long a connection waits for a lock another process holds, such as a backup.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 const MESSAGE_COLUMNS: &str = "conversation_id, seq, device_id, kind, content_kind, encrypted, \
-     epoch, pointer_seq, call_outcome, client_sent_at, server_saved_at, body, signature, \
-     call_ended_at";
+     epoch, pointer_seq, client_sent_at, server_saved_at, body, signature";
+
+const CALL_COLUMNS: &str = "conversation_id, call_seq, n, kind, device_id, server_at, client_at, \
+     epoch, signature, body, outcome";
 
 /// A message's kind, content kind, sender's account, sender's device's age, and save time.
 type BriefRow = (i64, Option<i64>, [u8; 16], i64, i64);
@@ -34,6 +39,8 @@ type BriefRow = (i64, Option<i64>, [u8; 16], i64, i64);
 pub struct Sqlite {
     writer: Arc<Mutex<Connection>>,
     reader: Arc<Mutex<Connection>>,
+    /// The last server time handed out for a message or call row. See `saved_now`.
+    last_saved: AtomicI64,
 }
 
 impl Sqlite {
@@ -62,9 +69,16 @@ impl Sqlite {
                 include_str!("sqlite.sql")
             ))?;
         }
+        let last_saved: Option<i64> = writer.query_row(
+            "SELECT MAX(at) FROM (SELECT MAX(server_saved_at) AS at FROM message
+             UNION ALL SELECT MAX(server_at) FROM call)",
+            [],
+            |row| row.get(0),
+        )?;
         Ok(Self {
             writer: Arc::new(Mutex::new(writer)),
             reader: Arc::new(Mutex::new(reader)),
+            last_saved: AtomicI64::new(last_saved.unwrap_or(0)),
         })
     }
 
@@ -162,8 +176,8 @@ fn opt_numbered<T: TryFrom<u8>>(value: Option<i64>) -> rusqlite::Result<Option<T
 }
 
 fn message_frame(row: &Row<'_>) -> rusqlite::Result<MessageFrame> {
-    let body: Option<Vec<u8>> = row.get(11)?;
-    let signature: Option<Vec<u8>> = row.get(12)?;
+    let body: Option<Vec<u8>> = row.get(10)?;
+    let signature: Option<Vec<u8>> = row.get(11)?;
     let encrypted: Option<i64> = row.get(5)?;
     Ok(MessageFrame {
         chat: Ulid::from_bytes(row.get(0)?),
@@ -174,12 +188,10 @@ fn message_frame(row: &Row<'_>) -> rusqlite::Result<MessageFrame> {
         encrypted: encrypted.map(|encrypted| encrypted == 1),
         epoch: opt_unsigned(row.get(6)?),
         pointer_seq: opt_unsigned(row.get(7)?),
-        client_sent_at: row.get(9)?,
-        server_saved_at: row.get(10)?,
+        client_sent_at: row.get(8)?,
+        server_saved_at: row.get(9)?,
         body: body.map(Bytes),
         signature: signature.map(Bytes),
-        call_outcome: opt_numbered(row.get(8)?)?,
-        call_ended_at: row.get(13)?,
     })
 }
 
@@ -197,7 +209,101 @@ fn call_event_row(row: &Row<'_>) -> rusqlite::Result<CallEvent> {
         epoch: opt_unsigned(row.get(7)?),
         signature: signature.map(Bytes),
         body: body.map(Bytes),
+        outcome: opt_numbered(row.get(10)?)?,
     })
+}
+
+/// Where a row stands in a `sync`: server time, chat, sequence id, and `n`, 0 for a message.
+fn message_position(message: &MessageFrame) -> SyncPosition {
+    SyncPosition {
+        at: message.server_saved_at.unwrap_or(0),
+        chat: message.chat,
+        seq: message.seq,
+        n: 0,
+    }
+}
+
+fn call_position(event: &CallEvent) -> SyncPosition {
+    SyncPosition {
+        at: event.server_at,
+        chat: event.chat,
+        seq: event.call_seq,
+        n: event.n,
+    }
+}
+
+/// What one `sync` asks for: from where, in the account's chats or only `chat`, and how many rows.
+#[derive(Clone, Copy)]
+struct SyncAsk {
+    account: Ulid,
+    chat: Option<Ulid>,
+    from: SyncFrom,
+    limit: u32,
+}
+
+/// Rows of one table for `ask`. `order` names the time and sequence id columns this table orders
+/// by, and its `n` column. A message has none, and stands at `n` 0 before its call's rows.
+fn sync_rows<T>(
+    connection: &Connection,
+    query: &str,
+    order: (&str, &str, Option<&str>),
+    ask: SyncAsk,
+    row_of: fn(&Row<'_>) -> rusqlite::Result<T>,
+) -> rusqlite::Result<Vec<T>> {
+    let SyncAsk {
+        account,
+        chat,
+        from,
+        limit,
+    } = ask;
+    let (at, seq, n) = order;
+    // SQLite reads a bare number in ORDER BY as a column's place, so a message orders without one.
+    let order_by = match n {
+        Some(n) => format!("{at}, conversation_id, {seq}, {n}"),
+        None => format!("{at}, conversation_id, {seq}"),
+    };
+    let n = n.unwrap_or("0");
+    let scope = match chat {
+        Some(_) => "conversation_id = ?1",
+        None => "conversation_id IN (SELECT conversation_id FROM member WHERE account_id = ?1)",
+    };
+    let scope_id = match chat {
+        Some(chat) => *chat.bytes(),
+        None => *account.bytes(),
+    };
+    let mut row_list = Vec::new();
+    match from {
+        SyncFrom::Since(since) => {
+            let mut statement = connection.prepare(&format!(
+                "{query} WHERE {scope} AND {at} >= ?2
+                 ORDER BY {order_by} LIMIT ?3"
+            ))?;
+            for row in statement.query_map(params![scope_id, since, limit], row_of)? {
+                row_list.push(row?);
+            }
+        }
+        SyncFrom::After(position) => {
+            let mut statement = connection.prepare(&format!(
+                "{query} WHERE {scope} AND ({at}, conversation_id, {seq}, {n}) > (?2, ?3, ?4, ?5)
+                 ORDER BY {order_by} LIMIT ?6"
+            ))?;
+            let rows = statement.query_map(
+                params![
+                    scope_id,
+                    position.at,
+                    position.chat.bytes(),
+                    int(position.seq),
+                    int(position.n),
+                    limit
+                ],
+                row_of,
+            )?;
+            for row in rows {
+                row_list.push(row?);
+            }
+        }
+    }
+    Ok(row_list)
 }
 
 fn account_row(row: &Row<'_>) -> rusqlite::Result<Account> {
@@ -782,8 +888,6 @@ impl Storage for Sqlite {
                 server_saved_at: Some(device.now),
                 body: Some(Bytes(Vec::new())),
                 signature: Some(Bytes(device.stamp)),
-                call_outcome: None,
-                call_ended_at: None,
             })))
         })
         .await
@@ -1248,16 +1352,15 @@ impl Storage for Sqlite {
             if message.kind == Kind::Delete {
                 connection.execute(
                     "UPDATE message SET device_id = NULL, kind = NULL, content_kind = NULL,
-                     encrypted = NULL, epoch = NULL, pointer_seq = NULL,
-                     call_outcome = NULL, call_ended_at = NULL, client_sent_at = NULL,
-                     server_saved_at = NULL,
+                     encrypted = NULL, epoch = NULL, pointer_seq = NULL, client_sent_at = NULL,
+                     server_saved_at = ?3,
                      expires_at = NULL, signature = NULL, body = NULL
                      WHERE conversation_id = ?1 AND (seq = ?2 OR (kind = 1 AND pointer_seq = ?2))",
-                    params![chat.bytes(), opt_int(message.pointer_seq)],
+                    params![chat.bytes(), opt_int(message.pointer_seq), message.now],
                 )?;
-                // A deleted call takes what happened inside it along.
+                // A deleted call takes everything about it along.
                 connection.execute(
-                    "DELETE FROM call_event WHERE conversation_id = ?1 AND call_seq = ?2",
+                    "DELETE FROM call WHERE conversation_id = ?1 AND call_seq = ?2",
                     params![chat.bytes(), opt_int(message.pointer_seq)],
                 )?;
             }
@@ -1361,43 +1464,73 @@ impl Storage for Sqlite {
         .await
     }
 
-    async fn history(
+    async fn sync(
         &self,
-        chat: Ulid,
-        after_seq: u64,
-        before_seq: Option<u64>,
+        account: Ulid,
+        chat: Option<Ulid>,
+        from: SyncFrom,
         limit: u32,
-    ) -> Result<Vec<MessageFrame>> {
+    ) -> Result<SyncPage> {
         self.read(move |connection| {
-            let mut message_list = Vec::new();
-            if let Some(before_seq) = before_seq {
-                let mut statement = connection.prepare(&format!(
-                    "SELECT {MESSAGE_COLUMNS} FROM message
-                     WHERE conversation_id = ?1 AND seq > ?2 AND seq < ?3
-                     ORDER BY seq DESC LIMIT ?4"
-                ))?;
-                let rows = statement.query_map(
-                    params![chat.bytes(), int(after_seq), int(before_seq), limit],
-                    message_frame,
-                )?;
-                for message in rows {
-                    message_list.push(message?);
+            // One more than a page from each table tells whether more follow.
+            let ask = SyncAsk {
+                account,
+                chat,
+                from,
+                limit: limit.saturating_add(1),
+            };
+            let message_list = sync_rows(
+                connection,
+                &format!("SELECT {MESSAGE_COLUMNS} FROM message"),
+                ("server_saved_at", "seq", None),
+                ask,
+                message_frame,
+            )?;
+            let call_list = sync_rows(
+                connection,
+                &format!("SELECT {CALL_COLUMNS} FROM call"),
+                ("server_at", "call_seq", Some("n")),
+                ask,
+                call_event_row,
+            )?;
+            // The two merged in order, cut at the page's size.
+            let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+            let mut page = SyncPage {
+                message_list: Vec::new(),
+                call_list: Vec::new(),
+                more: false,
+            };
+            let mut messages = message_list.into_iter().peekable();
+            let mut calls = call_list.into_iter().peekable();
+            loop {
+                let take_message = match (messages.peek(), calls.peek()) {
+                    (Some(message), Some(event)) => {
+                        message_position(message) < call_position(event)
+                    }
+                    (Some(_), None) => true,
+                    (None, Some(_)) => false,
+                    (None, None) => break,
+                };
+                if page.message_list.len() + page.call_list.len() == limit {
+                    page.more = true;
+                    break;
                 }
-                message_list.reverse();
-            } else {
-                let mut statement = connection.prepare(&format!(
-                    "SELECT {MESSAGE_COLUMNS} FROM message WHERE conversation_id = ?1 AND seq > ?2
-                     ORDER BY seq LIMIT ?3"
-                ))?;
-                let rows = statement
-                    .query_map(params![chat.bytes(), int(after_seq), limit], message_frame)?;
-                for message in rows {
-                    message_list.push(message?);
+                if take_message {
+                    if let Some(message) = messages.next() {
+                        page.message_list.push(message);
+                    }
+                } else if let Some(event) = calls.next() {
+                    page.call_list.push(event);
                 }
             }
-            Ok(message_list)
+            Ok(page)
         })
         .await
+    }
+
+    fn saved_now(&self) -> i64 {
+        let now = Ulid::now();
+        self.last_saved.fetch_max(now, Ordering::Relaxed).max(now)
     }
 
     async fn record_position(&self, report: PositionReport) -> Result<Option<MarkItem>> {
@@ -1592,16 +1725,17 @@ impl Storage for Sqlite {
         .await
     }
 
-    async fn save_call(&self, change: CallChange) -> Result<()> {
+    async fn save_call(&self, event_list: Vec<CallEvent>) -> Result<()> {
         self.write(move |connection| {
-            for event in &change.event_list {
+            for event in &event_list {
                 connection.execute(
-                    "INSERT INTO call_event (conversation_id, call_seq, n, kind, device_id,
-                     server_at, client_at, epoch, signature, body)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    &format!(
+                        "INSERT INTO call ({CALL_COLUMNS})
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
+                    ),
                     params![
-                        change.chat.bytes(),
-                        int(change.call_seq),
+                        event.chat.bytes(),
+                        int(event.call_seq),
                         int(event.n),
                         event.kind as u8,
                         event.device.bytes(),
@@ -1609,20 +1743,8 @@ impl Storage for Sqlite {
                         event.client_at,
                         opt_int(event.epoch),
                         event.signature.as_ref().map(|signature| &signature.0),
-                        event.body.as_ref().map(|body| &body.0)
-                    ],
-                )?;
-            }
-            if change.outcome.is_some() || change.ended_at.is_some() {
-                connection.execute(
-                    "UPDATE message SET call_outcome = COALESCE(call_outcome, ?3),
-                     call_ended_at = COALESCE(call_ended_at, ?4)
-                     WHERE conversation_id = ?1 AND seq = ?2 AND content_kind = 8",
-                    params![
-                        change.chat.bytes(),
-                        int(change.call_seq),
-                        change.outcome.map(|outcome| outcome as u8),
-                        change.ended_at
+                        event.body.as_ref().map(|body| &body.0),
+                        event.outcome.map(|outcome| outcome as u8)
                     ],
                 )?;
             }
@@ -1631,38 +1753,28 @@ impl Storage for Sqlite {
         .await
     }
 
-    async fn call_events(&self, chat: Ulid, call_seq: u64) -> Result<Vec<CallEvent>> {
-        self.read(move |connection| {
-            let mut statement = connection.prepare(
-                "SELECT conversation_id, call_seq, n, kind, device_id, server_at, client_at,
-                 epoch, signature, body FROM call_event
-                 WHERE conversation_id = ?1 AND call_seq = ?2 ORDER BY n",
-            )?;
-            let rows = statement.query_map(params![chat.bytes(), int(call_seq)], call_event_row)?;
-            let mut event_list = Vec::new();
-            for event in rows {
-                event_list.push(event?);
-            }
-            Ok(event_list)
-        })
-        .await
-    }
-
     async fn end_open_calls(&self, now: i64) -> Result<()> {
         self.write(move |connection| {
+            // Answered once a device of an account other than the caller's joined.
             connection.execute(
-                "INSERT INTO call_event (conversation_id, call_seq, n, kind, device_id, server_at)
+                "INSERT INTO call (conversation_id, call_seq, n, kind, device_id, server_at, outcome)
                  SELECT m.conversation_id, m.seq,
-                 COALESCE((SELECT MAX(e.n) FROM call_event e
-                           WHERE e.conversation_id = m.conversation_id AND e.call_seq = m.seq), 0)
-                 + 1, 4, m.device_id, ?1
-                 FROM message m WHERE m.content_kind = 8 AND m.call_ended_at IS NULL",
-                params![now],
-            )?;
-            connection.execute(
-                "UPDATE message SET call_outcome = COALESCE(call_outcome, 0), call_ended_at = ?1
-                 WHERE content_kind = 8 AND call_ended_at IS NULL",
-                params![now],
+                 COALESCE((SELECT MAX(c.n) FROM call c
+                           WHERE c.conversation_id = m.conversation_id AND c.call_seq = m.seq), 0)
+                 + 1, ?2, m.device_id, ?1,
+                 EXISTS (SELECT 1 FROM call c
+                         JOIN device joined ON joined.id = c.device_id
+                         JOIN device caller ON caller.id = m.device_id
+                         WHERE c.conversation_id = m.conversation_id AND c.call_seq = m.seq
+                         AND c.kind = ?3 AND joined.account_id <> caller.account_id)
+                 FROM message m WHERE m.content_kind = 8
+                 AND NOT EXISTS (SELECT 1 FROM call c WHERE c.conversation_id = m.conversation_id
+                                 AND c.call_seq = m.seq AND c.kind = ?2)",
+                params![
+                    now,
+                    CallEventKind::End as u8,
+                    CallEventKind::Join as u8
+                ],
             )?;
             Ok(())
         })

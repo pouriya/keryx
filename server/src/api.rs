@@ -36,14 +36,13 @@ use keryx_core::mls::{
     verify_password_reset, verify_revocation,
 };
 use keryx_core::protocol::{
-    AccountInfo, AccountKeysBody, AccountListReply, AccountReply, Bytes, CallEventListReply,
-    ChallengeBody, ChallengeReply, ChatDeviceListReply, ChatMode, ChatReply, ClientFrame,
-    ContentKind, CountReply, CreateAccountBody, CreateChatBody, CreateFileBody,
-    CreatedAccountReply, DeviceListReply, DeviceReply, DevicesReply, EmptyReply, FeaturesReply,
-    FileReply, FileStatusReply, GroupInfoReply, KeyPackageListReply, KeyPackagesBody, LoginBody,
-    LoginReply, ReducedDeviceItem, ReducedDeviceListReply, RegisterBody, RegisterDeviceBody,
-    ResetBody, SelfChatReply, ServerFrame, SessionListReply, SetupBody, SetupReply, SignedBody,
-    WrapListReply,
+    AccountInfo, AccountKeysBody, AccountListReply, AccountReply, Bytes, ChallengeBody,
+    ChallengeReply, ChatDeviceListReply, ChatMode, ChatReply, ClientFrame, ContentKind, CountReply,
+    CreateAccountBody, CreateChatBody, CreateFileBody, CreatedAccountReply, DeviceListReply,
+    DeviceReply, DevicesReply, EmptyReply, FeaturesReply, FileReply, FileStatusReply,
+    GroupInfoReply, KeyPackageListReply, KeyPackagesBody, LoginBody, LoginReply, ReducedDeviceItem,
+    ReducedDeviceListReply, RegisterBody, RegisterDeviceBody, ResetBody, SelfChatReply,
+    ServerFrame, SessionListReply, SetupBody, SetupReply, SignedBody, WrapListReply,
 };
 use keryx_core::ulid::Ulid;
 use serde::de::DeserializeOwned;
@@ -64,7 +63,7 @@ use crate::moq;
 use crate::storage::sqlite::Sqlite;
 use crate::storage::{
     self, BuiltInRole, NewAccount, NewDevice, NewFile, NewSession, Registered, Session, Storage,
-    StoredFile,
+    StoredFile, SyncFrom,
 };
 
 pub const CHAT_CREATE_DIRECT: &str = "chat.create_direct";
@@ -120,6 +119,9 @@ const SUBPROTOCOL: &str = "keryx.v1";
 const COOKIE_NAME: &str = "keryx_session";
 const MAX_PASSWORD_CHARS: usize = 1024;
 
+/// A first `sync` page starts this far before the client's `since`, for rows saved just before it
+/// whose writes landed after the client read past them.
+const SYNC_BACK_MS: i64 = 1000;
 /// A challenge or a new device's id works for 5 minutes.
 const CHALLENGE_MS: i64 = 5 * 60 * 1000;
 const PURPOSE_RESET: i64 = 0;
@@ -1213,7 +1215,7 @@ pub async fn run_register_device(
                 web_platform: input.web_platform,
                 web_platform_version: input.web_platform_version,
                 ip,
-                now: Ulid::now(),
+                now: app.storage.saved_now(),
             },
             session.id,
             app.settings.max_devices,
@@ -1480,23 +1482,6 @@ pub async fn run_chat_wraps(
     Ok(WrapListReply { wrap_list })
 }
 
-/// What happened inside one call, for its replay. Membership is all it needs, as for history.
-pub async fn run_call_events(
-    app: &App,
-    caller: &Caller,
-    chat: Ulid,
-    call_seq: u64,
-) -> Result<CallEventListReply, Refused> {
-    check(app, caller, Need::Device).await?;
-    check(app, caller, Need::Member(chat)).await?;
-    let brief = app.storage.message_brief(chat, call_seq).await?;
-    if !brief.is_some_and(|brief| brief.content_kind == Some(ContentKind::Call)) {
-        return Err(refused(404, "no_such_message", "That call does not exist"));
-    }
-    let event_list = app.storage.call_events(chat, call_seq).await?;
-    Ok(CallEventListReply { event_list })
-}
-
 /// A new upload into a chat. Its declared type picks the limit and the permission to send it, and
 /// its size must be one a sealed file of that many chunks can have.
 pub async fn run_create_file(
@@ -1636,37 +1621,45 @@ pub async fn run_frame(
 ) -> Option<ServerFrame> {
     let caller = Caller::Session(session);
     let (chat, reference) = match &frame {
-        ClientFrame::Sync { reference } => {
-            let reference = *reference;
+        ClientFrame::Sync {
+            reference,
+            since,
+            after,
+            chat,
+        } => {
+            let (reference, since, after, chat) = (*reference, *since, *after, *chat);
             let result = operation!("Sync", "sync", async {
                 check(app, &caller, Need::Session).await?;
-                let chat_list = app.storage.chat_list(session.account).await?;
+                if let Some(chat) = chat {
+                    check(app, &caller, Need::Member(chat)).await?;
+                }
+                // A continued page starts exactly after the last row. A first one goes a second back,
+                // for rows saved just before `since` whose writes landed after it was read.
+                let from = match after {
+                    Some(position) => SyncFrom::After(position),
+                    None => {
+                        SyncFrom::Since(since.map_or(0, |since| since.saturating_sub(SYNC_BACK_MS)))
+                    }
+                };
+                let chat_list = match after {
+                    Some(_) => Vec::new(),
+                    None => app.storage.chat_list(session.account).await?,
+                };
+                let page = app
+                    .storage
+                    .sync(
+                        session.account,
+                        chat,
+                        from,
+                        app.settings.limits.history_page,
+                    )
+                    .await?;
                 Ok(ServerFrame::Chats {
                     reference,
                     chat_list,
-                })
-            });
-            return Some(answer_of(reference, result));
-        }
-        ClientFrame::History {
-            reference,
-            chat,
-            after_seq,
-            before_seq,
-            limit,
-        } => {
-            let (reference, chat, after_seq, before_seq) =
-                (*reference, *chat, *after_seq, *before_seq);
-            let limit = (*limit).min(app.settings.limits.history_page);
-            let result = operation!("History", "history", async {
-                check(app, &caller, Need::Member(chat)).await?;
-                let message_list = app
-                    .storage
-                    .history(chat, after_seq, before_seq, limit)
-                    .await?;
-                Ok(ServerFrame::Page {
-                    reference,
-                    message_list,
+                    message_list: page.message_list,
+                    call_list: page.call_list,
+                    more: page.more,
                 })
             });
             return Some(answer_of(reference, result));
@@ -2093,20 +2086,6 @@ async fn chat_wraps(State(app): Shared, headers: HeaderMap, Path(id): Path<Strin
     respond(operation!("ChatWraps", "chat_wraps", async {
         let caller = caller_of(&app, &headers).await?;
         run_chat_wraps(&app, &caller, path_id(&id)?).await
-    }))
-}
-
-async fn call_events(
-    State(app): Shared,
-    headers: HeaderMap,
-    Path((id, seq)): Path<(String, String)>,
-) -> Response {
-    respond(operation!("CallEvents", "call_events", async {
-        let caller = caller_of(&app, &headers).await?;
-        let Ok(call_seq) = seq.parse() else {
-            return Err(refused(404, "not_found", "There is nothing there"));
-        };
-        run_call_events(&app, &caller, path_id(&id)?, call_seq).await
     }))
 }
 
@@ -2568,7 +2547,6 @@ fn router(app: Arc<App>, www: &FilePath) -> Router {
         .route("/api/v1/chats/{id}/group_info", get(group_info))
         .route("/api/v1/chats/{id}/devices", get(chat_devices))
         .route("/api/v1/chats/{id}/wraps", get(chat_wraps))
-        .route("/api/v1/chats/{id}/calls/{seq}/events", get(call_events))
         .route("/api/v1/chats/{id}/files", post(create_file))
         .route("/api/v1/files/{id}", get(file_status))
         .route(
@@ -2797,7 +2775,7 @@ pub async fn serve(settings: Settings) -> Result<(), ServeError> {
     if settings.calls.test_ring.is_some() || settings.calls.test_grace.is_some() {
         tracing::warn!(msg = "A call's ring or drop grace is shortened, which is for tests only");
     }
-    if let Err(source) = storage.end_open_calls(Ulid::now()).await {
+    if let Err(source) = storage.end_open_calls(storage.saved_now()).await {
         return Err(ServeError::Prepare(source));
     }
     if let Some(captcha) = &settings.captcha

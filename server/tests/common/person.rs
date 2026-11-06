@@ -3,13 +3,13 @@
 //! Apart from `mod.rs`, because a test file that has no use for it would fail clippy on dead code,
 //! and `#[allow]` is not used here.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
 use keryx_core::client::{Auth, Client, Command, Event, Input, Output, Platform, Secret};
 use keryx_core::mls::{AccountKey, Device, stamp_account_key};
-use keryx_core::protocol::{Bytes, ChatType};
+use keryx_core::protocol::{Bytes, CallEvent, ChatType, MessageFrame};
 use keryx_core::seed::{AccountKeys, derive};
 use keryx_core::ulid::Ulid;
 use serde_json::{Value, json};
@@ -41,6 +41,9 @@ pub struct App {
     pub files: HashMap<u64, Vec<u8>>,
     /// What the client asked of the platform's call code, in order.
     pub call_outputs: VecDeque<Output>,
+    /// The archive an app keeps on disk: every message and call row as the server sent it.
+    pub archive: BTreeMap<(Ulid, u64), MessageFrame>,
+    pub archive_calls: BTreeMap<(Ulid, u64, u64), CallEvent>,
 }
 
 /// One request with raw bytes each way, as file chunks go: the status and the reply's bytes.
@@ -103,6 +106,8 @@ impl App {
             events: VecDeque::new(),
             files: HashMap::new(),
             call_outputs: VecDeque::new(),
+            archive: BTreeMap::new(),
+            archive_calls: BTreeMap::new(),
         }
     }
 
@@ -273,6 +278,57 @@ impl App {
                 | Output::CallText { .. }) => {
                     self.call_outputs.push_back(call);
                     None
+                }
+                Output::SaveRows {
+                    id,
+                    message_list,
+                    call_list,
+                } => {
+                    for message in message_list {
+                        let key = (message.chat, message.seq);
+                        if message.kind.is_none() {
+                            self.archive_calls
+                                .retain(|(chat, call_seq, _), _| (*chat, *call_seq) != key);
+                            self.archive.insert(key, message);
+                        } else {
+                            self.archive.entry(key).or_insert(message);
+                        }
+                    }
+                    for event in call_list {
+                        self.archive_calls
+                            .entry((event.chat, event.call_seq, event.n))
+                            .or_insert(event);
+                    }
+                    Some(Input::RowsSaved { id })
+                }
+                Output::ReadRows {
+                    id,
+                    chat,
+                    before_seq,
+                    limit,
+                } => {
+                    let before = before_seq.unwrap_or(u64::MAX);
+                    let mut message_list: Vec<MessageFrame> = self
+                        .archive
+                        .range((chat, 0)..(chat, before))
+                        .rev()
+                        .take(usize::try_from(limit).unwrap())
+                        .map(|(_, message)| message.clone())
+                        .collect();
+                    message_list.reverse();
+                    let call_list = self
+                        .archive_calls
+                        .iter()
+                        .filter(|((c, call_seq, _), _)| {
+                            *c == chat && message_list.iter().any(|m| m.seq == *call_seq)
+                        })
+                        .map(|(_, event)| event.clone())
+                        .collect();
+                    Some(Input::RowsRead {
+                        id,
+                        message_list,
+                        call_list,
+                    })
                 }
                 Output::Event { event } => {
                     if let Event::Chats { chat_list } = &event {

@@ -12,7 +12,7 @@ use keryx_core::file;
 use keryx_core::mls::{AccountWrap, Commit, Device};
 use keryx_core::protocol::{
     Bytes, CallEvent, CallEventKind, CallOutcome, ChatType, ClientFrame, ContentKind, Header, Kind,
-    MessageFrame, SendFrame, ServerFrame, WelcomeItem, WrapItem,
+    MessageFrame, SendFrame, ServerFrame, SyncPosition, WelcomeItem, WrapItem,
 };
 use keryx_core::ulid::Ulid;
 use person::{
@@ -66,8 +66,7 @@ fn reference_of(frame: &ServerFrame) -> Option<Ulid> {
         ServerFrame::Sent { reference, .. }
         | ServerFrame::Done { reference }
         | ServerFrame::Refused { reference, .. }
-        | ServerFrame::Chats { reference, .. }
-        | ServerFrame::Page { reference, .. } => Some(*reference),
+        | ServerFrame::Chats { reference, .. } => Some(*reference),
         _ => None,
     }
 }
@@ -364,27 +363,85 @@ fn pair() -> Pair {
     pair_on(open_server())
 }
 
-fn history(socket: &mut Socket, chat: Ulid, after_seq: u64, limit: u32) -> Vec<MessageFrame> {
-    let wanted = reference();
-    let answer = socket.request(
-        &ClientFrame::History {
-            reference: wanted,
-            chat,
-            after_seq,
-            before_seq: None,
-            limit,
-        },
-        wanted,
-    );
-    match answer {
-        ServerFrame::Page { message_list, .. } => message_list,
-        other => panic!("Wanted a page, and got {other:?}"),
+/// One chat's messages after `after_seq`, at most `limit`, through `sync` from the start, page by
+/// page, in sequence order.
+fn chat_messages(socket: &mut Socket, chat: Ulid, after_seq: u64, limit: u32) -> Vec<MessageFrame> {
+    let (message_list, _) = sync_chat(socket, chat);
+    message_list
+        .into_iter()
+        .filter(|message| message.seq > after_seq)
+        .take(usize::try_from(limit).unwrap())
+        .collect()
+}
+
+/// Everything `sync` holds for one chat from the start, following `more` to the last page: its
+/// messages in sequence order, and its call rows.
+fn sync_chat(socket: &mut Socket, chat: Ulid) -> (Vec<MessageFrame>, Vec<CallEvent>) {
+    let mut message_list = Vec::new();
+    let mut call_list = Vec::new();
+    let mut after = None;
+    loop {
+        let wanted = reference();
+        let answer = socket.request(
+            &ClientFrame::Sync {
+                reference: wanted,
+                since: None,
+                after,
+                chat: Some(chat),
+            },
+            wanted,
+        );
+        let ServerFrame::Chats {
+            message_list: messages,
+            call_list: calls,
+            more,
+            ..
+        } = answer
+        else {
+            panic!("Wanted a sync page, and got {answer:?}");
+        };
+        let mut last = after;
+        for message in &messages {
+            let position = SyncPosition {
+                at: message.server_saved_at.unwrap(),
+                chat,
+                seq: message.seq,
+                n: 0,
+            };
+            last = last.max(Some(position));
+        }
+        for event in &calls {
+            let position = SyncPosition {
+                at: event.server_at,
+                chat,
+                seq: event.call_seq,
+                n: event.n,
+            };
+            last = last.max(Some(position));
+        }
+        message_list.extend(messages);
+        call_list.extend(calls);
+        if !more {
+            break;
+        }
+        after = last;
+    }
+    message_list.sort_by_key(|message| message.seq);
+    (message_list, call_list)
+}
+
+fn sync_frame(reference: Ulid) -> ClientFrame {
+    ClientFrame::Sync {
+        reference,
+        since: None,
+        after: None,
+        chat: None,
     }
 }
 
 fn chat_item(socket: &mut Socket, chat: Ulid) -> keryx_core::protocol::ChatItem {
     let wanted = reference();
-    let answer = socket.request(&ClientFrame::Sync { reference: wanted }, wanted);
+    let answer = socket.request(&sync_frame(wanted), wanted);
     let ServerFrame::Chats { chat_list, .. } = answer else {
         panic!("Wanted the chats");
     };
@@ -618,7 +675,7 @@ fn a_new_device_cannot_remove_its_notice_but_an_older_one_can() {
     let token = log_in(&pair.server, "sara_x");
     let new_device = add_device(&pair.server, pair.sara.id, &pair.sara.keys, &token);
     let mut new_socket = connect(&pair.server, &token);
-    let page = history(&mut new_socket, self_chat, 0, 200);
+    let page = chat_messages(&mut new_socket, self_chat, 0, 200);
     assert_eq!(page.len(), 2, "one notice per device so far");
     let notice_seq = page[1].seq;
     assert_eq!(page[1].device, Some(new_device.record().device));
@@ -661,7 +718,7 @@ fn a_new_device_cannot_remove_its_notice_but_an_older_one_can() {
         "notice_protected",
     );
     let seq = seq_of(post(&mut pair.sara_socket, delete(&pair.sara.device)));
-    let page = history(&mut pair.sara_socket, self_chat, notice_seq - 1, 200);
+    let page = chat_messages(&mut pair.sara_socket, self_chat, notice_seq - 1, 200);
     assert_eq!(page[0].kind, None, "it is wiped to its sequence id");
     assert_eq!(page[1].seq, seq);
 
@@ -758,7 +815,7 @@ fn only_the_sender_edits_and_a_delete_wipes_the_target_and_its_edits() {
     let received = pair.babak_socket.message(chat, delete_seq);
     assert_eq!(received.kind, Some(Kind::Delete));
     assert_eq!(received.pointer_seq, Some(second_seq));
-    let page = history(&mut pair.sara_socket, chat, first_seq - 1, 200);
+    let page = chat_messages(&mut pair.sara_socket, chat, first_seq - 1, 200);
     let mut seen = Vec::new();
     for message in &page {
         seen.push(message.seq);
@@ -1020,12 +1077,11 @@ fn a_stranger_gets_nothing_from_a_chat() {
         {
             let wanted = reference();
             socket.request(
-                &ClientFrame::History {
+                &ClientFrame::Sync {
                     reference: wanted,
-                    chat,
-                    after_seq: 0,
-                    before_seq: None,
-                    limit: 10,
+                    since: None,
+                    after: None,
+                    chat: Some(chat),
                 },
                 wanted,
             )
@@ -1113,12 +1169,11 @@ fn a_stranger_gets_nothing_from_a_chat() {
         {
             let wanted = reference();
             boss_socket.request(
-                &ClientFrame::History {
+                &ClientFrame::Sync {
                     reference: wanted,
-                    chat,
-                    after_seq: 0,
-                    before_seq: None,
-                    limit: 10,
+                    since: None,
+                    after: None,
+                    chat: Some(chat),
                 },
                 wanted,
             )
@@ -1236,47 +1291,105 @@ fn seen_and_received_keep_the_highest_and_tell_the_sender_and_typing_is_not_save
     };
     assert_eq!(account, pair.sara.id);
     assert!(on);
-    assert_eq!(history(&mut pair.sara_socket, chat, seq, 10).len(), 0);
+    assert_eq!(chat_messages(&mut pair.sara_socket, chat, seq, 10).len(), 0);
 }
 
 #[test]
-fn history_pages_backward_from_before_seq() {
-    let mut pair = pair();
+fn sync_pages_follow_the_cursor_and_step_back_a_second() {
+    let mut pair = pair_on(Server::start(
+        "",
+        "[registration]\nallow = true\n[limits]\nhistory_page = 2\n",
+    ));
     let chat = pair.chat;
     let mut seq_list = Vec::new();
-    for text in [b"a", b"b", b"c", b"d"] {
+    for text in [b"a", b"b", b"c", b"d", b"e"] {
         let frame = sealed(&pair.sara, chat, Kind::Content, None, text);
         seq_list.push(seq_of(post(&mut pair.sara_socket, frame)));
     }
-    let last = *seq_list.last().unwrap();
-    let page = |socket: &mut Socket, before_seq| {
+    let page = |socket: &mut Socket, since, after| {
         let wanted = reference();
-        match socket.request(
-            &ClientFrame::History {
+        let answer = socket.request(
+            &ClientFrame::Sync {
                 reference: wanted,
-                chat,
-                after_seq: 0,
-                before_seq: Some(before_seq),
-                limit: 2,
+                since,
+                after,
+                chat: Some(chat),
             },
             wanted,
-        ) {
-            ServerFrame::Page { message_list, .. } => {
-                let mut found = Vec::new();
-                for message in message_list {
-                    found.push(message.seq);
-                }
-                found
-            }
-            other => panic!("Wanted a page, and got {other:?}"),
-        }
+        );
+        let ServerFrame::Chats {
+            chat_list,
+            message_list,
+            call_list,
+            more,
+            ..
+        } = answer
+        else {
+            panic!("Wanted a sync page, and got {answer:?}");
+        };
+        assert!(call_list.is_empty());
+        (chat_list.len(), message_list, more)
     };
-    assert_eq!(page(&mut pair.babak_socket, last + 1), vec![last - 1, last]);
-    assert_eq!(
-        page(&mut pair.babak_socket, last - 1),
-        vec![last - 3, last - 2]
-    );
-    assert_eq!(page(&mut pair.babak_socket, 1), Vec::<u64>::new());
+    let mut found = Vec::new();
+    let mut after = None;
+    let mut pages = 0;
+    loop {
+        let (listed, message_list, more) = page(&mut pair.babak_socket, None, after);
+        assert!(message_list.len() <= 2);
+        assert_eq!(
+            listed > 0,
+            after.is_none(),
+            "Only a first page lists the chats"
+        );
+        pages += 1;
+        for message in &message_list {
+            after = after.max(Some(SyncPosition {
+                at: message.server_saved_at.unwrap(),
+                chat,
+                seq: message.seq,
+                n: 0,
+            }));
+            found.push(message.seq);
+        }
+        if !more {
+            break;
+        }
+    }
+    assert!(pages >= 3);
+    let mut sorted = found.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), found.len(), "No row comes twice");
+    for seq in &seq_list {
+        assert!(found.contains(seq));
+    }
+    let (_, message_list, more) = page(&mut pair.babak_socket, None, after);
+    assert!(message_list.is_empty());
+    assert!(!more);
+    // A `since` just under a second after the newest row still finds it, from the step back.
+    let newest = after.unwrap().at;
+    let mut since = Some(newest + 999);
+    let mut after = None;
+    let mut found = Vec::new();
+    loop {
+        let (_, message_list, more) = page(&mut pair.babak_socket, since, after);
+        for message in &message_list {
+            let at = message.server_saved_at.unwrap();
+            assert!(at >= newest - 1);
+            after = after.max(Some(SyncPosition {
+                at,
+                chat,
+                seq: message.seq,
+                n: 0,
+            }));
+            found.push(message.seq);
+        }
+        since = None;
+        if !more {
+            break;
+        }
+    }
+    assert!(found.contains(seq_list.last().unwrap()));
 }
 
 #[test]
@@ -2010,7 +2123,7 @@ fn the_websocket_works_over_tls_and_the_certificate_is_checked() {
         let (mut socket, response) = tungstenite::client::client(request(), stream).unwrap();
         assert_eq!(response.headers()["sec-websocket-protocol"], "keryx.v1");
         let wanted = reference();
-        let frame = serde_json::to_string(&ClientFrame::Sync { reference: wanted }).unwrap();
+        let frame = serde_json::to_string(&sync_frame(wanted)).unwrap();
         socket.send(Message::text(frame)).unwrap();
         loop {
             let Message::Text(text) = socket.read().unwrap() else {
@@ -2099,7 +2212,7 @@ fn a_full_outgoing_buffer_closes_only_that_connection_and_loses_nothing() {
     let mut after_seq = seq_list[0] - 1;
     let mut fetched = Vec::new();
     loop {
-        let page = history(&mut back, chat, after_seq, 5);
+        let page = chat_messages(&mut back, chat, after_seq, 5);
         let Some(last) = page.last() else {
             break;
         };
@@ -2241,9 +2354,7 @@ fn what_a_client_sends_holds_pings_back_but_its_own_pings_do_not() {
     let sara = sign_up(&server, "sara_x", SARA_WORDS);
     let mut socket = connect(&server, &sara.token);
     for _ in 0..6 {
-        socket.send(&ClientFrame::Sync {
-            reference: reference(),
-        });
+        socket.send(&sync_frame(reference()));
         let ping_list = socket.watch_pings(Duration::from_millis(500));
         assert!(ping_list.is_empty(), "a busy connection was pinged");
     }
@@ -2772,17 +2883,22 @@ fn call_event(socket: &mut Socket) -> CallEvent {
     }
 }
 
-fn replay(server: &Server, token: &str, chat: Ulid, call_seq: u64) -> (u16, Value) {
-    server.call(
-        "GET",
-        &format!("/api/v1/chats/{chat}/calls/{call_seq}/events"),
-        Some(token),
-        None,
-    )
+/// One call's rows, as `sync` gives them, in order of `n`.
+fn call_rows(socket: &mut Socket, chat: Ulid, call_seq: u64) -> Vec<CallEvent> {
+    let (_, call_list) = sync_chat(socket, chat);
+    let mut row_list: Vec<CallEvent> = call_list
+        .into_iter()
+        .filter(|event| event.call_seq == call_seq)
+        .collect();
+    row_list.sort_by_key(|event| event.n);
+    row_list
 }
 
-fn stored(socket: &mut Socket, chat: Ulid, seq: u64) -> MessageFrame {
-    history(socket, chat, seq - 1, 1).remove(0)
+/// The call's `end` row, once it has ended.
+fn call_end(socket: &mut Socket, chat: Ulid, call_seq: u64) -> Option<CallEvent> {
+    call_rows(socket, chat, call_seq)
+        .into_iter()
+        .find(|event| event.kind == CallEventKind::End)
 }
 
 #[test]
@@ -2795,7 +2911,6 @@ fn a_chat_has_one_open_call_and_a_decline_ends_it_as_missed() {
     let call_seq = seq_of(post(&mut pair.sara_socket, call_frame(&pair.sara, chat)));
     let ring = pair.babak_socket.message(chat, call_seq);
     assert_eq!(ring.content_kind, Some(ContentKind::Call));
-    assert_eq!(ring.call_outcome, None);
 
     // Calling back while it rings meets the open call, and the refusal names it.
     match post(&mut pair.babak_socket, call_frame(&pair.babak, chat)) {
@@ -2839,45 +2954,16 @@ fn a_chat_has_one_open_call_and_a_decline_ends_it_as_missed() {
     let ended = call_event(&mut pair.babak_socket);
     assert_eq!((ended.kind, ended.n), (CallEventKind::End, 2));
 
-    let message = stored(&mut pair.sara_socket, chat, call_seq);
-    assert_eq!(message.call_outcome, Some(CallOutcome::Missed));
-    assert!(message.call_ended_at.is_some());
+    let end = call_end(&mut pair.sara_socket, chat, call_seq).unwrap();
+    assert_eq!(end.outcome, Some(CallOutcome::Missed));
     assert_refused(
         decline(&mut pair.babak_socket, chat, call_seq),
         "call_ended",
     );
 
-    let (status, reply) = replay(&pair.server, &pair.babak.token, chat, call_seq);
-    assert_eq!(status, 200, "{reply}");
-    let event_list: Vec<CallEvent> =
-        serde_json::from_value(reply["data"]["event_list"].clone()).unwrap();
-    assert_eq!(event_list, vec![declined, ended]);
-    assert_ne!(event_list[0].device, sara_device);
-
-    // Not a call, not a number, and someone else's chat.
-    let text_seq = seq_of(post(
-        &mut pair.sara_socket,
-        sealed(&pair.sara, chat, Kind::Content, None, b"hi"),
-    ));
-    let (status, reply) = replay(&pair.server, &pair.babak.token, chat, text_seq);
-    assert_eq!(
-        (status, reply["code"].as_str()),
-        (404, Some("no_such_message"))
-    );
-    let (status, _) = pair.server.call(
-        "GET",
-        &format!("/api/v1/chats/{chat}/calls/one/events"),
-        Some(&pair.babak.token),
-        None,
-    );
-    assert_eq!(status, 404);
-    let (status, reply) = replay(
-        &pair.server,
-        &pair.babak.token,
-        Ulid::new().unwrap(),
-        call_seq,
-    );
-    assert_eq!((status, reply["code"].as_str()), (404, Some("not_member")));
+    let row_list = call_rows(&mut pair.babak_socket, chat, call_seq);
+    assert_eq!(row_list, vec![declined, ended]);
+    assert_ne!(row_list[0].device, sara_device);
 
     // Once it ended, a new call can start.
     seq_of(post(&mut pair.babak_socket, call_frame(&pair.babak, chat)));
@@ -2900,9 +2986,8 @@ fn a_call_nobody_answers_ends_as_missed_by_the_caller() {
             (CallEventKind::End, 1, sara_device, call_seq)
         );
     }
-    let message = stored(&mut pair.babak_socket, chat, call_seq);
-    assert_eq!(message.call_outcome, Some(CallOutcome::Missed));
-    assert!(message.call_ended_at.is_some());
+    let end = call_end(&mut pair.babak_socket, chat, call_seq).unwrap();
+    assert_eq!(end.outcome, Some(CallOutcome::Missed));
 }
 
 #[test]
@@ -2930,8 +3015,7 @@ fn deleting_an_open_call_ends_it_first() {
     let delete = pair.babak_socket.message(chat, delete_seq);
     assert_eq!(delete.pointer_seq, Some(call_seq));
     // The call and what happened inside it are gone.
-    let (status, _) = replay(&pair.server, &pair.babak.token, chat, call_seq);
-    assert_eq!(status, 404);
+    assert!(call_rows(&mut pair.babak_socket, chat, call_seq).is_empty());
     seq_of(post(&mut pair.babak_socket, call_frame(&pair.babak, chat)));
 }
 
@@ -3006,10 +3090,8 @@ fn joining_answers_a_call_and_media_and_text_flow_through_the_relay() {
         (CallEventKind::Join, 2, babak_device)
     );
     on_call(&sara_call, is_event(CallEventKind::Join, 2));
-    // The other account joined, so the call is answered and stops ringing.
-    let message = stored(&mut pair.babak_socket, chat, call_seq);
-    assert_eq!(message.call_outcome, Some(CallOutcome::Answered));
-    assert_eq!(message.call_ended_at, None);
+    // The other account joined, so the call is answered and stops ringing. It is still open.
+    assert_eq!(call_end(&mut pair.babak_socket, chat, call_seq), None);
     assert_refused(
         decline(&mut pair.babak_socket, chat, call_seq),
         "call_answered",
@@ -3109,15 +3191,10 @@ fn joining_answers_a_call_and_media_and_text_flow_through_the_relay() {
     );
     let ended = call_event(&mut pair.sara_socket);
     assert_eq!((ended.kind, ended.n), (CallEventKind::End, 6));
-    let message = stored(&mut pair.babak_socket, chat, call_seq);
-    assert_eq!(message.call_outcome, Some(CallOutcome::Answered));
-    assert!(message.call_ended_at.is_some());
-    let (status, body) = replay(&pair.server, &pair.babak.token, chat, call_seq);
-    assert_eq!(status, 200);
-    let event_list: Vec<CallEvent> =
-        serde_json::from_value(body["data"]["event_list"].clone()).unwrap();
+    let end = call_end(&mut pair.babak_socket, chat, call_seq).unwrap();
+    assert_eq!(end.outcome, Some(CallOutcome::Answered));
     let mut kind_list = Vec::new();
-    for event in event_list {
+    for event in call_rows(&mut pair.babak_socket, chat, call_seq) {
         kind_list.push(event.kind);
     }
     assert_eq!(
@@ -3156,8 +3233,8 @@ fn a_call_that_rings_out_closes_its_sockets() {
     let ended = call_event(&mut pair.babak_socket);
     assert_eq!((ended.kind, ended.n), (CallEventKind::End, 2));
     assert_eq!(call_closed(&sara_call), (1000, "call_ended".to_string()));
-    let message = stored(&mut pair.babak_socket, chat, call_seq);
-    assert_eq!(message.call_outcome, Some(CallOutcome::Missed));
+    let end = call_end(&mut pair.babak_socket, chat, call_seq).unwrap();
+    assert_eq!(end.outcome, Some(CallOutcome::Missed));
 }
 
 #[test]

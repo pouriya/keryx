@@ -212,12 +212,32 @@ the WASM build, because there is one `Cargo.lock`. Make targets stay inside
 - **Each user has their own list of conversations, worked out by the server.** The
   client never sends the list. It shows the list, updates state with the latest for
   all of them, then fetches pages in the background from the last id it has to the
-  latest. **How, chosen by the author:** on every reconnect, each chat this session already
-  knew is paged forward with `after_seq` from the last sequence id it handled, commits applied in
-  order and content opened. After a reload there is no last id. The list carries this member's seen
-  position, and updating fetches from there, so the unread count is the content messages decrypted
-  in that fetch. A reaction does not count, and neither does one of this account's own messages, which
-  core marks `mine`. A chat still opens on its newest page. See [core/AGENTS.md](core/AGENTS.md).
+  latest. **How, chosen by the author: sync by server time, for messages and calls together.** The
+  client sends `sync` with `since`, the server time in milliseconds of the last thing it received, and
+  optionally one `chat`. The server goes 1 second back and answers with the `chats` list plus every
+  message and call row saved after that, in all the account's chats or the one named, and the client
+  drops what it already has by `(chat, seq)` and `(chat, call_seq, n)`. One request after any
+  reconnect, not one per chat. **Sequence ids stay, chosen by the author:** they are the order, the
+  pointer and the read position, whatever the clock does, and their run 1, 2, 3 lets a client see
+  that a chat is complete. Time only finds where to start. **No `since` means everything from 0, chosen
+  by the author**, so a new device holds the whole archive. **Answers come in pages with a cursor,
+  chosen by the author:** at most `[limits] history_page` rows, ordered by server time, chat, seq and
+  `n`, with `more` and the last row's position, and the next request continues exactly after it with
+  no step back, so a burst in one millisecond never loops. **The client saves each page, and only once
+  the save is confirmed asks for the next**, and only then does its `since` move. **`history` and the
+  call replay route are gone, chosen by the author:** `sync` is the one read path, scrolling reads the
+  client's own archive, and core's commit catch-up uses `sync`. The unread count is the content
+  messages after this member's seen position in the archive. A reaction does not count, and neither does
+  one of this account's own messages, which core marks `mine`. See [core/AGENTS.md](core/AGENTS.md).
+- **Saved server times never go back, chosen by the author.** Every one is the larger of the clock and
+  the last one written, server-wide, seeded at startup from the newest row. A clock that steps back,
+  from NTP or a moved VM, could otherwise hide a row from "after time T" and from the page cursor.
+- **Each client keeps a local archive, chosen by the author:** every message and call row exactly as
+  the server sent it, ciphertext, header and signature, opened when shown with the epoch keys its
+  snapshot already holds. The phone's copy is no easier to read than the server's, and a signature can
+  be checked again at any time. Core stays without I/O: it hands each page to the platform to save,
+  and the platform confirms. Android keeps it in SQLite and the web in IndexedDB: see their
+  AGENTS.md.
 
 ### Removal
 
@@ -255,6 +275,9 @@ the WASM build, because there is one `Cargo.lock`. Make targets stay inside
 - **A removed message keeps only its `seq`**, whether it was deleted or expired. Every other
   field is wiped, so pages have no gaps, and a client knows something was there, not what.
   Rows are never dropped, so one small row per removed message stays for as long as the chat.
+  **Its server time becomes the time it was wiped, chosen by the author**, so sync returns it as an
+  empty row and every device drops its copy, an expiry too, which has no delete message. It reveals
+  only when the removal happened, which a delete row shows anyway.
 - **Deleting also removes the message's edits**, because an edit holds its newer text.
 - **The notice's 7 days give a thief a way out:** after that, stolen words can erase it. The
   device list still shows the device, and contacts saw the join.
@@ -371,17 +394,18 @@ so groups and channels fit later; recording comes after the phone test.
 
 - **A call is one chat message with one sequence id, chosen by the author:** content kind `call`, which
   replaced `voice_call`, `video_call` and `text_call`, since what each person sends is their own choice.
-  Its body limit is `[limits.body] call`, and sending one needs `message.send.call`. **Everything else
-  about the call lives inside it, never as chat rows:** joins, leaves, declines, its end and the text
-  typed in it, kept with the call and shown in its replay. Like a call's own messages before, none of
-  them count as unread or move the preview.
+  Its body limit is `[limits.body] call`, and sending one needs `message.send.call`. **The message row
+  holds nothing more about the call, chosen by the author:** no outcome and no end time, there or in its
+  frame. **Everything else lives in one `call` table, with many rows per call, chosen by the author:**
+  joins, leaves, declines, the text typed in it and its end, keyed by chat, `call_seq` and `n`, the
+  call row pointing at its message. None of them count as unread or move the preview.
 - **Starting a call sends that message, and its delivery over the chat's WebSocket is the ring.** Joining
   needs membership only, like `seen`. **Its encrypted body says what the caller has on, chosen by the
   author:** `{"video": true|false, "voice": true|false}`, so the ring can say video or voice call.
-- **The server saves what happens inside a call as it goes, chosen by the author**, in a `call_event`
+- **The server saves what happens inside a call as it goes, chosen by the author**, in the `call`
   table: chat, `call_seq`, `n` (1, 2, 3 inside the call), device, kind, and for client events the body
-  and client time, and always the server time. A replay reads them from
-  `GET /api/v1/chats/{id}/calls/{seq}/events`. **Client events use the normal message encryption**, with
+  and client time, and always the server time. Clients get them through `sync`, beside the messages,
+  into their archive. **Client events use the normal message encryption**, with
   the call's sequence id as `call_seq` in the signed header, so a new device with only the words reads
   them too.
 - **Join and leave are written by the server**, as readable events with device and time, because it
@@ -395,23 +419,22 @@ so groups and channels fit later; recording comes after the phone test.
   missed or answered, with no declined value. Groups, later, keep ringing the rest. **The `end` that
   follows a decline names the decliner's device, chosen by the author**, as the device whose action
   ended the call. **A decline for a call that is not open is refused with `call_ended`, chosen by the
-  author**, the same word the call socket's close uses. **Replaying a sequence id that is not a call is
-  refused with `no_such_message`, chosen by the author**, so it needs no new code. **A decline after
+  author**, the same word the call socket's close uses. **A decline after
   the call was answered is refused with `call_answered`, and nothing is saved, chosen by the author**:
   a device that missed the join learns the call was taken and stops ringing, and the call its person
   is in can never be ended from another device.
 - **Every call event but text also goes to the chat's online devices, chosen by the author:** `join`,
   `leave`, `decline` and `end` are sent as `call_event` on the chat's WebSocket as well as on the
   `events` track. A device that rang stops when its person joins on another device, and a chat can show
-  who is in a call. Text stays inside the call, on `events` and in the replay.
+  who is in a call. Text stays inside the call, on `events` and in `sync`.
 - **Text typed in a call travels through MoQ, chosen by the author.** Each device sends it on its own
   `text` track. The relay, in the same binary, hands it to the chat's task, which saves it with the next
   `n` inside the call and republishes it on the `server` broadcast's `events` track, which everyone in
   the call reads, so all see one order. Joins, leaves and the end go out on that track too.
 - **A call ends when its last device leaves, and an ended call cannot be joined again**; a new call is
   started instead. **If nobody else joins within 60 seconds, fixed in code, the server ends it as
-  missed.** The server writes the readable outcome on the call's message row, `call_outcome` missed or
-  answered, with `call_ended_at`, and an `end` event inside the call.
+  missed.** The call's `end` row carries the readable outcome, missed or answered, and its server time
+  is when the call ended. **An open call is one with no `end` row yet.**
 - **A dropped connection gets 10 seconds, fixed in code, before it counts as a leave, chosen by the
   author.** A clean close of the call's MoQ is a leave at once. A device that reconnects within the 10
   seconds writes no leave and no new join, so a blip from the caller while it rings does not end the
@@ -574,8 +597,9 @@ so groups and channels fit later; recording comes after the phone test.
   joiner needs no setup sent apart. Opus carries no `OpusHead`: every receiver builds its own from the
   fixed settings, mono at 48 kHz.
 - **Every call event is the same JSON, chosen by the author**, on the `events` track, in the WebSocket's
-  `call_event` and in the replay route: `{chat, call_seq, n, kind, device, server_at, client_at?,
-  epoch?, signature?, body?}`, with kind `join`, `leave`, `decline`, `text` or `end`. **A decline has no
+  `call_event` and in `sync`'s call rows: `{chat, call_seq, n, kind, device, server_at, client_at?,
+  epoch?, signature?, body?, outcome?}`, with kind `join`, `leave`, `decline`, `text` or `end`, and
+  `outcome` on `end` only. **A decline has no
   body**, since the server sees who sent it anyway. **Text is encrypted and signed like a message**, with
   header kind content, content kind text and `call_seq` set, so it can never pass for a chat message. A
   device sends text on its `text` track as `{client_at, epoch, signature, body}`.
@@ -653,11 +677,11 @@ warns and runs without it. `nodelay` is on by default. `keepalive_idle`, `keepal
 
 **Every envelope frame has a `type`, and a request's `ref` is a ULID the client makes.** The server
 holds it in memory only for that request and sends it back in its answer, so requests and replies
-match over one socket: a `send` gets its sequence id this way, and a history request its page. **The
+match over one socket: a `send` gets its sequence id this way, and a `sync` its pages. **The
 server never stores a client's ULID, and it is not in the signed header.** What is saved goes by
 its sequence id, from 1. REST carries the same bodies. A client sends `send`,
-`seen`, `received`, `typing`, `sync`, `history`, `group_info`, `wraps`, `call_event` and `ping`. The server sends `features`, `sent`, `done`,
-`refused`, `message`, `chats`, `page`, `welcome`, `typing`, `marks`, `revoked` and `call_event`. `group_info` and `wraps` are not
+`seen`, `received`, `typing`, `sync`, `group_info`, `wraps`, `call_event` and `ping`. The server sends `features`, `sent`, `done`,
+`refused`, `message`, `chats`, `welcome`, `typing`, `marks`, `revoked` and `call_event`. `group_info` and `wraps` are not
 messages, so they take no sequence id and stay out of history, and what has no sequence id is
 answered with `done`. Binary fields are standard base64 with padding, through `base64ct`, which is
 already in the tree and constant-time. Kinds and modes are the schema's numbers. **A commit is a `send` with kind 3 plus its wraps, welcomes,
@@ -734,9 +758,6 @@ Whatever is saved to show later gets the next number. Whatever is not saved gets
   last accepted commit, which the server already keeps for ordering commits. A device back from
   being away compares it with its own and catches up or rejoins at once, rather than noticing only
   when its own commit loses. It is an optional field, so the version does not change.
-- **`history` takes an optional `before_seq`, chosen by the author.** With it, the server returns up
-  to `limit` messages just below it, still oldest first, and one past the last sequence id gives the
-  newest page. So a chat opens on its newest page and scrolling up loads older ones.
 - **What a sender sees, as drawn by the web client.** A message in the queue, or sent but not yet
   answered with its sequence id, shows as waiting. In a direct chat it gets one mark with its
   sequence id, two once the other person's device has received it, and both marks change colour
@@ -911,7 +932,6 @@ POST /api/v1/chats/{id}/files       member: kind, size, chunks -> file
 PUT  /api/v1/files/{id}/chunks/{n}  its uploader: the encrypted chunk's raw bytes
 GET  /api/v1/files/{id}             member -> size, chunks, received
 GET  /api/v1/files/{id}/chunks/{n}  member, once a sent message keeps it -> the raw bytes
-GET  /api/v1/chats/{id}/calls/{seq}/events  member -> event_list, what happened inside a call
 GET  /api/v1/ws                     cookie or Bearer, subprotocol keryx.v1
 GET  /api/v1/calls/{chat}/{call_seq}/moq  member, until the call ends: MoQ over qmux
 ```

@@ -1,7 +1,7 @@
 use keryx_core::mls::{Device, verify_message};
 use keryx_core::protocol::{
     Bytes, ChatItem, ChatMode, ChatType, ClientFrame, ContentKind, Header, Kind, MarkItem,
-    MessageFrame, SendFrame, ServerFrame, WelcomeItem, WrapItem,
+    MessageFrame, SendFrame, ServerFrame, SyncPosition, WelcomeItem, WrapItem,
 };
 use keryx_core::seed::derive;
 use keryx_core::ulid::Ulid;
@@ -188,29 +188,35 @@ fn every_client_frame_has_the_agreed_shape() {
         (
             ClientFrame::Sync {
                 reference: ulid(REF),
+                since: None,
+                after: None,
+                chat: None,
             },
             json!({"type": "sync", "ref": REF}),
         ),
         (
-            ClientFrame::History {
+            ClientFrame::Sync {
                 reference: ulid(REF),
-                chat: ulid(CHAT),
-                after_seq: 41,
-                before_seq: None,
-                limit: 100,
+                since: Some(1800),
+                after: None,
+                chat: Some(ulid(CHAT)),
             },
-            json!({"type": "history", "ref": REF, "chat": CHAT, "after_seq": 41, "limit": 100}),
+            json!({"type": "sync", "ref": REF, "since": 1800, "chat": CHAT}),
         ),
         (
-            ClientFrame::History {
+            ClientFrame::Sync {
                 reference: ulid(REF),
-                chat: ulid(CHAT),
-                after_seq: 0,
-                before_seq: Some(43),
-                limit: 100,
+                since: None,
+                after: Some(SyncPosition {
+                    at: 1800,
+                    chat: ulid(CHAT),
+                    seq: 42,
+                    n: 0,
+                }),
+                chat: None,
             },
-            json!({"type": "history", "ref": REF, "chat": CHAT, "after_seq": 0, "before_seq": 43,
-                   "limit": 100}),
+            json!({"type": "sync", "ref": REF,
+                   "after": {"at": 1800, "chat": CHAT, "seq": 42, "n": 0}}),
         ),
         (
             ClientFrame::Received {
@@ -266,11 +272,9 @@ fn every_server_frame_has_the_agreed_shape() {
         epoch: None,
         pointer_seq: None,
         client_sent_at: None,
-        server_saved_at: None,
+        server_saved_at: Some(1900),
         body: None,
         signature: None,
-        call_outcome: None,
-        call_ended_at: None,
     };
     let chat = ChatItem {
         chat: ulid(CHAT),
@@ -322,18 +326,23 @@ fn every_server_frame_has_the_agreed_shape() {
         ),
         (
             ServerFrame::Message(Box::new(removed.clone())),
-            json!({"type": "message", "chat": CHAT, "seq": 5}),
+            json!({"type": "message", "chat": CHAT, "seq": 5, "server_saved_at": 1900}),
         ),
         (
             ServerFrame::Chats {
                 reference: ulid(REF),
                 chat_list: vec![chat, marked],
+                message_list: vec![removed.clone()],
+                call_list: Vec::new(),
+                more: true,
             },
-            json!({"type": "chats", "ref": REF, "chat_list": [{
+            json!({"type": "chats", "ref": REF, "message_list": [{"chat": CHAT, "seq": 5,
+                   "server_saved_at": 1900}], "call_list": [], "more": true, "chat_list": [{
                 "chat": CHAT, "type": 1, "mode": 0, "last_seq": 42, "last_kind": 0, "last_at": 1800,
             }, {
                 "chat": CHAT, "type": 1, "mode": 0, "last_seq": 42, "last_kind": 0, "last_at": 1800,
-                "last_content_seq": 5, "epoch": 3, "last_content": {"chat": CHAT, "seq": 5},
+                "last_content_seq": 5, "epoch": 3, "last_content": {"chat": CHAT, "seq": 5,
+                "server_saved_at": 1900},
                 "mark_list": [{"account": ID, "received_seq": 42, "seen_seq": 41}],
             }]}),
         ),
@@ -347,13 +356,6 @@ fn every_server_frame_has_the_agreed_shape() {
                 },
             },
             json!({"type": "marks", "chat": CHAT, "account": ID, "received_seq": 42}),
-        ),
-        (
-            ServerFrame::Page {
-                reference: ulid(REF),
-                message_list: vec![removed],
-            },
-            json!({"type": "page", "ref": REF, "message_list": [{"chat": CHAT, "seq": 5}]}),
         ),
         (
             ServerFrame::Features {
@@ -402,7 +404,10 @@ fn unknown_fields_are_ignored_because_they_do_not_bump_the_version() {
     assert_eq!(
         from_str::<ClientFrame>(&text).unwrap(),
         ClientFrame::Sync {
-            reference: ulid(REF)
+            reference: ulid(REF),
+            since: None,
+            after: None,
+            chat: None,
         }
     );
 }
@@ -459,8 +464,6 @@ fn a_removed_message_has_no_header_and_a_stored_one_verifies_after_the_wire() {
         server_saved_at: Some(6),
         body: Some(Bytes(b"hello".to_vec())),
         signature: Some(Bytes(signature.to_vec())),
-        call_outcome: None,
-        call_ended_at: None,
     };
     let text = serde_json::to_string(&ServerFrame::Message(Box::new(frame))).unwrap();
     let ServerFrame::Message(received) = from_str::<ServerFrame>(&text).unwrap() else {
