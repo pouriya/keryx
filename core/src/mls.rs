@@ -9,7 +9,8 @@
 //! said: [`Device::commit_accepted`] or [`Device::commit_rejected`]. A failed save means the
 //! commit is never sent.
 
-use crate::protocol::Header;
+use crate::call::{self, CallIndex, CallKey};
+use crate::protocol::{Bytes, Header};
 use crate::seed::AccountKeys;
 use crate::ulid::Ulid;
 use crate::wrap::{self, WRAP_SIZE, WrapError};
@@ -1019,6 +1020,35 @@ impl Device {
             list.push(read_leaf(&member.credential, &member.signature_key)?);
         }
         Ok(list)
+    }
+
+    /// The current epoch's SFrame base secret for calls, with this device's MLS index, and every
+    /// member device's index, so a frame's sender can be checked against its broadcast.
+    pub fn call_key(&self, chat: Ulid) -> Result<(CallKey, Vec<CallIndex>), MlsError> {
+        let state = self.chat(chat)?;
+        let secret = match state.group.export_secret(
+            self.provider.crypto(),
+            call::BASE_LABEL,
+            &[],
+            call::BASE_LEN,
+        ) {
+            Ok(secret) => secret,
+            Err(source) => return Err(group_error("export the call secret", source)),
+        };
+        let mut index_list = Vec::new();
+        for member in state.group.members() {
+            let record = read_leaf(&member.credential, &member.signature_key)?;
+            index_list.push(CallIndex {
+                device: record.device,
+                index: member.index.u32(),
+            });
+        }
+        let key = CallKey {
+            epoch: state.group.epoch().as_u64(),
+            index: state.group.own_leaf_index().u32(),
+            secret: Bytes(secret),
+        };
+        Ok((key, index_list))
     }
 
     /// Redo every wrap of the current epoch and compare, returning the right wrap for each account

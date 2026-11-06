@@ -5,13 +5,14 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use keryx_core::client::{
     Auth, Client, Command, Event, FileSpec, Input, Output, Platform, Pointer, Problem, Secret,
-    Thumbnail,
+    ShownCallEvent, Thumbnail,
 };
 use keryx_core::file::{self, FileInfo};
 use keryx_core::mls::{AccountKey, Device, sign_revocation, stamp_account_key};
 use keryx_core::protocol::{
-    AccountKeysBody, Bytes, CaptchaAnswer, ChatItem, ChatMode, ChatType, ClientFrame, ContentKind,
-    Kind, MarkItem, MessageFrame, SendFrame, ServerFrame, WrapEntry,
+    AccountKeysBody, Bytes, CallBody, CallEvent, CallEventKind, CaptchaAnswer, ChatItem, ChatMode,
+    ChatType, ClientFrame, ContentKind, Kind, MarkItem, MessageFrame, SendFrame, ServerFrame,
+    WrapEntry,
 };
 use keryx_core::seed::derive;
 use keryx_core::ulid::Ulid;
@@ -1032,6 +1033,8 @@ struct Phone {
     gets: VecDeque<(u64, String)>,
     /// The next reads come back one byte short.
     short_reads: usize,
+    /// What the client handed its call code: joins, keys, leaves and text.
+    call_outputs: Vec<Output>,
 }
 
 struct World {
@@ -1053,6 +1056,8 @@ struct World {
     files: Vec<HubFile>,
     /// Every chunk handed out has its first byte changed.
     garble_chunks: bool,
+    /// What happened inside each call, by chat and the call's sequence id.
+    call_events: HashMap<(Ulid, u64), Vec<CallEvent>>,
 }
 
 fn reply_ok(data: Value) -> (u16, String) {
@@ -1071,6 +1076,7 @@ fn refused(reference: Ulid, code: &str) -> ServerFrame {
         reference,
         code: code.to_string(),
         message: "Refused".to_string(),
+        call_seq: None,
     }
 }
 
@@ -1090,6 +1096,7 @@ fn kind_of(frame: &ClientFrame) -> &'static str {
         ClientFrame::GroupInfo { .. } => "group_info",
         ClientFrame::Ping { .. } => "ping",
         ClientFrame::Wraps { .. } => "wraps",
+        ClientFrame::CallEvent { .. } => "call_event",
     }
 }
 
@@ -1102,7 +1109,8 @@ fn reference_of(frame: &ClientFrame) -> Ulid {
         | ClientFrame::History { reference, .. }
         | ClientFrame::GroupInfo { reference, .. }
         | ClientFrame::Ping { reference }
-        | ClientFrame::Wraps { reference, .. } => *reference,
+        | ClientFrame::Wraps { reference, .. }
+        | ClientFrame::CallEvent { reference, .. } => *reference,
         ClientFrame::Typing { .. } => Ulid::from_bytes([0; 16]),
     }
 }
@@ -1117,11 +1125,12 @@ fn wiped(chat: Ulid, seq: u64) -> MessageFrame {
         encrypted: None,
         epoch: None,
         pointer_seq: None,
-        call_seq: None,
         client_sent_at: None,
         server_saved_at: None,
         body: None,
         signature: None,
+        call_outcome: None,
+        call_ended_at: None,
     }
 }
 
@@ -1142,6 +1151,7 @@ impl World {
             hide_epoch: false,
             files: Vec::new(),
             garble_chunks: false,
+            call_events: HashMap::new(),
         }
     }
 
@@ -1175,6 +1185,7 @@ impl World {
             puts: VecDeque::new(),
             gets: VecDeque::new(),
             short_reads: 0,
+            call_outputs: Vec::new(),
         });
         self.phones.len() - 1
     }
@@ -1225,6 +1236,10 @@ impl World {
                     id, path, bytes, ..
                 } => phone.puts.push_back((id, path, bytes)),
                 Output::GetChunk { id, path, .. } => phone.gets.push_back((id, path)),
+                Output::JoinCall { .. }
+                | Output::CallKey { .. }
+                | Output::LeaveCall { .. }
+                | Output::CallText { .. } => phone.call_outputs.push(output),
                 Output::WriteChunk {
                     handle,
                     offset,
@@ -1753,6 +1768,33 @@ impl World {
     }
 
     /// Hands a frame to every online device of these accounts but one.
+    /// Saves something inside a call under its next number, as the server's chat task does.
+    fn call_event(
+        &mut self,
+        chat: Ulid,
+        call_seq: u64,
+        kind: CallEventKind,
+        device: Ulid,
+        text: Option<keryx_core::protocol::CallText>,
+    ) -> CallEvent {
+        let now = self.now;
+        let list = self.call_events.entry((chat, call_seq)).or_default();
+        let event = CallEvent {
+            chat,
+            call_seq,
+            n: list.len() as u64 + 1,
+            kind,
+            device,
+            server_at: now,
+            client_at: text.as_ref().map(|text| text.client_at),
+            epoch: text.as_ref().map(|text| text.epoch),
+            signature: text.as_ref().map(|text| text.signature.clone()),
+            body: text.map(|text| text.body),
+        };
+        list.push(event.clone());
+        event
+    }
+
     fn deliver(&mut self, account_list: &[Ulid], except: Option<Ulid>, frame: &ServerFrame) {
         for p in 0..self.phones.len() {
             let phone = &self.phones[p];
@@ -2164,6 +2206,11 @@ impl World {
                     _ => panic!("No such route: {method} {path}"),
                 }
             }
+            ("GET", ["chats", chat, "calls", call_seq, "events"]) => {
+                let key = (parse(chat), call_seq.parse::<u64>().unwrap());
+                let event_list = self.call_events.get(&key).cloned().unwrap_or_default();
+                reply_ok(json!({ "event_list": event_list }))
+            }
             ("GET", ["public", "features"]) => {
                 reply_ok(json!({"registration": true, "captcha": false}))
             }
@@ -2212,11 +2259,12 @@ impl World {
             encrypted: Some(false),
             epoch: None,
             pointer_seq: None,
-            call_seq: None,
             client_sent_at: Some(self.now),
             server_saved_at: Some(self.now),
             body: Some(Bytes(Vec::new())),
             signature: Some(stamp),
+            call_outcome: None,
+            call_ended_at: None,
         });
         reply_ok(json!({ "device": device }))
     }
@@ -2278,6 +2326,21 @@ impl World {
                     },
                 );
                 None
+            }
+            ClientFrame::CallEvent {
+                reference,
+                chat,
+                call_seq,
+                kind,
+            } => {
+                let event = self.call_event(chat, call_seq, kind, device, None);
+                let member_list = self.hub_chat(chat).member_list.clone();
+                self.deliver(
+                    &member_list,
+                    Some(device),
+                    &ServerFrame::CallEvent(Box::new(event)),
+                );
+                Some(ServerFrame::Done { reference })
             }
             ClientFrame::Sync { reference } => Some(ServerFrame::Chats {
                 reference,
@@ -2435,11 +2498,12 @@ impl World {
             encrypted: Some(send.encrypted),
             epoch: send.epoch,
             pointer_seq: send.pointer_seq,
-            call_seq: send.call_seq,
             client_sent_at: Some(send.client_sent_at),
             server_saved_at: Some(self.now),
             body: Some(send.body),
             signature: Some(send.signature),
+            call_outcome: None,
+            call_ended_at: None,
         });
         let mut handed = Vec::new();
         for welcome in send.welcome_list {
@@ -2831,11 +2895,12 @@ fn a_message_that_cannot_be_shown_still_appears_with_its_problem() {
         encrypted: Some(true),
         epoch: Some(0),
         pointer_seq: None,
-        call_seq: None,
         client_sent_at: Some(world.now),
         server_saved_at: Some(world.now),
         body: Some(Bytes(vec![1, 2, 3])),
         signature: Some(Bytes(vec![4; 64])),
+        call_outcome: None,
+        call_ended_at: None,
     });
     world.online(mina);
     let mut found = Vec::new();
@@ -2936,11 +3001,12 @@ fn a_failed_commit_or_welcome_rejoins_and_one_refused_for_what_it_is_does_not() 
         encrypted: Some(true),
         epoch: Some(join.epoch),
         pointer_seq: None,
-        call_seq: None,
         client_sent_at: Some(world.now),
         server_saved_at: Some(world.now),
         body: Some(Bytes(join.commit)),
         signature: None,
+        call_outcome: None,
+        call_ended_at: None,
     });
     world.settle();
     assert!(error_count(&world, omid, "bad_commit") >= 1);
@@ -2985,11 +3051,12 @@ fn a_new_device_notice_is_checked() {
         encrypted: Some(false),
         epoch: None,
         pointer_seq: None,
-        call_seq: None,
         client_sent_at: Some(world.now),
         server_saved_at: Some(world.now),
         body: Some(Bytes(Vec::new())),
         signature: Some(Bytes(vec![1; 64])),
+        call_outcome: None,
+        call_ended_at: None,
     });
     world.settle();
     assert!(has_notice(&world, first, Some(Problem::BadSignature)));
@@ -3335,11 +3402,12 @@ fn unknown_message(world: &World, chat: Ulid) -> MessageFrame {
         encrypted: Some(true),
         epoch: Some(0),
         pointer_seq: None,
-        call_seq: None,
         client_sent_at: Some(world.now),
         server_saved_at: Some(world.now),
         body: Some(Bytes(vec![1, 2, 3])),
         signature: Some(Bytes(vec![4; 64])),
+        call_outcome: None,
+        call_ended_at: None,
     }
 }
 
@@ -4162,11 +4230,12 @@ fn an_unencrypted_message_shows_as_such_and_one_with_no_device_is_malformed() {
         encrypted: Some(false),
         epoch: world.hub_chat(chat).epoch,
         pointer_seq: None,
-        call_seq: None,
         client_sent_at: Some(world.now),
         server_saved_at: Some(world.now),
         body: Some(Bytes(br#"{"text":"in the clear"}"#.to_vec())),
         signature: None,
+        call_outcome: None,
+        call_ended_at: None,
     };
     let signature = device
         .sign(
@@ -4241,11 +4310,12 @@ fn a_device_removed_by_a_commit_keeps_what_it_could_read_stops_and_rejoins_on_re
         encrypted: Some(true),
         epoch: Some(removal.epoch),
         pointer_seq: None,
-        call_seq: None,
         client_sent_at: Some(world.now),
         server_saved_at: Some(world.now),
         body: Some(Bytes(removal.commit)),
         signature: None,
+        call_outcome: None,
+        call_ended_at: None,
     });
     world.settle();
     assert!(
@@ -4708,4 +4778,261 @@ fn a_download_that_is_changed_cut_or_unreadable_stops_with_its_reason() {
     download(&mut world, 5);
     assert!(downloaded(&world, mina, 5));
     assert_eq!(world.phones[mina].held[&5], vec![5; 10]);
+}
+
+fn call_events(world: &World, phone: usize) -> Vec<ShownCallEvent> {
+    let mut list = Vec::new();
+    for event in &world.phones[phone].events {
+        if let Event::CallEvent { event } = event {
+            list.push(event.clone());
+        }
+    }
+    list
+}
+
+fn last_call_output(world: &World, phone: usize) -> Output {
+    world.phones[phone].call_outputs.last().unwrap().clone()
+}
+
+/// What the relay does with text from a device's `text` track: saves it in the call, and every
+/// device in it reads it back from the `events` track.
+fn relay_text(world: &mut World, from: usize, to: &[usize]) -> CallEvent {
+    let Output::CallText {
+        chat,
+        call_seq,
+        frame,
+    } = last_call_output(world, from)
+    else {
+        panic!("no text went up");
+    };
+    let device = world.phones[from].device.unwrap();
+    let event = world.call_event(chat, call_seq, CallEventKind::Text, device, Some(frame));
+    for &p in to {
+        world.input(
+            p,
+            Input::CallEvent {
+                event: event.clone(),
+            },
+        );
+    }
+    event
+}
+
+fn start_call(world: &mut World, from: usize, to: usize, chat: Ulid) -> u64 {
+    world.command(
+        from,
+        Command::StartCall {
+            chat,
+            video: true,
+            voice: true,
+        },
+    );
+    world.settle();
+    let mut ring = None;
+    for event in &world.phones[to].events {
+        if let Event::Message { message } = event
+            && message.content_kind == Some(ContentKind::Call)
+        {
+            ring = Some(message.clone());
+        }
+    }
+    // The start is a message, and its delivery is the ring.
+    let ring = ring.unwrap();
+    assert_eq!(
+        ring.call,
+        Some(CallBody {
+            video: true,
+            voice: true
+        })
+    );
+    assert_eq!(ring.call_outcome, None);
+    ring.seq
+}
+
+#[test]
+fn a_call_rings_is_declined_joined_written_in_and_replayed() {
+    let (mut world, omid, mina, chat) = pair();
+    let call_seq = start_call(&mut world, omid, mina, chat);
+
+    // Mina declines, and Omid sees it inside the call.
+    world.command(mina, Command::DeclineCall { chat, call_seq });
+    world.settle();
+    let declined = call_events(&world, omid);
+    assert_eq!(declined.len(), 1);
+    assert_eq!(declined[0].kind, CallEventKind::Decline);
+    assert_eq!(declined[0].n, 1);
+    assert!(!declined[0].mine);
+
+    // Both join: the same secret, each its own index, the same path.
+    world.command(omid, Command::JoinCall { chat, call_seq });
+    world.command(mina, Command::JoinCall { chat, call_seq });
+    let Output::JoinCall {
+        path,
+        key: omid_key,
+        index_list,
+        ..
+    } = last_call_output(&world, omid)
+    else {
+        panic!("no join went out");
+    };
+    let Output::JoinCall { key: mina_key, .. } = last_call_output(&world, mina) else {
+        panic!("no join went out");
+    };
+    assert_eq!(path, format!("/api/v1/calls/{chat}/{call_seq}/moq"));
+    assert_eq!(omid_key.secret, mina_key.secret);
+    assert_ne!(omid_key.index, mina_key.index);
+    assert_eq!(index_list.len(), 2);
+
+    // Text written in the call reaches both, once, even when it comes twice.
+    world.command(
+        omid,
+        Command::CallText {
+            chat,
+            call_seq,
+            text: Secret("سلام in the call".to_string()),
+        },
+    );
+    let event = relay_text(&mut world, omid, &[omid, mina]);
+    world.input(mina, Input::CallEvent { event });
+    let mina_saw = call_events(&world, mina);
+    // The decline went to her other devices, not back to the one that sent it.
+    assert_eq!(mina_saw.len(), 1);
+    assert_eq!(
+        mina_saw[0].text,
+        Some(Secret("سلام in the call".to_string()))
+    );
+    assert_eq!(mina_saw[0].kind, CallEventKind::Text);
+    assert!(!mina_saw[0].mine);
+    let omid_saw = call_events(&world, omid);
+    assert!(omid_saw.last().unwrap().mine);
+    assert_eq!(omid_saw.last().unwrap().text, mina_saw[0].text);
+    // The chat itself holds no row for it.
+    assert!(
+        !world
+            .texts(mina, chat)
+            .iter()
+            .any(|text| text.contains("in the call"))
+    );
+
+    // The app restarts and replays the call from the server.
+    let reader = world.reload(mina);
+    world.settle();
+    world.command(reader, Command::CallEvents { chat, call_seq });
+    world.settle();
+    let replay = call_events(&world, reader);
+    assert_eq!(replay.len(), 2);
+    assert_eq!(replay[1].text, Some(Secret("سلام in the call".to_string())));
+
+    // Leaving tells the call code, and a second leave does nothing.
+    world.command(omid, Command::LeaveCall { chat });
+    assert!(matches!(
+        last_call_output(&world, omid),
+        Output::LeaveCall { .. }
+    ));
+    let count = world.phones[omid].call_outputs.len();
+    world.command(omid, Command::LeaveCall { chat });
+    assert_eq!(world.phones[omid].call_outputs.len(), count);
+}
+
+#[test]
+fn text_in_a_call_that_does_not_check_out_shows_its_problem() {
+    let (mut world, omid, mina, chat) = pair();
+    let call_seq = start_call(&mut world, omid, mina, chat);
+    // Not joined yet: nothing to write in.
+    world.command(
+        omid,
+        Command::CallText {
+            chat,
+            call_seq,
+            text: Secret("too early".to_string()),
+        },
+    );
+    assert_eq!(error_count(&world, omid, "not_in_call"), 1);
+    world.command(omid, Command::JoinCall { chat, call_seq });
+    world.command(
+        omid,
+        Command::CallText {
+            chat,
+            call_seq,
+            text: Secret("checked".to_string()),
+        },
+    );
+    let good = relay_text(&mut world, omid, &[]);
+
+    let mut changed = good.clone();
+    changed.n = 10;
+    changed.body.as_mut().unwrap().0[5] ^= 1;
+    let mut unsigned = good.clone();
+    unsigned.n = 11;
+    unsigned.signature = None;
+    let mut stranger = good.clone();
+    stranger.n = 12;
+    stranger.device = Ulid::from_bytes([77; 16]);
+    for event in [changed, unsigned, stranger] {
+        world.input(mina, Input::CallEvent { event });
+    }
+    world.settle();
+    let problems: Vec<Option<Problem>> = call_events(&world, mina)
+        .iter()
+        .map(|event| event.problem)
+        .collect();
+    assert_eq!(
+        problems,
+        vec![
+            Some(Problem::BadSignature),
+            Some(Problem::Malformed),
+            Some(Problem::UnknownDevice)
+        ]
+    );
+}
+
+#[test]
+fn a_joined_call_gets_the_new_key_when_the_chat_moves_on_and_there_is_one_call_at_a_time() {
+    let (mut world, omid, mina, chat) = pair();
+    let call_seq = start_call(&mut world, omid, mina, chat);
+    world.command(omid, Command::JoinCall { chat, call_seq });
+    let Output::JoinCall { key: first, .. } = last_call_output(&world, omid) else {
+        panic!("no join went out");
+    };
+    // A week on, the next send changes the key first, and the call follows it.
+    world.advance(8 * DAY);
+    tell(&mut world, omid, chat, "after a week");
+    let Output::CallKey { key: next, .. } = last_call_output(&world, omid) else {
+        panic!("no new key went out");
+    };
+    assert_eq!(next.epoch, first.epoch + 1);
+    assert_ne!(next.secret, first.secret);
+
+    // Joining another call leaves this one first.
+    world.command(
+        omid,
+        Command::JoinCall {
+            chat,
+            call_seq: call_seq + 100,
+        },
+    );
+    let outputs = &world.phones[omid].call_outputs;
+    assert!(matches!(
+        outputs[outputs.len() - 2],
+        Output::LeaveCall { .. }
+    ));
+    assert!(matches!(
+        outputs[outputs.len() - 1],
+        Output::JoinCall { .. }
+    ));
+
+    // A chat this device is not in has no call to join.
+    world.command(
+        omid,
+        Command::JoinCall {
+            chat: Ulid::from_bytes([88; 16]),
+            call_seq: 1,
+        },
+    );
+    assert_eq!(error_count(&world, omid, "not_joined"), 1);
+
+    // Declining needs the socket.
+    world.offline(mina);
+    world.command(mina, Command::DeclineCall { chat, call_seq });
+    assert_eq!(error_count(&world, mina, "offline"), 1);
 }

@@ -24,7 +24,6 @@ fn send_frame() -> SendFrame {
         encrypted: true,
         epoch: Some(3),
         pointer_seq: None,
-        call_seq: None,
         client_sent_at: 1800,
         body: Bytes(vec![1, 2, 3]),
         signature: Bytes(vec![255]),
@@ -265,11 +264,12 @@ fn every_server_frame_has_the_agreed_shape() {
         encrypted: None,
         epoch: None,
         pointer_seq: None,
-        call_seq: None,
         client_sent_at: None,
         server_saved_at: None,
         body: None,
         signature: None,
+        call_outcome: None,
+        call_ended_at: None,
     };
     let chat = ChatItem {
         chat: ulid(CHAT),
@@ -315,6 +315,7 @@ fn every_server_frame_has_the_agreed_shape() {
                 reference: ulid(REF),
                 code: "too_many_devices".to_string(),
                 message: "No".to_string(),
+                call_seq: None,
             },
             json!({"type": "refused", "ref": REF, "code": "too_many_devices", "message": "No"}),
         ),
@@ -453,11 +454,12 @@ fn a_removed_message_has_no_header_and_a_stored_one_verifies_after_the_wire() {
         encrypted: Some(header.encrypted),
         epoch: header.epoch,
         pointer_seq: header.pointer_seq,
-        call_seq: header.call_seq,
         client_sent_at: Some(header.client_sent_at),
         server_saved_at: Some(6),
         body: Some(Bytes(b"hello".to_vec())),
         signature: Some(Bytes(signature.to_vec())),
+        call_outcome: None,
+        call_ended_at: None,
     };
     let text = serde_json::to_string(&ServerFrame::Message(Box::new(frame))).unwrap();
     let ServerFrame::Message(received) = from_str::<ServerFrame>(&text).unwrap() else {

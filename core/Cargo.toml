@@ -51,6 +51,10 @@ aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "al
 # platform hands it small RGBA pixels.
 blurhash = { version = "0.2.3", default-features = false }
 
+# SFrame (RFC 9605) for call media, chosen by the author: its MLS key scheme and the RFC's test
+# vectors. The RustCrypto backend builds to WASM; it brings aes-gcm 0.11 beside openmls's 0.10.
+sframe = { version = "2.1.0", default-features = false, features = ["rust-crypto"] }
+
 # Random bytes for ULIDs, words and nonces, straight from the OS.
 getrandom = "0.4.3"
 

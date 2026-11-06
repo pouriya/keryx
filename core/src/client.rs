@@ -24,20 +24,22 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
+use crate::call::{CallIndex, CallKey};
 use crate::file::{self, FileInfo};
 use crate::mls::{
     AccountKey, Device, DeviceRecord, MlsError, sign_revocation, stamp_account_key, verify_logout,
     verify_message, verify_revocation,
 };
 use crate::protocol::{
-    AccountBrief, AccountInfo, AccountKeysBody, AccountListReply, AccountReply, Bytes,
-    CaptchaAnswer, CaptchaReply, ChallengeBody, ChallengeReply, ChatDevice, ChatDeviceListReply,
-    ChatItem, ChatReply, ChatType, ClientFrame, ContentKind, CountReply, CreateChatBody,
-    CreateFileBody, DeviceProof, DeviceReply, DevicesReply, EmptyReply, FeaturesReply, FileReply,
-    GroupInfoReply, Header, KeyPackageItem, KeyPackageListReply, KeyPackagesBody, Kind, LoginBody,
-    LoginReply, MarkItem, MessageFrame, RefusedReply, RegisterBody, RegisterDeviceBody, SendFrame,
-    ServerFrame, SetupBody, SetupReply, SignedBody, WelcomeItem, WrapEntry, WrapItem,
-    WrapListReply,
+    AccountBrief, AccountInfo, AccountKeysBody, AccountListReply, AccountReply, Bytes, CallBody,
+    CallEvent, CallEventKind, CallEventListReply, CallOutcome, CallText, CaptchaAnswer,
+    CaptchaReply, ChallengeBody, ChallengeReply, ChatDevice, ChatDeviceListReply, ChatItem,
+    ChatReply, ChatType, ClientFrame, ContentKind, CountReply, CreateChatBody, CreateFileBody,
+    DeviceProof, DeviceReply, DevicesReply, EmptyReply, FeaturesReply, FileReply, GroupInfoReply,
+    Header, KeyPackageItem, KeyPackageListReply, KeyPackagesBody, Kind, LoginBody, LoginReply,
+    MarkItem, MessageFrame, RefusedReply, RegisterBody, RegisterDeviceBody, SendFrame, ServerFrame,
+    SetupBody, SetupReply, SignedBody, WelcomeItem, WrapEntry, WrapItem, WrapListReply,
+    call_text_header,
 };
 use crate::queue::{Level, Queue, Target};
 use crate::seed::{self, AccountKeys};
@@ -247,6 +249,37 @@ pub enum Command {
     LogOut,
     /// Retry the connection and anything waiting to retry, now.
     NetworkBack,
+    /// Starts a call: one message, whose delivery rings the others. It says what the caller has on.
+    StartCall {
+        chat: Ulid,
+        video: bool,
+        voice: bool,
+    },
+    /// Declines a ringing call, without joining it.
+    DeclineCall {
+        chat: Ulid,
+        call_seq: u64,
+    },
+    /// Joins a call: [`Output::JoinCall`] hands the platform's call code where to connect and the
+    /// key. One call at a time.
+    JoinCall {
+        chat: Ulid,
+        call_seq: u64,
+    },
+    LeaveCall {
+        chat: Ulid,
+    },
+    /// Text typed in the joined call, sealed here and sent on the device's `text` track.
+    CallText {
+        chat: Ulid,
+        call_seq: u64,
+        text: Secret,
+    },
+    /// What happened inside a call, for its replay.
+    CallEvents {
+        chat: Ulid,
+        call_seq: u64,
+    },
 }
 
 /// Everything that goes into [`Client::step`].
@@ -309,6 +342,10 @@ pub enum Input {
         #[serde(with = "serde_bytes")]
         #[cfg_attr(feature = "wasm", tsify(type = "Uint8Array"))]
         bytes: Vec<u8>,
+    },
+    /// A frame from the joined call's `events` track.
+    CallEvent {
+        event: CallEvent,
     },
 }
 
@@ -385,6 +422,33 @@ pub enum Output {
         #[cfg_attr(feature = "wasm", tsify(type = "Uint8Array"))]
         bytes: Vec<u8>,
     },
+    /// Connect to a call's MoQ over a WebSocket at `path`, publish as this device and read the
+    /// others. The key and the members' MLS indexes are for the Rust that seals and opens frames,
+    /// and never go into a platform's own language.
+    JoinCall {
+        chat: Ulid,
+        call_seq: u64,
+        path: String,
+        bearer: Option<Secret>,
+        key: CallKey,
+        index_list: Vec<CallIndex>,
+    },
+    /// The joined call's chat moved to a new epoch: seal with this key from now on, and open with
+    /// it too.
+    CallKey {
+        chat: Ulid,
+        key: CallKey,
+        index_list: Vec<CallIndex>,
+    },
+    LeaveCall {
+        chat: Ulid,
+    },
+    /// Publish this on the device's `text` track in the joined call.
+    CallText {
+        chat: Ulid,
+        call_seq: u64,
+        frame: CallText,
+    },
 }
 
 /// Why a message cannot be shown as it is. It still appears, so the timeline has no hole.
@@ -421,6 +485,32 @@ pub struct Shown {
     /// A file message's files, or a bundle's.
     #[serde(default)]
     pub files: Vec<FileInfo>,
+    /// A call's start: what the caller had on.
+    #[serde(default)]
+    pub call: Option<CallBody>,
+    /// Missed or answered, once the server knows.
+    #[serde(default)]
+    pub call_outcome: Option<CallOutcome>,
+    #[serde(default)]
+    pub call_ended_at: Option<i64>,
+    pub problem: Option<Problem>,
+}
+
+/// Something that happened inside a call, to show in it or in its replay.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify), tsify(missing_as_null))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShownCallEvent {
+    pub chat: Ulid,
+    pub call_seq: u64,
+    pub n: u64,
+    pub kind: CallEventKind,
+    pub device: Ulid,
+    pub account: Option<Ulid>,
+    pub mine: bool,
+    pub at: i64,
+    /// Text's own clock, as sent.
+    pub sent_at: Option<i64>,
+    pub text: Option<Secret>,
     pub problem: Option<Problem>,
 }
 
@@ -571,6 +661,10 @@ pub enum Event {
         handle: u64,
         code: String,
     },
+    /// Something happened inside a call: live, or from its replay.
+    CallEvent {
+        event: ShownCallEvent,
+    },
     Online,
     Offline,
     LoggedOut,
@@ -591,6 +685,7 @@ enum Item {
         text: Option<Secret>,
         files: Vec<FileInfo>,
         remove: Vec<Ulid>,
+        call: Option<CallBody>,
     },
     Typing {
         chat: Ulid,
@@ -700,6 +795,7 @@ enum Asked {
         n: u64,
     },
     Features,
+    CallEvents,
 }
 
 /// A REST request, kept until it is answered, to go again if nothing answered.
@@ -722,8 +818,17 @@ struct Content {
     text: Option<Secret>,
     files: Vec<FileInfo>,
     remove: Vec<Ulid>,
+    /// A call's start body.
+    call: Option<CallBody>,
     /// The platform's handles for `files`, for its pending message.
     handles: Vec<u64>,
+}
+
+/// The call this device has joined.
+struct ActiveCall {
+    chat: Ulid,
+    call_seq: u64,
+    epoch: u64,
 }
 
 /// A file message's files going up, one at a time, before the message joins the queue.
@@ -970,6 +1075,9 @@ pub struct Client {
     uploads: HashMap<u64, Upload>,
     next_upload: u64,
     downloads: HashMap<u64, Download>,
+    call: Option<ActiveCall>,
+    /// Call events already shown, since one can come over the WebSocket and on the call's track.
+    call_events_shown: HashSet<(Ulid, u64, u64)>,
     dirty: bool,
     now: i64,
     out: Vec<Output>,
@@ -1027,18 +1135,38 @@ fn refused_for_safety(error: &MlsError) -> bool {
     )
 }
 
-/// A message's text and files: `{"text": "...", "files": [...]}`, each optional.
-fn content_of(plaintext: &[u8]) -> (Option<Secret>, Vec<FileInfo>) {
+/// What a message holds once opened.
+#[derive(Default)]
+struct Opened {
+    text: Option<Secret>,
+    files: Vec<FileInfo>,
+    call: Option<CallBody>,
+}
+
+/// A message's text and files, `{"text": "...", "files": [...]}`, each optional, or a call's start,
+/// `{"video": ..., "voice": ...}`.
+fn content_of(plaintext: &[u8]) -> Opened {
     #[derive(Deserialize)]
     struct Plain {
         #[serde(default)]
         text: Option<String>,
         #[serde(default)]
         files: Vec<FileInfo>,
+        #[serde(default)]
+        video: Option<bool>,
+        #[serde(default)]
+        voice: Option<bool>,
     }
     match serde_json::from_slice::<Plain>(plaintext) {
-        Ok(plain) => (plain.text.map(Secret), plain.files),
-        Err(_) => (None, Vec::new()),
+        Ok(plain) => Opened {
+            text: plain.text.map(Secret),
+            files: plain.files,
+            call: match (plain.video, plain.voice) {
+                (Some(video), Some(voice)) => Some(CallBody { video, voice }),
+                _ => None,
+            },
+        },
+        Err(_) => Opened::default(),
     }
 }
 
@@ -1062,12 +1190,8 @@ fn account_key(info: &AccountInfo) -> Option<AccountKey> {
     })
 }
 
-fn shown(
-    message: &MessageFrame,
-    account: Option<Ulid>,
-    mine: bool,
-    (text, files): (Option<Secret>, Vec<FileInfo>),
-) -> Shown {
+fn shown(message: &MessageFrame, account: Option<Ulid>, mine: bool, opened: Opened) -> Shown {
+    let Opened { text, files, call } = opened;
     Shown {
         chat: message.chat,
         seq: message.seq,
@@ -1080,6 +1204,9 @@ fn shown(
         saved_at: message.server_saved_at.unwrap_or(0),
         text,
         files,
+        call,
+        call_outcome: message.call_outcome,
+        call_ended_at: message.call_ended_at,
         problem: None,
     }
 }
@@ -1127,6 +1254,8 @@ impl Client {
             uploads: HashMap::new(),
             next_upload: 0,
             downloads: HashMap::new(),
+            call: None,
+            call_events_shown: HashSet::new(),
             dirty: false,
             now: 0,
             out: Vec::new(),
@@ -1177,6 +1306,7 @@ impl Client {
             Input::Timer => self.timer(),
             Input::ChunkRead { handle, n, bytes } => self.chunk_read(handle, n, bytes),
             Input::Fetched { id, status, bytes } => self.fetched(id, status, &bytes),
+            Input::CallEvent { event } => self.call_event(event),
         }
         loop {
             self.run_plans();
@@ -1191,6 +1321,7 @@ impl Client {
         if self.dirty && !self.commit_busy && save_due {
             self.save_state();
         }
+        self.rekey_call();
         self.schedule();
         std::mem::take(&mut self.out)
     }
@@ -1516,6 +1647,44 @@ impl Client {
                 }
             }
             Command::Devices => self.get("/api/v1/devices".to_string(), Asked::Devices),
+            Command::StartCall { chat, video, voice } => self.push_content(
+                chat,
+                Kind::Content,
+                None,
+                Content {
+                    content_kind: Some(ContentKind::Call),
+                    call: Some(CallBody { video, voice }),
+                    ..Content::default()
+                },
+            ),
+            Command::DeclineCall { chat, call_seq } => {
+                let reference = reference();
+                let frame = ClientFrame::CallEvent {
+                    reference,
+                    chat,
+                    call_seq,
+                    kind: CallEventKind::Decline,
+                };
+                if !self.ask(frame, reference, Waiting::Done) {
+                    self.error("offline", "Not connected, so the call was not declined");
+                }
+            }
+            Command::JoinCall { chat, call_seq } => self.join_call(chat, call_seq),
+            Command::LeaveCall { chat } => {
+                if self.call.as_ref().is_some_and(|call| call.chat == chat) {
+                    self.call = None;
+                    self.out.push(Output::LeaveCall { chat });
+                }
+            }
+            Command::CallText {
+                chat,
+                call_seq,
+                text,
+            } => self.call_text(chat, call_seq, text),
+            Command::CallEvents { chat, call_seq } => self.get(
+                format!("/api/v1/chats/{chat}/calls/{call_seq}/events"),
+                Asked::CallEvents,
+            ),
             Command::Terminate { device, words } => {
                 let Some(account) = self.account else {
                     return self.error("not_logged_in", "Log in first");
@@ -1731,6 +1900,7 @@ impl Client {
             text,
             files,
             remove,
+            call,
             handles,
         } = content;
         let item = Item::Content {
@@ -1740,6 +1910,7 @@ impl Client {
             text: text.clone(),
             files,
             remove,
+            call,
         };
         let local = self.queue.push(Level::Content, item, queue_target);
         self.event(Event::Pending {
@@ -1970,6 +2141,7 @@ impl Client {
                 text: going.text,
                 files,
                 remove: Vec::new(),
+                call: None,
                 handles,
             },
         );
@@ -2474,6 +2646,7 @@ impl Client {
                     text,
                     files,
                     remove,
+                    call,
                 } => match self.can_seal(chat) {
                     Seal::Now => {
                         let content = Content {
@@ -2481,6 +2654,7 @@ impl Client {
                             text,
                             files,
                             remove,
+                            call,
                             handles: Vec::new(),
                         };
                         self.send_content(outgoing.id, chat, kind, outgoing.pointer_seq, content);
@@ -2540,6 +2714,7 @@ impl Client {
             text,
             files,
             remove,
+            call,
             ..
         } = content;
         let after = self.chat(chat).known.unwrap_or(0);
@@ -2572,6 +2747,13 @@ impl Client {
             Vec::new()
         };
         let sealed = match (kind, text) {
+            (Kind::Content, _) if call.is_some() => {
+                let plaintext = match serde_json::to_vec(&call) {
+                    Ok(plaintext) => plaintext,
+                    Err(_) => return self.fail(chat, local, "internal"),
+                };
+                device.seal(&header, &plaintext)
+            }
             (Kind::Content | Kind::Edit, text) => {
                 let mut plain = serde_json::Map::new();
                 if let Some(mut text) = text {
@@ -2610,7 +2792,6 @@ impl Client {
             encrypted: true,
             epoch: Some(epoch),
             pointer_seq,
-            call_seq: None,
             client_sent_at: self.now,
             body: Bytes(body),
             signature: Bytes(signature.to_vec()),
@@ -2800,7 +2981,6 @@ impl Client {
             encrypted: false,
             epoch: Some(commit.epoch),
             pointer_seq: None,
-            call_seq: None,
             client_sent_at: now,
             body: Bytes(commit.commit),
             signature: Bytes(signature.to_vec()),
@@ -2944,6 +3124,166 @@ impl Client {
     }
 
     // ---------------------------------------------------------------------------------------------
+    // Calls
+    // ---------------------------------------------------------------------------------------------
+
+    /// Hands the platform's call code where to connect and the current key. Leaves any other call
+    /// first, as there is one at a time.
+    fn join_call(&mut self, chat: Ulid, call_seq: u64) {
+        let Some(device) = self.device.as_ref() else {
+            return self.error("no_device", "This client has no device");
+        };
+        let (key, index_list) = match device.call_key(chat) {
+            Ok(found) => found,
+            Err(_) => return self.error("not_joined", "This device is not in the chat yet"),
+        };
+        if let Some(call) = self.call.take() {
+            self.out.push(Output::LeaveCall { chat: call.chat });
+        }
+        self.call = Some(ActiveCall {
+            chat,
+            call_seq,
+            epoch: key.epoch,
+        });
+        let bearer = self.bearer();
+        self.out.push(Output::JoinCall {
+            chat,
+            call_seq,
+            path: format!("/api/v1/calls/{chat}/{call_seq}/moq"),
+            bearer,
+            key,
+            index_list,
+        });
+    }
+
+    /// A new epoch in the joined call's chat means a new key, for sealing and opening.
+    fn rekey_call(&mut self) {
+        let (Some(call), Some(device)) = (self.call.as_mut(), self.device.as_ref()) else {
+            return;
+        };
+        let Ok(epoch) = device.epoch(call.chat) else {
+            return;
+        };
+        if epoch == call.epoch {
+            return;
+        }
+        let Ok((key, index_list)) = device.call_key(call.chat) else {
+            return;
+        };
+        call.epoch = key.epoch;
+        let chat = call.chat;
+        self.out.push(Output::CallKey {
+            chat,
+            key,
+            index_list,
+        });
+    }
+
+    /// Seals text for the joined call, signed with `call_seq` in its header so it can never pass
+    /// for a chat message.
+    fn call_text(&mut self, chat: Ulid, call_seq: u64, mut text: Secret) {
+        if !self
+            .call
+            .as_ref()
+            .is_some_and(|call| call.chat == chat && call.call_seq == call_seq)
+        {
+            return self.error("not_in_call", "Join the call before writing in it");
+        }
+        let Some(device) = self.device.as_ref() else {
+            return self.error("no_device", "This client has no device");
+        };
+        let Ok(epoch) = device.epoch(chat) else {
+            return self.error("not_joined", "This device is not in the chat yet");
+        };
+        let header = call_text_header(chat, device.record().device, call_seq, epoch, self.now);
+        let mut plain = serde_json::Map::new();
+        plain.insert(
+            "text".to_string(),
+            serde_json::Value::String(std::mem::take(&mut text.0)),
+        );
+        let plaintext = match serde_json::to_vec(&plain) {
+            Ok(plaintext) => zeroize::Zeroizing::new(plaintext),
+            Err(_) => return self.error("internal", "Could not write the text"),
+        };
+        let (body, signature) = match device.seal(&header, &plaintext) {
+            Ok(sealed) => sealed,
+            Err(_) => return self.error("seal_failed", "Could not seal the text"),
+        };
+        self.out.push(Output::CallText {
+            chat,
+            call_seq,
+            frame: CallText {
+                client_at: header.client_sent_at,
+                epoch,
+                signature: Bytes(signature.to_vec()),
+                body: Bytes(body),
+            },
+        });
+    }
+
+    /// Shows one thing that happened inside a call, once, opening text with the chat's keys.
+    fn call_event(&mut self, event: CallEvent) {
+        if !self
+            .call_events_shown
+            .insert((event.chat, event.call_seq, event.n))
+        {
+            return;
+        }
+        let known = self.devices.get(&event.device).copied();
+        let account = known.map(|known| known.account);
+        let mut shown = ShownCallEvent {
+            chat: event.chat,
+            call_seq: event.call_seq,
+            n: event.n,
+            kind: event.kind,
+            device: event.device,
+            account,
+            mine: account.is_some() && account == self.account,
+            at: event.server_at,
+            sent_at: event.client_at,
+            text: None,
+            problem: None,
+        };
+        if event.kind == CallEventKind::Text {
+            let opened = self.open_call_text(&event, known);
+            match opened {
+                Ok(text) => shown.text = text,
+                Err(problem) => shown.problem = Some(problem),
+            }
+        }
+        self.event(Event::CallEvent { event: shown });
+    }
+
+    fn open_call_text(
+        &mut self,
+        event: &CallEvent,
+        known: Option<KnownDevice>,
+    ) -> Result<Option<Secret>, Problem> {
+        let Some(known) = known else {
+            self.devices_of(event.chat);
+            return Err(Problem::UnknownDevice);
+        };
+        let signature = match &event.signature {
+            Some(signature) => fixed::<64>(&signature.0),
+            None => None,
+        };
+        let (Some(header), Some(signature), Some(body)) = (event.header(), signature, &event.body)
+        else {
+            return Err(Problem::Malformed);
+        };
+        if verify_message(&header, &body.0, &signature, &known.public).is_err() {
+            return Err(Problem::BadSignature);
+        }
+        let Some(own) = self.device.as_ref() else {
+            return Ok(None);
+        };
+        match own.open(&header, &body.0, &signature, &known.public) {
+            Ok(plaintext) => Ok(content_of(&plaintext).text),
+            Err(_) => Ok(None),
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------
     // Frames
     // ---------------------------------------------------------------------------------------------
 
@@ -2980,6 +3320,7 @@ impl Client {
                 reference,
                 code,
                 message,
+                ..
             } => {
                 if let Some(waiting) = self.waiting.remove(&reference) {
                     self.refused(waiting, &code, &message);
@@ -3011,6 +3352,7 @@ impl Client {
                 device,
                 statement,
             } => self.revoked(account, device, &statement.0),
+            ServerFrame::CallEvent(event) => self.call_event(*event),
         }
     }
 
@@ -3807,7 +4149,7 @@ impl Client {
                         self.chat(chat).waiting.push(message);
                         continue;
                     }
-                    Err(_) => (None, Vec::new()),
+                    Err(_) => Opened::default(),
                 }
             };
             let mine = self.account == Some(known.account);
@@ -3837,7 +4179,7 @@ impl Client {
 
     fn problem(&mut self, message: &MessageFrame, account: Option<Ulid>, problem: Problem) {
         let mine = account.is_some() && account == self.account;
-        let mut shown = shown(message, account, mine, (None, Vec::new()));
+        let mut shown = shown(message, account, mine, Opened::default());
         shown.problem = Some(problem);
         self.event(Event::Message { message: shown });
     }
@@ -4252,6 +4594,13 @@ impl Client {
                     return self.restored_without(chat);
                 };
                 self.wraps(chat, wrap_list);
+            }
+            Asked::CallEvents => {
+                if let Some(CallEventListReply { event_list }) = self.data(body) {
+                    for event in event_list {
+                        self.call_event(event);
+                    }
+                }
             }
             Asked::Search => {
                 if let Some(AccountListReply { account_list }) = self.data(body) {

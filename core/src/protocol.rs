@@ -105,6 +105,27 @@ numbered!(
 );
 
 numbered!(
+    /// The numbers are the `message.call_outcome` column's. Readable, because a missed call counts
+    /// as unread and an answered one does not.
+    CallOutcome {
+        Missed = 0,
+        Answered = 1,
+    }
+);
+
+numbered!(
+    /// The numbers are the `call_event.kind` column's. The server writes join, leave and end, and
+    /// clients send decline and text.
+    CallEventKind {
+        Join = 0,
+        Leave = 1,
+        Decline = 2,
+        Text = 3,
+        End = 4,
+    }
+);
+
+numbered!(
     /// The numbers are the `conversation.type` column's.
     ChatType {
         SelfChat = 0,
@@ -197,8 +218,6 @@ pub struct SendFrame {
     pub epoch: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pointer_seq: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub call_seq: Option<u64>,
     pub client_sent_at: i64,
     pub body: Bytes,
     pub signature: Bytes,
@@ -280,6 +299,92 @@ pub enum ClientFrame {
         epoch: u64,
         wrap_list: Vec<WrapItem>,
     },
+    /// Declining a call, from a device not in its MoQ. Saved inside the call and answered with
+    /// `done`. Text in a call goes up on MoQ instead.
+    CallEvent {
+        #[serde(rename = "ref")]
+        reference: Ulid,
+        chat: Ulid,
+        call_seq: u64,
+        kind: CallEventKind,
+    },
+}
+
+/// What happened inside a call, numbered from 1 within it. The same JSON on the `events` track, in
+/// the WebSocket's `call_event` and in the replay route. Only text has a body, encrypted and signed
+/// like a message, with `call_seq` in its header so it can never pass for a chat message.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallEvent {
+    pub chat: Ulid,
+    pub call_seq: u64,
+    pub n: u64,
+    pub kind: CallEventKind,
+    pub device: Ulid,
+    pub server_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<Bytes>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<Bytes>,
+}
+
+impl CallEvent {
+    /// Text's signed header. `None` for any other kind, or text missing a field it always has.
+    pub fn header(&self) -> Option<Header> {
+        if self.kind != CallEventKind::Text {
+            return None;
+        }
+        Some(call_text_header(
+            self.chat,
+            self.device,
+            self.call_seq,
+            self.epoch?,
+            self.client_at?,
+        ))
+    }
+}
+
+/// The header text in a call is signed and sealed under.
+pub fn call_text_header(
+    chat: Ulid,
+    device: Ulid,
+    call_seq: u64,
+    epoch: u64,
+    client_at: i64,
+) -> Header {
+    Header {
+        chat,
+        device,
+        kind: Kind::Content,
+        content_kind: Some(ContentKind::Text),
+        encrypted: true,
+        epoch: Some(epoch),
+        pointer_seq: None,
+        call_seq: Some(call_seq),
+        client_sent_at: client_at,
+    }
+}
+
+/// Text a device sends on its own `text` track in a call. The relay hands it to the chat's task.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallText {
+    pub client_at: i64,
+    pub epoch: u64,
+    pub signature: Bytes,
+    pub body: Bytes,
+}
+
+/// A call's start message's body, inside its encryption: what the caller has on.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallBody {
+    pub video: bool,
+    pub voice: bool,
 }
 
 /// A stored message. **A removed one has only `chat` and `seq`**, so pages have no gaps, and a
@@ -302,11 +407,15 @@ pub struct MessageFrame {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pointer_seq: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub call_seq: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_sent_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_saved_at: Option<i64>,
+    /// A call's readable outcome, set by the server once it is missed or answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_outcome: Option<CallOutcome>,
+    /// When a call ended, set by the server with its end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_ended_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<Bytes>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -325,7 +434,7 @@ impl MessageFrame {
             encrypted: self.encrypted?,
             epoch: self.epoch,
             pointer_seq: self.pointer_seq,
-            call_seq: self.call_seq,
+            call_seq: None,
             client_sent_at: self.client_sent_at?,
         })
     }
@@ -403,6 +512,9 @@ pub enum ServerFrame {
         reference: Ulid,
         code: String,
         message: String,
+        /// Only for `call_open`: the open call's sequence id, so the client joins that one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_seq: Option<u64>,
     },
     Message(Box<MessageFrame>),
     Chats {
@@ -430,6 +542,8 @@ pub enum ServerFrame {
         #[serde(flatten)]
         mark: MarkItem,
     },
+    /// Something happened inside a call, sent to the chat's online devices.
+    CallEvent(Box<CallEvent>),
     /// A device of someone sharing a chat ended. `statement` is its signed revocation or logout,
     /// which a client verifies before removing the device from each chat.
     Revoked {
@@ -800,4 +914,13 @@ pub struct WrapListReply {
 pub struct RefusedReply {
     pub code: String,
     pub message: String,
+    /// Only for `call_open`: the open call's sequence id, so the client joins that one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_seq: Option<u64>,
+}
+
+/// What happened inside one call, oldest first, for its replay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallEventListReply {
+    pub event_list: Vec<CallEvent>,
 }
