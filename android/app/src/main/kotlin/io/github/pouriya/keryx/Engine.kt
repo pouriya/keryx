@@ -384,6 +384,26 @@ class Engine(
 
     fun send(command: Command) = thread.execute { handle(command) }
 
+    /**
+     * Stops for good once its screen is gone: the socket closes and the client is dropped. The
+     * threads stay idle rather than shut down, since a late socket callback still hands them work,
+     * which the new generation turns away.
+     */
+    fun close() =
+        thread.execute {
+            socket?.close(1000, null)
+            socket = null
+            timer?.cancel(false)
+            reading.values.forEach { it.first.close() }
+            reading.clear()
+            picked.clear()
+            generation += 1
+            if (client >= 0) {
+                Core.drop(client)
+                client = -1
+            }
+        }
+
     /** A call event as `Core.callNext` handed it over, fed back into core to be opened. */
     fun callEvent(json: String) =
         thread.execute {

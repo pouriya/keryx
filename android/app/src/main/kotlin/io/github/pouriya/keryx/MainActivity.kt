@@ -140,6 +140,14 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /** Rotating keeps this activity, so this runs only when it really goes: nothing it started runs on. */
+    override fun onDestroy() {
+        session.value?.close()
+        session.value = null
+        engine.close()
+        super.onDestroy()
+    }
+
     private fun apply(event: Event) {
         if (event is Event.Progress) {
             transfers[event.handle] = "${event.done} of ${event.total} chunks"
