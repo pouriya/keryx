@@ -36,13 +36,14 @@ use keryx_core::mls::{
     verify_password_reset, verify_revocation,
 };
 use keryx_core::protocol::{
-    AccountInfo, AccountKeysBody, AccountListReply, AccountReply, Bytes, ChallengeBody,
-    ChallengeReply, ChatDeviceListReply, ChatMode, ChatReply, ClientFrame, ContentKind, CountReply,
-    CreateAccountBody, CreateChatBody, CreateFileBody, CreatedAccountReply, DeviceListReply,
-    DeviceReply, DevicesReply, EmptyReply, FeaturesReply, FileReply, FileStatusReply,
-    GroupInfoReply, KeyPackageListReply, KeyPackagesBody, LoginBody, LoginReply, ReducedDeviceItem,
-    ReducedDeviceListReply, RegisterBody, RegisterDeviceBody, ResetBody, SelfChatReply,
-    ServerFrame, SessionListReply, SetupBody, SetupReply, SignedBody, WrapListReply,
+    AccountInfo, AccountKeysBody, AccountListReply, AccountReply, Bytes, CallEventListReply,
+    ChallengeBody, ChallengeReply, ChatDeviceListReply, ChatMode, ChatReply, ClientFrame,
+    ContentKind, CountReply, CreateAccountBody, CreateChatBody, CreateFileBody,
+    CreatedAccountReply, DeviceListReply, DeviceReply, DevicesReply, EmptyReply, FeaturesReply,
+    FileReply, FileStatusReply, GroupInfoReply, KeyPackageListReply, KeyPackagesBody, LoginBody,
+    LoginReply, ReducedDeviceItem, ReducedDeviceListReply, RegisterBody, RegisterDeviceBody,
+    ResetBody, SelfChatReply, ServerFrame, SessionListReply, SetupBody, SetupReply, SignedBody,
+    WrapListReply,
 };
 use keryx_core::ulid::Ulid;
 use serde::de::DeserializeOwned;
@@ -150,6 +151,8 @@ pub struct Settings {
     pub session: SessionSettings,
     #[serde(default)]
     pub chat: ChatSettings,
+    #[serde(default)]
+    pub calls: CallSettings,
     pub www: WwwSettings,
     pub files: FilesSettings,
     #[serde(default)]
@@ -216,6 +219,15 @@ impl Default for ChatSettings {
     fn default() -> Self {
         Self { idle_after: 5 * 60 }
     }
+}
+
+/// `[calls]`: for the tests only, left out of the template. The ring and the drop grace are fixed in
+/// code, and these shorten them so a test does not wait a minute for a missed call.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+pub struct CallSettings {
+    pub test_ring: Option<u64>,
+    pub test_grace: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -421,6 +433,8 @@ pub struct Refused {
     pub status: u16,
     pub code: &'static str,
     pub message: String,
+    /// Only for `call_open`: the open call's sequence id, so the client joins that one.
+    pub call_seq: Option<u64>,
 }
 
 pub fn refused(status: u16, code: &'static str, message: &str) -> Refused {
@@ -428,6 +442,7 @@ pub fn refused(status: u16, code: &'static str, message: &str) -> Refused {
         status,
         code,
         message: message.to_string(),
+        call_seq: None,
     }
 }
 
@@ -563,6 +578,7 @@ pub async fn check(app: &App, caller: &Caller, need: Need) -> Result<(), Refused
                     status: 403,
                     code: "device_limit",
                     message: format!("This account may have {limit} devices"),
+                    call_seq: None,
                 });
             }
             Ok(())
@@ -627,6 +643,7 @@ fn fixed<const N: usize>(bytes: &Bytes, field: &str) -> Result<[u8; N], Refused>
             status: 400,
             code: "bad_body",
             message: format!("{field} must be {N} bytes"),
+            call_seq: None,
         }),
     }
 }
@@ -1197,6 +1214,7 @@ pub async fn run_register_device(
             status: 403,
             code: "device_limit",
             message: format!("This account may have {limit} devices"),
+            call_seq: None,
         }),
         Registered::Saved(notice) => {
             app.hub.deliver(
@@ -1447,6 +1465,23 @@ pub async fn run_chat_wraps(
     Ok(WrapListReply { wrap_list })
 }
 
+/// What happened inside one call, for its replay. Membership is all it needs, as for history.
+pub async fn run_call_events(
+    app: &App,
+    caller: &Caller,
+    chat: Ulid,
+    call_seq: u64,
+) -> Result<CallEventListReply, Refused> {
+    check(app, caller, Need::Device).await?;
+    check(app, caller, Need::Member(chat)).await?;
+    let brief = app.storage.message_brief(chat, call_seq).await?;
+    if !brief.is_some_and(|brief| brief.content_kind == Some(ContentKind::Call)) {
+        return Err(refused(404, "no_such_message", "That call does not exist"));
+    }
+    let event_list = app.storage.call_events(chat, call_seq).await?;
+    Ok(CallEventListReply { event_list })
+}
+
 /// A new upload into a chat. Its declared type picks the limit and the permission to send it, and
 /// its size must be one a sealed file of that many chunks can have.
 pub async fn run_create_file(
@@ -1633,6 +1668,9 @@ pub async fn run_frame(
         }
         | ClientFrame::Wraps {
             reference, chat, ..
+        }
+        | ClientFrame::CallEvent {
+            reference, chat, ..
         } => (*chat, Some(*reference)),
         ClientFrame::Typing { chat, .. } => (*chat, None),
         // The socket's own loop answers these, so that a slow request cannot delay one.
@@ -1700,7 +1738,12 @@ impl IntoResponse for Refused {
         (
             status,
             [(CONTENT_TYPE, "application/json")],
-            json!({"ok": false, "code": self.code, "message": self.message}).to_string(),
+            match self.call_seq {
+                Some(call_seq) => json!({"ok": false, "code": self.code, "message": self.message,
+                    "call_seq": call_seq}),
+                None => json!({"ok": false, "code": self.code, "message": self.message}),
+            }
+            .to_string(),
         )
             .into_response()
     }
@@ -2038,6 +2081,20 @@ async fn chat_wraps(State(app): Shared, headers: HeaderMap, Path(id): Path<Strin
     }))
 }
 
+async fn call_events(
+    State(app): Shared,
+    headers: HeaderMap,
+    Path((id, seq)): Path<(String, String)>,
+) -> Response {
+    respond(operation!("CallEvents", "call_events", async {
+        let caller = caller_of(&app, &headers).await?;
+        let Ok(call_seq) = seq.parse() else {
+            return Err(refused(404, "not_found", "There is nothing there"));
+        };
+        run_call_events(&app, &caller, path_id(&id)?, call_seq).await
+    }))
+}
+
 async fn create_file(
     State(app): Shared,
     headers: HeaderMap,
@@ -2353,6 +2410,7 @@ fn bad_frame(text: &str) -> Option<Message> {
             reference,
             code: "bad_frame".to_string(),
             message: "That frame is not what this needs".to_string(),
+            call_seq: None,
         };
         if let Some(text) = encode(&answer) {
             return Some(Message::Text(text));
@@ -2459,6 +2517,7 @@ fn router(app: Arc<App>, www: &FilePath) -> Router {
         .route("/api/v1/chats/{id}/group_info", get(group_info))
         .route("/api/v1/chats/{id}/devices", get(chat_devices))
         .route("/api/v1/chats/{id}/wraps", get(chat_wraps))
+        .route("/api/v1/chats/{id}/calls/{seq}/events", get(call_events))
         .route("/api/v1/chats/{id}/files", post(create_file))
         .route("/api/v1/files/{id}", get(file_status))
         .route(
@@ -2682,6 +2741,12 @@ pub async fn serve(settings: Settings) -> Result<(), ServeError> {
         Err(source) => return Err(ServeError::Prepare(source)),
     }
     if let Err(source) = storage.close_device_logs(Ulid::now()).await {
+        return Err(ServeError::Prepare(source));
+    }
+    if settings.calls.test_ring.is_some() || settings.calls.test_grace.is_some() {
+        tracing::warn!(msg = "A call's ring or drop grace is shortened, which is for tests only");
+    }
+    if let Err(source) = storage.end_open_calls(Ulid::now()).await {
         return Err(ServeError::Prepare(source));
     }
     if let Some(captcha) = &settings.captcha

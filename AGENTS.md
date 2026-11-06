@@ -373,7 +373,11 @@ so groups and channels fit later; recording comes after the phone test.
   chat's online devices. **In a direct chat a decline ends the call at once, chosen by the author:** a
   decline from any of the other account's devices is followed by `end` as missed, and the caller's
   socket closes with `call_ended`, so nobody hears ringing for a minute after a no. The outcome stays
-  missed or answered, with no declined value. Groups, later, keep ringing the rest.
+  missed or answered, with no declined value. Groups, later, keep ringing the rest. **The `end` that
+  follows a decline names the decliner's device, chosen by the author**, as the device whose action
+  ended the call. **A decline for a call that is not open is refused with `call_ended`, chosen by the
+  author**, the same word the call socket's close uses. **Replaying a sequence id that is not a call is
+  refused with `no_such_message`, chosen by the author**, so it needs no new code.
 - **Every call event but text also goes to the chat's online devices, chosen by the author:** `join`,
   `leave`, `decline` and `end` are sent as `call_event` on the chat's WebSocket as well as on the
   `events` track. A device that rang stops when its person joins on another device, and a chat can show
@@ -390,6 +394,19 @@ so groups and channels fit later; recording comes after the phone test.
   author.** A clean close of the call's MoQ is a leave at once. A device that reconnects within the 10
   seconds writes no leave and no new join, so a blip from the caller while it rings does not end the
   call as missed. Without it, the last device's blip would end the call for good.
+- **Tests shorten both timers with test-only keys, chosen by the author**, as captcha's `test_answer`
+  does: `[calls] test_ring` and `test_grace`, left out of the template, and the server warns at startup
+  whenever either is set. Production keeps 60 and 10 seconds fixed in code, and the server's tests, which
+  run the real binary, do not wait a minute for a missed call.
+- **A call is answered only by the other account, chosen by the author.** In a direct chat, only a join
+  from a device of the account that did not start the call makes it answered and stops the 60-second
+  timer. The caller's own other device may join, and the call still rings. Only the other account's
+  devices may decline: a decline from the caller's own account is refused with `bad_message`. Clients do
+  not ring for their own account's call, which core marks `mine`.
+- **Calls are refused in a self chat, chosen by the author**, with a new code, `call_not_allowed`, since
+  the first build is direct chats only. A self chat's call could reach only the caller's own devices,
+  with no rule for answered or missed. Groups and channels get the same refusal until their calls are
+  designed.
 - **A chat has at most one open call, chosen by the author.** Starting another while one has not ended
   is refused with `call_open`, naming the open call's sequence id, so the client joins that one. Two
   people calling each other at once meet in one room, not two that each ring. **The id goes in an

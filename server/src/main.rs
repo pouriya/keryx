@@ -119,6 +119,12 @@ fn read_configuration(path: &Path) -> anyhow::Result<Settings> {
             "chat",
             StaticMap::new().optional("idle_after", DurationValue::new().to_int()),
         )
+        .optional(
+            "calls",
+            StaticMap::new()
+                .optional("test_ring", DurationValue::new().to_int())
+                .optional("test_grace", DurationValue::new().to_int()),
+        )
         .required("www", StaticMap::new().required_any("directory"))
         .required("files", StaticMap::new().required_any("directory"))
         .optional(
@@ -193,6 +199,8 @@ fn read_configuration(path: &Path) -> anyhow::Result<Settings> {
         ("tcp.user_timeout", settings.tcp.user_timeout),
         ("tcp.keepalive_idle", settings.tcp.keepalive_idle),
         ("tcp.keepalive_interval", settings.tcp.keepalive_interval),
+        ("calls.test_ring", settings.calls.test_ring),
+        ("calls.test_grace", settings.calls.test_grace),
     ];
     for (key, value) in time_list {
         if value == Some(0) {

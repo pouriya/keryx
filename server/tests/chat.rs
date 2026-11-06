@@ -11,8 +11,8 @@ use keryx_core::client::{Command, Event, FileSpec, Pointer, Secret, Thumbnail};
 use keryx_core::file;
 use keryx_core::mls::{AccountWrap, Commit, Device};
 use keryx_core::protocol::{
-    Bytes, ChatType, ClientFrame, ContentKind, Header, Kind, MessageFrame, SendFrame, ServerFrame,
-    WelcomeItem, WrapItem,
+    Bytes, CallEvent, CallEventKind, CallOutcome, ChatType, ClientFrame, ContentKind, Header, Kind,
+    MessageFrame, SendFrame, ServerFrame, WelcomeItem, WrapItem,
 };
 use keryx_core::ulid::Ulid;
 use person::{
@@ -217,7 +217,6 @@ fn sealed_as(
         encrypted: true,
         epoch: Some(epoch),
         pointer_seq,
-        call_seq: None,
         client_sent_at,
         body: Bytes(body),
         signature: Bytes(signature.to_vec()),
@@ -261,7 +260,6 @@ fn commit_frame(
         encrypted: false,
         epoch: Some(commit.epoch),
         pointer_seq: None,
-        call_seq: None,
         client_sent_at,
         body: Bytes(commit.commit.clone()),
         signature: Bytes(signature.to_vec()),
@@ -647,7 +645,6 @@ fn a_new_device_cannot_remove_its_notice_but_an_older_one_can() {
             encrypted: true,
             epoch: Some(0),
             pointer_seq: Some(notice_seq),
-            call_seq: None,
             client_sent_at,
             body: Bytes(Vec::new()),
             signature: Bytes(signature.to_vec()),
@@ -895,10 +892,6 @@ fn frames_that_break_the_rules_are_refused_with_their_reference() {
         (
             Box::new(|frame: &mut SendFrame| frame.pointer_seq = Some(1)),
             "bad_message",
-        ),
-        (
-            Box::new(|frame: &mut SendFrame| frame.call_seq = Some(1)),
-            "commit_or_ok",
         ),
         (
             Box::new(|frame: &mut SendFrame| {
@@ -2730,4 +2723,205 @@ fn a_file_and_a_bundle_go_up_encrypted_and_come_down_whole() {
         matches!(event, Event::TransferFailed { handle: 6, .. })
     });
     assert!(matches!(failed, Event::TransferFailed { code, .. } if code == "file_too_large"));
+}
+
+/// A call's start from this person, in this chat.
+fn call_frame(person: &Person, chat: Ulid) -> SendFrame {
+    let epoch = person.device.epoch(chat).unwrap();
+    sealed_as(
+        person,
+        chat,
+        Kind::Content,
+        Some(ContentKind::Call),
+        epoch,
+        None,
+        br#"{"video":true,"voice":true}"#,
+    )
+}
+
+fn call_event_frame(chat: Ulid, call_seq: u64, kind: CallEventKind) -> (ClientFrame, Ulid) {
+    let wanted = reference();
+    let frame = ClientFrame::CallEvent {
+        reference: wanted,
+        chat,
+        call_seq,
+        kind,
+    };
+    (frame, wanted)
+}
+
+fn decline(socket: &mut Socket, chat: Ulid, call_seq: u64) -> ServerFrame {
+    let (frame, wanted) = call_event_frame(chat, call_seq, CallEventKind::Decline);
+    socket.request(&frame, wanted)
+}
+
+/// The next call event this socket gets.
+fn call_event(socket: &mut Socket) -> CallEvent {
+    match socket.next_where(|frame| matches!(frame, ServerFrame::CallEvent(_))) {
+        ServerFrame::CallEvent(event) => *event,
+        _ => unreachable!(),
+    }
+}
+
+fn replay(server: &Server, token: &str, chat: Ulid, call_seq: u64) -> (u16, Value) {
+    server.call(
+        "GET",
+        &format!("/api/v1/chats/{chat}/calls/{call_seq}/events"),
+        Some(token),
+        None,
+    )
+}
+
+fn stored(socket: &mut Socket, chat: Ulid, seq: u64) -> MessageFrame {
+    history(socket, chat, seq - 1, 1).remove(0)
+}
+
+#[test]
+fn a_chat_has_one_open_call_and_a_decline_ends_it_as_missed() {
+    let mut pair = pair();
+    let chat = pair.chat;
+    let sara_device = pair.sara.device.record().device;
+    let babak_device = pair.babak.device.record().device;
+
+    let call_seq = seq_of(post(&mut pair.sara_socket, call_frame(&pair.sara, chat)));
+    let ring = pair.babak_socket.message(chat, call_seq);
+    assert_eq!(ring.content_kind, Some(ContentKind::Call));
+    assert_eq!(ring.call_outcome, None);
+
+    // Calling back while it rings meets the open call, and the refusal names it.
+    match post(&mut pair.babak_socket, call_frame(&pair.babak, chat)) {
+        ServerFrame::Refused {
+            code,
+            call_seq: open,
+            ..
+        } => {
+            assert_eq!(code, "call_open");
+            assert_eq!(open, Some(call_seq));
+        }
+        other => panic!("Wanted call_open, and got {other:?}"),
+    }
+
+    // Only the other account declines, only a decline comes over the socket, and only an open call.
+    assert_refused(
+        decline(&mut pair.sara_socket, chat, call_seq),
+        "bad_message",
+    );
+    let (text, wanted) = call_event_frame(chat, call_seq, CallEventKind::Text);
+    assert_refused(pair.babak_socket.request(&text, wanted), "bad_message");
+    assert_refused(
+        decline(&mut pair.babak_socket, chat, call_seq + 9),
+        "call_ended",
+    );
+    let (stranger, wanted) =
+        call_event_frame(Ulid::new().unwrap(), call_seq, CallEventKind::Decline);
+    assert_refused(pair.babak_socket.request(&stranger, wanted), "not_member");
+
+    done(decline(&mut pair.babak_socket, chat, call_seq));
+    let declined = call_event(&mut pair.sara_socket);
+    assert_eq!(declined.kind, CallEventKind::Decline);
+    assert_eq!((declined.n, declined.device), (1, babak_device));
+    assert_eq!(declined.call_seq, call_seq);
+    let ended = call_event(&mut pair.sara_socket);
+    assert_eq!(
+        (ended.kind, ended.n, ended.device),
+        (CallEventKind::End, 2, babak_device)
+    );
+    // The decliner's own device has its answer, so the end is the first event it gets.
+    let ended = call_event(&mut pair.babak_socket);
+    assert_eq!((ended.kind, ended.n), (CallEventKind::End, 2));
+
+    let message = stored(&mut pair.sara_socket, chat, call_seq);
+    assert_eq!(message.call_outcome, Some(CallOutcome::Missed));
+    assert!(message.call_ended_at.is_some());
+    assert_refused(
+        decline(&mut pair.babak_socket, chat, call_seq),
+        "call_ended",
+    );
+
+    let (status, reply) = replay(&pair.server, &pair.babak.token, chat, call_seq);
+    assert_eq!(status, 200, "{reply}");
+    let event_list: Vec<CallEvent> =
+        serde_json::from_value(reply["data"]["event_list"].clone()).unwrap();
+    assert_eq!(event_list, vec![declined, ended]);
+    assert_ne!(event_list[0].device, sara_device);
+
+    // Not a call, not a number, and someone else's chat.
+    let text_seq = seq_of(post(
+        &mut pair.sara_socket,
+        sealed(&pair.sara, chat, Kind::Content, None, b"hi"),
+    ));
+    let (status, reply) = replay(&pair.server, &pair.babak.token, chat, text_seq);
+    assert_eq!(
+        (status, reply["code"].as_str()),
+        (404, Some("no_such_message"))
+    );
+    let (status, _) = pair.server.call(
+        "GET",
+        &format!("/api/v1/chats/{chat}/calls/one/events"),
+        Some(&pair.babak.token),
+        None,
+    );
+    assert_eq!(status, 404);
+    let (status, reply) = replay(
+        &pair.server,
+        &pair.babak.token,
+        Ulid::new().unwrap(),
+        call_seq,
+    );
+    assert_eq!((status, reply["code"].as_str()), (404, Some("not_member")));
+
+    // Once it ended, a new call can start.
+    seq_of(post(&mut pair.babak_socket, call_frame(&pair.babak, chat)));
+}
+
+#[test]
+fn a_call_nobody_answers_ends_as_missed_by_the_caller() {
+    let server = Server::start(
+        "",
+        "[registration]\nallow = true\n[calls]\ntest_ring = \"1s\"\ntest_grace = \"1s\"\n",
+    );
+    let mut pair = pair_on(server);
+    let chat = pair.chat;
+    let sara_device = pair.sara.device.record().device;
+    let call_seq = seq_of(post(&mut pair.sara_socket, call_frame(&pair.sara, chat)));
+    for socket in [&mut pair.sara_socket, &mut pair.babak_socket] {
+        let ended = call_event(socket);
+        assert_eq!(
+            (ended.kind, ended.n, ended.device, ended.call_seq),
+            (CallEventKind::End, 1, sara_device, call_seq)
+        );
+    }
+    let message = stored(&mut pair.babak_socket, chat, call_seq);
+    assert_eq!(message.call_outcome, Some(CallOutcome::Missed));
+    assert!(message.call_ended_at.is_some());
+}
+
+#[test]
+fn a_call_is_refused_outside_a_direct_chat() {
+    let mut pair = pair();
+    let self_chat = pair.sara.self_chat;
+    assert_refused(
+        post(&mut pair.sara_socket, call_frame(&pair.sara, self_chat)),
+        "call_not_allowed",
+    );
+}
+
+#[test]
+fn deleting_an_open_call_ends_it_first() {
+    let mut pair = pair();
+    let chat = pair.chat;
+    let call_seq = seq_of(post(&mut pair.sara_socket, call_frame(&pair.sara, chat)));
+    pair.babak_socket.message(chat, call_seq);
+    let delete_seq = seq_of(post(
+        &mut pair.sara_socket,
+        sealed(&pair.sara, chat, Kind::Delete, Some(call_seq), b""),
+    ));
+    let ended = call_event(&mut pair.babak_socket);
+    assert_eq!((ended.kind, ended.call_seq), (CallEventKind::End, call_seq));
+    let delete = pair.babak_socket.message(chat, delete_seq);
+    assert_eq!(delete.pointer_seq, Some(call_seq));
+    // The call and what happened inside it are gone.
+    let (status, _) = replay(&pair.server, &pair.babak.token, chat, call_seq);
+    assert_eq!(status, 404);
+    seq_of(post(&mut pair.babak_socket, call_frame(&pair.babak, chat)));
 }

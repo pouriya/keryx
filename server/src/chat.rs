@@ -3,7 +3,9 @@
 //! The task stores and publishes. It never waits on a connection: each device has a bounded outgoing
 //! buffer, and when that fills, the connection is closed. The device reconnects and fetches what it
 //! missed, so nothing is lost, because every message is saved. Tasks end after `[chat] idle_after` and
-//! restart on the next event, so memory does not grow with old chats.
+//! restart on the next event, so memory does not grow with old chats. A task whose chat has an open
+//! call does not idle out: it holds the call's state, and nothing about a call is rebuilt from the
+//! database.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12,21 +14,22 @@ use std::time::Duration;
 
 use axum::extract::ws::Utf8Bytes;
 use keryx_core::protocol::{
-    Bytes, ChatMode, ChatType, ClientFrame, ContentKind, Kind, MessageFrame, SendFrame,
-    ServerFrame, WelcomeItem, WrapItem,
+    Bytes, CallEvent, CallEventKind, CallOutcome, ChatMode, ChatType, ClientFrame, ContentKind,
+    Kind, MessageFrame, SendFrame, ServerFrame, WelcomeItem, WrapItem,
 };
 use keryx_core::ulid::Ulid;
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use crate::api::{
     App, Caller, DELETE_OWN, EDIT_OWN, MESSAGE_COMMIT, Need, Refused, SEND_UNENCRYPTED, TRACE,
-    check, new_id, operation, refused, send_permission,
+    check, current_trace, new_id, operation, refused, send_permission,
 };
 use crate::file;
 use crate::storage::{
-    Appended, GroupInfoPut, NewMessage, NewWelcome, NewWrap, Position, PositionReport, Session,
-    Storage,
+    Appended, CallChange, GroupInfoPut, NewMessage, NewWelcome, NewWrap, Position, PositionReport,
+    Session, Storage,
 };
 
 /// How many events may wait for a chat's task before their senders wait in turn.
@@ -34,6 +37,10 @@ const CHAT_QUEUE: usize = 256;
 
 /// For its first 7 days, a new-device notice cannot be removed by that device or any newer one.
 const NOTICE_PROTECTED_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
+/// A call nobody else joins ends as missed after this, fixed in code. `[calls] test_ring` shortens it
+/// for the tests only.
+const RING: Duration = Duration::from_secs(60);
 
 /// What a connection's socket is told to do.
 pub enum Out {
@@ -234,6 +241,53 @@ impl Hub {
     }
 }
 
+/// The chat's open call, held by its task. A chat has at most one.
+struct OpenCall {
+    seq: u64,
+    /// The account that started it, which can neither answer nor decline it.
+    caller: Ulid,
+    caller_device: Ulid,
+    /// The next event's number inside the call, from 1.
+    next_n: u64,
+    /// When it ends as missed.
+    ring_until: Instant,
+}
+
+impl OpenCall {
+    /// Events numbered from `next_n` on, by the server's clock. Only saving them moves `next_n`.
+    fn events(&self, chat: Ulid, kind_list: &[(CallEventKind, Ulid)], now: i64) -> Vec<CallEvent> {
+        let mut event_list = Vec::with_capacity(kind_list.len());
+        for (n, (kind, device)) in (self.next_n..).zip(kind_list) {
+            event_list.push(CallEvent {
+                chat,
+                call_seq: self.seq,
+                n,
+                kind: *kind,
+                device: *device,
+                server_at: now,
+                client_at: None,
+                epoch: None,
+                signature: None,
+                body: None,
+            });
+        }
+        event_list
+    }
+}
+
+/// What a chat's task keeps between events.
+#[derive(Default)]
+struct ChatState {
+    call: Option<OpenCall>,
+}
+
+/// What a task's wait ended with.
+enum Woken {
+    Job(Option<Job>),
+    Rang,
+    Idle,
+}
+
 async fn run_chat(
     app: Arc<App>,
     chat: Ulid,
@@ -250,14 +304,45 @@ async fn run_chat(
         tracing::error!(msg = "Could not remove unused uploads", code = refusal.code);
     }
     let idle_after = Duration::from_secs(app.settings.chat.idle_after.max(1));
+    let mut state = ChatState::default();
     loop {
-        match tokio::time::timeout(idle_after, queue.recv()).await {
-            Ok(Some(job)) => handle(&app, job).await,
-            Ok(None) => return,
-            Err(_) => {
+        let woken = match &state.call {
+            Some(call) => {
+                let ring_until = call.ring_until;
+                tokio::select! {
+                    job = queue.recv() => Woken::Job(job),
+                    () = tokio::time::sleep_until(ring_until) => Woken::Rang,
+                }
+            }
+            None => match tokio::time::timeout(idle_after, queue.recv()).await {
+                Ok(job) => Woken::Job(job),
+                Err(_) => Woken::Idle,
+            },
+        };
+        match woken {
+            Woken::Job(Some(job)) => handle(&app, &mut state, job).await,
+            Woken::Job(None) => return,
+            Woken::Rang => {
+                let trace = current_trace();
+                let result = TRACE
+                    .scope(trace, async {
+                        operation!(
+                            "CallMissed",
+                            "call_missed",
+                            ring_out(&app, chat, &mut state)
+                        )
+                    })
+                    .await;
+                if result.is_err() {
+                    // Kept out of memory anyway, or the timer would fire again at once. A restart
+                    // ends it in the database.
+                    state.call = None;
+                }
+            }
+            Woken::Idle => {
                 queue.close();
                 while let Some(job) = queue.recv().await {
-                    handle(&app, job).await;
+                    handle(&app, &mut state, job).await;
                 }
                 let mut chats = locked(&app.hub.chats);
                 if let Some(task) = chats.get(&chat)
@@ -271,7 +356,7 @@ async fn run_chat(
     }
 }
 
-async fn handle(app: &Arc<App>, job: Job) {
+async fn handle(app: &Arc<App>, state: &mut ChatState, job: Job) {
     let Job {
         trace,
         session,
@@ -283,7 +368,7 @@ async fn handle(app: &Arc<App>, job: Job) {
             match frame {
                 ClientFrame::Send(frame) => {
                     let reference = frame.reference;
-                    let result = operation!("Send", "send", run_send(app, session, frame));
+                    let result = operation!("Send", "send", run_send(app, state, session, frame));
                     Some(answer_of(reference, result))
                 }
                 ClientFrame::Seen {
@@ -361,6 +446,19 @@ async fn handle(app: &Arc<App>, job: Job) {
                     );
                     Some(answer_of(reference, result))
                 }
+                ClientFrame::CallEvent {
+                    reference,
+                    chat,
+                    call_seq,
+                    kind,
+                } => {
+                    let result = operation!(
+                        "CallEvent",
+                        "call_event",
+                        run_call_event(app, state, session, reference, chat, call_seq, kind)
+                    );
+                    Some(answer_of(reference, result))
+                }
                 ClientFrame::Sync { reference }
                 | ClientFrame::History { reference, .. }
                 | ClientFrame::Ping { reference } => Some(answer_of(
@@ -385,6 +483,7 @@ pub fn answer_of(reference: Ulid, result: Result<ServerFrame, Refused>) -> Serve
             reference,
             code: refusal.code.to_string(),
             message: refusal.message,
+            call_seq: refusal.call_seq,
         },
     }
 }
@@ -395,6 +494,7 @@ fn bad(message: &str) -> Refused {
 
 async fn run_send(
     app: &Arc<App>,
+    state: &mut ChatState,
     session: Session,
     frame: Box<SendFrame>,
 ) -> Result<ServerFrame, Refused> {
@@ -408,8 +508,8 @@ async fn run_send(
     if frame.kind == Kind::Content && frame.content_kind.is_none() {
         return Err(bad("A content message needs its content kind"));
     }
-    if frame.kind != Kind::Content && (frame.content_kind.is_some() || frame.call_seq.is_some()) {
-        return Err(bad("Only a content message has a content kind or a call"));
+    if frame.kind != Kind::Content && frame.content_kind.is_some() {
+        return Err(bad("Only a content message has a content kind"));
     }
     if frame.encrypted && frame.epoch.is_none() {
         return Err(bad("An encrypted message needs its epoch"));
@@ -549,6 +649,23 @@ async fn run_send(
             }
             _ => {}
         }
+        if frame.kind == Kind::Content && frame.content_kind == Some(ContentKind::Call) {
+            if access.chat_type != ChatType::Direct {
+                return Err(refused(
+                    403,
+                    "call_not_allowed",
+                    "Calls are for direct chats only",
+                ));
+            }
+            if let Some(call) = &state.call {
+                return Err(Refused {
+                    status: 409,
+                    code: "call_open",
+                    message: "This chat already has an open call".to_string(),
+                    call_seq: Some(call.seq),
+                });
+            }
+        }
     }
 
     let member_list = app.storage.member_accounts(chat).await?;
@@ -580,6 +697,14 @@ async fn run_send(
         }
     }
 
+    // Deleting an open call ends it first, so its devices see the end before the message goes.
+    if frame.kind == Kind::Delete
+        && let Some(call) = &state.call
+        && Some(call.seq) == frame.pointer_seq
+    {
+        end_call(app, chat, state, None, device).await?;
+    }
+
     let now = Ulid::now();
     let appended = app
         .storage
@@ -591,7 +716,6 @@ async fn run_send(
             encrypted: frame.encrypted,
             epoch: frame.epoch,
             pointer_seq: frame.pointer_seq,
-            call_seq: frame.call_seq,
             client_sent_at: frame.client_sent_at,
             now,
             signature: frame.signature.0.clone(),
@@ -613,6 +737,19 @@ async fn run_send(
             ));
         }
     };
+    if frame.kind == Kind::Content && frame.content_kind == Some(ContentKind::Call) {
+        let ring = match app.settings.calls.test_ring {
+            Some(seconds) => Duration::from_secs(seconds),
+            None => RING,
+        };
+        state.call = Some(OpenCall {
+            seq,
+            caller: session.account,
+            caller_device: device,
+            next_n: 1,
+            ring_until: Instant::now() + ring,
+        });
+    }
     app.hub.deliver(
         &member_list,
         Some(device),
@@ -625,11 +762,12 @@ async fn run_send(
             encrypted: Some(frame.encrypted),
             epoch: frame.epoch,
             pointer_seq: frame.pointer_seq,
-            call_seq: frame.call_seq,
             client_sent_at: Some(frame.client_sent_at),
             server_saved_at: Some(now),
             body: Some(frame.body),
             signature: Some(frame.signature),
+            call_outcome: None,
+            call_ended_at: None,
         })),
     );
     for file in frame.remove {
@@ -643,6 +781,90 @@ async fn run_send(
         seq,
         server_saved_at: now,
     })
+}
+
+/// A decline, from the other account's device, while the call rings. In a direct chat it ends the call
+/// at once as missed.
+async fn run_call_event(
+    app: &Arc<App>,
+    state: &mut ChatState,
+    session: Session,
+    reference: Ulid,
+    chat: Ulid,
+    call_seq: u64,
+    kind: CallEventKind,
+) -> Result<ServerFrame, Refused> {
+    check(app, &Caller::Session(session), Need::Member(chat)).await?;
+    let device = session.device()?;
+    if kind != CallEventKind::Decline {
+        return Err(bad("Only a decline comes over the chat's socket"));
+    }
+    let Some(call) = state.call.as_ref().filter(|call| call.seq == call_seq) else {
+        return Err(refused(409, "call_ended", "That call has ended"));
+    };
+    if call.caller == session.account {
+        return Err(bad("Only the other account declines a call"));
+    }
+    end_call(
+        app,
+        chat,
+        state,
+        Some((CallEventKind::Decline, device)),
+        device,
+    )
+    .await?;
+    Ok(ServerFrame::Done { reference })
+}
+
+/// Nobody else joined in time, so the call ends as missed, by the caller's device.
+async fn ring_out(app: &Arc<App>, chat: Ulid, state: &mut ChatState) -> Result<(), Refused> {
+    let Some(call) = &state.call else {
+        return Ok(());
+    };
+    let caller_device = call.caller_device;
+    end_call(app, chat, state, None, caller_device).await
+}
+
+/// Ends the open call, after `first` if given, as missed unless it was answered, and tells the chat's
+/// online devices. `first`'s own device already has its answer, so it is left out of that one.
+async fn end_call(
+    app: &Arc<App>,
+    chat: Ulid,
+    state: &mut ChatState,
+    first: Option<(CallEventKind, Ulid)>,
+    ender: Ulid,
+) -> Result<(), Refused> {
+    let Some(call) = &state.call else {
+        return Ok(());
+    };
+    let now = Ulid::now();
+    let mut kind_list = Vec::with_capacity(2);
+    kind_list.extend(first);
+    kind_list.push((CallEventKind::End, ender));
+    let event_list = call.events(chat, &kind_list, now);
+    app.storage
+        .save_call(CallChange {
+            chat,
+            call_seq: call.seq,
+            event_list: event_list.clone(),
+            outcome: Some(CallOutcome::Missed),
+            ended_at: Some(now),
+        })
+        .await?;
+    state.call = None;
+    let member_list = app.storage.member_accounts(chat).await?;
+    for event in event_list {
+        let except = match event.kind {
+            CallEventKind::End => None,
+            _ => Some(event.device),
+        };
+        app.hub.deliver(
+            &member_list,
+            except,
+            &ServerFrame::CallEvent(Box::new(event)),
+        );
+    }
+    Ok(())
 }
 
 /// The most files one bundle holds, fixed by the author.

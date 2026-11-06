@@ -467,3 +467,71 @@ async fn a_setup_link_says_whether_it_is_unknown_used_or_expired() {
             .unwrap()
     );
 }
+
+#[tokio::test]
+async fn calls_still_open_at_startup_end_and_keep_an_answer() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("keryx.db");
+    let storage = Sqlite::open(&path).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .unwrap();
+    account(&connection, 1, "sara_x");
+    account(&connection, 2, "babak_x");
+    device(&connection, 11, 1);
+    device(&connection, 12, 2);
+    direct(&connection, 30, 1, 2).unwrap();
+    // 1 rings, 2 was answered and has a join, 3 ended long ago, 4 is text.
+    for seq in 1..=3 {
+        message(&connection, 30, seq, 11, 0, Some(7), Some(1)).unwrap();
+    }
+    message(&connection, 30, 4, 11, 0, Some(0), Some(1)).unwrap();
+    connection
+        .execute(
+            "UPDATE message SET call_outcome = 1 WHERE conversation_id = ?1 AND seq = 2",
+            params![id(30)],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE message SET call_outcome = 0, call_ended_at = 7
+             WHERE conversation_id = ?1 AND seq = 3",
+            params![id(30)],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO call_event (conversation_id, call_seq, n, kind, device_id, server_at)
+             VALUES (?1, 2, 1, 0, ?2, 5)",
+            params![id(30), id(12)],
+        )
+        .unwrap();
+
+    storage.end_open_calls(500).await.unwrap();
+
+    let chat = Ulid::from_bytes(id(30));
+    let state = |seq: i64| -> (Option<i64>, Option<i64>) {
+        connection
+            .query_row(
+                "SELECT call_outcome, call_ended_at FROM message
+                 WHERE conversation_id = ?1 AND seq = ?2",
+                params![id(30), seq],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    };
+    assert_eq!(state(1), (Some(0), Some(500)));
+    assert_eq!(state(2), (Some(1), Some(500)));
+    assert_eq!(state(3), (Some(0), Some(7)));
+    assert_eq!(state(4), (None, None));
+
+    let rang = storage.call_events(chat, 1).await.unwrap();
+    assert_eq!(rang.len(), 1);
+    assert_eq!((rang[0].n, rang[0].server_at), (1, 500));
+    assert_eq!(rang[0].device, Ulid::from_bytes(id(11)));
+    let answered = storage.call_events(chat, 2).await.unwrap();
+    assert_eq!(answered.len(), 2);
+    assert_eq!(answered[1].n, 2);
+    assert!(storage.call_events(chat, 3).await.unwrap().is_empty());
+}

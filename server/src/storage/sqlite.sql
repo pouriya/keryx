@@ -441,13 +441,11 @@ CREATE TABLE message (
     -- [Actions, Replies] the target's seq. In an encrypted chat only delete and edit fill it,
     -- because the server acts on those. Reply and reaction pointers stay inside the ciphertext.
     pointer_seq        INTEGER,
-    -- [Text calls] the seq of the text_call this message belongs to. Sent through the MoQ call,
-    -- encrypted, and saved here so a new device can read it.
-    call_seq           INTEGER,
-    -- [Calls, Chat list] for a video, voice or text call: 0 missed, 1 answered, NULL while it is
-    -- ringing. Readable because a missed call counts as unread and an answered one does not.
-    -- Length, devices and any recording's file key stay in the encrypted body.
+    -- [Calls, Chat list] for a call: 0 missed, 1 answered, NULL while it is ringing. Written by the
+    -- server. Readable because a missed call counts as unread and an answered one does not.
     call_outcome       INTEGER CHECK (call_outcome IN (0, 1)),
+    -- [Calls] when a call ended, written by the server. NULL while it can still be joined.
+    call_ended_at      INTEGER,
     -- [Resend check] the client's clock.
     client_sent_at     INTEGER,
     -- [Chat list, Retention] the server's clock.
@@ -464,8 +462,8 @@ CREATE TABLE message (
     PRIMARY KEY (conversation_id, seq),
     CHECK (encrypted = 0 OR epoch IS NOT NULL),
     CHECK ((kind = 0) = (content_kind IS NOT NULL)),
-    CHECK (call_seq IS NULL OR kind = 0),
     CHECK (call_outcome IS NULL OR content_kind = 7),
+    CHECK (call_ended_at IS NULL OR content_kind = 7),
     CHECK (kind <> 3 OR epoch IS NOT NULL),
     CHECK (kind NOT IN (1, 2) OR pointer_seq IS NOT NULL),
     CHECK (content_kind IS NOT 2 OR encrypted = 1 OR pointer_seq IS NOT NULL),
@@ -478,25 +476,56 @@ CREATE TABLE message (
     CHECK ((kind IS NULL) = (server_saved_at IS NULL)),
     CHECK ((kind IS NULL) = (signature IS NULL)),
     CHECK ((kind IS NULL) = (body IS NULL)),
-    CHECK (kind IS NOT NULL OR (epoch IS NULL AND pointer_seq IS NULL AND call_seq IS NULL AND call_outcome IS NULL AND expires_at IS NULL))
+    CHECK (kind IS NOT NULL OR (epoch IS NULL AND pointer_seq IS NULL AND call_outcome IS NULL AND call_ended_at IS NULL AND expires_at IS NULL))
 ) STRICT;
 
 -- [Chat list] finds the preview after the last message is removed.
-CREATE INDEX message_preview ON message (conversation_id, seq)
-    WHERE kind = 0 AND call_seq IS NULL;
--- [Chat list] counts unread. A reaction does not count, nor a call's own messages, nor an answered
--- call. A missed call does.
+CREATE INDEX message_preview ON message (conversation_id, seq) WHERE kind = 0;
+-- [Chat list] counts unread. A reaction does not count, nor an answered call. A missed call does.
 CREATE INDEX message_unread ON message (conversation_id, seq)
-    WHERE kind = 0 AND content_kind <> 2 AND call_seq IS NULL AND (call_outcome IS NULL OR call_outcome = 0);
+    WHERE kind = 0 AND content_kind <> 2 AND (call_outcome IS NULL OR call_outcome = 0);
 -- [Commit order] the first commit for an epoch wins, and a second cannot be stored.
 CREATE UNIQUE INDEX message_commit ON message (conversation_id, epoch) WHERE kind = 3;
 -- [Delete] an edit holds a message's newer text, so deleting the message must find and remove
 -- its edits too. Edit pointers are readable, which is what makes this possible.
 CREATE INDEX message_edit ON message (conversation_id, pointer_seq) WHERE kind = 1;
--- [Text calls] a call's messages.
-CREATE INDEX message_call ON message (conversation_id, call_seq, seq) WHERE call_seq IS NOT NULL;
+-- [Calls] calls still open, ended at startup since nobody can be in them after a restart.
+CREATE INDEX message_open_call ON message (conversation_id, seq)
+    WHERE content_kind = 7 AND call_ended_at IS NULL;
 -- [Retention] the sweep.
 CREATE INDEX message_expiry ON message (expires_at) WHERE expires_at IS NOT NULL;
+
+-- [Call replay] what happened inside a call, never chat rows: joins, leaves and the end written by
+-- the server, and declines and text from clients.
+CREATE TABLE call_event (
+    -- [Calls] the call's chat.
+    conversation_id    BLOB NOT NULL,
+    -- [Calls] the sequence id of the call's message.
+    call_seq           INTEGER NOT NULL,
+    -- [Calls] 1, 2, 3 inside the call, in the order the chat's task saved them.
+    n                  INTEGER NOT NULL CHECK (n >= 1),
+    -- [Calls] 0 join, 1 leave, 2 decline, 3 text, 4 end. Join, leave and end are the server's.
+    kind               INTEGER NOT NULL CHECK (kind BETWEEN 0 AND 4),
+    -- [Calls] whose. For an end, the device whose leaving or decline ended it, or the caller's if it
+    -- rang out or was still open at startup.
+    device_id          BLOB NOT NULL REFERENCES device (id),
+    -- [Calls] the server's clock.
+    server_at          INTEGER NOT NULL,
+    -- [Calls, Signatures] text only: the client's clock, the key it is sealed under, its signature
+    -- over the header and body, and the ciphertext. The header names call_seq, so it can never
+    -- pass for a chat message.
+    client_at          INTEGER,
+    epoch              INTEGER,
+    signature          BLOB,
+    body               BLOB,
+    PRIMARY KEY (conversation_id, call_seq, n),
+    FOREIGN KEY (conversation_id, call_seq) REFERENCES message (conversation_id, seq)
+        ON DELETE CASCADE,
+    CHECK ((kind = 3) = (body IS NOT NULL)),
+    CHECK ((kind = 3) = (signature IS NOT NULL)),
+    CHECK ((kind = 3) = (epoch IS NOT NULL)),
+    CHECK ((kind = 3) = (client_at IS NOT NULL))
+) WITHOUT ROWID, STRICT;
 
 -- [Seen times] one row per `seen`, with one time for many messages. A member saw message N
 -- at the time on their first row reaching N. Deleted once the messages it covers expire.

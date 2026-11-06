@@ -76,6 +76,7 @@ good.
     PUT  /files/{id}/chunks/{n}           the encrypted chunk's raw bytes -> size, chunks, received
     GET  /files/{id}                      -> size, chunks, received
     GET  /files/{id}/chunks/{n}           -> the encrypted chunk's raw bytes
+    GET  /chats/{id}/calls/{seq}/events   -> event_list, what happened inside a call
 
 Claiming hands out one package per device and deletes it. `POST /chats` gives the pair's chat, and your
 own account id gives your self chat. The `/chats/{id}` routes need you to be in that chat. In
@@ -102,10 +103,11 @@ itself. To check the server yourself, send a WebSocket ping, or a `ping` frame, 
 
 Every frame is JSON with a `type`. A request's `ref` is a ULID you make, which comes back in its answer.
 
-You send: `send`, `seen`, `received`, `typing`, `sync`, `history`, `group_info`, `wraps`, `ping`.
+You send: `send`, `seen`, `received`, `typing`, `sync`, `history`, `group_info`, `wraps`, `call_event`,
+`ping`.
 
 The server sends: `features`, `sent`, `done`, `refused`, `message`, `chats`, `page`, `welcome`, `typing`,
-`marks`, `revoked`.
+`marks`, `revoked`, `call_event`.
 
 `received` and `seen` each carry `chat` and `up_to_seq`, and the server keeps the highest of each. When
 one rises, the other members' online devices get `marks` with the `account`, its `received_seq` and its
@@ -120,6 +122,19 @@ chat's group info at that epoch, which is saved with it. The first commit for ea
 loser gets `refused` with the code `commit_lost`. A chat's group starts when someone sends `group_info`
 for epoch 0, and if two people start it at once the second gets `chat_started` and waits for its
 Welcome. The same epoch 0 bytes sent again are accepted, as a resend whose answer was lost.
+
+## Calls
+
+A call is one `send` with content kind 7, in a direct chat only, and its delivery is the ring. A chat
+has one open call at a time: starting another is refused with `call_open`, and the refusal carries the
+open call's `call_seq`, so join that one instead. Calls elsewhere are refused with `call_not_allowed`.
+
+The other account declines with a `call_event` frame of `kind` 2 and the call's `call_seq`, answered
+with `done`, and in a direct chat that ends the call as missed. A call nobody answers ends as missed
+after 60 seconds. Every `join`, `leave`, `decline` and `end` reaches the chat's online devices as
+`call_event`: `{chat, call_seq, n, kind, device, server_at}`, with `kind` 0 join, 1 leave, 2 decline,
+3 text and 4 end. The call's message then carries `call_outcome`, 0 missed or 1 answered, and
+`call_ended_at`. An ended call cannot be joined again.
 
 ## Common refusal codes
 

@@ -4,8 +4,8 @@
 use std::future::Future;
 
 use keryx_core::protocol::{
-    AccountBrief, ChatDevice, ChatItem, ChatMode, ChatType, ContentKind, DeviceItem,
-    KeyPackageItem, Kind, MarkItem, MessageFrame, SessionItem, WrapEntry,
+    AccountBrief, CallEvent, CallOutcome, ChatDevice, ChatItem, ChatMode, ChatType, ContentKind,
+    DeviceItem, KeyPackageItem, Kind, MarkItem, MessageFrame, SessionItem, WrapEntry,
 };
 use keryx_core::ulid::Ulid;
 
@@ -195,7 +195,6 @@ pub struct NewMessage {
     pub encrypted: bool,
     pub epoch: Option<u64>,
     pub pointer_seq: Option<u64>,
-    pub call_seq: Option<u64>,
     pub client_sent_at: i64,
     pub now: i64,
     pub signature: Vec<u8>,
@@ -216,6 +215,16 @@ pub enum Appended {
     Saved(u64),
     /// A commit that was not for the next epoch, or for a group with none uploaded yet.
     CommitLost,
+}
+
+/// What happened inside a call, saved in one step: its events, and the readable outcome and end on
+/// the call's message. An outcome already written stays, so a call answered never becomes missed.
+pub struct CallChange {
+    pub chat: Ulid,
+    pub call_seq: u64,
+    pub event_list: Vec<CallEvent>,
+    pub outcome: Option<CallOutcome>,
+    pub ended_at: Option<i64>,
 }
 
 pub enum GroupInfoPut {
@@ -446,6 +455,17 @@ pub trait Storage: Send + Sync + 'static {
         &self,
         device: Ulid,
     ) -> impl Future<Output = Result<Vec<(Ulid, Vec<u8>)>>> + Send;
+
+    fn save_call(&self, change: CallChange) -> impl Future<Output = Result<()>> + Send;
+    /// What happened inside one call, oldest first.
+    fn call_events(
+        &self,
+        chat: Ulid,
+        call_seq: u64,
+    ) -> impl Future<Output = Result<Vec<CallEvent>>> + Send;
+    /// Ends every call still open, as missed unless it was answered, with an `end` from the
+    /// caller's device. Nobody can be in one after a restart.
+    fn end_open_calls(&self, now: i64) -> impl Future<Output = Result<()>> + Send;
 
     fn create_file(&self, file: NewFile) -> impl Future<Output = Result<()>> + Send;
     /// A chat's file, removed or not. `None` for an account's file or none at all.

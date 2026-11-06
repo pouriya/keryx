@@ -9,23 +9,24 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use keryx_core::protocol::{
-    AccountBrief, Bytes, ChatDevice, ChatItem, ChatMode, ChatType, DeviceItem, DeviceLogItem,
-    KeyPackageItem, Kind, MarkItem, MessageFrame, SessionItem, WrapEntry,
+    AccountBrief, Bytes, CallEvent, ChatDevice, ChatItem, ChatMode, ChatType, DeviceItem,
+    DeviceLogItem, KeyPackageItem, Kind, MarkItem, MessageFrame, SessionItem, WrapEntry,
 };
 use keryx_core::ulid::Ulid;
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
 use super::{
-    Account, Appended, BuiltInRole, ChatAccess, DeviceKey, DeviceUsage, Error, GroupInfoPut,
-    MessageBrief, NewAccount, NewDevice, NewFile, NewMessage, NewSession, NewWrap, Position,
-    PositionReport, Registered, Result, Session, SetupLink, Storage, StoredFile,
+    Account, Appended, BuiltInRole, CallChange, ChatAccess, DeviceKey, DeviceUsage, Error,
+    GroupInfoPut, MessageBrief, NewAccount, NewDevice, NewFile, NewMessage, NewSession, NewWrap,
+    Position, PositionReport, Registered, Result, Session, SetupLink, Storage, StoredFile,
 };
 
 /// How long a connection waits for a lock another process holds, such as a backup.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 const MESSAGE_COLUMNS: &str = "conversation_id, seq, device_id, kind, content_kind, encrypted, \
-     epoch, pointer_seq, call_seq, client_sent_at, server_saved_at, body, signature";
+     epoch, pointer_seq, call_outcome, client_sent_at, server_saved_at, body, signature, \
+     call_ended_at";
 
 /// A message's kind, content kind, sender's account, sender's device's age, and save time.
 type BriefRow = (i64, Option<i64>, [u8; 16], i64, i64);
@@ -173,11 +174,29 @@ fn message_frame(row: &Row<'_>) -> rusqlite::Result<MessageFrame> {
         encrypted: encrypted.map(|encrypted| encrypted == 1),
         epoch: opt_unsigned(row.get(6)?),
         pointer_seq: opt_unsigned(row.get(7)?),
-        call_seq: opt_unsigned(row.get(8)?),
         client_sent_at: row.get(9)?,
         server_saved_at: row.get(10)?,
         body: body.map(Bytes),
         signature: signature.map(Bytes),
+        call_outcome: opt_numbered(row.get(8)?)?,
+        call_ended_at: row.get(13)?,
+    })
+}
+
+fn call_event_row(row: &Row<'_>) -> rusqlite::Result<CallEvent> {
+    let signature: Option<Vec<u8>> = row.get(8)?;
+    let body: Option<Vec<u8>> = row.get(9)?;
+    Ok(CallEvent {
+        chat: Ulid::from_bytes(row.get(0)?),
+        call_seq: unsigned(row.get(1)?),
+        n: unsigned(row.get(2)?),
+        kind: numbered(row.get(3)?)?,
+        device: Ulid::from_bytes(row.get(4)?),
+        server_at: row.get(5)?,
+        client_at: row.get(6)?,
+        epoch: opt_unsigned(row.get(7)?),
+        signature: signature.map(Bytes),
+        body: body.map(Bytes),
     })
 }
 
@@ -759,11 +778,12 @@ impl Storage for Sqlite {
                 encrypted: Some(false),
                 epoch: None,
                 pointer_seq: None,
-                call_seq: None,
                 client_sent_at: Some(device.now),
                 server_saved_at: Some(device.now),
                 body: Some(Bytes(Vec::new())),
                 signature: Some(Bytes(device.stamp)),
+                call_outcome: None,
+                call_ended_at: None,
             })))
         })
         .await
@@ -1228,18 +1248,24 @@ impl Storage for Sqlite {
             if message.kind == Kind::Delete {
                 connection.execute(
                     "UPDATE message SET device_id = NULL, kind = NULL, content_kind = NULL,
-                     encrypted = NULL, epoch = NULL, pointer_seq = NULL, call_seq = NULL,
-                     call_outcome = NULL, client_sent_at = NULL, server_saved_at = NULL,
+                     encrypted = NULL, epoch = NULL, pointer_seq = NULL,
+                     call_outcome = NULL, call_ended_at = NULL, client_sent_at = NULL,
+                     server_saved_at = NULL,
                      expires_at = NULL, signature = NULL, body = NULL
                      WHERE conversation_id = ?1 AND (seq = ?2 OR (kind = 1 AND pointer_seq = ?2))",
+                    params![chat.bytes(), opt_int(message.pointer_seq)],
+                )?;
+                // A deleted call takes what happened inside it along.
+                connection.execute(
+                    "DELETE FROM call_event WHERE conversation_id = ?1 AND call_seq = ?2",
                     params![chat.bytes(), opt_int(message.pointer_seq)],
                 )?;
             }
             let content_kind = message.content_kind.map(|content_kind| content_kind as u8);
             connection.execute(
                 "INSERT INTO message (conversation_id, seq, device_id, kind, content_kind,
-                 encrypted, epoch, pointer_seq, call_seq, client_sent_at, server_saved_at,
-                 signature, body) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                 encrypted, epoch, pointer_seq, client_sent_at, server_saved_at,
+                 signature, body) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     chat.bytes(),
                     seq,
@@ -1249,7 +1275,6 @@ impl Storage for Sqlite {
                     message.encrypted,
                     opt_int(message.epoch),
                     opt_int(message.pointer_seq),
-                    opt_int(message.call_seq),
                     message.client_sent_at,
                     message.now,
                     message.signature,
@@ -1269,7 +1294,7 @@ impl Storage for Sqlite {
                 )?;
             }
             match message.kind {
-                Kind::Content if message.call_seq.is_none() => {
+                Kind::Content => {
                     connection.execute(
                         "UPDATE conversation SET last_at = ?2, last_content_seq = ?3 WHERE id = ?1",
                         params![chat.bytes(), message.now, seq],
@@ -1280,11 +1305,11 @@ impl Storage for Sqlite {
                         "UPDATE conversation SET
                          last_content_seq = (
                              SELECT seq FROM message WHERE conversation_id = ?1 AND kind = 0
-                             AND call_seq IS NULL ORDER BY seq DESC LIMIT 1
+                             ORDER BY seq DESC LIMIT 1
                          ),
                          last_at = (
                              SELECT server_saved_at FROM message WHERE conversation_id = ?1
-                             AND (kind = 4 OR (kind = 0 AND call_seq IS NULL))
+                             AND kind IN (0, 4)
                              ORDER BY seq DESC LIMIT 1
                          )
                          WHERE id = ?1",
@@ -1563,6 +1588,83 @@ impl Storage for Sqlite {
                 welcome_list.push(welcome?);
             }
             Ok(welcome_list)
+        })
+        .await
+    }
+
+    async fn save_call(&self, change: CallChange) -> Result<()> {
+        self.write(move |connection| {
+            for event in &change.event_list {
+                connection.execute(
+                    "INSERT INTO call_event (conversation_id, call_seq, n, kind, device_id,
+                     server_at, client_at, epoch, signature, body)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    params![
+                        change.chat.bytes(),
+                        int(change.call_seq),
+                        int(event.n),
+                        event.kind as u8,
+                        event.device.bytes(),
+                        event.server_at,
+                        event.client_at,
+                        opt_int(event.epoch),
+                        event.signature.as_ref().map(|signature| &signature.0),
+                        event.body.as_ref().map(|body| &body.0)
+                    ],
+                )?;
+            }
+            if change.outcome.is_some() || change.ended_at.is_some() {
+                connection.execute(
+                    "UPDATE message SET call_outcome = COALESCE(call_outcome, ?3),
+                     call_ended_at = COALESCE(call_ended_at, ?4)
+                     WHERE conversation_id = ?1 AND seq = ?2 AND content_kind = 7",
+                    params![
+                        change.chat.bytes(),
+                        int(change.call_seq),
+                        change.outcome.map(|outcome| outcome as u8),
+                        change.ended_at
+                    ],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    async fn call_events(&self, chat: Ulid, call_seq: u64) -> Result<Vec<CallEvent>> {
+        self.read(move |connection| {
+            let mut statement = connection.prepare(
+                "SELECT conversation_id, call_seq, n, kind, device_id, server_at, client_at,
+                 epoch, signature, body FROM call_event
+                 WHERE conversation_id = ?1 AND call_seq = ?2 ORDER BY n",
+            )?;
+            let rows = statement.query_map(params![chat.bytes(), int(call_seq)], call_event_row)?;
+            let mut event_list = Vec::new();
+            for event in rows {
+                event_list.push(event?);
+            }
+            Ok(event_list)
+        })
+        .await
+    }
+
+    async fn end_open_calls(&self, now: i64) -> Result<()> {
+        self.write(move |connection| {
+            connection.execute(
+                "INSERT INTO call_event (conversation_id, call_seq, n, kind, device_id, server_at)
+                 SELECT m.conversation_id, m.seq,
+                 COALESCE((SELECT MAX(e.n) FROM call_event e
+                           WHERE e.conversation_id = m.conversation_id AND e.call_seq = m.seq), 0)
+                 + 1, 4, m.device_id, ?1
+                 FROM message m WHERE m.content_kind = 7 AND m.call_ended_at IS NULL",
+                params![now],
+            )?;
+            connection.execute(
+                "UPDATE message SET call_outcome = COALESCE(call_outcome, 0), call_ended_at = ?1
+                 WHERE content_kind = 7 AND call_ended_at IS NULL",
+                params![now],
+            )?;
+            Ok(())
         })
         .await
     }

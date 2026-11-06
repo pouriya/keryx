@@ -39,6 +39,8 @@ pub struct App {
     pub events: VecDeque<Event>,
     /// The files this app holds, by handle: what it sends, and what it downloads into.
     pub files: HashMap<u64, Vec<u8>>,
+    /// What the client asked of the platform's call code, in order.
+    pub call_outputs: VecDeque<Output>,
 }
 
 /// One request with raw bytes each way, as file chunks go: the status and the reply's bytes.
@@ -100,6 +102,7 @@ impl App {
             self_chat: None,
             events: VecDeque::new(),
             files: HashMap::new(),
+            call_outputs: VecDeque::new(),
         }
     }
 
@@ -262,6 +265,13 @@ impl App {
                         held.resize(start + bytes.len(), 0);
                     }
                     held[start..start + bytes.len()].copy_from_slice(&bytes);
+                    None
+                }
+                call @ (Output::JoinCall { .. }
+                | Output::CallKey { .. }
+                | Output::LeaveCall { .. }
+                | Output::CallText { .. }) => {
+                    self.call_outputs.push_back(call);
                     None
                 }
                 Output::Event { event } => {
