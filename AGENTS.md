@@ -385,7 +385,10 @@ so groups and channels fit later; recording comes after the phone test.
   call as missed. Without it, the last device's blip would end the call for good.
 - **A chat has at most one open call, chosen by the author.** Starting another while one has not ended
   is refused with `call_open`, naming the open call's sequence id, so the client joins that one. Two
-  people calling each other at once meet in one room, not two that each ring.
+  people calling each other at once meet in one room, not two that each ring. **The id goes in an
+  optional `call_seq` on the refusal, chosen by the author**, on the WebSocket's `refused` and in REST's
+  error body, set only for `call_open`. It is a new optional field, so `keryx.v1` stays, and the client
+  can join at once even before the winning call's message reaches it.
 - **The chat's task does not idle out while its chat has an open call, chosen by the author.** It holds
   the call's state in memory: who is in it, the next `n`, the 60-second missed timer and the 10-second
   drop timers. A voice-only call sends the task nothing, so `[chat] idle_after` would otherwise end it
@@ -411,6 +414,32 @@ so groups and channels fit later; recording comes after the phone test.
   answered as the chat's WebSocket answers, chosen by the author:** the upgrade is accepted, then closed
   with code 4403 and the refusal's code as the reason, so browsers, which cannot read a failed upgrade's
   reply, and native clients get one rule. `keryx-moq` reads that close reason before any MoQ setup.
+- **`keryx-moq` opens the WebSocket itself, then hands it to `qmux`, chosen by the author.** `qmux`
+  0.5's own `ws::Client` sends no custom headers, so it cannot carry the Bearer token, and secrets never
+  go in a URL. It also turns a close frame into a bare `Closed`, losing 4403 and its reason. So
+  `keryx-moq` connects with `tokio-tungstenite` 0.29, the version axum already pulls in, sending the
+  Bearer header and the subprotocol. It wraps the stream in a thin adapter that records a close frame's
+  code and reason, and gives it to `qmux`'s `Upgraded::with_alpn(..).connect()`. Stock `qmux`, no fork.
+- **The server keeps axum's `WebSocketUpgrade` and adapts its socket for `qmux`, chosen by the author.**
+  So the `Origin` check, cookie or Bearer, subprotocol choice, the `[tcp]` socket wrapper and the 4403
+  close work as on the chat's WebSocket. A small Stream and Sink adapter in `moq.rs` maps axum's
+  `Message` to tungstenite's and back, both on tungstenite 0.29, with no new dependency.
+- **Each device publishes into its own origin, and the relay copies, chosen by the author.** If every
+  session shared one origin, `moq-net` would forward frames without keryx seeing them, so neither
+  `call_frame` nor text going to the chat's task could hold. Each device's origin is scoped with
+  `moq-net`'s `scope()` to its own device id. Per track, a relay task reads each frame, whose size is
+  declared before its bytes, so one over `call_frame` closes that device before it is buffered. Allowed
+  `state`, `audio` and `video` frames are written into the call's shared origin, which everyone reads,
+  and any other track name is refused. `text` is not forwarded: it goes to the chat's task, which saves
+  it and republishes it on `events`. This costs one in-memory copy and one task per track.
+- **Both ends speak moq-lite 05 only, and every frame's `moq-net` timestamp is zero, chosen by the
+  author.** moq-lite 05 writes each frame's timestamp in the clear, and 04 writes none. `keryx-moq`
+  writes `Timestamp::ZERO` and the relay writes zero when it copies, so the real clock stays inside
+  SFrame and only track names are in the clear. In `moq-net` 0.2.22 timestamps only convert between
+  time scales: cached groups expire by the relay's own clock at last access, and its own tests write
+  zero. It costs a byte per frame. 05 keeps `TRACK_INFO`, so audio's priority over video, ordering and
+  the latency window travel with each track, and it is the version a later browser MoQ client and
+  `moq-net` 0.3 are most likely to speak.
 - **keryx's own layout on MoQ, not `hang`'s:** each device's broadcast, named by its device id, has
   `state`, `audio`, `video` and `text` tracks, and the server's broadcast `server` has `events`. Every
   media frame is SFrame-encrypted with its timestamp inside, and a video keyframe starts a new MoQ
@@ -1262,9 +1291,6 @@ another device still holding the key.
 - Calls in groups and channels: who may start one, and who may send video or voice in a channel
 - Recording: how it is chosen now that each person picks what they send, and who records
 - Video size, frame rate and bitrate for live calls beyond the phone test
-- How the `call_open` refusal carries the open call's sequence id: a refusal has only `code` and
-  `message` today
-
 **Attachments and search**
 
 - Quotas and retention for attachments
