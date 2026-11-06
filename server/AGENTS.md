@@ -190,8 +190,10 @@ Already agreed: `tokio` (with `signal` and `time`), `axum` (with `ws`), `axum-se
 ring provider), `rusqlite` (`bundled`), `clap` (derive), `tanzim`, `serde`, `serde_json`,
 `getrandom`, `thiserror`, `anyhow`, `tracing`, `tracing-subscriber`, `argon2`, `captcha`, `sha2`,
 `tower-http` (`fs`), `ureq` (the subcommands are clients), `base64ct` (captcha images and tokens) and
-`rustls` (switching on the ring provider), `socket2` (the `[tcp]` settings), all already in the tree, plus `core/`. For tests: `tempfile` and
-`tungstenite`. Take the current version of each when adding it.
+`rustls` (switching on the ring provider), `socket2` (the `[tcp]` settings), all already in the tree, plus `core/`.
+For the call relay, chosen by the author: `moq-net` 0.2.22, `qmux` 0.5.3 with only `ws`, and `futures`
+for the adapter's Stream and Sink traits. For tests: `tempfile`, `tungstenite` and `keryx-moq`, the
+tests' call client. Take the current version of each when adding it.
 
 ```toml
 [profile.release]

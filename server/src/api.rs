@@ -58,8 +58,9 @@ use tower_http::services::{ServeDir, ServeFile};
 use tracing::Instrument;
 
 use crate::captcha;
-use crate::chat::{Hub, Job, Out, answer_of, encode, hand_welcomes, push};
+use crate::chat::{Hub, Job, Out, Work, answer_of, encode, hand_welcomes, push};
 use crate::file;
+use crate::moq;
 use crate::storage::sqlite::Sqlite;
 use crate::storage::{
     self, BuiltInRole, NewAccount, NewDevice, NewFile, NewSession, Registered, Session, Storage,
@@ -252,6 +253,8 @@ pub struct Limits {
     pub ping_every: u64,
     pub ping_timeout: u64,
     pub key_packages: u64,
+    pub call_frame: usize,
+    pub call_cache: usize,
     pub body: BodyLimits,
     pub upload: UploadLimits,
 }
@@ -267,6 +270,8 @@ impl Default for Limits {
             ping_every: 15,
             ping_timeout: 5,
             key_packages: 100,
+            call_frame: 256 * 1024,
+            call_cache: 16 * 1024 * 1024,
             body: BodyLimits::default(),
             upload: UploadLimits::default(),
         }
@@ -400,6 +405,8 @@ pub struct App {
     pub storage: Sqlite,
     pub hub: Hub,
     pub stopping: watch::Sender<bool>,
+    /// The relay's one byte budget for cached groups, `[limits] call_cache`, shared by every call.
+    pub call_pool: moq_net::cache::Pool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1684,7 +1691,7 @@ pub async fn run_frame(
         let job = Job {
             trace: current_trace(),
             session,
-            frame,
+            work: Work::Frame(frame),
             reply: None,
         };
         app.hub.submit(app, chat, job).await;
@@ -1700,7 +1707,7 @@ pub async fn run_frame(
     let job = Job {
         trace: current_trace(),
         session,
-        frame,
+        work: Work::Frame(frame),
         reply: Some(reply),
     };
     app.hub.submit(app, chat, job).await;
@@ -2183,14 +2190,30 @@ async fn websocket(
     headers: HeaderMap,
     upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Response {
-    let upgrade = match upgrade {
-        Ok(upgrade) => upgrade,
-        Err(_) => {
-            return refused(400, "not_websocket", "This address is a WebSocket").into_response();
-        }
+    let (upgrade, caller) = match upgrade_of(&app, &headers, upgrade).await {
+        Ok(upgraded) => upgraded,
+        Err(refusal) => return refusal.into_response(),
     };
-    // A page from another site is not one of our clients, so it gets no upgrade at all. Scripts and
-    // agents send no Origin.
+    let ip = client_ip(&headers, address);
+    let frame_limit = app.settings.limits.websocket_frame;
+    let upgrade = upgrade
+        .protocols([SUBPROTOCOL])
+        .max_message_size(frame_limit)
+        .max_frame_size(frame_limit);
+    let spoke_version = upgrade.selected_protocol().is_some();
+    upgrade.on_upgrade(move |socket| connection(app, socket, caller, spoke_version, ip))
+}
+
+/// A WebSocket upgrade from one of our clients, and who asks. A page from another site is not one of
+/// our clients, so it gets no upgrade at all. Scripts and agents send no Origin.
+async fn upgrade_of(
+    app: &App,
+    headers: &HeaderMap,
+    upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
+) -> Result<(WebSocketUpgrade, Caller), Refused> {
+    let Ok(upgrade) = upgrade else {
+        return Err(refused(400, "not_websocket", "This address is a WebSocket"));
+    };
     if let Some(origin) = headers.get(ORIGIN) {
         let public_url = app.settings.public_url.as_str();
         let authority_at = match public_url.find("://") {
@@ -2202,21 +2225,40 @@ async fn websocket(
             None => public_url,
         };
         if origin.as_bytes() != expected.as_bytes() {
-            return refused(403, "bad_origin", "This site may not connect").into_response();
+            return Err(refused(403, "bad_origin", "This site may not connect"));
         }
     }
-    let caller = match caller_of(&app, &headers).await {
-        Ok(caller) => caller,
+    let caller = caller_of(app, headers).await?;
+    Ok((upgrade, caller))
+}
+
+/// A device's socket to a call's MoQ. Admission and refusals happen after the upgrade, in the relay.
+async fn call_socket(
+    State(app): Shared,
+    headers: HeaderMap,
+    Path((chat, seq)): Path<(String, String)>,
+    upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
+) -> Response {
+    let chat = match path_id(&chat) {
+        Ok(chat) => chat,
         Err(refusal) => return refusal.into_response(),
     };
-    let ip = client_ip(&headers, address);
+    let Ok(call_seq) = seq.parse::<u64>() else {
+        return refused(404, "not_found", "There is nothing there").into_response();
+    };
+    let (upgrade, caller) = match upgrade_of(&app, &headers, upgrade).await {
+        Ok(upgraded) => upgraded,
+        Err(refusal) => return refusal.into_response(),
+    };
     let frame_limit = app.settings.limits.websocket_frame;
     let upgrade = upgrade
-        .protocols([SUBPROTOCOL])
+        .protocols([moq::PROTOCOL])
         .max_message_size(frame_limit)
         .max_frame_size(frame_limit);
     let spoke_version = upgrade.selected_protocol().is_some();
-    upgrade.on_upgrade(move |socket| connection(app, socket, caller, spoke_version, ip))
+    upgrade.on_upgrade(move |socket| {
+        moq::connection(app, socket, caller, spoke_version, chat, call_seq)
+    })
 }
 
 fn close_frame(code: u16, reason: &str) -> Message {
@@ -2491,6 +2533,7 @@ fn router(app: Arc<App>, www: &FilePath) -> Router {
     Router::new()
         .route("/api/v1", get(guide))
         .route("/api/v1/ws", get(websocket))
+        .route("/api/v1/calls/{chat}/{seq}/moq", get(call_socket))
         .route("/api/v1/captcha", get(captcha_route))
         .route("/api/v1/public/features", get(features))
         .route("/api/v1/register", post(register))
@@ -2787,11 +2830,13 @@ pub async fn serve(settings: Settings) -> Result<(), ServeError> {
     };
     let www = settings.www.directory.clone();
     let (stopping, _) = watch::channel(false);
+    let call_pool = moq_net::cache::Pool::new(settings.limits.call_cache as u64);
     let app = Arc::new(App {
         settings,
         storage,
         hub: Hub::default(),
         stopping,
+        call_pool,
     });
     captcha::start_sweep(Arc::clone(&app));
     if let Err(refusal) = file::sweep(&app, None).await {

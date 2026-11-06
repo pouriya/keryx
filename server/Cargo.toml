@@ -41,6 +41,19 @@ axum = { version = "0.8.9", default-features = false, features = [
 # aws-lc-rs, and borhan's rustls uses ring.
 axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls-no-provider"] }
 
+# The call relay's fan-out, chosen by the author: origins, broadcasts, tracks and the moq-lite 05
+# session. 0.2, because it takes qmux 0.5's session directly. Brings kio, web-async,
+# web-transport-trait and num_enum.
+moq-net = "0.2.22"
+
+# MoQ over the WebSocket axum already upgraded, through `Upgraded`. Only `ws`: TLS is axum-server's.
+# Brings web-transport-proto and futures.
+qmux = { version = "0.5.3", default-features = false, features = ["ws"] }
+
+# The Stream and Sink traits of the adapter between axum's WebSocket and qmux. Already brought in by
+# qmux's `ws`.
+futures = { version = "0.3.32", default-features = false, features = ["std"] }
+
 # Only to switch on the ring provider that axum-server leaves out. Already in the tree.
 rustls = { version = "0.23.37", default-features = false, features = ["ring", "std"] }
 
@@ -109,3 +122,6 @@ tempfile = "3.27.0"
 
 # The WebSocket client in the tests. Blocking, as the tests are. The version axum already pulls in.
 tungstenite = "0.29.0"
+
+# The tests' call client, chosen by the author: keryx's own MoQ client against the real relay.
+keryx-moq = { path = "../moq" }

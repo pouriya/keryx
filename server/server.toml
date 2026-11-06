@@ -55,6 +55,8 @@ ping_after = "5s"         # quiet this long: the first ping
 ping_every = "15s"        # then one ping this often
 ping_timeout = "5s"       # each ping's time to answer, or the connection closes
 key_packages = 100        # the most one device may keep on the server
+call_frame = "256KiB"     # one frame on a call's state, audio or video track. Larger: that device leaves
+call_cache = "16MiB"      # the relay's room for older groups. Newest groups are always kept
 
 [limits.body]             # one message's body. A file's bytes upload separately
 text = "64KiB"

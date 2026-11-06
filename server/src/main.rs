@@ -138,6 +138,8 @@ fn read_configuration(path: &Path) -> anyhow::Result<Settings> {
                 .optional("ping_every", DurationValue::new().to_int())
                 .optional("ping_timeout", DurationValue::new().to_int())
                 .optional_any("key_packages")
+                .optional("call_frame", ByteSize::new())
+                .optional("call_cache", ByteSize::new())
                 .optional("body", body)
                 .optional("upload", upload),
         )

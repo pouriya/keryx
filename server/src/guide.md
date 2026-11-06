@@ -77,6 +77,7 @@ good.
     GET  /files/{id}                      -> size, chunks, received
     GET  /files/{id}/chunks/{n}           -> the encrypted chunk's raw bytes
     GET  /chats/{id}/calls/{seq}/events   -> event_list, what happened inside a call
+    GET  /calls/{chat}/{seq}/moq          a WebSocket: the call's MoQ, while the call is open
 
 Claiming hands out one package per device and deletes it. `POST /chats` gives the pair's chat, and your
 own account id gives your self chat. The `/chats/{id}` routes need you to be in that chat. In
@@ -135,6 +136,19 @@ after 60 seconds. Every `join`, `leave`, `decline` and `end` reaches the chat's 
 `call_event`: `{chat, call_seq, n, kind, device, server_at}`, with `kind` 0 join, 1 leave, 2 decline,
 3 text and 4 end. The call's message then carries `call_outcome`, 0 missed or 1 answered, and
 `call_ended_at`. An ended call cannot be joined again.
+
+Joining is a WebSocket to `/api/v1/calls/{chat}/{seq}/moq`, with the same cookie or Bearer token as
+`/api/v1/ws` and the subprotocol `qmux-02.moq-lite-05`: MoQ over qmux, moq-lite 05 only. A refusal
+comes after the upgrade, as close code 4403 with the refusal's code as the reason, such as
+`call_ended`. A device publishes the broadcast named by its device id, with `state`, `audio`, `video`
+and `text` tracks, every frame sealed with SFrame and every MoQ timestamp zero. It reads the others'
+broadcasts and the broadcast `server`, whose `events` track carries each call event's JSON, text
+included. A join by the other account answers the call. A clean close is a leave at once; a socket
+that drops gets 10 seconds to come back before it counts as a leave, and the last device to leave
+ends the call. A frame over the server's limit closes the socket with 4403 `frame_too_large`, and
+text that is not `{client_at, epoch, signature, body}` with 4403 `bad_frame`. When the call ends, open
+call sockets close with 1000 `call_ended`, and a newer socket from the same device closes the older
+one with 1000 `replaced`. A decline after the call was answered is refused with `call_answered`.
 
 ## Common refusal codes
 

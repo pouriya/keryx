@@ -2925,3 +2925,328 @@ fn deleting_an_open_call_ends_it_first() {
     assert_eq!(status, 404);
     seq_of(post(&mut pair.babak_socket, call_frame(&pair.babak, chat)));
 }
+
+/// Joins a call's MoQ as this person's device, through keryx-moq, the tests' call client.
+fn join_call(server: &Server, person: &Person, chat: Ulid, call_seq: u64) -> keryx_moq::Call {
+    let (key, index_list) = person.device.call_key(chat).unwrap();
+    let url = format!(
+        "{}/api/v1/calls/{chat}/{call_seq}/moq",
+        server.origin.replace("http://", "ws://")
+    );
+    keryx_moq::Call::connect(&url, Some(&person.token), key, index_list).unwrap()
+}
+
+/// The next of a call's events that `wanted` takes, skipping the rest, within 10 seconds.
+fn on_call(call: &keryx_moq::Call, wanted: impl Fn(&keryx_moq::Event) -> bool) -> keryx_moq::Event {
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    while let Some(left) = until.checked_duration_since(std::time::Instant::now()) {
+        match call.next(left) {
+            Some(event) if wanted(&event) => return event,
+            Some(keryx_moq::Event::Closed { code, reason }) => {
+                panic!("The call socket closed with {code} {reason}")
+            }
+            Some(_) => {}
+            None => break,
+        }
+    }
+    panic!("Nothing wanted arrived on the call");
+}
+
+fn call_closed(call: &keryx_moq::Call) -> (u16, String) {
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    while let Some(left) = until.checked_duration_since(std::time::Instant::now()) {
+        match call.next(left) {
+            Some(keryx_moq::Event::Closed { code, reason }) => return (code, reason),
+            Some(_) => {}
+            None => break,
+        }
+    }
+    panic!("The call socket did not close");
+}
+
+fn moq_event(event: keryx_moq::Event) -> CallEvent {
+    match event {
+        keryx_moq::Event::CallEvent(event) => event,
+        other => panic!("Wanted a call event, and got {other:?}"),
+    }
+}
+
+fn is_event(kind: CallEventKind, n: u64) -> impl Fn(&keryx_moq::Event) -> bool {
+    move |event| matches!(event, keryx_moq::Event::CallEvent(event) if event.kind == kind && event.n == n)
+}
+
+#[test]
+fn joining_answers_a_call_and_media_and_text_flow_through_the_relay() {
+    let mut pair = pair();
+    let chat = pair.chat;
+    let sara_device = pair.sara.device.record().device;
+    let babak_device = pair.babak.device.record().device;
+    let call_seq = seq_of(post(&mut pair.sara_socket, call_frame(&pair.sara, chat)));
+    pair.babak_socket.message(chat, call_seq);
+
+    let sara_call = join_call(&pair.server, &pair.sara, chat, call_seq);
+    let joined = call_event(&mut pair.babak_socket);
+    assert_eq!(
+        (joined.kind, joined.n, joined.device),
+        (CallEventKind::Join, 1, sara_device)
+    );
+    let babak_call = join_call(&pair.server, &pair.babak, chat, call_seq);
+    let joined = call_event(&mut pair.sara_socket);
+    assert_eq!(
+        (joined.kind, joined.n, joined.device),
+        (CallEventKind::Join, 2, babak_device)
+    );
+    on_call(&sara_call, is_event(CallEventKind::Join, 2));
+    // The other account joined, so the call is answered and stops ringing.
+    let message = stored(&mut pair.babak_socket, chat, call_seq);
+    assert_eq!(message.call_outcome, Some(CallOutcome::Answered));
+    assert_eq!(message.call_ended_at, None);
+    assert_refused(
+        decline(&mut pair.babak_socket, chat, call_seq),
+        "call_answered",
+    );
+
+    // Each side sends until the other reads, since the other's subscription starts when it sees
+    // the broadcast.
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    let heard = loop {
+        assert!(
+            std::time::Instant::now() < until,
+            "No audio crossed the relay"
+        );
+        sara_call.audio(1_000, b"sara speaks").unwrap();
+        if let Some(event @ keryx_moq::Event::Audio { .. }) =
+            babak_call.next(Duration::from_millis(100))
+        {
+            break event;
+        }
+    };
+    let keryx_moq::Event::Audio { device, ts, bytes } = heard else {
+        unreachable!();
+    };
+    assert_eq!(
+        (device, ts, bytes.as_slice()),
+        (sara_device, 1_000, &b"sara speaks"[..])
+    );
+    let state = keryx_core::call::State {
+        video: true,
+        voice: false,
+        width: Some(640),
+        height: Some(360),
+        rotation: Some(90),
+    };
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    let (seen, shown) = loop {
+        assert!(
+            std::time::Instant::now() < until,
+            "No video crossed the relay"
+        );
+        babak_call.video(2_000, b"a keyframe", true).unwrap();
+        babak_call.state(&state).unwrap();
+        if let Some(keryx_moq::Event::Video { device, ts, bytes }) =
+            sara_call.next(Duration::from_millis(100))
+        {
+            break ((device, ts), bytes.to_vec());
+        }
+    };
+    assert_eq!(
+        (seen, shown.as_slice()),
+        ((babak_device, 2_000), &b"a keyframe"[..])
+    );
+    let keryx_moq::Event::State {
+        device,
+        state: read,
+    } = on_call(&sara_call, |event| {
+        matches!(event, keryx_moq::Event::State { .. })
+    })
+    else {
+        unreachable!();
+    };
+    assert_eq!((device, read), (babak_device, state));
+
+    // Text goes up on Babak's own track, and comes back to both on `events`, saved inside the call.
+    let epoch = pair.babak.device.epoch(chat).unwrap();
+    let header = keryx_core::protocol::call_text_header(chat, babak_device, call_seq, epoch, 5);
+    let (body, signature) = pair
+        .babak
+        .device
+        .seal(&header, br#"{"text":"salam"}"#)
+        .unwrap();
+    babak_call
+        .text(&keryx_core::protocol::CallText {
+            client_at: 5,
+            epoch,
+            signature: Bytes(signature.to_vec()),
+            body: Bytes(body.clone()),
+        })
+        .unwrap();
+    let text = moq_event(on_call(&sara_call, is_event(CallEventKind::Text, 3)));
+    assert_eq!(
+        (text.device, text.client_at, text.epoch, text.body),
+        (babak_device, Some(5), Some(epoch), Some(Bytes(body)))
+    );
+    on_call(&babak_call, is_event(CallEventKind::Text, 3));
+
+    // A clean close is a leave at once, and the last one to leave ends the call.
+    drop(sara_call);
+    let left = moq_event(on_call(&babak_call, is_event(CallEventKind::Leave, 4)));
+    assert_eq!(left.device, sara_device);
+    drop(babak_call);
+    // Sara's chat socket gets every event but her own leave.
+    let ended = call_event(&mut pair.sara_socket);
+    assert_eq!(
+        (ended.kind, ended.n, ended.device),
+        (CallEventKind::Leave, 5, babak_device)
+    );
+    let ended = call_event(&mut pair.sara_socket);
+    assert_eq!((ended.kind, ended.n), (CallEventKind::End, 6));
+    let message = stored(&mut pair.babak_socket, chat, call_seq);
+    assert_eq!(message.call_outcome, Some(CallOutcome::Answered));
+    assert!(message.call_ended_at.is_some());
+    let (status, body) = replay(&pair.server, &pair.babak.token, chat, call_seq);
+    assert_eq!(status, 200);
+    let event_list: Vec<CallEvent> =
+        serde_json::from_value(body["data"]["event_list"].clone()).unwrap();
+    let mut kind_list = Vec::new();
+    for event in event_list {
+        kind_list.push(event.kind);
+    }
+    assert_eq!(
+        kind_list,
+        [
+            CallEventKind::Join,
+            CallEventKind::Join,
+            CallEventKind::Text,
+            CallEventKind::Leave,
+            CallEventKind::Leave,
+            CallEventKind::End
+        ]
+    );
+}
+
+#[test]
+fn a_call_socket_is_refused_after_its_upgrade() {
+    let pair = pair();
+    let call = join_call(&pair.server, &pair.sara, pair.chat, 99);
+    assert_eq!(call_closed(&call), (4403, "call_ended".to_string()));
+}
+
+#[test]
+fn a_call_that_rings_out_closes_its_sockets() {
+    let server = Server::start(
+        "",
+        "[registration]\nallow = true\n[calls]\ntest_ring = \"1s\"\n",
+    );
+    let mut pair = pair_on(server);
+    let chat = pair.chat;
+    let call_seq = seq_of(post(&mut pair.sara_socket, call_frame(&pair.sara, chat)));
+    let sara_call = join_call(&pair.server, &pair.sara, chat, call_seq);
+    // The caller's own join does not answer it, so it rings out, and says so before the close.
+    let ended = call_event(&mut pair.babak_socket);
+    assert_eq!((ended.kind, ended.n), (CallEventKind::Join, 1));
+    let ended = call_event(&mut pair.babak_socket);
+    assert_eq!((ended.kind, ended.n), (CallEventKind::End, 2));
+    assert_eq!(call_closed(&sara_call), (1000, "call_ended".to_string()));
+    let message = stored(&mut pair.babak_socket, chat, call_seq);
+    assert_eq!(message.call_outcome, Some(CallOutcome::Missed));
+}
+
+#[test]
+fn a_new_call_socket_replaces_the_old_one_and_writes_nothing() {
+    let mut pair = pair();
+    let chat = pair.chat;
+    let call_seq = seq_of(post(&mut pair.sara_socket, call_frame(&pair.sara, chat)));
+    let first = join_call(&pair.server, &pair.sara, chat, call_seq);
+    on_call(&first, is_event(CallEventKind::Join, 1));
+    let second = join_call(&pair.server, &pair.sara, chat, call_seq);
+    assert_eq!(call_closed(&first), (1000, "replaced".to_string()));
+    let babak_call = join_call(&pair.server, &pair.babak, chat, call_seq);
+    // Babak's join is the second event: the replacement wrote no leave and no join.
+    on_call(&second, is_event(CallEventKind::Join, 2));
+    drop(babak_call);
+}
+
+#[test]
+fn a_frame_over_call_frame_closes_its_socket_as_a_leave() {
+    let server = Server::start(
+        "",
+        "[registration]\nallow = true\n[limits]\ncall_frame = \"1KiB\"\n",
+    );
+    let mut pair = pair_on(server);
+    let chat = pair.chat;
+    let call_seq = seq_of(post(&mut pair.sara_socket, call_frame(&pair.sara, chat)));
+    let babak_call = join_call(&pair.server, &pair.babak, chat, call_seq);
+    let sara_call = join_call(&pair.server, &pair.sara, chat, call_seq);
+    on_call(&babak_call, is_event(CallEventKind::Join, 2));
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    let closed = loop {
+        assert!(
+            std::time::Instant::now() < until,
+            "The large frame was never refused"
+        );
+        let _ = sara_call.audio(1, &[7u8; 2048]);
+        if let Some(keryx_moq::Event::Closed { code, reason }) =
+            sara_call.next(Duration::from_millis(100))
+        {
+            break (code, reason);
+        }
+    };
+    assert_eq!(closed, (4403, "frame_too_large".to_string()));
+    let left = moq_event(on_call(&babak_call, is_event(CallEventKind::Leave, 3)));
+    assert_eq!(left.device, pair.sara.device.record().device);
+}
+
+/// A call socket opened by hand and dropped without a close frame, as a phone losing its network.
+fn drop_call_socket(server: &Server, person: &Person, chat: Ulid, call_seq: u64) {
+    let url = format!(
+        "{}/api/v1/calls/{chat}/{call_seq}/moq",
+        server.origin.replace("http://", "ws://")
+    );
+    let builder = ClientRequestBuilder::new(url.parse().unwrap())
+        .with_header("Authorization", format!("Bearer {}", person.token))
+        .with_sub_protocol(keryx_moq::PROTOCOL);
+    let (socket, _) = tungstenite::connect(builder).unwrap();
+    drop(socket);
+}
+
+#[test]
+fn a_dropped_call_socket_gets_the_grace() {
+    let server = Server::start(
+        "",
+        "[registration]\nallow = true\n[calls]\ntest_grace = \"1s\"\n",
+    );
+    let mut pair = pair_on(server);
+    let chat = pair.chat;
+    let sara_device = pair.sara.device.record().device;
+    let call_seq = seq_of(post(&mut pair.sara_socket, call_frame(&pair.sara, chat)));
+    drop_call_socket(&pair.server, &pair.sara, chat, call_seq);
+    let joined = call_event(&mut pair.babak_socket);
+    assert_eq!((joined.kind, joined.n), (CallEventKind::Join, 1));
+    // Back within the grace: no leave and no new join.
+    let sara_call = join_call(&pair.server, &pair.sara, chat, call_seq);
+    let babak_call = join_call(&pair.server, &pair.babak, chat, call_seq);
+    on_call(&sara_call, is_event(CallEventKind::Join, 2));
+    drop(sara_call);
+    drop(babak_call);
+    while call_event(&mut pair.sara_socket).kind != CallEventKind::End {}
+
+    // Gone for longer than the grace: the leave comes, and the last one ends the call.
+    let call_seq = seq_of(post(&mut pair.sara_socket, call_frame(&pair.sara, chat)));
+    drop_call_socket(&pair.server, &pair.sara, chat, call_seq);
+    let mut kind_list = Vec::new();
+    while kind_list.len() < 3 {
+        let event = call_event(&mut pair.babak_socket);
+        if event.call_seq == call_seq {
+            assert_eq!(event.device, sara_device);
+            kind_list.push((event.kind, event.n));
+        }
+    }
+    assert_eq!(
+        kind_list,
+        [
+            (CallEventKind::Join, 1),
+            (CallEventKind::Leave, 2),
+            (CallEventKind::End, 3)
+        ]
+    );
+}

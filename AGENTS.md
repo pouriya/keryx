@@ -41,6 +41,9 @@ error paths, are still to do:** see [core/tests/AGENTS.md](core/tests/AGENTS.md)
 - **Done on Android:** `android/ffi/` and a bare screen that signed up, set its words, started a chat
   with a web account and sent it encrypted text, read on the web, on the author's phone.
 - **Files are done in core and the server.** Their Android screen waits until calls are built.
+- **Calls are done in core, the server and `keryx-moq`** for direct chats: ringing, decline, joins,
+  leaves, the drop grace, media, state and text through the relay, tested end to end in the server's
+  tests with `keryx-moq` as the client. Android's call screen is next.
 - **Next, chosen by the author: calls, then Android for files and calls.** Both clients stay as they
   are and grow only what testing needs; standard screens and a full redesign come after.
 
@@ -379,7 +382,10 @@ so groups and channels fit later; recording comes after the phone test.
   follows a decline names the decliner's device, chosen by the author**, as the device whose action
   ended the call. **A decline for a call that is not open is refused with `call_ended`, chosen by the
   author**, the same word the call socket's close uses. **Replaying a sequence id that is not a call is
-  refused with `no_such_message`, chosen by the author**, so it needs no new code.
+  refused with `no_such_message`, chosen by the author**, so it needs no new code. **A decline after
+  the call was answered is refused with `call_answered`, and nothing is saved, chosen by the author**:
+  a device that missed the join learns the call was taken and stops ringing, and the call its person
+  is in can never be ended from another device.
 - **Every call event but text also goes to the chat's online devices, chosen by the author:** `join`,
   `leave`, `decline` and `end` are sent as `call_event` on the chat's WebSocket as well as on the
   `events` track. A device that rang stops when its person joins on another device, and a chat can show
@@ -470,6 +476,14 @@ so groups and channels fit later; recording comes after the phone test.
   `state`, `audio` and `video` frames are written into the call's shared origin, which everyone reads,
   and any other track name is refused. `text` is not forwarded: it goes to the chat's task, which saves
   it and republishes it on `events`. This costs one in-memory copy and one task per track.
+  **A device that breaks a call rule is closed with 4403 and a code, and that is a leave at once,
+  chosen by the author:** `frame_too_large` for a frame over `call_frame` or text over `[limits.body]
+  text`, and `bad_frame` for text that is not call text's JSON, the chat socket's rule for a broken
+  frame. The server ended it, so there is no 10-second grace, and the device may join again.
+- **The relay's own close frame goes straight on the WebSocket, and qmux's application close is never
+  sent.** A device's `moq-net` closes its session locally the moment it reads qmux's close, which
+  hides the code and reason it carried, so `call_ended`, `replaced` and the 4403 codes travel only in
+  the WebSocket's close frame, after whatever was already written.
 - **Both ends speak moq-lite 05 only, and every frame's `moq-net` timestamp is zero, chosen by the
   author.** moq-lite 05 writes each frame's timestamp in the clear, and 04 writes none. `keryx-moq`
   writes `Timestamp::ZERO` and the relay writes zero when it copies, so the real clock stays inside
@@ -920,8 +934,8 @@ their words, and send encrypted text over WebSocket, under keys from MLS. This c
 and calls come after it.
 
 **The first server build also has delete and edit in 1:1 chats,** with wiping and the preview walking
-back. Files, profiles, retention, MCP and calls come after it, so `mcp.rs` and `moq.rs` do not exist
-yet.
+back. Files, profiles, retention, MCP and calls come after it. Files and calls are built since, so
+`mcp.rs` is the one module on the closed list that does not exist yet.
 
 **To do after files and calls, chosen by the author: remove the password.** It unlocks almost nothing
 the words or a device key do not already cover: a new device still needs the words to register, and a
