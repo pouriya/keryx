@@ -40,7 +40,11 @@ error paths, are still to do:** see [core/tests/AGENTS.md](core/tests/AGENTS.md)
   the account screens and the chat list, all checked in the author's Chromium.
 - **Done on Android:** `android/ffi/` and a bare screen that signed up, set its words, started a chat
   with a web account and sent it encrypted text, read on the web, on the author's phone.
-- **Files are done in core and the server.** Their Android screen waits until calls are built.
+- **Files are done in core and the server, and on Android's bare screen:** an image, a video, a PDF,
+  a text file, a 3-chunk file, an image-and-video bundle and an MP3 as music, with its title, artist,
+  duration and cover's BlurHash, went up from the author's phone and came back byte-identical, with
+  their BlurHashes, opened in other apps. Another account opening them waits
+  for the second phone.
 - **Calls are done in core, the server and `keryx-moq`** for direct chats: ringing, decline, joins,
   leaves, the drop grace, media, state and text through the relay, tested end to end in the server's
   tests with `keryx-moq` as the client. Android's call screen is next.
@@ -472,7 +476,7 @@ so groups and channels fit later; recording comes after the phone test.
   **`connect` waits at most 10 seconds for the upgrade, fixed in code, chosen by the author**, the same
   as a dead socket takes to be noticed, so a hung server never freezes a call screen or a test.
   **It speaks `ws://` only for now, chosen by the author:** no rustls and no root store, as the tests use
-  plain HTTP and the phone test reaches `127.0.0.1:7777` through `adb reverse`. How it trusts a `wss://`
+  plain HTTP and the phone test reaches `127.0.0.1:7778` through `adb reverse`. How it trusts a `wss://`
   server's certificate is on the Open list.
 - **The server keeps axum's `WebSocketUpgrade` and adapts its socket for `qmux`, chosen by the author.**
   So the `Origin` check, cookie or Bearer, subprotocol choice, the `[tcp]` socket wrapper and the 4403
@@ -564,7 +568,11 @@ so groups and channels fit later; recording comes after the phone test.
   receiver checks that the sender index belongs to the device whose broadcast the frame came on.
 - **A media frame's plaintext is `[timestamp, 8 bytes big-endian microseconds][codec bytes]`, chosen by
   the author.** The `state` track's is JSON `{"video": bool, "voice": bool, "width"?, "height"?,
-  "rotation"?: 0|90|180|270}`, sealed the same way.
+  "rotation"?: 0|90|180|270}`, sealed the same way. **The codec bytes are H.264 in Annex B, with its
+  SPS and PPS in front of every keyframe, and Opus as bare packets, chosen by the author.** Annex B is
+  what MediaCodec writes and WebCodecs reads, and any keyframe starts a decoder from nothing, so a
+  joiner needs no setup sent apart. Opus carries no `OpusHead`: every receiver builds its own from the
+  fixed settings, mono at 48 kHz.
 - **Every call event is the same JSON, chosen by the author**, on the `events` track, in the WebSocket's
   `call_event` and in the replay route: `{chat, call_seq, n, kind, device, server_at, client_at?,
   epoch?, signature?, body?}`, with kind `join`, `leave`, `decline`, `text` or `end`. **A decline has no

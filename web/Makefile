@@ -35,7 +35,7 @@ build: wasm
 	npx vite build
 
 
-# Vite with hot reload at http://127.0.0.1:5173, and keryx serve behind it on 7777 with dev.toml.
+# Vite with hot reload at http://127.0.0.1:5173, and keryx serve behind it on 7778 with dev.toml.
 dev: wasm
 	$(MAKE) -C ../server dev
 	@ mkdir -p ../tmp/dev

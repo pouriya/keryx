@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Only downloaded files, in the app's cache, can be handed to another app to open. -->
+<paths>
+    <cache-path name="files" path="files/" />
+</paths>

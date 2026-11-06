@@ -1,10 +1,21 @@
-// One background thread holds core's client, the WebSocket, the requests, the timer and the locked
-// files, like the web's worker. It does what core asks and feeds back what happened. Commands come
+// One background thread holds core's client, the WebSocket, the requests, the timer, the locked
+// files and the chunks of files going up and coming down, like the web's worker. It does what core asks and feeds back what happened. Commands come
 // from the screen as they are, and events go back as they are. Nothing here logs, since what passes
 // through holds passwords, words, tokens and messages.
 
 package io.github.pouriya.keryx
 
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.ImageDecoder
+import android.media.MediaMetadataRetriever
+import android.net.Uri
+import android.os.ParcelFileDescriptor
+import android.provider.OpenableColumns
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.put
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.MediaType.Companion.toMediaType
@@ -14,10 +25,21 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
+import java.io.File
+import java.io.FileInputStream
 import java.io.IOException
+import java.io.RandomAccessFile
+import java.nio.ByteBuffer
+import java.nio.channels.FileChannel
+import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
+
+/** What pickers call an MP3, which goes as music: android/AGENTS.md. */
+private val MP3_TYPES = setOf("audio/mpeg", "audio/mp3", "audio/mpeg3")
 
 /** The JNI glue in android/ffi. */
 object Core {
@@ -33,24 +55,298 @@ object Core {
         now: Long,
     ): String
 
+    /** `step` for `chunk_read` and `fetched`, whose bytes cross beside their JSON. */
+    @JvmStatic external fun stepBytes(
+        handle: Long,
+        input: String,
+        bytes: ByteArray,
+        now: Long,
+    ): String
+
+    /** The bytes a `put_chunk` or `write_chunk` held back, once. */
+    @JvmStatic external fun chunk(
+        handle: Long,
+        chunk: Long,
+    ): ByteArray?
+
+    /** A BlurHash drawn as RGBA pixels, or null if it is not one. */
+    @JvmStatic external fun blurhash(
+        hash: String,
+        width: Int,
+        height: Int,
+    ): ByteArray?
+
     @JvmStatic external fun drop(handle: Long)
+
+    /** Connects the call the last `join_call` named. Blocks for up to 10 seconds. */
+    @JvmStatic external fun callConnect(
+        handle: Long,
+        server: String,
+    ): Boolean
+
+    @JvmStatic external fun callAudio(
+        handle: Long,
+        ts: Long,
+        bytes: ByteArray,
+    )
+
+    @JvmStatic external fun callVideo(
+        handle: Long,
+        ts: Long,
+        bytes: ByteArray,
+        keyframe: Boolean,
+    )
+
+    @JvmStatic external fun callState(
+        handle: Long,
+        state: String,
+    )
+
+    /** Null on a timeout, or byte 0 as the kind and then the frame: see android/AGENTS.md. */
+    @JvmStatic external fun callNext(
+        handle: Long,
+        timeout: Long,
+    ): ByteArray?
 }
 
 class Engine(
+    private val context: Context,
     private val vault: Vault,
     private val platform: Platform,
     private val show: (Event) -> Unit,
+    private val calls: (Output) -> Unit,
 ) {
     private val thread = Executors.newSingleThreadScheduledExecutor()
     private val http = OkHttpClient()
-    private var server: String? = null
-    private var client = -1L
+
+    @Volatile private var server: String? = null
+
+    @Volatile private var client = -1L
+
+    /** The client's handle, for the call's own threads. */
+    val handle get() = client
+
+    /** The server's address, for the call's connection. */
+    val base get() = server
 
     /** Bumped with each new client, so a reply meant for an old one is dropped. */
     private var generation = 0
     private var bound: String? = null
     private var socket: WebSocket? = null
     private var timer: ScheduledFuture<*>? = null
+
+    /** Files are read and their thumbnails made here, off the engine's thread. */
+    private val preparing = Executors.newSingleThreadExecutor()
+    private val handles = AtomicLong(1)
+
+    /** Files going up, by handle: picked, then opened at their first chunk. */
+    private val picked = HashMap<Long, Uri>()
+    private val reading = HashMap<Long, Pair<ParcelFileDescriptor, FileChannel>>()
+
+    /** Files coming down, by handle, into the app's cache. */
+    private val downloads = ConcurrentHashMap<Long, File>()
+
+    /** Where a download is written, once asked for. */
+    fun downloadedFile(handle: Long): File? = downloads[handle]
+
+    /**
+     * Sends the picked files as one message, with the caption unless it is blank. One file's kind
+     * comes from its MIME type, and several go as a bundle, which core takes only as images and
+     * videos, as android/AGENTS.md chose.
+     */
+    fun sendFiles(
+        chat: String,
+        uris: List<Uri>,
+        caption: String,
+    ) = preparing.execute {
+        val specs = uris.mapNotNull { uri -> spec(uri)?.let { uri to it } }
+        if (specs.isEmpty()) {
+            return@execute
+        }
+        thread.execute {
+            for ((uri, spec) in specs) {
+                picked[spec.handle] = uri
+            }
+            handle(Command.SendFiles(chat, specs.map { it.second }, caption.ifBlank { null }))
+        }
+    }
+
+    /** Fetches a shown file into the app's cache, and returns the handle its progress names. */
+    fun download(file: FileInfo): Long {
+        val handle = handles.getAndIncrement()
+        val folder = File(File(context.cacheDir, "files"), file.id)
+        val target = File(folder, file.name.replace('/', '_').trimStart('.').ifBlank { "file" })
+        downloads[handle] = target
+        thread.execute {
+            folder.mkdirs()
+            target.delete()
+            handle(Command.Download(file, handle))
+        }
+        return handle
+    }
+
+    private fun spec(uri: Uri): FileSpec? {
+        val resolver = context.contentResolver
+        var name = "file"
+        var size = -1L
+        try {
+            resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null)?.use {
+                if (it.moveToFirst()) {
+                    name = it.getString(0) ?: name
+                    if (!it.isNull(1)) size = it.getLong(1)
+                }
+            }
+            if (size < 0) {
+                size = resolver.openFileDescriptor(uri, "r")?.use { it.statSize } ?: -1
+            }
+        } catch (_: Exception) {
+            return null
+        }
+        if (size < 0) {
+            return null
+        }
+        val picked = resolver.getType(uri) ?: "application/octet-stream"
+        // An MP3 is music whatever the picker called it, and always goes as audio/mpeg.
+        val mp3 = picked in MP3_TYPES || name.lowercase(Locale.ROOT).endsWith(".mp3")
+        val kind = if (mp3) 4 else kindOf(picked)
+        val tags =
+            if (mp3) {
+                try {
+                    tags(uri)
+                } catch (_: Exception) {
+                    null
+                }
+            } else {
+                null
+            }
+        val picture =
+            try {
+                when (kind) {
+                    3 -> image(ImageDecoder.createSource(resolver, uri))
+                    4 -> tags?.cover
+                    5 -> video(uri)
+                    else -> null
+                }
+            } catch (_: Exception) {
+                null
+            }
+        return FileSpec(
+            handle = handles.getAndIncrement(),
+            kind = kind,
+            name = name,
+            mime = if (mp3) "audio/mpeg" else picked,
+            size = size,
+            width = picture?.first,
+            height = picture?.second,
+            thumbnail = picture?.third,
+            title = tags?.title,
+            artist = tags?.artist,
+            duration = tags?.duration,
+        )
+    }
+
+    private fun kindOf(mime: String) =
+        when {
+            mime.startsWith("image/") -> 3
+            mime.startsWith("video/") -> 5
+            mime == "application/pdf" || mime == "application/msword" ||
+                mime.startsWith("application/vnd.openxmlformats-officedocument.") ||
+                mime.startsWith("application/vnd.ms-") ||
+                mime.startsWith("application/vnd.oasis.opendocument.") -> 6
+            else -> 7
+        }
+
+    private class Tags(
+        val title: String?,
+        val artist: String?,
+        val duration: Long?,
+        val cover: Triple<Int, Int, Thumbnail>?,
+    )
+
+    /** An MP3's title, artist and length in milliseconds from its tags, and its cover small. */
+    private fun tags(uri: Uri): Tags {
+        val retriever = MediaMetadataRetriever()
+        try {
+            retriever.setDataSource(context, uri)
+            val text = { key: Int -> retriever.extractMetadata(key)?.takeIf { it.isNotBlank() } }
+            val cover =
+                retriever.embeddedPicture?.let { bytes ->
+                    try {
+                        image(ImageDecoder.createSource(ByteBuffer.wrap(bytes)))
+                    } catch (_: Exception) {
+                        null
+                    }
+                }
+            return Tags(
+                title = text(MediaMetadataRetriever.METADATA_KEY_TITLE),
+                artist = text(MediaMetadataRetriever.METADATA_KEY_ARTIST),
+                duration = text(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull(),
+                cover = cover,
+            )
+        } finally {
+            retriever.release()
+        }
+    }
+
+    /** An image's size, and its pixels decoded small for the BlurHash. */
+    private fun image(source: ImageDecoder.Source): Triple<Int, Int, Thumbnail> {
+        var width = 0
+        var height = 0
+        val bitmap =
+            ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
+                width = info.size.width
+                height = info.size.height
+                val (small, smallHeight) = fit(width, height)
+                decoder.setTargetSize(small, smallHeight)
+                decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+            }
+        return Triple(width, height, thumbnail(bitmap))
+    }
+
+    /** A video's size as shown, and its first frame small for the BlurHash. */
+    private fun video(uri: Uri): Triple<Int, Int, Thumbnail>? {
+        val retriever = MediaMetadataRetriever()
+        try {
+            retriever.setDataSource(context, uri)
+            val number = { key: Int -> retriever.extractMetadata(key)?.toIntOrNull() ?: 0 }
+            val turned = number(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION) % 180 != 0
+            val wide = number(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)
+            val high = number(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
+            val (width, height) = if (turned) high to wide else wide to high
+            val frame = retriever.getFrameAtTime(0) ?: return null
+            val (small, smallHeight) = fit(frame.width, frame.height)
+            return Triple(width, height, thumbnail(Bitmap.createScaledBitmap(frame, small, smallHeight, true)))
+        } finally {
+            retriever.release()
+        }
+    }
+
+    /** At most 32 pixels on the longer side, which is plenty for a BlurHash. */
+    private fun fit(
+        width: Int,
+        height: Int,
+    ): Pair<Int, Int> {
+        if (width <= 0 || height <= 0) {
+            return 32 to 32
+        }
+        val longer = maxOf(width, height)
+        return maxOf(1, width * 32 / longer) to maxOf(1, height * 32 / longer)
+    }
+
+    private fun thumbnail(bitmap: Bitmap): Thumbnail {
+        val width = bitmap.width
+        val height = bitmap.height
+        val pixels = IntArray(width * height)
+        bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
+        val rgba = ByteArray(pixels.size * 4)
+        for ((at, pixel) in pixels.withIndex()) {
+            rgba[at * 4] = (pixel shr 16).toByte()
+            rgba[at * 4 + 1] = (pixel shr 8).toByte()
+            rgba[at * 4 + 2] = pixel.toByte()
+            rgba[at * 4 + 3] = (pixel ushr 24).toByte()
+        }
+        return Thumbnail(width, height, rgba)
+    }
 
     /** Talks to this server from now on, after checking it answers as a keryx server. */
     fun use(
@@ -88,6 +384,18 @@ class Engine(
 
     fun send(command: Command) = thread.execute { handle(command) }
 
+    /** A call event as `Core.callNext` handed it over, fed back into core to be opened. */
+    fun callEvent(json: String) =
+        thread.execute {
+            val event =
+                try {
+                    wire.parseToJsonElement(json).jsonObject
+                } catch (_: IllegalArgumentException) {
+                    return@execute
+                }
+            feed(Input.CallEvent(event))
+        }
+
     private fun start(base: String) {
         vault.setNote("server", base)
         server = base
@@ -106,6 +414,9 @@ class Engine(
         socket = null
         timer?.cancel(false)
         bound = null
+        reading.values.forEach { it.first.close() }
+        reading.clear()
+        picked.clear()
         if (client >= 0) {
             Core.drop(client)
         }
@@ -146,7 +457,21 @@ class Engine(
         if (client < 0) {
             return
         }
-        val text = Core.step(client, wire.encodeToString(Input.serializer(), input), System.currentTimeMillis())
+        outputs(Core.step(client, wire.encodeToString(Input.serializer(), input), System.currentTimeMillis()))
+    }
+
+    /** Feeds `chunk_read` or `fetched`, with their bytes beside the JSON. */
+    private fun feedBytes(
+        input: JsonObject,
+        bytes: ByteArray,
+    ) {
+        if (client < 0) {
+            return
+        }
+        outputs(Core.stepBytes(client, input.toString(), bytes, System.currentTimeMillis()))
+    }
+
+    private fun outputs(text: String) {
         for (output in wire.decodeFromString(kotlinx.serialization.builtins.ListSerializer(Output.serializer()), text)) {
             run(output)
         }
@@ -160,6 +485,136 @@ class Engine(
         if (meant == generation) {
             feed(input())
         }
+    }
+
+    /** Feeds bytes a callback on another thread fetched, unless the client is gone. */
+    private fun laterBytes(
+        meant: Int,
+        input: JsonObject,
+        bytes: ByteArray,
+    ) = thread.execute {
+        if (meant == generation) {
+            feedBytes(input, bytes)
+        }
+    }
+
+    /** Stops reading a file that went up, or will not. */
+    private fun doneReading(handle: Long) {
+        reading.remove(handle)?.first?.close()
+        picked.remove(handle)
+    }
+
+    private fun readChunk(asked: Output.ReadChunk) {
+        val bytes =
+            try {
+                val (_, channel) =
+                    reading.getOrPut(asked.handle) {
+                        val uri = picked[asked.handle] ?: throw IOException("not picked")
+                        val opened = context.contentResolver.openFileDescriptor(uri, "r") ?: throw IOException("not opened")
+                        opened to FileInputStream(opened.fileDescriptor).channel
+                    }
+                val buffer = ByteBuffer.allocate(asked.length.toInt())
+                channel.position(asked.offset)
+                while (buffer.hasRemaining() && channel.read(buffer) >= 0) {
+                    continue
+                }
+                buffer.array().copyOf(buffer.position())
+            } catch (_: Exception) {
+                ByteArray(0)
+            }
+        feedBytes(
+            buildJsonObject {
+                put("type", "chunk_read")
+                put("handle", asked.handle)
+                put("n", asked.n)
+            },
+            bytes,
+        )
+    }
+
+    private fun writeChunk(asked: Output.WriteChunk) {
+        val bytes = Core.chunk(client, asked.chunk) ?: return
+        val target = downloads[asked.handle] ?: return
+        try {
+            RandomAccessFile(target, "rw").use {
+                it.seek(asked.offset)
+                it.write(bytes)
+            }
+        } catch (_: IOException) {
+            // Core counts the chunk written either way, and opening the file shows what is missing.
+        }
+    }
+
+    private fun putChunk(
+        base: String,
+        asked: Output.PutChunk,
+    ) {
+        val meant = generation
+        val bytes = Core.chunk(client, asked.chunk) ?: ByteArray(0)
+        val builder =
+            Request
+                .Builder()
+                .url(base + asked.path)
+                .put(bytes.toRequestBody("application/octet-stream".toMediaType()))
+        asked.bearer?.let { builder.header("Authorization", "Bearer $it") }
+        http.newCall(builder.build()).enqueue(
+            object : Callback {
+                override fun onFailure(
+                    call: Call,
+                    e: IOException,
+                ) = later(meant) { Input.Reply(asked.id, 0, "") }
+
+                override fun onResponse(
+                    call: Call,
+                    response: Response,
+                ) {
+                    val body =
+                        try {
+                            response.use { it.body?.string() ?: "" }
+                        } catch (_: IOException) {
+                            return later(meant) { Input.Reply(asked.id, 0, "") }
+                        }
+                    later(meant) { Input.Reply(asked.id, response.code, body) }
+                }
+            },
+        )
+    }
+
+    private fun getChunk(
+        base: String,
+        asked: Output.GetChunk,
+    ) {
+        val meant = generation
+        val fetched = { status: Int ->
+            buildJsonObject {
+                put("type", "fetched")
+                put("id", asked.id)
+                put("status", status)
+            }
+        }
+        val builder = Request.Builder().url(base + asked.path)
+        asked.bearer?.let { builder.header("Authorization", "Bearer $it") }
+        http.newCall(builder.build()).enqueue(
+            object : Callback {
+                override fun onFailure(
+                    call: Call,
+                    e: IOException,
+                ) = laterBytes(meant, fetched(0), ByteArray(0))
+
+                override fun onResponse(
+                    call: Call,
+                    response: Response,
+                ) {
+                    val bytes =
+                        try {
+                            response.use { it.body?.bytes() ?: ByteArray(0) }
+                        } catch (_: IOException) {
+                            return laterBytes(meant, fetched(0), ByteArray(0))
+                        }
+                    laterBytes(meant, fetched(response.code), bytes)
+                }
+            },
+        )
     }
 
     private fun run(output: Output) {
@@ -201,6 +656,11 @@ class Engine(
                         TimeUnit.MILLISECONDS,
                     )
             }
+            is Output.JoinCall, is Output.LeaveCall -> calls(output)
+            is Output.ReadChunk -> readChunk(output)
+            is Output.PutChunk -> putChunk(base, output)
+            is Output.GetChunk -> getChunk(base, output)
+            is Output.WriteChunk -> writeChunk(output)
             is Output.Show -> {
                 when (val event = output.event) {
                     is Event.SignedIn -> {
@@ -216,6 +676,8 @@ class Engine(
                                 vault.put(base, username, "token", token.toByteArray())
                             }
                         }
+                    is Event.Progress -> if (event.done >= event.total) doneReading(event.handle)
+                    is Event.TransferFailed -> doneReading(event.handle)
                     else -> Unit
                 }
                 show(output.event)

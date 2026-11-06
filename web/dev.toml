@@ -2,7 +2,7 @@
 # under tmp/ with @ROOT@ replaced by the repository's path. public_url is Vite's address, so the
 # WebSocket's Origin check and the cookie match. Registration is open. There is no captcha. The
 # password and the username may be 4 characters, so trying the client is not a chore.
-listen = "127.0.0.1:7777"
+listen = "127.0.0.1:7778"
 public_url = "http://127.0.0.1:5173"
 
 [database]

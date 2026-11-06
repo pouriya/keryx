@@ -4,6 +4,14 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
+    <!-- Calls: asked for when first needed, and a refused one keeps that sense off. The speaker is
+         chosen for the call, which needs MODIFY_AUDIO_SETTINGS. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
+
     <!-- No backup: the locked files' key stays in this phone's Keystore, so a backup could not be
          opened anywhere else. Plain HTTP is allowed for a server without TLS, such as one being
          developed on this machine. -->
@@ -25,5 +33,15 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <!-- A downloaded file is handed to another app to open, read-only, through this. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.files"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/opened_files" />
+        </provider>
     </application>
 </manifest>

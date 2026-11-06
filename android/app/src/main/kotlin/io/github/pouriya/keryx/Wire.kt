@@ -17,6 +17,7 @@ import kotlinx.serialization.encoding.Encoder
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonDecoder
 import kotlinx.serialization.json.JsonEncoder
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -173,6 +174,23 @@ sealed interface Command {
         val text: String,
     ) : Command
 
+    /** One file, or up to 20 images and videos as a bundle, with an optional caption. */
+    @Serializable
+    @SerialName("send_files")
+    data class SendFiles(
+        val chat: String,
+        val files: List<FileSpec>,
+        val text: String? = null,
+    ) : Command
+
+    /** Fetches a shown file into `handle`. The ffi puts the file's key back in. */
+    @Serializable
+    @SerialName("download")
+    data class Download(
+        val file: FileInfo,
+        val handle: Long,
+    ) : Command
+
     @Serializable
     @SerialName("edit")
     data class Edit(
@@ -220,7 +238,86 @@ sealed interface Command {
     @Serializable
     @SerialName("network_back")
     data object NetworkBack : Command
+
+    @Serializable
+    @SerialName("start_call")
+    data class StartCall(
+        val chat: String,
+        val video: Boolean,
+        val voice: Boolean,
+    ) : Command
+
+    @Serializable
+    @SerialName("decline_call")
+    data class DeclineCall(
+        val chat: String,
+        val call_seq: Long,
+    ) : Command
+
+    @Serializable
+    @SerialName("join_call")
+    data class JoinCall(
+        val chat: String,
+        val call_seq: Long,
+    ) : Command
+
+    @Serializable
+    @SerialName("leave_call")
+    data class LeaveCall(
+        val chat: String,
+    ) : Command
+
+    @Serializable
+    @SerialName("call_text")
+    data class CallText(
+        val chat: String,
+        val call_seq: Long,
+        val text: String,
+    ) : Command
 }
+
+/** A picture's small pixels, from which core makes its BlurHash. */
+@Serializable
+data class Thumbnail(
+    val width: Int,
+    val height: Int,
+    @Serializable(with = Octets::class) val rgba: ByteArray,
+)
+
+/** One file to send, its bytes read from `handle` as core asks. Kinds: 3 image, 4 video, 5 doc, 6 file. */
+@Serializable
+data class FileSpec(
+    val handle: Long,
+    val kind: Int,
+    val name: String,
+    @SerialName("type") val mime: String,
+    val size: Long,
+    val width: Int? = null,
+    val height: Int? = null,
+    val thumbnail: Thumbnail? = null,
+    val description: String? = null,
+    val title: String? = null,
+    val artist: String? = null,
+    val duration: Long? = null,
+)
+
+/** A file inside a shown message. Its key stays in the ffi, as android/AGENTS.md chose. */
+@Serializable
+data class FileInfo(
+    val id: String,
+    val kind: Int,
+    val name: String,
+    @SerialName("type") val mime: String,
+    val size: Long,
+    val chunks: Long,
+    val width: Int? = null,
+    val height: Int? = null,
+    val blurhash: String? = null,
+    val description: String? = null,
+    val title: String? = null,
+    val artist: String? = null,
+    val duration: Long? = null,
+)
 
 @Serializable
 sealed interface Input {
@@ -279,6 +376,13 @@ sealed interface Input {
     @Serializable
     @SerialName("timer")
     data object Timer : Input
+
+    /** A frame from the joined call's `events` track, as `Core.callNext` handed it over. */
+    @Serializable
+    @SerialName("call_event")
+    data class CallEvent(
+        val event: JsonObject,
+    ) : Input
 }
 
 @Serializable
@@ -331,6 +435,59 @@ sealed interface Output {
     @SerialName("event")
     data class Show(
         val event: Event,
+    ) : Output
+
+    /** Connect with `Core.callConnect` on the call's own thread: the key stays in Rust. */
+    @Serializable
+    @SerialName("join_call")
+    data class JoinCall(
+        val chat: String,
+        val call_seq: Long,
+    ) : Output
+
+    @Serializable
+    @SerialName("leave_call")
+    data class LeaveCall(
+        val chat: String,
+    ) : Output
+
+    /** Read these bytes of `handle`, and answer with `chunk_read` through `Core.stepBytes`. */
+    @Serializable
+    @SerialName("read_chunk")
+    data class ReadChunk(
+        val handle: Long,
+        val n: Long,
+        val offset: Long,
+        val length: Long,
+    ) : Output
+
+    /** A PUT of the bytes `Core.chunk` hands over, answered with `reply`. */
+    @Serializable
+    @SerialName("put_chunk")
+    data class PutChunk(
+        val id: Long,
+        val path: String,
+        val bearer: String? = null,
+        val chunk: Long,
+    ) : Output
+
+    /** A GET of raw bytes, answered with `fetched` through `Core.stepBytes`. */
+    @Serializable
+    @SerialName("get_chunk")
+    data class GetChunk(
+        val id: Long,
+        val path: String,
+        val bearer: String? = null,
+    ) : Output
+
+    /** Write the opened bytes `Core.chunk` hands over at `offset` of `handle`. */
+    @Serializable
+    @SerialName("write_chunk")
+    data class WriteChunk(
+        val handle: Long,
+        val n: Long,
+        val offset: Long,
+        val chunk: Long,
     ) : Output
 }
 
@@ -391,6 +548,32 @@ data class Shown(
     val encrypted: Boolean,
     val sent_at: Long,
     val saved_at: Long,
+    val text: String? = null,
+    val files: List<FileInfo> = emptyList(),
+    val call: CallBody? = null,
+    val call_outcome: Int? = null,
+    val call_ended_at: Long? = null,
+    val problem: String? = null,
+)
+
+@Serializable
+data class CallBody(
+    val video: Boolean,
+    val voice: Boolean,
+)
+
+/** Something that happened inside a call. Kinds: 0 join, 1 leave, 2 decline, 3 text, 4 end. */
+@Serializable
+data class ShownCallEvent(
+    val chat: String,
+    val call_seq: Long,
+    val n: Long,
+    val kind: Int,
+    val device: String,
+    val account: String? = null,
+    val mine: Boolean,
+    val at: Long,
+    val sent_at: Long? = null,
     val text: String? = null,
     val problem: String? = null,
 )
@@ -548,6 +731,7 @@ sealed interface Event {
         val kind: Int,
         val target: Pointer? = null,
         val text: String? = null,
+        val handles: List<Long> = emptyList(),
     ) : Event
 
     @Serializable
@@ -630,6 +814,35 @@ sealed interface Event {
     @Serializable
     @SerialName("logged_out")
     data object LoggedOut : Event
+
+    @Serializable
+    @SerialName("call_event")
+    data class CallEvent(
+        val event: ShownCallEvent,
+    ) : Event
+
+    /** `done` of `total` chunks of `handle`, going up or coming down. */
+    @Serializable
+    @SerialName("progress")
+    data class Progress(
+        val handle: Long,
+        val done: Long,
+        val total: Long,
+    ) : Event
+
+    @Serializable
+    @SerialName("downloaded")
+    data class Downloaded(
+        val handle: Long,
+    ) : Event
+
+    /** An upload or download stopped for good. An upload's message is not sent. */
+    @Serializable
+    @SerialName("transfer_failed")
+    data class TransferFailed(
+        val handle: Long,
+        val code: String,
+    ) : Event
 
     @Serializable
     @SerialName("error")

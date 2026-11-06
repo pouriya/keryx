@@ -1817,7 +1817,9 @@ version = "0.1.0"
 dependencies = [
  "jni",
  "keryx-core",
+ "keryx-moq",
  "serde_json",
+ "zeroize",
 ]
 
 [[package]]

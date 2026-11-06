@@ -2,7 +2,7 @@
 name = "keryx-ffi"
 version = "0.1.0"
 edition = "2024"
-description = "The hand-written JNI glue around keryx-core's client, for Android"
+description = "The hand-written JNI glue around keryx-core's client and keryx-moq's call, for Android"
 authors = ["Pouriya Jahanbakhsh <pouriya.jahanbakhsh@gmail.com>"]
 rust-version = "1.91"
 license = "MIT"
@@ -15,9 +15,16 @@ crate-type = ["cdylib"]
 [dependencies]
 keryx-core = { path = "../../core" }
 
+# The joined call: MoQ over a WebSocket, sealing and opening its frames, so a call's key never
+# crosses JNI. See android/AGENTS.md.
+keryx-moq = { path = "../../moq" }
+
 # The JNI calls, through its safe wrappers for strings, exceptions and references, chosen by the
 # author over raw jni-sys. See android/AGENTS.md.
 jni = "0.22.4"
 
 # Core's inputs and outputs cross JNI as JSON text, in core's own serde shapes. Already in the tree.
 serde_json = { version = "1.0.154", default-features = false, features = ["std"] }
+
+# A call's token and media are wiped when dropped. Already in the tree.
+zeroize = "1.9.1"
