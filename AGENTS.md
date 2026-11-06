@@ -370,7 +370,14 @@ so groups and channels fit later; recording comes after the phone test.
   know, a modified client cannot skip them, and a phone that dies still leaves.
 - **Declining is a `call_event` frame over the chat's WebSocket**, answered with `done`, since the person
   has not joined the call's MoQ. The server saves it inside the call and sends it as `call_event` to the
-  chat's online devices.
+  chat's online devices. **In a direct chat a decline ends the call at once, chosen by the author:** a
+  decline from any of the other account's devices is followed by `end` as missed, and the caller's
+  socket closes with `call_ended`, so nobody hears ringing for a minute after a no. The outcome stays
+  missed or answered, with no declined value. Groups, later, keep ringing the rest.
+- **Every call event but text also goes to the chat's online devices, chosen by the author:** `join`,
+  `leave`, `decline` and `end` are sent as `call_event` on the chat's WebSocket as well as on the
+  `events` track. A device that rang stops when its person joins on another device, and a chat can show
+  who is in a call. Text stays inside the call, on `events` and in the replay.
 - **Text typed in a call travels through MoQ, chosen by the author.** Each device sends it on its own
   `text` track. The relay, in the same binary, hands it to the chat's task, which saves it with the next
   `n` inside the call and republishes it on the `server` broadcast's `events` track, which everyone in
