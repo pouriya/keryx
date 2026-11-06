@@ -115,6 +115,7 @@ class Engine(
     private val platform: Platform,
     private val show: (Event) -> Unit,
     private val calls: (Output) -> Unit,
+    private val unread: (Map<String, Int>) -> Unit,
 ) {
     private val thread = Executors.newSingleThreadScheduledExecutor()
     private val http = OkHttpClient()
@@ -132,6 +133,7 @@ class Engine(
     /** Bumped with each new client, so a reply meant for an old one is dropped. */
     private var generation = 0
     private var bound: String? = null
+    private var archive: Archive? = null
     private var socket: WebSocket? = null
     private var timer: ScheduledFuture<*>? = null
 
@@ -397,6 +399,7 @@ class Engine(
             reading.values.forEach { it.first.close() }
             reading.clear()
             picked.clear()
+            closeArchive()
             generation += 1
             if (client >= 0) {
                 Core.drop(client)
@@ -437,6 +440,7 @@ class Engine(
         reading.values.forEach { it.first.close() }
         reading.clear()
         picked.clear()
+        closeArchive()
         if (client >= 0) {
             Core.drop(client)
         }
@@ -460,6 +464,7 @@ class Engine(
         }
         bound = username
         vault.setNote("last", username)
+        openArchive(base, username)
         val token = vault.get(base, username, "token")?.toString(Charsets.UTF_8)
         feed(Input.Loaded(vault.get(base, username, "slot0"), vault.get(base, username, "slot1"), resume, token))
     }
@@ -681,11 +686,22 @@ class Engine(
             is Output.PutChunk -> putChunk(base, output)
             is Output.GetChunk -> getChunk(base, output)
             is Output.WriteChunk -> writeChunk(output)
+            is Output.SaveRows -> saveRows(output)
+            is Output.ReadRows -> readRows(output)
             is Output.Show -> {
                 when (val event = output.event) {
                     is Event.SignedIn -> {
                         bound = event.username
                         vault.setNote("last", event.username)
+                        if (archive == null) openArchive(base, event.username)
+                    }
+                    is Event.Chats -> {
+                        archive?.seen(event.chat_list)
+                        reportUnread()
+                    }
+                    is Event.OwnDevices -> {
+                        archive?.devices(event.device_list)
+                        reportUnread()
                     }
                     is Event.Token ->
                         bound?.let { username ->
@@ -703,6 +719,65 @@ class Engine(
                 show(output.event)
             }
         }
+    }
+
+    private fun openArchive(
+        base: String,
+        username: String,
+    ) {
+        archive?.close()
+        archive = null
+        val dir = vault.accountDir(base, username)
+        dir.mkdirs()
+        archive =
+            try {
+                Archive.open(File(dir, "archive.db"))
+            } catch (_: android.database.SQLException) {
+                null
+            }
+    }
+
+    private fun closeArchive() {
+        archive?.close()
+        archive = null
+        unread(emptyMap())
+    }
+
+    private fun reportUnread() {
+        val counts =
+            try {
+                archive?.unread() ?: emptyMap()
+            } catch (_: android.database.SQLException) {
+                emptyMap()
+            }
+        unread(counts)
+    }
+
+    private fun saveRows(asked: Output.SaveRows) {
+        val kept = archive
+        if (kept == null) {
+            feed(Input.RowsSaveFailed(asked.id))
+            return
+        }
+        try {
+            kept.save(asked.message_list, asked.call_list)
+        } catch (_: android.database.SQLException) {
+            feed(Input.RowsSaveFailed(asked.id))
+            return
+        }
+        reportUnread()
+        feed(Input.RowsSaved(asked.id))
+    }
+
+    private fun readRows(asked: Output.ReadRows) {
+        val read =
+            try {
+                archive?.read(asked.chat, asked.before_seq, asked.limit)
+            } catch (_: android.database.SQLException) {
+                null
+            }
+        val (messages, calls) = read ?: (emptyList<MessageFrame>() to emptyList())
+        feed(Input.RowsRead(asked.id, messages, calls))
     }
 
     private fun request(

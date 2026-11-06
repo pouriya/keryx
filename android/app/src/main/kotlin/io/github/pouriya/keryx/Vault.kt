@@ -52,6 +52,12 @@ class Vault(
     /** The usernames that have something kept for this server. */
     fun usernames(server: String): List<String> = folder(server, null).list()?.sorted() ?: emptyList()
 
+    /** This account's folder: the snapshot, the token and the archive, apart per server. */
+    fun accountDir(
+        server: String,
+        username: String,
+    ): File = folder(server, username)
+
     fun get(
         server: String,
         username: String,

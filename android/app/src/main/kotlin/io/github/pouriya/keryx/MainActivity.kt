@@ -58,6 +58,7 @@ class MainActivity : ComponentActivity() {
     private val serverFine = mutableStateOf<Boolean?>(null)
     private val words = mutableStateOf<String?>(null)
     private val chats = mutableStateListOf<ChatItem>()
+    private val unreadCounts = mutableStateMapOf<String, Int>()
     private val chosen = mutableStateOf<String?>(null)
     private val messages = mutableStateListOf<Shown>()
     private val happened = mutableStateListOf<String>()
@@ -108,6 +109,14 @@ class MainActivity : ComponentActivity() {
                 platform,
                 { event -> runOnUiThread { apply(event) } },
                 { output -> runOnUiThread { call(output) } },
+                { counts ->
+                    runOnUiThread {
+                        unreadCounts.clear()
+                        for ((chat, count) in counts) {
+                            if (count > 0) unreadCounts[chat] = count
+                        }
+                    }
+                },
             )
         if (vault.note("server") != null) {
             engine.use(server.value) { fine -> runOnUiThread { serverFine.value = fine } }
@@ -207,6 +216,7 @@ class MainActivity : ComponentActivity() {
             is Event.LoggedOut -> {
                 chats.clear()
                 messages.clear()
+                unreadCounts.clear()
                 chosen.value = null
             }
             else -> Unit
@@ -476,8 +486,10 @@ class MainActivity : ComponentActivity() {
             Text("Chats", style = MaterialTheme.typography.titleMedium)
             for (chat in chats) {
                 val mark = if (chat.chat == chosen.value) "▶ " else ""
+                val name = if (chat.type == 0) "Saved messages" else chat.chat
+                val count = unreadCounts[chat.chat]?.let { " ($it)" } ?: ""
                 Text(
-                    "$mark${if (chat.type == 0) "Saved messages" else chat.chat}",
+                    "$mark$name$count",
                     Modifier.fillMaxWidth().clickable { choose(chat.chat) }.padding(vertical = 4.dp),
                 )
             }

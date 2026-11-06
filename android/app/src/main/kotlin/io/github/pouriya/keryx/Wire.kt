@@ -383,6 +383,29 @@ sealed interface Input {
     data class CallEvent(
         val event: JsonObject,
     ) : Input
+
+    /** `save_rows` was written, all of it. */
+    @Serializable
+    @SerialName("rows_saved")
+    data class RowsSaved(
+        val id: Long,
+    ) : Input
+
+    /** `save_rows` was not written. Nothing of it stayed. */
+    @Serializable
+    @SerialName("rows_save_failed")
+    data class RowsSaveFailed(
+        val id: Long,
+    ) : Input
+
+    /** `read_rows`'s answer: messages oldest first, and the call rows among them. */
+    @Serializable
+    @SerialName("rows_read")
+    data class RowsRead(
+        val id: Long,
+        val message_list: List<MessageFrame>,
+        val call_list: List<CallRow>,
+    ) : Input
 }
 
 @Serializable
@@ -489,6 +512,25 @@ sealed interface Output {
         val offset: Long,
         val chunk: Long,
     ) : Output
+
+    /** Keep these rows, then answer with `rows_saved` or `rows_save_failed`. */
+    @Serializable
+    @SerialName("save_rows")
+    data class SaveRows(
+        val id: Long,
+        val message_list: List<MessageFrame>,
+        val call_list: List<CallRow>,
+    ) : Output
+
+    /** Read up to `limit` newest messages below `before_seq`, and answer with `rows_read`. */
+    @Serializable
+    @SerialName("read_rows")
+    data class ReadRows(
+        val id: Long,
+        val chat: String,
+        val before_seq: Long? = null,
+        val limit: Int,
+    ) : Output
 }
 
 @Serializable
@@ -515,11 +557,26 @@ data class MessageFrame(
     val encrypted: Boolean? = null,
     val epoch: Long? = null,
     val pointer_seq: Long? = null,
-    val call_seq: Long? = null,
     val client_sent_at: Long? = null,
     val server_saved_at: Long? = null,
     val body: String? = null,
     val signature: String? = null,
+)
+
+/** One row of a call, as `sync` and `save_rows` carry it. Kinds: 0 join, 1 leave, 2 decline, 3 text, 4 end. */
+@Serializable
+data class CallRow(
+    val chat: String,
+    val call_seq: Long,
+    val n: Long,
+    val kind: Int,
+    val device: String,
+    val server_at: Long,
+    val client_at: Long? = null,
+    val epoch: Long? = null,
+    val signature: String? = null,
+    val body: String? = null,
+    val outcome: Int? = null,
 )
 
 @Serializable
@@ -676,6 +733,13 @@ sealed interface Event {
     @SerialName("chats")
     data class Chats(
         val chat_list: List<ChatItem>,
+    ) : Event
+
+    /** This account's devices so far, so unread can leave out its own messages. */
+    @Serializable
+    @SerialName("own_devices")
+    data class OwnDevices(
+        val device_list: List<String>,
     ) : Event
 
     @Serializable
