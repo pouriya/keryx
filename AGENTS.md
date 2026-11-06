@@ -513,7 +513,9 @@ so groups and channels fit later; recording comes after the phone test.
   Android client for now. **A keyframe comes every 2 seconds, and at once on each `join`, chosen by
   the author:** each sender forces one when a join arrives on the `events` track, which everyone in the
   call already reads, so a joiner gets video at once with no new request in the protocol.
-- **Live calls are H.264 video and Opus audio**, the same as recordings. Android encodes both through
+- **Live calls are H.264 video and Opus audio**, the same as recordings. **Live H.264 is Constrained
+  Baseline, chosen by the author:** every hardware decoder and browser plays it, and with no B-frames
+  frames leave in capture order with no reordering delay, at about 10 to 15% less efficiency than High. Android encodes both through
   MediaCodec, which has Opus from Android 10, so the Android client starts at API 29.
 - **The code, chosen by the author:** `core/src/call.rs` has no I/O and holds SFrame sealing and
   opening, the media frame layout, the `state` track and call events, driven by `client.rs`. A new
