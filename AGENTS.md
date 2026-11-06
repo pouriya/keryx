@@ -440,6 +440,45 @@ so groups and channels fit later; recording comes after the phone test.
   zero. It costs a byte per frame. 05 keeps `TRACK_INFO`, so audio's priority over video, ordering and
   the latency window travel with each track, and it is the version a later browser MoQ client and
   `moq-net` 0.3 are most likely to speak.
+- **`keryx-moq` runs its own tokio runtime and gives its callers a plain handle, chosen by the author.**
+  Both callers are synchronous: `android/ffi/` has no tokio and drives core's no-I/O commands, and the
+  server's tests block. So each call gets one current-thread runtime on its own thread. Sends never
+  block, as they queue to that runtime, and incoming frames come from a blocking `next(timeout)`. One
+  thread per call, and a device has one call at a time.
+- **`keryx-moq`'s API is typed per track, chosen by the author:** `Call::connect(url, bearer, key,
+  index_list)`, then `audio(ts, bytes)`, `video(ts, bytes, keyframe)`, where a keyframe starts a new
+  MoQ group, `state(State)`, `text(CallText)` and `rekey(key, index_list)`. One incoming `Event`:
+  `Audio{device, ts, bytes}`, `Video{device, ts, bytes}`, `State{device, State}`, `CallEvent` and
+  `Closed{code, reason}`. Track names and grouping live in one place, so no caller can name a wrong
+  track.
+- **The relay's cache is `[limits] call_cache`, 16 MiB by default, chosen by the author.** It is
+  `moq-net`'s process-wide byte budget for cached groups, unbounded unless a relay sets it. **It never
+  evicts a track's newest group, so it does not limit how many calls run:** it is the room for older
+  groups a receiver that fell behind catches up from. A direct call at the phone test's 500 kbps holds
+  about one 2-second group of video per device, about 122 KiB, plus a little audio. Counted in both the
+  device's origin and the shared one, that is about 0.5 MiB of older groups per call, so 16 MiB serves
+  **about 32 direct calls at once** with full catch-up room: about 64 if the copy is charged once, and
+  about 16 if two groups sit in the window. Past that, older groups go first, so a receiver that falls
+  behind skips to the newest keyframe sooner. Calls keep running, and memory still grows by the newest
+  groups, about 0.25 MiB per extra call.
+- **Track priority and windows are fixed in code, chosen by the author:** `events` before `audio` before
+  `state` before `video`, so voice survives a weak link. `latency_max` is 500 ms for `audio`, 2 seconds
+  for `video`, one group at the keyframe interval, and 2 seconds for `state` and `events`. The newest
+  group is always kept, so a joiner gets the current state.
+- **A call socket's keep-alive is `qmux`'s, set from the chat socket's keys, chosen by the author.** Once
+  `qmux` owns the WebSocket, keryx's own ping timer cannot send on it. So `qmux`'s `KeepAlive` pings
+  every `[limits] ping_after` and closes when nothing arrives within `ping_after` plus `ping_timeout`,
+  about 10 seconds, as on the chat socket. Browsers answer WebSocket pings themselves. A dead phone then
+  leaves after about 20 seconds: 10 to notice and the 10-second drop grace.
+- **A device's new connection to a call replaces its old one, chosen by the author.** The relay closes
+  the old one with 1000 and reason `replaced` and moves the device's broadcast to the new one, writing
+  no `leave` or `join`, as within the drop grace. A phone that switched networks before the server
+  noticed its old socket was dead is never locked out of its own call.
+- **When the server ends a call with devices still in it, it says so first, chosen by the author.** The
+  chat's task writes `end` and publishes it on `events` and as `call_event` on the chat's WebSocket,
+  then the relay closes each device's call socket with 1000 and reason `call_ended`. This covers a call
+  that rang out with its caller still there. **Deleting an open call ends it this way first**, then wipes
+  it with its events, so devices see the end before the message goes.
 - **keryx's own layout on MoQ, not `hang`'s:** each device's broadcast, named by its device id, has
   `state`, `audio`, `video` and `text` tracks, and the server's broadcast `server` has `events`. Every
   media frame is SFrame-encrypted with its timestamp inside, and a video keyframe starts a new MoQ
@@ -926,6 +965,7 @@ accepts the first for each step. The loser gets a rejection, catches up and retr
   ping_timeout = "5s"       # each ping's time to answer, or the connection closes
   key_packages = 100        # the most one device may keep on the server
   call_frame = "256KiB"     # one frame on a call's state, audio or video track. Larger: that device leaves
+  call_cache = "16MiB"      # the relay's room for older groups. Newest groups are always kept
 
   [limits.body]             # one message's body. A file's bytes upload separately
   text = "64KiB"
