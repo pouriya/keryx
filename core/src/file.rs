@@ -20,6 +20,8 @@ pub const CHUNK: u64 = 1024 * 1024;
 pub const TAG: u64 = 16;
 /// The most files one bundle holds, fixed by the author.
 pub const BUNDLE_FILES: usize = 20;
+/// Music's one type: MP3, chosen by the author.
+pub const MUSIC_TYPE: &str = "audio/mpeg";
 
 /// The associated data's label, so a chunk's seal can never be taken for anything else's.
 const CHUNK_LABEL: &[u8] = b"keryx v1 file chunk";
@@ -44,8 +46,9 @@ pub enum FileError {
 }
 
 /// What a message says about one of its files, inside its encryption. `size` is the real size, and
-/// `width`, `height` and `blurhash` are for images and videos. `description` is an image's or
-/// video's own text in a bundle.
+/// `width`, `height` and `blurhash` are for images, videos and a music file's cover. `description`
+/// is an image's or video's own text in a bundle. `title`, `artist` and `duration`, in milliseconds,
+/// are music's, from its tags.
 #[cfg_attr(feature = "wasm", derive(tsify::Tsify), tsify(missing_as_null))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileInfo {
@@ -65,6 +68,12 @@ pub struct FileInfo {
     pub blurhash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artist: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration: Option<u64>,
 }
 
 /// A new random key, for one file only.

@@ -174,10 +174,13 @@ the WASM build, because there is one `Cargo.lock`. Make targets stay inside
   or edit points at its target, a reply at the message replied to, and a reaction at
   the message it is on.
 - **A reply is a property of a message, not a kind:** a content message with a pointer.
-- **Every content message has a `content_kind`:** text, voice, reaction, image, video, doc,
+- **Every content message has a `content_kind`:** text, voice, reaction, image, music, video, doc,
   file, `call` (one per call, saved, and can be replied to: see Calls), and `media_bundle` (several
   images and videos in one message, built with files, chosen by the author). The server can read
-  `content_kind`, so roles can allow or refuse each one.
+  `content_kind`, so roles can allow or refuse each one. **Music is an MP3, apart from voice, which
+  is a recorded note, chosen by the author.** It is numbered 4, right after image, and every kind
+  from video on moved up one, so the numbers are text 0, voice 1, reaction 2, image 3, music 4,
+  video 5, doc 6, file 7, call 8 and media_bundle 9.
 - **A reaction is content.** It does not affect the unread count, but it brings the chat up in
   the sorted list and shows as the preview, like "Sara reacted 👍", until the next message.
 - **A recording, when it is built, is saved at the lowest quality for now:**
@@ -328,7 +331,8 @@ chosen by the author**, fixed in code: long enough for a slow upload of a large 
 - **Chunks can be read only once a sent message has marked the file to stay.** Nobody fetches a
   half-upload.
 - **Limits are per declared type under `[limits.upload]`, chosen by the author:** voice 50 MiB, image
-  20 MiB, video 2 GiB, doc 100 MiB and file 2 GiB, each changeable. A file's real type is encrypted, so
+  20 MiB, music 200 MiB, video 2 GiB, doc 100 MiB and file 2 GiB, each changeable. Music's 200 MiB
+  holds about 80 minutes of MP3 at 320 kbps, so an album or a long mix goes as one file. A file's real type is encrypted, so
   the server trusts what a client declares, and a client that lies gets the largest limit.
 - **There are no quotas for now**, only the per-file limits. They stay open, as rate limits do.
 - **The bytes live under `[files] directory` in `server.toml`**, an absolute path like `[www]`, with a
@@ -338,6 +342,12 @@ chosen by the author**, fixed in code: long enough for a slow upload of a large 
   right space before downloading. **BlurHash is made and read by core with the `blurhash` crate**, the
   platform handing it small RGBA pixels, so there is one implementation. **A file message may carry an
   optional caption.**
+- **Music is one MP3, of type `audio/mpeg`, and core refuses anything else with `bad_files`, chosen by
+  the author**, since the server cannot see a file's type. A modified client could still mislabel one,
+  and receivers open files by their type, so that does no harm. **Music carries optional `title`,
+  `artist` and `duration` in milliseconds from its tags, and its cover as a BlurHash with the cover's
+  `width` and `height`, chosen by the author.** Core keeps `title`, `artist` and `duration` on music
+  only. Music never goes in a bundle.
 - **`media_bundle` holds images and videos only, at most 20, fixed in core**, each with its own upload
   limit by its type. **Each image and video may carry its own optional description, chosen by the
   author**, and the bundle one optional caption. Its body limit is 64 KiB, which holds all of them. **An edit may remove files from
@@ -1037,6 +1047,7 @@ accepts the first for each step. The loser gets a rejection, catches up and retr
   reaction = "1KiB"
   voice = "16KiB"
   image = "16KiB"
+  music = "16KiB"
   video = "16KiB"
   doc = "16KiB"
   file = "16KiB"
@@ -1046,6 +1057,7 @@ accepts the first for each step. The loser gets a rejection, catches up and retr
   [limits.upload]           # one file's encrypted bytes, by the type its uploader declares
   voice = "50MiB"
   image = "20MiB"
+  music = "200MiB"
   video = "2GiB"
   doc = "100MiB"
   file = "2GiB"

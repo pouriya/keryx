@@ -2398,6 +2398,12 @@ fn files_go_up_in_order_are_kept_by_a_sent_message_and_go_with_its_delete() {
         create_file(&pair, &sara, 3, huge, 21).1["code"],
         "file_too_large"
     );
+    // Music, an MP3, has its own limit of 200 MiB.
+    let album = 201 * (1024 * 1024 + 16);
+    assert_eq!(
+        create_file(&pair, &sara, 4, album, 201).1["code"],
+        "file_too_large"
+    );
     let (status, reply) = create_file(&pair, &sara, 3, size, 2);
     assert_eq!(status, 200);
     let file = reply["data"]["file"].as_str().unwrap().to_string();
@@ -2548,6 +2554,9 @@ fn spec(handle: u64, kind: ContentKind, size: usize) -> FileSpec {
         height: None,
         thumbnail: None,
         description: None,
+        title: None,
+        artist: None,
+        duration: None,
     }
 }
 

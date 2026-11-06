@@ -1617,7 +1617,7 @@ impl Storage for Sqlite {
                 connection.execute(
                     "UPDATE message SET call_outcome = COALESCE(call_outcome, ?3),
                      call_ended_at = COALESCE(call_ended_at, ?4)
-                     WHERE conversation_id = ?1 AND seq = ?2 AND content_kind = 7",
+                     WHERE conversation_id = ?1 AND seq = ?2 AND content_kind = 8",
                     params![
                         change.chat.bytes(),
                         int(change.call_seq),
@@ -1656,12 +1656,12 @@ impl Storage for Sqlite {
                  COALESCE((SELECT MAX(e.n) FROM call_event e
                            WHERE e.conversation_id = m.conversation_id AND e.call_seq = m.seq), 0)
                  + 1, 4, m.device_id, ?1
-                 FROM message m WHERE m.content_kind = 7 AND m.call_ended_at IS NULL",
+                 FROM message m WHERE m.content_kind = 8 AND m.call_ended_at IS NULL",
                 params![now],
             )?;
             connection.execute(
                 "UPDATE message SET call_outcome = COALESCE(call_outcome, 0), call_ended_at = ?1
-                 WHERE content_kind = 7 AND call_ended_at IS NULL",
+                 WHERE content_kind = 8 AND call_ended_at IS NULL",
                 params![now],
             )?;
             Ok(())

@@ -237,8 +237,8 @@ fn a_message_is_whole_or_only_its_sequence_id() {
 #[test]
 fn kinds_and_their_fields_go_together() {
     let connection = world();
-    // 8 is media_bundle, and 9 does not exist.
-    assert!(message(&connection, 30, 1, 11, 0, Some(9), Some(1)).is_err());
+    // 9 is media_bundle, and 10 does not exist.
+    assert!(message(&connection, 30, 1, 11, 0, Some(10), Some(1)).is_err());
     assert!(message(&connection, 30, 1, 11, 5, None, Some(1)).is_err());
     assert!(message(&connection, 30, 1, 11, 0, None, Some(1)).is_err());
     assert!(message(&connection, 30, 1, 11, 1, Some(0), Some(1)).is_err());
@@ -484,7 +484,7 @@ async fn calls_still_open_at_startup_end_and_keep_an_answer() {
     direct(&connection, 30, 1, 2).unwrap();
     // 1 rings, 2 was answered and has a join, 3 ended long ago, 4 is text.
     for seq in 1..=3 {
-        message(&connection, 30, seq, 11, 0, Some(7), Some(1)).unwrap();
+        message(&connection, 30, seq, 11, 0, Some(8), Some(1)).unwrap();
     }
     message(&connection, 30, 4, 11, 0, Some(0), Some(1)).unwrap();
     connection

@@ -429,10 +429,10 @@ CREATE TABLE message (
     kind               INTEGER CHECK (kind BETWEEN 0 AND 4),
     -- [RBAC, Chat list, Calls] what a content message is, and NULL for every other kind. Readable
     -- by the server even in an encrypted chat, so roles can allow or refuse each one:
-    -- 0 text, 1 voice, 2 reaction, 3 image, 4 video, 5 doc, 6 file,
-    -- 7 call (one per call, saved, and can be replied to; what happens inside it is in
-    -- call_event), 8 media_bundle (several images and videos in one message).
-    content_kind       INTEGER CHECK (content_kind BETWEEN 0 AND 8),
+    -- 0 text, 1 voice, 2 reaction, 3 image, 4 music (an MP3), 5 video, 6 doc, 7 file,
+    -- 8 call (one per call, saved, and can be replied to; what happens inside it is in
+    -- call_event), 9 media_bundle (several images and videos in one message).
+    content_kind       INTEGER CHECK (content_kind BETWEEN 0 AND 9),
     -- [Unencrypted messages] the flag that tells a client how to read the body.
     encrypted          INTEGER CHECK (encrypted IN (0, 1)),
     -- [Restore, Commit order] the key this was encrypted under, and for a commit, the step it
@@ -462,8 +462,8 @@ CREATE TABLE message (
     PRIMARY KEY (conversation_id, seq),
     CHECK (encrypted = 0 OR epoch IS NOT NULL),
     CHECK ((kind = 0) = (content_kind IS NOT NULL)),
-    CHECK (call_outcome IS NULL OR content_kind = 7),
-    CHECK (call_ended_at IS NULL OR content_kind = 7),
+    CHECK (call_outcome IS NULL OR content_kind = 8),
+    CHECK (call_ended_at IS NULL OR content_kind = 8),
     CHECK (kind <> 3 OR epoch IS NOT NULL),
     CHECK (kind NOT IN (1, 2) OR pointer_seq IS NOT NULL),
     CHECK (content_kind IS NOT 2 OR encrypted = 1 OR pointer_seq IS NOT NULL),
@@ -491,7 +491,7 @@ CREATE UNIQUE INDEX message_commit ON message (conversation_id, epoch) WHERE kin
 CREATE INDEX message_edit ON message (conversation_id, pointer_seq) WHERE kind = 1;
 -- [Calls] calls still open, ended at startup since nobody can be in them after a restart.
 CREATE INDEX message_open_call ON message (conversation_id, seq)
-    WHERE content_kind = 7 AND call_ended_at IS NULL;
+    WHERE content_kind = 8 AND call_ended_at IS NULL;
 -- [Retention] the sweep.
 CREATE INDEX message_expiry ON message (expires_at) WHERE expires_at IS NOT NULL;
 
@@ -586,8 +586,8 @@ CREATE TABLE file (
     -- [Unencrypted messages] 0 only for files in an unencrypted chat.
     encrypted        INTEGER NOT NULL CHECK (encrypted IN (0, 1)),
     -- [Upload limits] the type its uploader declared, which picks the limit: 1 voice, 3 image,
-    -- 4 video, 5 doc, 6 file, as message.content_kind. The real type is encrypted.
-    kind             INTEGER NOT NULL CHECK (kind IN (1, 3, 4, 5, 6)),
+    -- 4 music, 5 video, 6 doc, 7 file, as message.content_kind. The real type is encrypted.
+    kind             INTEGER NOT NULL CHECK (kind IN (1, 3, 4, 5, 6, 7)),
     -- [Quotas, Upload limits] the exact encrypted size in bytes.
     size             INTEGER NOT NULL CHECK (size >= 0),
     -- [Files] how many chunks it is uploaded in.

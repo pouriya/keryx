@@ -90,17 +90,19 @@ numbered!(
 
 numbered!(
     /// The numbers are the `message.content_kind` column's. `Call` is one call, with everything
-    /// inside it kept beside it. `MediaBundle` is several images and videos in one message.
+    /// inside it kept beside it. `MediaBundle` is several images and videos in one message. `Music` is
+    /// an MP3, apart from `Voice`, which is a recorded note.
     ContentKind {
         Text = 0,
         Voice = 1,
         Reaction = 2,
         Image = 3,
-        Video = 4,
-        Doc = 5,
-        File = 6,
-        Call = 7,
-        MediaBundle = 8,
+        Music = 4,
+        Video = 5,
+        Doc = 6,
+        File = 7,
+        Call = 8,
+        MediaBundle = 9,
     }
 );
 

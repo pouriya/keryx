@@ -119,7 +119,9 @@ pub struct Thumbnail {
 }
 
 /// One file to send. The platform holds its bytes as `handle`, its own number, and core asks for
-/// them chunk by chunk. `kind` is voice, image, video, doc or file, and `size` its real size.
+/// them chunk by chunk. `kind` is voice, image, music, video, doc or file, and `size` its real size.
+/// Music is an MP3 only, whose type is `audio/mpeg`: its `title`, `artist` and `duration` in
+/// milliseconds come from its tags, and its cover goes as `thumbnail`, with `width` and `height`.
 #[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileSpec {
@@ -138,6 +140,12 @@ pub struct FileSpec {
     /// An image's or video's own text, in a bundle.
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub artist: Option<String>,
+    #[serde(default)]
+    pub duration: Option<u64>,
 }
 
 /// What the person does.
@@ -1940,6 +1948,7 @@ impl Client {
                 one.kind,
                 ContentKind::Voice
                     | ContentKind::Image
+                    | ContentKind::Music
                     | ContentKind::Video
                     | ContentKind::Doc
                     | ContentKind::File
@@ -1957,6 +1966,12 @@ impl Client {
                 "A message holds one file, or up to 20 images and videos",
             );
         }
+        if specs
+            .iter()
+            .any(|spec| spec.kind == ContentKind::Music && spec.mime != file::MUSIC_TYPE)
+        {
+            return self.error("bad_files", "Music is an MP3 only, of type audio/mpeg");
+        }
         let content_kind = match specs.first() {
             Some(spec) if !bundle => spec.kind,
             _ => ContentKind::MediaBundle,
@@ -1973,6 +1988,7 @@ impl Client {
                 }
                 None => None,
             };
+            let music = spec.kind == ContentKind::Music;
             files.push(UpFile {
                 handle: spec.handle,
                 info: FileInfo {
@@ -1987,6 +2003,9 @@ impl Client {
                     height: spec.height,
                     blurhash,
                     description: spec.description,
+                    title: spec.title.filter(|_| music),
+                    artist: spec.artist.filter(|_| music),
+                    duration: spec.duration.filter(|_| music),
                 },
                 key,
                 next: 0,

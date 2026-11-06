@@ -105,6 +105,7 @@ fn kinds_match_the_schema() {
         ContentKind::Voice,
         ContentKind::Reaction,
         ContentKind::Image,
+        ContentKind::Music,
         ContentKind::Video,
         ContentKind::Doc,
         ContentKind::File,

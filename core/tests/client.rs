@@ -4375,6 +4375,9 @@ fn spec(handle: u64, kind: ContentKind, size: u64) -> FileSpec {
         height: None,
         thumbnail: None,
         description: None,
+        title: None,
+        artist: None,
+        duration: None,
     }
 }
 
@@ -4591,6 +4594,69 @@ fn a_bundle_holds_images_and_videos_and_an_edit_and_a_delete_name_the_files_they
 }
 
 #[test]
+fn music_carries_its_tags_and_cover_and_other_files_do_not() {
+    let (mut world, omid, mina, chat) = pair();
+    for handle in [1, 2] {
+        world.phones[omid].held.insert(handle, vec![7; 10]);
+    }
+    let tagged = |mut one: FileSpec| {
+        one.title = Some("Song".to_string());
+        one.artist = Some("Band".to_string());
+        one.duration = Some(225_500);
+        one
+    };
+    let mut song = tagged(spec(1, ContentKind::Music, 10));
+    song.mime = file::MUSIC_TYPE.to_string();
+    song.width = Some(300);
+    song.height = Some(300);
+    song.thumbnail = Some(Thumbnail {
+        width: 4,
+        height: 4,
+        rgba: vec![90; 4 * 4 * 4],
+    });
+    let plain = tagged(spec(2, ContentKind::File, 10));
+    for one in [song, plain] {
+        world.command(
+            omid,
+            Command::SendFiles {
+                chat,
+                files: vec![one],
+                text: None,
+            },
+        );
+        world.settle();
+    }
+    assert!(world.errors(omid).is_empty(), "{:?}", world.errors(omid));
+    let files = shown_files(&world, mina, chat);
+    let mut shown = files.values().map(|(_, list)| list[0].clone());
+    let music = shown.next().unwrap();
+    assert_eq!(
+        (
+            music.kind,
+            music.mime.as_str(),
+            music.title.as_deref(),
+            music.artist.as_deref(),
+            music.duration,
+            music.width
+        ),
+        (
+            ContentKind::Music,
+            "audio/mpeg",
+            Some("Song"),
+            Some("Band"),
+            Some(225_500),
+            Some(300)
+        )
+    );
+    assert!(music.blurhash.is_some());
+    let other = shown.next().unwrap();
+    assert_eq!(
+        (other.kind, other.title, other.artist, other.duration),
+        (ContentKind::File, None, None, None)
+    );
+}
+
+#[test]
 fn a_message_holds_one_file_or_a_bundle_and_a_client_with_no_device_sends_none() {
     let mut client = Client::new(Auth::Cookie, platform());
     let out = command(
@@ -4604,11 +4670,16 @@ fn a_message_holds_one_file_or_a_bundle_and_a_client_with_no_device_sends_none()
     assert!(matches!(&events(&out)[0], Event::Error { code, .. } if code == "no_device"));
     let (mut world, omid, _, chat) = pair();
     let image = |handle| spec(handle, ContentKind::Image, 1);
+    let mut mp3 = spec(2, ContentKind::Music, 1);
+    mp3.mime = file::MUSIC_TYPE.to_string();
     for files in [
         Vec::new(),
         vec![spec(1, ContentKind::Reaction, 1)],
         vec![image(1), spec(2, ContentKind::Doc, 1)],
         (0..21).map(image).collect(),
+        // Music is an MP3 only, and never in a bundle.
+        vec![spec(1, ContentKind::Music, 1)],
+        vec![image(1), mp3],
     ] {
         let before = world.errors(omid).len();
         world.command(

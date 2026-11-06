@@ -1263,6 +1263,7 @@ async fn check_files(app: &App, session: Session, frame: &SendFrame) -> Result<(
             Some(
                 ContentKind::Voice
                 | ContentKind::Image
+                | ContentKind::Music
                 | ContentKind::Video
                 | ContentKind::Doc
                 | ContentKind::File,
