@@ -65,7 +65,7 @@ web/            The browser client: the account screens and the chat list, on ho
 android/        The Android client, in Kotlin and Jetpack Compose
   AGENTS.md     The Android client's decisions and rules
   ffi/          A workspace crate holding only the hand-written JNI glue around keryx-core
-moq/            A workspace crate, keryx-moq: only the native MoQ client for calls, over WebSocket
+moq/            A workspace crate, keryx-moq: the native MoQ client for calls, over WebSocket, sealing its frames
 ```
 
 **`server/` and `core/` follow the strict rules.** The file lists are closed, code
@@ -379,6 +379,18 @@ so groups and channels fit later; recording comes after the phone test.
   started instead. **If nobody else joins within 60 seconds, fixed in code, the server ends it as
   missed.** The server writes the readable outcome on the call's message row, `call_outcome` missed or
   answered, with `call_ended_at`, and an `end` event inside the call.
+- **A dropped connection gets 10 seconds, fixed in code, before it counts as a leave, chosen by the
+  author.** A clean close of the call's MoQ is a leave at once. A device that reconnects within the 10
+  seconds writes no leave and no new join, so a blip from the caller while it rings does not end the
+  call as missed. Without it, the last device's blip would end the call for good.
+- **A chat has at most one open call, chosen by the author.** Starting another while one has not ended
+  is refused with `call_open`, naming the open call's sequence id, so the client joins that one. Two
+  people calling each other at once meet in one room, not two that each ring.
+- **The chat's task does not idle out while its chat has an open call, chosen by the author.** It holds
+  the call's state in memory: who is in it, the next `n`, the 60-second missed timer and the 10-second
+  drop timers. A voice-only call sends the task nothing, so `[chat] idle_after` would otherwise end it
+  mid-call. Once the call ends, the idle timeout counts again. Calls still open at startup are ended,
+  since nobody can be in them after a restart, so the state is never rebuilt from the database.
 - **Turning video or voice on or off is live only**, never saved: each device's encrypted `state` track
   says what it has on.
 
@@ -395,7 +407,10 @@ so groups and channels fit later; recording comes after the phone test.
 - **WebSocket only for now, with no QUIC**: MoQ over `qmux` on a WebSocket, on the same port as the API at
   `GET /api/v1/calls/{chat}/{call_seq}/moq`, with the same cookie or Bearer token as the chat's
   WebSocket. A device is admitted only if it is a member of the chat and the call has not ended. It may
-  publish only under its own device id, and may read everyone in that call.
+  publish only under its own device id, and may read everyone in that call. **A refused device is
+  answered as the chat's WebSocket answers, chosen by the author:** the upgrade is accepted, then closed
+  with code 4403 and the refusal's code as the reason, so browsers, which cannot read a failed upgrade's
+  reply, and native clients get one rule. `keryx-moq` reads that close reason before any MoQ setup.
 - **keryx's own layout on MoQ, not `hang`'s:** each device's broadcast, named by its device id, has
   `state`, `audio`, `video` and `text` tracks, and the server's broadcast `server` has `events`. Every
   media frame is SFrame-encrypted with its timestamp inside, and a video keyframe starts a new MoQ
@@ -415,15 +430,24 @@ so groups and channels fit later; recording comes after the phone test.
   body**, since the server sees who sent it anyway. **Text is encrypted and signed like a message**, with
   header kind content, content kind text and `call_seq` set, so it can never pass for a chat message. A
   device sends text on its `text` track as `{client_at, epoch, signature, body}`.
+- **One frame on a call's tracks is at most `[limits] call_frame`, 256 KiB by default, chosen by the
+  author**, for `state`, `audio` and `video`. Text on the `text` track uses `[limits.body] text`. A
+  larger frame closes that device's connection to the call. The relay forwards and keeps each track's
+  current group, so without a limit one member could fill the server's memory.
 - **Live video for the phone test is 640x360 at 15 fps and 500 kbps, chosen by the author**, fixed in the
-  Android client for now.
+  Android client for now. **A keyframe comes every 2 seconds, and at once on each `join`, chosen by
+  the author:** each sender forces one when a join arrives on the `events` track, which everyone in the
+  call already reads, so a joiner gets video at once with no new request in the protocol.
 - **Live calls are H.264 video and Opus audio**, the same as recordings. Android encodes both through
   MediaCodec, which has Opus from Android 10, so the Android client starts at API 29.
 - **The code, chosen by the author:** `core/src/call.rs` has no I/O and holds SFrame sealing and
   opening, the media frame layout, the `state` track and call events, driven by `client.rs`. A new
-  workspace crate `moq/` (`keryx-moq`) holds only the native MoQ client over `qmux`'s WebSocket,
-  used by `android/ffi/` and by the server's tests. On Android it lives inside keryx's own bridge, so
-  Kotlin only captures, encodes and decodes.
+  workspace crate `moq/` (`keryx-moq`) holds the native MoQ client over `qmux`'s WebSocket, used by
+  `android/ffi/` and by the server's tests. **It seals and opens frames itself, chosen by the author:**
+  it depends on `keryx-core`, takes the `CallKey` and the members' MLS indexes, and its callers hand it
+  plain codec frames and get plain frames back. So `android/ffi/` and the tests share one path, and
+  keys never leave Rust. On Android it lives inside keryx's own bridge, so Kotlin only captures,
+  encodes and decodes.
 
 ### Sending a message
 
@@ -872,6 +896,7 @@ accepts the first for each step. The loser gets a rejection, catches up and retr
   ping_every = "15s"        # then one ping this often
   ping_timeout = "5s"       # each ping's time to answer, or the connection closes
   key_packages = 100        # the most one device may keep on the server
+  call_frame = "256KiB"     # one frame on a call's state, audio or video track. Larger: that device leaves
 
   [limits.body]             # one message's body. A file's bytes upload separately
   text = "64KiB"
@@ -1237,6 +1262,8 @@ another device still holding the key.
 - Calls in groups and channels: who may start one, and who may send video or voice in a channel
 - Recording: how it is chosen now that each person picks what they send, and who records
 - Video size, frame rate and bitrate for live calls beyond the phone test
+- How the `call_open` refusal carries the open call's sequence id: a refusal has only `code` and
+  `message` today
 
 **Attachments and search**
 
