@@ -42,12 +42,13 @@ not claim it passed without running it.
 
 | Target | What it does |
 |--------|--------------|
-| `make all` | **The gate**: `dev` + `clippy` + `coverage` + `check-style` |
+| `make all` | **The gate**: `dev` + `clippy` + `moq` + `coverage` + `check-style` |
 | `make dev` | Debug build → `build/keryx-<version>-<target>-dev` |
 | `make release` | Release build → `build/keryx-<version>-<target>` |
 | `make version` | Prints the `Cargo.toml` version |
 | `make start-dev` | `make dev`, then runs `serve` with `--debug` |
 | `make clippy` | `cargo clippy --all-targets --no-deps -- -D warnings` |
+| `make moq` | `make lint` in `../moq`, since the tests use keryx-moq as their call client |
 | `make check-style` | `cargo fmt --check` |
 | `make fmt` | Rewrites formatting in place |
 | `make lint` | `clippy` + `check-style`, no build |

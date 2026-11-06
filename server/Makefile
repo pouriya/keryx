@@ -5,7 +5,7 @@ CARGO_TARGET_DIR ?= ../target
 COVERAGE_TABLE=tests/AGENTS.md
 
 
-all: dev clippy coverage check-style
+all: dev clippy moq coverage check-style
 
 
 version:
@@ -43,6 +43,11 @@ fmt:
 	cargo fmt
 
 
+# keryx-moq's own lint, chosen by the author: the tests use it as their call client.
+moq:
+	$(MAKE) -C ../moq lint
+
+
 lint: clippy check-style
 
 
@@ -75,4 +80,4 @@ dist-clean: clean
 	rm -rf ${BUILD_DIR}
 
 
-.PHONY: all version dev release start-dev clippy check-style fmt lint test coverage clean dist-clean
+.PHONY: all version dev release start-dev clippy moq check-style fmt lint test coverage clean dist-clean

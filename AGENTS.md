@@ -66,6 +66,7 @@ android/        The Android client, in Kotlin and Jetpack Compose
   AGENTS.md     The Android client's decisions and rules
   ffi/          A workspace crate holding only the hand-written JNI glue around keryx-core
 moq/            A workspace crate, keryx-moq: the native MoQ client for calls, over WebSocket, sealing its frames
+  AGENTS.md     keryx-moq's layout, dependencies and checks
 ```
 
 **`server/` and `core/` follow the strict rules.** The file lists are closed, code
@@ -75,7 +76,8 @@ integration tests. **`web/` is loose for now, by the author's choice:** see
 `android/ffi/`, which follows core's strict Rust rules: see [android/AGENTS.md](android/AGENTS.md).
 **`moq/` follows core's strict Rust rules the same way, chosen by the author**, and is checked by clippy
 and fmt. The server's integration tests use it as their call client, so it has no tests or coverage
-table of its own.
+table of its own. **It is one file with its own Makefile and AGENTS.md, chosen by the author**: see
+[moq/AGENTS.md](moq/AGENTS.md). The server's `make all` runs its `make lint` too, since its tests use it.
 
 **`web/wasm/` is its own crate, not a module in `core/`**, so `core/` holds no JavaScript glue and
 its native coverage is not pulled down by code its tests cannot run. **`android/ffi/` is its sibling
@@ -87,7 +89,7 @@ and read the same MLS state. One implementation means one thing to audit.
 
 **The workspace is what keeps crypto versions identical** between the server and
 the WASM build, because there is one `Cargo.lock`. Make targets stay inside
-`server/`, `core/` and `web/`.
+`server/`, `core/`, `web/`, `android/` and `moq/`.
 
 ## What has been decided
 
@@ -437,13 +439,25 @@ so groups and channels fit later; recording comes after the phone test.
   publish only under its own device id, and may read everyone in that call. **A refused device is
   answered as the chat's WebSocket answers, chosen by the author:** the upgrade is accepted, then closed
   with code 4403 and the refusal's code as the reason, so browsers, which cannot read a failed upgrade's
-  reply, and native clients get one rule. `keryx-moq` reads that close reason before any MoQ setup.
+  reply, and native clients get one rule. **`keryx-moq` reports it as every other ending, chosen by the
+  author:** `Call::connect` returns once the WebSocket is upgraded, and a refusal arrives from `next()`
+  as `Closed{4403, code}`, beside `1000 call_ended` and `1000 replaced`. A socket that ends with no close
+  frame is `Closed{1006}`, as the WebSocket standard says. Since an admitted socket sends nothing at
+  once, `connect` could not know how long to wait for a refusal.
+- **The call socket's subprotocol is `qmux-02.moq-lite-05` only, chosen by the author:** qmux's own
+  form, its newest draft, and moq-lite 05. Both ends offer and accept exactly this one, so a stock MoQ
+  client, such as a later browser one, can connect. keryx's own version stays in the `/api/v1` path.
 - **`keryx-moq` opens the WebSocket itself, then hands it to `qmux`, chosen by the author.** `qmux`
   0.5's own `ws::Client` sends no custom headers, so it cannot carry the Bearer token, and secrets never
   go in a URL. It also turns a close frame into a bare `Closed`, losing 4403 and its reason. So
   `keryx-moq` connects with `tokio-tungstenite` 0.29, the version axum already pulls in, sending the
   Bearer header and the subprotocol. It wraps the stream in a thin adapter that records a close frame's
   code and reason, and gives it to `qmux`'s `Upgraded::with_alpn(..).connect()`. Stock `qmux`, no fork.
+  **`connect` waits at most 10 seconds for the upgrade, fixed in code, chosen by the author**, the same
+  as a dead socket takes to be noticed, so a hung server never freezes a call screen or a test.
+  **It speaks `ws://` only for now, chosen by the author:** no rustls and no root store, as the tests use
+  plain HTTP and the phone test reaches `127.0.0.1:7777` through `adb reverse`. How it trusts a `wss://`
+  server's certificate is on the Open list.
 - **The server keeps axum's `WebSocketUpgrade` and adapts its socket for `qmux`, chosen by the author.**
   So the `Origin` check, cookie or Bearer, subprotocol choice, the `[tcp]` socket wrapper and the 4403
   close work as on the chat's WebSocket. A small Stream and Sink adapter in `moq.rs` maps axum's
@@ -474,7 +488,16 @@ so groups and channels fit later; recording comes after the phone test.
   MoQ group, `state(State)`, `text(CallText)` and `rekey(key, index_list)`. One incoming `Event`:
   `Audio{device, ts, bytes}`, `Video{device, ts, bytes}`, `State{device, State}`, `CallEvent` and
   `Closed{code, reason}`. Track names and grouping live in one place, so no caller can name a wrong
-  track.
+  track. **Each `state` and `text` frame is its own MoQ group, chosen by the author**, as each audio frame
+  is: the relay keeps the newest group, so a joiner reads a sender's current state at once, and a late
+  frame never holds up a newer one. **A frame that will not open is dropped silently, chosen by the
+  author:** an unknown key, a sender index that does not match its broadcast, a device missing from the
+  index list, or bad state JSON. A frame sealed under a key not yet received is normal for a moment
+  during a rekey, and a malicious one gets nothing. **Up to 256 events wait for `next()`, chosen by the
+  author:** past that, new audio, video and state are dropped, and call events and `Closed` are always
+  kept, so a stalled decoder cannot grow memory. **`keryx-moq` logs nothing of its own, chosen by the
+  author**, like core: every ending is an `Event` or a `Result`. `moq-net`'s and `qmux`'s own `tracing`
+  reaches whatever subscriber its caller installs.
 - **The relay's cache is `[limits] call_cache`, 16 MiB by default, chosen by the author.** It is
   `moq-net`'s process-wide byte budget for cached groups, unbounded unless a relay sets it. **It never
   evicts a track's newest group, so it does not limit how many calls run:** it is the room for older
@@ -486,7 +509,9 @@ so groups and channels fit later; recording comes after the phone test.
   behind skips to the newest keyframe sooner. Calls keep running, and memory still grows by the newest
   groups, about 0.25 MiB per extra call.
 - **Track priority and windows are fixed in code, chosen by the author:** `events` before `audio` before
-  `state` before `video`, so voice survives a weak link. `latency_max` is 500 ms for `audio`, 2 seconds
+  `state` before `video`, so voice survives a weak link. **A device's `text` track has the same priority
+  and 2-second window as `events`, chosen by the author**, since it becomes events: it is small and rare,
+  so going first costs voice nothing, and typed words never wait behind video. `latency_max` is 500 ms for `audio`, 2 seconds
   for `video`, one group at the keyframe interval, and 2 seconds for `state` and `events`. The newest
   group is always kept, so a joiner gets the current state.
 - **A call socket's keep-alive is `qmux`'s, set from the chat socket's keys, chosen by the author.** Once
@@ -1354,6 +1379,9 @@ another device still holding the key.
 **Calls**
 
 - QUIC for calls: its UDP port and certificates, when WebSocket alone is not enough
+- How `keryx-moq` trusts a `wss://` server's certificate: Mozilla's roots compiled in, or the platform's
+  own store through `rustls-platform-verifier`. It speaks `ws://` only until a phone has to reach a TLS
+  server
 - Calls in groups and channels: who may start one, and who may send video or voice in a channel
 - Recording: how it is chosen now that each person picks what they send, and who records
 - Video size, frame rate and bitrate for live calls beyond the phone test
