@@ -28,4 +28,26 @@
     <string name="setup_unreachable">به این سرور نمی‌شود رسید.</string>
     <string name="setup_not_keryx">این سرور، سرور کریکس نیست.</string>
     <string name="setup_registration_closed">این سرور ثبت‌نام را اجازه نمی‌دهد.</string>
+    <string name="words_title">کلمات تو</string>
+    <string name="words_keep">این‌ها را یادداشت کن. اگر گم‌شان کنی، ممکن است این حساب را هم از دست بدهی، و هیچ‌کس نمی‌تواند پیام‌های قبلی‌ات را باز کند.</string>
+    <string name="words_count">%1$d کلمه</string>
+    <string name="wrote_them">یادداشت کردم</string>
+    <string name="copy">کپی</string>
+    <string name="copy_warning">کپی کردن این کلمات راه خوبی برای نگه‌داشتنشان نیست. روی کلیپ‌بورد می‌مانند و هر چیزی که بتواند آن را بخواند، آن‌ها را می‌خواند.</string>
+    <string name="words_check">کلمه‌ی %1$d، کلمه‌ی %2$d و کلمه‌ی %3$d را وارد کن.</string>
+    <string name="word_n">کلمه‌ی %1$d</string>
+    <string name="continue_word">ادامه</string>
+    <string name="back">بازگشت</string>
+    <string name="words_mismatch">این سه کلمه همان‌ها نیست.</string>
+    <string name="restore_intro">این‌ها کلماتی است که یادداشت کردی، به ترتیب.</string>
+    <string name="lost_words">کلمات را ندارم</string>
+    <string name="lost_title">این کلمات از دست رفته‌اند</string>
+    <string name="lost_body">پیام‌های قبلی می‌مانند، ولی این گوشی نمی‌تواند آن‌ها را باز کند. هیچ‌کس نمی‌تواند کلمات قبلی را دوباره بسازد. این کار برگشت ندارد.</string>
+    <string name="lost_go">فهمیدم، کلمات تازه بساز</string>
+    <string name="word_of">کلمه‌ی %1$d از %2$d</string>
+    <string name="next_word">بعدی</string>
+    <string name="wrong_word">این کلمه در فهرست نیست.</string>
+    <string name="bad_checksum">این کلمات با هم جور نیستند.</string>
+    <string name="wrong_words">این کلمات برای این حساب نیست.</string>
+    <string name="keys_set">این حساب کلیدهایش را دارد.</string>
 </resources>

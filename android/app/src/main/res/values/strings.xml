@@ -28,4 +28,26 @@
     <string name="setup_unreachable">Can\'t reach that server.</string>
     <string name="setup_not_keryx">That server is not a keryx server.</string>
     <string name="setup_registration_closed">This server does not allow registration.</string>
+    <string name="words_title">Your words</string>
+    <string name="words_keep">Write these down. If you lose them, you may lose this account, and nobody can open your old messages.</string>
+    <string name="words_count">%1$d words</string>
+    <string name="wrote_them">I wrote them down</string>
+    <string name="copy">Copy</string>
+    <string name="copy_warning">Copying these words is a poor way to keep them. They stay on the clipboard, and anything that can read it can read them.</string>
+    <string name="words_check">Type word %1$d, word %2$d and word %3$d.</string>
+    <string name="word_n">Word %1$d</string>
+    <string name="continue_word">Continue</string>
+    <string name="back">Back</string>
+    <string name="words_mismatch">Those are not the three words.</string>
+    <string name="restore_intro">These are the words you wrote down, in order.</string>
+    <string name="lost_words">I don\'t have the words</string>
+    <string name="lost_title">These words are gone</string>
+    <string name="lost_body">Your old messages stay, but this phone cannot open them. Nobody can make the old words again. This cannot be undone.</string>
+    <string name="lost_go">I understand, set up new words</string>
+    <string name="word_of">Word %1$d of %2$d</string>
+    <string name="next_word">Next</string>
+    <string name="wrong_word">Not one of the words.</string>
+    <string name="bad_checksum">Those words do not check.</string>
+    <string name="wrong_words">Those are not this account\'s words.</string>
+    <string name="keys_set">This account already has its keys.</string>
 </resources>

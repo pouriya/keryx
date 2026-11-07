@@ -23,7 +23,6 @@ import androidx.compose.foundation.layout.exclude
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBars
@@ -83,7 +82,7 @@ private val tile = Color(0xFF2A436B)
 private val accent = Color(0xFF4576C4)
 private val onAccent = Color(0xFFFFFFFF)
 
-private data class Ink(
+internal data class Ink(
     val page: Color,
     val text: Color,
     val muted: Color,
@@ -92,6 +91,32 @@ private data class Ink(
     val danger: Color,
     val reached: Color,
 )
+
+@Composable
+internal fun ink(): Ink {
+    val dark = isSystemInDarkTheme()
+    return if (dark) {
+        Ink(
+            Color(0xFF141B24),
+            Color(0xFFF4F6F8),
+            Color(0xFF93A0B0),
+            Color(0xFF243041),
+            Color(0xFF1E2833),
+            Color(0xFFFF6B6B),
+            Color(0xFF6FCF97),
+        )
+    } else {
+        Ink(
+            Color(0xFFFFFFFF),
+            Color(0xFF121212),
+            Color(0xFF5E6A78),
+            Color(0xFFE4E8F0),
+            Color(0xFFFFFFFF),
+            Color(0xFFC0392B),
+            Color(0xFF1B7F4A),
+        )
+    }
+}
 
 @Composable
 fun Setup(
@@ -125,28 +150,7 @@ fun Setup(
     onLink: () -> Unit,
 ) {
     val dark = isSystemInDarkTheme()
-    val ink =
-        if (dark) {
-            Ink(
-                Color(0xFF141B24),
-                Color(0xFFF4F6F8),
-                Color(0xFF93A0B0),
-                Color(0xFF243041),
-                Color(0xFF1E2833),
-                Color(0xFFFF6B6B),
-                Color(0xFF6FCF97),
-            )
-        } else {
-            Ink(
-                Color(0xFFFFFFFF),
-                Color(0xFF121212),
-                Color(0xFF5E6A78),
-                Color(0xFFE4E8F0),
-                Color(0xFFFFFFFF),
-                Color(0xFFC0392B),
-                Color(0xFF1B7F4A),
-            )
-        }
+    val ink = ink()
     val addressFocus = remember { FocusRequester() }
     val usernameFocus = remember { FocusRequester() }
     val passwordFocus = remember { FocusRequester() }
@@ -404,10 +408,11 @@ private fun Field(
             Modifier
                 .padding(top = 6.dp)
                 .fillMaxWidth()
-                .heightIn(min = 48.dp)
+                .height(48.dp)
                 .border(1.dp, border, RoundedCornerShape(12.dp))
                 .background(ink.field, RoundedCornerShape(12.dp))
-                .padding(start = 14.dp, top = 12.dp, end = if (password) 4.dp else 14.dp, bottom = 12.dp),
+                .padding(start = 14.dp, end = if (password) 4.dp else 14.dp),
+            contentAlignment = Alignment.CenterStart,
         ) {
             val text = @Composable {
                 BasicTextField(

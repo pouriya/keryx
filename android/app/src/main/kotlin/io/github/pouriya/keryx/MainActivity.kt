@@ -61,7 +61,7 @@ class MainActivity : ComponentActivity() {
     private val language = mutableStateOf("en")
 
     /** Welcome, then account setup, then the test screen until the words screen is built. */
-    private enum class Place { Welcome, Setup, Test }
+    private enum class Place { Welcome, Setup, Words, Test }
 
     private enum class After { None, EnterSignUp, LogIn, SignUp, SetupLink }
 
@@ -94,6 +94,9 @@ class MainActivity : ComponentActivity() {
     private var checkGeneration = 0
     private var afterCheck = After.None
     private val words = mutableStateOf<String?>(null)
+    private val wordsRestore = mutableStateOf(false)
+    private val wordsError = mutableStateOf<String?>(null)
+    private var wordsBack: () -> Boolean = { false }
     private val chats = mutableStateListOf<ChatItem>()
     private val unreadCounts = mutableStateMapOf<String, Int>()
     private val chosen = mutableStateOf<String?>(null)
@@ -172,6 +175,7 @@ class MainActivity : ComponentActivity() {
             val joined = session.value
             BackHandler(enabled = joined == null && place.value != Place.Welcome) {
                 when (place.value) {
+                    Place.Words -> if (!wordsBack()) place.value = Place.Setup
                     Place.Test -> place.value = Place.Setup
                     Place.Setup -> if (linkStage.value) closeLink() else place.value = Place.Welcome
                     Place.Welcome -> Unit
@@ -229,6 +233,31 @@ class MainActivity : ComponentActivity() {
                                 onPrimary = ::onPrimary,
                                 onQuiet = ::onQuiet,
                                 onLink = ::openLink,
+                            )
+                        Place.Words ->
+                            Words(
+                                server = normalized(address.value),
+                                username = username.value.trim().lowercase(),
+                                phrase = words.value,
+                                restore = wordsRestore.value,
+                                error = wordsError.value,
+                                busy = busy.value,
+                                onGenerate = { count ->
+                                    wordsError.value = null
+                                    engine.send(Command.GenerateWords(count))
+                                },
+                                onSet = { phrase ->
+                                    wordsError.value = null
+                                    busy.value = true
+                                    engine.send(Command.SetWords(phrase))
+                                },
+                                onRestore = { phrase ->
+                                    wordsError.value = null
+                                    busy.value = true
+                                    engine.send(Command.Restore(phrase))
+                                },
+                                onClearError = { wordsError.value = null },
+                                onBindBack = { wordsBack = it },
                             )
                         Place.Test -> Surface(Modifier.fillMaxSize()) { Bare() }
                     }
@@ -535,6 +564,9 @@ class MainActivity : ComponentActivity() {
         "bad_link" -> getString(R.string.link_unknown)
         "link_used" -> getString(R.string.link_used)
         "link_expired" -> getString(R.string.link_expired)
+        "wrong_words" -> getString(R.string.wrong_words)
+        "bad_words" -> getString(R.string.bad_checksum)
+        "keys_set" -> getString(R.string.keys_set)
         else -> message
     }
 
@@ -646,12 +678,17 @@ class MainActivity : ComponentActivity() {
                 if (event.device != null) words.value = null
                 busy.value = false
                 afterCheck = After.None
+                if (place.value == Place.Words && event.device != null) place.value = Place.Test
                 if (place.value == Place.Setup) place.value = Place.Test
             }
             is Event.NeedWords -> {
                 busy.value = false
                 afterCheck = After.None
-                if (place.value == Place.Setup) place.value = Place.Test
+                wordsRestore.value = event.restore
+                wordsError.value = null
+                words.value = null
+                if (!event.restore) engine.send(Command.GenerateWords(12))
+                place.value = Place.Words
             }
             is Event.Chats -> {
                 chats.clear()
@@ -699,10 +736,13 @@ class MainActivity : ComponentActivity() {
             is Event.Error -> {
                 happened[0] = "Error: ${event.code}"
                 busy.value = false
-                if (place.value == Place.Setup) formError.value = accountMessage(event.code, event.message)
+                val shown = accountMessage(event.code, event.message)
+                if (place.value == Place.Words) wordsError.value = shown
+                if (place.value == Place.Setup) formError.value = shown
             }
             is Event.DeviceLimit -> {
                 busy.value = false
+                if (place.value == Place.Words) wordsError.value = event.message
                 if (place.value == Place.Setup) formError.value = event.message
             }
             is Event.LoggedOut -> {
