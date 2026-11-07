@@ -109,6 +109,14 @@ object Core {
     ): ByteArray?
 }
 
+/** What asking a server for its public features found. */
+enum class Reach {
+    Answers,
+    NotAddress,
+    Unreachable,
+    NotKeryx,
+}
+
 class Engine(
     private val context: Context,
     private val vault: Vault,
@@ -350,17 +358,26 @@ class Engine(
         return Thumbnail(width, height, rgba)
     }
 
-    /** Talks to this server from now on, after checking it answers as a keryx server. */
+    /**
+     * Talks to this server from now on, after checking it answers as a keryx server.
+     * [Reach.NotAddress] is not a URL, [Reach.Unreachable] did not answer, and [Reach.NotKeryx]
+     * answered as something else.
+     */
     fun use(
         address: String,
-        answer: (Boolean) -> Unit,
+        answer: (Reach) -> Unit,
     ) {
         val base = address.trim().trimEnd('/')
+        val scheme = base.substringBefore("://", "").lowercase()
+        if (scheme != "http" && scheme != "https") {
+            answer(Reach.NotAddress)
+            return
+        }
         val request =
             try {
                 Request.Builder().url("$base/api/v1/public/features").build()
             } catch (_: IllegalArgumentException) {
-                answer(false)
+                answer(Reach.NotAddress)
                 return
             }
         http.newCall(request).enqueue(
@@ -368,7 +385,7 @@ class Engine(
                 override fun onFailure(
                     call: Call,
                     e: IOException,
-                ) = answer(false)
+                ) = answer(Reach.Unreachable)
 
                 override fun onResponse(
                     call: Call,
@@ -377,8 +394,10 @@ class Engine(
                     val fine = response.use { it.isSuccessful && (it.body?.string() ?: "").contains("\"ok\":true") }
                     if (fine) {
                         thread.execute { start(base) }
+                        answer(Reach.Answers)
+                    } else {
+                        answer(Reach.NotKeryx)
                     }
-                    answer(fine)
                 }
             },
         )

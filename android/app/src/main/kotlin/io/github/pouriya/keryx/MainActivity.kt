@@ -60,10 +60,39 @@ class MainActivity : ComponentActivity() {
     private lateinit var vault: Vault
     private val language = mutableStateOf("en")
 
-    /** Left once Connect is pressed. The account setup screen is not built, so that opens the test screen. */
-    private val pastWelcome = mutableStateOf(false)
+    /** Welcome, then account setup, then the test screen until the words screen is built. */
+    private enum class Place { Welcome, Setup, Test }
+
+    private enum class After { None, EnterSignUp, LogIn, SignUp, SetupLink }
+
+    private val place = mutableStateOf(Place.Welcome)
     private val server = mutableStateOf("http://127.0.0.1:7778")
     private val serverFine = mutableStateOf<Boolean?>(null)
+    private val address = mutableStateOf("http://127.0.0.1:7778")
+    private val username = mutableStateOf("")
+    private val password = mutableStateOf("")
+    private val signingUp = mutableStateOf(false)
+    private val addressError = mutableStateOf<Int?>(null)
+    private val checking = mutableStateOf(false)
+    private val reached = mutableStateOf(false)
+    private val gapField = mutableStateOf("")
+    private val focusNonce = mutableStateOf(0)
+    private val linkError = mutableStateOf<Int?>(null)
+    private val formError = mutableStateOf<String?>(null)
+    private val registration = mutableStateOf<Boolean?>(null)
+    private val captchaOn = mutableStateOf(false)
+    private val captchaId = mutableStateOf<String?>(null)
+    private val captchaImage = mutableStateOf<String?>(null)
+    private val captchaAnswer = mutableStateOf("")
+    private val busy = mutableStateOf(false)
+    private val linkStage = mutableStateOf(false)
+    private val setupPaste = mutableStateOf("")
+    private val setupToken = mutableStateOf<String?>(null)
+    private var linkBase: String? = null
+    private var checkedAddress: String? = null
+    private var pendingAddress: String? = null
+    private var checkGeneration = 0
+    private var afterCheck = After.None
     private val words = mutableStateOf<String?>(null)
     private val chats = mutableStateListOf<ChatItem>()
     private val unreadCounts = mutableStateMapOf<String, Int>()
@@ -118,7 +147,10 @@ class MainActivity : ComponentActivity() {
         super.onCreate(saved)
         vault = Vault(applicationContext)
         language.value = vault.note("lang")?.takeIf { it == "en" || it == "fa" } ?: "en"
-        vault.note("server")?.let { server.value = it }
+        vault.note("server")?.let {
+            server.value = it
+            address.value = it
+        }
         val platform = Platform(platform = 1, os = "android", os_version = Build.VERSION.RELEASE)
         engine =
             Engine(
@@ -136,12 +168,15 @@ class MainActivity : ComponentActivity() {
                     }
                 },
             )
-        if (vault.note("server") != null) {
-            engine.use(server.value) { fine -> runOnUiThread { serverFine.value = fine } }
-        }
         setContent {
             val joined = session.value
-            BackHandler(enabled = joined == null && pastWelcome.value) { pastWelcome.value = false }
+            BackHandler(enabled = joined == null && place.value != Place.Welcome) {
+                when (place.value) {
+                    Place.Test -> place.value = Place.Setup
+                    Place.Setup -> if (linkStage.value) closeLink() else place.value = Place.Welcome
+                    Place.Welcome -> Unit
+                }
+            }
             MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
                 if (joined != null) {
                     Surface(Modifier.fillMaxSize()) {
@@ -161,10 +196,42 @@ class MainActivity : ComponentActivity() {
                             { engine.send(Command.LeaveCall(joined.chat)) },
                         )
                     }
-                } else if (!pastWelcome.value) {
-                    Welcome(language.value, ::chooseLanguage) { pastWelcome.value = true }
                 } else {
-                    Surface(Modifier.fillMaxSize()) { Bare() }
+                    when (place.value) {
+                        Place.Welcome -> Welcome(language.value, ::chooseLanguage) { place.value = Place.Setup }
+                        Place.Setup ->
+                            Setup(
+                                link = linkStage.value,
+                                signingUp = signingUp.value,
+                                address = address.value,
+                                onAddress = ::onAddress,
+                                onAddressBlur = { ensureServer(After.None) },
+                                username = username.value,
+                                onUsername = ::onUsername,
+                                password = password.value,
+                                onPassword = ::onPassword,
+                                setupLink = setupPaste.value,
+                                onSetupLink = ::onSetupPaste,
+                                onSetupLinkBlur = { prepareLink(false) },
+                                checking = checking.value,
+                                reached = reached.value,
+                                addressError = addressError.value?.let { getString(it) },
+                                linkError = linkError.value?.let { getString(it) },
+                                formError = formError.value,
+                                showCaptcha = captchaOn.value,
+                                captchaImage = captchaImage.value,
+                                captchaAnswer = captchaAnswer.value,
+                                onCaptcha = ::onCaptcha,
+                                onRefreshCaptcha = ::refreshCaptcha,
+                                gap = gapField.value,
+                                focusNonce = focusNonce.value,
+                                busy = busy.value,
+                                onPrimary = ::onPrimary,
+                                onQuiet = ::onQuiet,
+                                onLink = ::openLink,
+                            )
+                        Place.Test -> Surface(Modifier.fillMaxSize()) { Bare() }
+                    }
                 }
             }
         }
@@ -177,6 +244,368 @@ class MainActivity : ComponentActivity() {
         }
         vault.setNote("lang", code)
         recreate()
+    }
+
+    private fun normalized(raw: String) = raw.trim().trimEnd('/')
+
+    private fun onAddress(value: String) {
+        address.value = value
+        addressError.value = null
+        formError.value = null
+        if (gapField.value == "address") gapField.value = ""
+        if (normalized(value) != checkedAddress) {
+            checkGeneration += 1
+            pendingAddress = null
+            checking.value = false
+            reached.value = false
+            checkedAddress = null
+            registration.value = null
+            captchaOn.value = false
+            clearCaptcha()
+            signingUp.value = false
+            afterCheck = After.None
+        }
+    }
+
+    private fun onUsername(value: String) {
+        username.value = value
+        formError.value = null
+        if (gapField.value == "username") gapField.value = ""
+    }
+
+    private fun onPassword(value: String) {
+        password.value = value
+        formError.value = null
+        if (gapField.value == "password") gapField.value = ""
+    }
+
+    private fun onCaptcha(value: String) {
+        captchaAnswer.value = value
+        formError.value = null
+        if (gapField.value == "captcha") gapField.value = ""
+    }
+
+    private fun onSetupPaste(value: String) {
+        setupPaste.value = value
+        linkError.value = null
+        addressError.value = null
+        formError.value = null
+        if (gapField.value == "link") gapField.value = ""
+        setupToken.value = null
+        linkBase = null
+        checkGeneration += 1
+        pendingAddress = null
+        checking.value = false
+        reached.value = false
+        checkedAddress = null
+        registration.value = null
+        captchaOn.value = false
+        clearCaptcha()
+    }
+
+    private fun clearCaptcha() {
+        captchaId.value = null
+        captchaImage.value = null
+        captchaAnswer.value = ""
+    }
+
+    /** Asks this address what it allows. A check already running for it is left to finish. */
+    private fun ensureServer(next: After) {
+        val base = normalized(if (linkStage.value) linkBase ?: return else address.value)
+        if (!linkStage.value && base.isEmpty()) {
+            checking.value = false
+            reached.value = false
+            addressError.value = R.string.setup_need_address
+            return
+        }
+        afterCheck = next
+        if (base == checkedAddress || base == pendingAddress) {
+            if (registration.value != null) {
+                finishCheck(registration.value == true)
+            }
+            return
+        }
+        check(base)
+    }
+
+    private fun check(base: String) {
+        val id = ++checkGeneration
+        pendingAddress = base
+        checking.value = true
+        reached.value = false
+        addressError.value = null
+        engine.use(base) { reach ->
+            runOnUiThread {
+                if (id != checkGeneration) {
+                    return@runOnUiThread
+                }
+                pendingAddress = null
+                checking.value = false
+                when (reach) {
+                    Reach.NotAddress -> failAddress(R.string.setup_need_address)
+                    Reach.Unreachable -> failAddress(R.string.setup_unreachable)
+                    Reach.NotKeryx -> failAddress(R.string.setup_not_keryx)
+                    Reach.Answers -> {
+                        addressError.value = null
+                        checkedAddress = base
+                        server.value = base
+                        reached.value = true
+                    }
+                }
+            }
+        }
+    }
+
+    private fun failAddress(message: Int) {
+        addressError.value = message
+        checkedAddress = null
+        reached.value = false
+        checking.value = false
+        registration.value = null
+        afterCheck = After.None
+    }
+
+    private fun finishCheck(open: Boolean) {
+        val next = afterCheck
+        afterCheck = After.None
+        when (next) {
+            After.EnterSignUp ->
+                if (open) {
+                    signingUp.value = true
+                } else {
+                    formError.value = getString(R.string.setup_registration_closed)
+                }
+            After.LogIn -> submit(false)
+            After.SignUp ->
+                if (open) {
+                    submit(true)
+                } else {
+                    formError.value = getString(R.string.setup_registration_closed)
+                }
+            After.SetupLink -> submitLink()
+            After.None -> Unit
+        }
+    }
+
+    private fun captchaValue(): CaptchaAnswer? {
+        val id = captchaId.value ?: return null
+        val answer = captchaAnswer.value.trim()
+        if (answer.isEmpty()) {
+            return null
+        }
+        return CaptchaAnswer(id, answer)
+    }
+
+    private fun submit(signUp: Boolean) {
+        val name = username.value.trim().lowercase()
+        if (name.isEmpty() || password.value.isEmpty()) {
+            return
+        }
+        val picture = captchaValue()
+        if (captchaOn.value && picture == null) {
+            return
+        }
+        formError.value = null
+        busy.value = true
+        engine.send(
+            if (signUp) {
+                Command.SignUp(name, password.value, captcha = picture)
+            } else {
+                Command.LogIn(name, password.value, captcha = picture)
+            },
+        )
+    }
+
+    /** The first box with nothing in it, in the order they are shown. */
+    private fun emptyBox(): String? {
+        if (linkStage.value) {
+            if (setupPaste.value.isBlank()) return "link"
+        } else if (normalized(address.value).isEmpty()) {
+            return "address"
+        }
+        if (!linkStage.value && username.value.trim().isEmpty()) return "username"
+        if (password.value.isEmpty()) return "password"
+        if (captchaOn.value && captchaAnswer.value.trim().isEmpty()) return "captcha"
+        return null
+    }
+
+    private fun showGap(field: String) {
+        gapField.value = field
+        focusNonce.value += 1
+        formError.value = null
+        if (field == "address") addressError.value = R.string.setup_need_address
+    }
+
+    private fun onPrimary() {
+        if (busy.value) {
+            return
+        }
+        val gap = emptyBox()
+        if (gap != null) {
+            showGap(gap)
+            return
+        }
+        if (linkStage.value) {
+            prepareLink(true)
+        } else {
+            ensureServer(if (signingUp.value) After.SignUp else After.LogIn)
+        }
+    }
+
+    private fun onQuiet() {
+        if (busy.value) {
+            return
+        }
+        formError.value = null
+        if (linkStage.value) {
+            closeLink()
+            return
+        }
+        if (signingUp.value) {
+            signingUp.value = false
+            return
+        }
+        when (registration.value) {
+            false -> formError.value = getString(R.string.setup_registration_closed)
+            true -> signingUp.value = true
+            null -> ensureServer(After.EnterSignUp)
+        }
+    }
+
+    private fun refreshCaptcha() {
+        captchaAnswer.value = ""
+        captchaId.value = null
+        captchaImage.value = null
+        engine.send(Command.Captcha)
+    }
+
+    private fun openLink() {
+        linkStage.value = true
+        setupPaste.value = ""
+        setupToken.value = null
+        linkBase = null
+        linkError.value = null
+        formError.value = null
+        addressError.value = null
+        password.value = ""
+        checkedAddress = null
+        pendingAddress = null
+        checking.value = false
+        reached.value = false
+        registration.value = null
+        captchaOn.value = false
+        clearCaptcha()
+        checkGeneration += 1
+        afterCheck = After.None
+        signingUp.value = false
+    }
+
+    private fun closeLink() {
+        linkStage.value = false
+        setupToken.value = null
+        linkBase = null
+        linkError.value = null
+        formError.value = null
+        addressError.value = null
+        password.value = ""
+        checkedAddress = null
+        pendingAddress = null
+        checking.value = false
+        reached.value = false
+        registration.value = null
+        captchaOn.value = false
+        clearCaptcha()
+        checkGeneration += 1
+        afterCheck = After.None
+    }
+
+    private fun onFeatures(event: Event.Features) {
+        registration.value = event.registration
+        captchaOn.value = event.captcha
+        if (event.captcha && captchaImage.value == null) {
+            engine.send(Command.Captcha)
+        }
+        finishCheck(event.registration)
+    }
+
+    private fun accountMessage(
+        code: String,
+        message: String,
+    ) = when (code) {
+        "bad_link" -> getString(R.string.link_unknown)
+        "link_used" -> getString(R.string.link_used)
+        "link_expired" -> getString(R.string.link_expired)
+        else -> message
+    }
+
+    /** A pasted `https://server/setup#token`. A missing token is reported apart from a link that is not one. */
+    private data class ParsedLink(
+        val base: String,
+        val token: String?,
+    )
+
+    private fun parseSetupLink(raw: String): ParsedLink? {
+        val uri = android.net.Uri.parse(raw.trim())
+        val scheme = uri.scheme?.lowercase()
+        val host = uri.host
+        if ((scheme != "http" && scheme != "https") || host.isNullOrEmpty()) {
+            return null
+        }
+        if (uri.path?.trimEnd('/') != "/setup") {
+            return null
+        }
+        val port = if (uri.port == -1) "" else ":${uri.port}"
+        val token =
+            try {
+                uri.fragment?.let { java.net.URLDecoder.decode(it, Charsets.UTF_8.name()) }?.takeIf { it.isNotEmpty() }
+            } catch (_: IllegalArgumentException) {
+                return null
+            }
+        return ParsedLink("$scheme://$host$port", token)
+    }
+
+    private fun prepareLink(submit: Boolean) {
+        if (setupPaste.value.isBlank()) {
+            return
+        }
+        val parsed = parseSetupLink(setupPaste.value)
+        if (parsed == null) {
+            linkError.value = R.string.link_unknown
+            return
+        }
+        if (parsed.token == null) {
+            linkError.value = R.string.setup_missing
+            return
+        }
+        linkError.value = null
+        setupToken.value = parsed.token
+        linkBase = parsed.base
+        if (submit) {
+            afterCheck = After.SetupLink
+        }
+        if (parsed.base == checkedAddress && registration.value != null) {
+            if (submit) {
+                finishCheck(registration.value == true)
+            }
+            return
+        }
+        if (parsed.base != pendingAddress) {
+            check(parsed.base)
+        }
+    }
+
+    private fun submitLink() {
+        val token = setupToken.value ?: return
+        if (password.value.isEmpty()) {
+            return
+        }
+        val picture = captchaValue()
+        if (captchaOn.value && picture == null) {
+            return
+        }
+        formError.value = null
+        busy.value = true
+        engine.send(Command.Setup(token, password.value, captcha = picture))
     }
 
     /** Rotating keeps this activity, so this runs only when it really goes: nothing it started runs on. */
@@ -198,7 +627,32 @@ class MainActivity : ComponentActivity() {
         }
         when (event) {
             is Event.Words -> words.value = event.words
-            is Event.SignedIn -> if (event.device != null) words.value = null
+            is Event.Features -> onFeatures(event)
+            is Event.Captcha -> {
+                captchaId.value = event.id
+                captchaImage.value = event.image
+                captchaAnswer.value = ""
+            }
+            is Event.Registered -> {
+                busy.value = false
+                signingUp.value = false
+                formError.value = null
+                clearCaptcha()
+                if (captchaOn.value) {
+                    engine.send(Command.Captcha)
+                }
+            }
+            is Event.SignedIn -> {
+                if (event.device != null) words.value = null
+                busy.value = false
+                afterCheck = After.None
+                if (place.value == Place.Setup) place.value = Place.Test
+            }
+            is Event.NeedWords -> {
+                busy.value = false
+                afterCheck = After.None
+                if (place.value == Place.Setup) place.value = Place.Test
+            }
             is Event.Chats -> {
                 chats.clear()
                 chats.addAll(event.chat_list)
@@ -242,7 +696,15 @@ class MainActivity : ComponentActivity() {
                 choose(event.chat)
                 engine.send(Command.ChatList)
             }
-            is Event.Error -> happened[0] = "Error: ${event.code}"
+            is Event.Error -> {
+                happened[0] = "Error: ${event.code}"
+                busy.value = false
+                if (place.value == Place.Setup) formError.value = accountMessage(event.code, event.message)
+            }
+            is Event.DeviceLimit -> {
+                busy.value = false
+                if (place.value == Place.Setup) formError.value = event.message
+            }
             is Event.LoggedOut -> {
                 chats.clear()
                 messages.clear()
@@ -457,7 +919,7 @@ class MainActivity : ComponentActivity() {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedTextField(server.value, { server.value = it }, Modifier.weight(1f), label = { Text("Server") })
                 Button({
-                    engine.use(server.value) { fine -> runOnUiThread { serverFine.value = fine } }
+                    engine.use(server.value) { reach -> runOnUiThread { serverFine.value = reach == Reach.Answers } }
                 }) { Text("Use") }
             }
             serverFine.value?.let { Text(if (it) "Server answers" else "Not a keryx server") }

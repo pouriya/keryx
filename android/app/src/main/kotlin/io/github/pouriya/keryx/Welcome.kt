@@ -158,7 +158,7 @@ private fun Language(
     }
 }
 
-private fun activity(context: Context): Activity {
+internal fun activity(context: Context): Activity {
     var current = context
     while (current is ContextWrapper) {
         if (current is Activity) {
@@ -172,7 +172,7 @@ private fun activity(context: Context): Activity {
 /** The page colour behind the status and navigation bars, put back when this screen goes. */
 @Composable
 @Suppress("DEPRECATION")
-private fun Bars(
+internal fun Bars(
     page: Color,
     dark: Boolean,
 ) {
