@@ -262,6 +262,37 @@ frames for the error cases, so this crate's coverage table counts it.
 text.** Later features add optional fields, such as a reply's target, so older clients still read
 newer messages. Unknown fields are ignored. This is permanent once messages exist.
 
+## Android redesign colours
+
+**Chosen by the author, and locked.** The home icon and the light and dark colours for the Android
+redesign are recorded in [REDESIGN.md](../REDESIGN.md), and the chosen icon and screens are drawn in
+[redesign.html](../redesign.html). **Do not change these colours or this icon until the Android client
+has been implemented completely from that file.** Later screens use them. They are not a reason to
+open the palette again.
+
+**The home icon is a white wing on `#2A436B`.** The wing is `#FFFFFF`, the approved six-feather mark,
+drawn at 58% of the tile, the padding the adaptive icon already uses, so a circular mask keeps the
+whole mark. The phone supplies the circle or the rounded square. Every committed logo file is this
+same tile, and it is not recoloured per theme.
+
+**The theme is Clear.** One accent, `#4576C4`, for the send button, the badges, the day checks and the
+compose button, with `#FFFFFF` on it. The night page is blue-charcoal. Your bubble is a pale tint by
+day and the icon's own tile by night. Checks, online and an unread time at night use `#C5D4E8`.
+
+| Role | Light | Dark |
+|------|-------|------|
+| Page | `#FFFFFF` | `#141B24` |
+| Text | `#121212` | `#F4F6F8` |
+| Muted | `#5E6A78` | `#93A0B0` |
+| Accent | `#4576C4` | `#4576C4` |
+| Accent text | `#4576C4` | `#C5D4E8` |
+| Line | `#E4E8F0` | `#243041` |
+| Incoming bubble | `#FFFFFF` | `#1E2833` |
+| Outgoing bubble | `#D6E2F4` | `#2A436B` |
+| Canvas | `#EEEFF2` | `#10161D` |
+| Composer field | `#FFFFFF` | `#1E2833` |
+| On accent | `#FFFFFF` | `#FFFFFF` |
+
 ## Testing
 
 **No unit tests. Integration tests only, in `tests/`.** See

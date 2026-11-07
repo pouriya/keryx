@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Home-screen icons keep the logo's white background, as on the web. -->
+<!-- White wing on #2A436B. The monochrome layer is the wing alone, which the system tints. -->
 <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
-    <background android:drawable="@android:color/white" />
+    <background android:drawable="@color/icon_tile" />
     <foreground android:drawable="@drawable/logo_foreground" />
     <monochrome android:drawable="@drawable/logo_foreground" />
 </adaptive-icon>
