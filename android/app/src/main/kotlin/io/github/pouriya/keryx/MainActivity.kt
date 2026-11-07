@@ -7,13 +7,16 @@ package io.github.pouriya.keryx
 
 import android.Manifest
 import android.content.ActivityNotFoundException
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.os.Build
 import android.os.Bundle
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
@@ -54,6 +57,11 @@ import java.nio.ByteBuffer
 import java.util.Locale
 
 class MainActivity : ComponentActivity() {
+    private lateinit var vault: Vault
+    private val language = mutableStateOf("en")
+
+    /** Left once Connect is pressed. The account setup screen is not built, so that opens the test screen. */
+    private val pastWelcome = mutableStateOf(false)
     private val server = mutableStateOf("http://127.0.0.1:7778")
     private val serverFine = mutableStateOf<Boolean?>(null)
     private val words = mutableStateOf<String?>(null)
@@ -97,9 +105,19 @@ class MainActivity : ComponentActivity() {
             granted = null
         }
 
+    override fun attachBaseContext(newBase: Context) {
+        val code = Vault(newBase).note("lang")?.takeIf { it == "en" || it == "fa" } ?: "en"
+        val locale = Locale.forLanguageTag(code)
+        val config = Configuration(newBase.resources.configuration)
+        config.setLocale(locale)
+        config.setLayoutDirection(locale)
+        super.attachBaseContext(newBase.createConfigurationContext(config))
+    }
+
     override fun onCreate(saved: Bundle?) {
         super.onCreate(saved)
-        val vault = Vault(applicationContext)
+        vault = Vault(applicationContext)
+        language.value = vault.note("lang")?.takeIf { it == "en" || it == "fa" } ?: "en"
         vault.note("server")?.let { server.value = it }
         val platform = Platform(platform = 1, os = "android", os_version = Build.VERSION.RELEASE)
         engine =
@@ -122,12 +140,11 @@ class MainActivity : ComponentActivity() {
             engine.use(server.value) { fine -> runOnUiThread { serverFine.value = fine } }
         }
         setContent {
+            val joined = session.value
+            BackHandler(enabled = joined == null && pastWelcome.value) { pastWelcome.value = false }
             MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
-                Surface(Modifier.fillMaxSize()) {
-                    val joined = session.value
-                    if (joined == null) {
-                        Bare()
-                    } else {
+                if (joined != null) {
+                    Surface(Modifier.fillMaxSize()) {
                         CallScreen(
                             joined,
                             {
@@ -144,9 +161,22 @@ class MainActivity : ComponentActivity() {
                             { engine.send(Command.LeaveCall(joined.chat)) },
                         )
                     }
+                } else if (!pastWelcome.value) {
+                    Welcome(language.value, ::chooseLanguage) { pastWelcome.value = true }
+                } else {
+                    Surface(Modifier.fillMaxSize()) { Bare() }
                 }
             }
         }
+    }
+
+    /** English until FA is chosen. Kept as a plain note, and the activity is built again so the screen mirrors. */
+    private fun chooseLanguage(code: String) {
+        if (code == language.value) {
+            return
+        }
+        vault.setNote("lang", code)
+        recreate()
     }
 
     /** Rotating keeps this activity, so this runs only when it really goes: nothing it started runs on. */

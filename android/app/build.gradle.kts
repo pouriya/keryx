@@ -32,6 +32,13 @@ android {
         compose = true
     }
 
+    // Both languages are in the apk. A split would drop Persian until a store downloaded it.
+    bundle {
+        language {
+            enableSplit = false
+        }
+    }
+
     lint {
         warningsAsErrors = true
         abortOnError = true

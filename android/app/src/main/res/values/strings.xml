@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="welcome_name">keryx</string>
+    <string name="welcome_line">An open-source, private and secure end-to-end encrypted messenger, with direct chats, groups, channels, calls and AI integration.</string>
+    <string name="welcome_connect">Connect to a server</string>
+</resources>

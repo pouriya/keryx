@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="welcome_name">کریکس</string>
+    <string name="welcome_line">یک پیام‌رسان متن‌باز، خصوصی و امن، با رمزنگاری انتهابه‌انتها، با گفتگوی دونفره، گروه، کانال، تماس و یکپارچگی با هوش مصنوعی.</string>
+    <string name="welcome_connect">اتصال به سرور</string>
+</resources>
