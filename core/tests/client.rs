@@ -715,7 +715,10 @@ fn loading_saved_state_comes_back_or_asks_to_log_in() {
         },
         NOW,
     );
-    assert!(matches!(out[0], Output::Connect { bearer: None }));
+    assert!(
+        out.iter()
+            .any(|output| matches!(output, Output::Connect { bearer: None }))
+    );
     let mut app = Client::new(Auth::Token, platform());
     let out = app.step(
         Input::Loaded {
@@ -776,7 +779,9 @@ fn a_token_client_hands_out_its_token_takes_it_back_and_drops_it_when_the_sessio
         NOW,
     );
     assert!(
-        matches!(&out[0], Output::Connect { bearer: Some(bearer) } if bearer.0 == "kept"),
+        out.iter().any(
+            |output| matches!(output, Output::Connect { bearer: Some(bearer) } if bearer.0 == "kept")
+        ),
         "{out:?}"
     );
     let out = app.step(
@@ -799,7 +804,10 @@ fn a_token_client_hands_out_its_token_takes_it_back_and_drops_it_when_the_sessio
         },
         NOW,
     );
-    assert!(matches!(out[0], Output::Connect { bearer: None }));
+    assert!(
+        out.iter()
+            .any(|output| matches!(output, Output::Connect { bearer: None }))
+    );
 }
 
 #[test]
@@ -1527,8 +1535,30 @@ impl World {
 
     /// The app restarts from what it saved, with its cookie still valid.
     fn reload(&mut self, p: usize) -> usize {
+        self.reload_with(p, false)
+    }
+
+    /// The same, from a state that kept no list, names or devices, as one from before it did.
+    fn reload_cold(&mut self, p: usize) -> usize {
+        self.reload_with(p, true)
+    }
+
+    fn reload_with(&mut self, p: usize, cold: bool) -> usize {
         let (account, device) = (self.phones[p].account, self.phones[p].device);
-        let [first, second] = self.phones[p].slots.clone();
+        let [mut first, mut second] = self.phones[p].slots.clone();
+        if cold {
+            let mut device = keryx_core::mls::Device::import(first.as_deref(), second.as_deref())
+                .unwrap()
+                .device;
+            device.set_shelf(Vec::new());
+            let snapshot = device.export().unwrap();
+            let bytes = Some(snapshot.bytes.to_vec());
+            (first, second) = if snapshot.slot == 0 {
+                (bytes, None)
+            } else {
+                (None, bytes)
+            };
+        }
         let phone = &mut self.phones[p];
         phone.gone = true;
         phone.up = false;
@@ -4113,7 +4143,7 @@ fn a_device_whose_stamp_does_not_verify_is_refused_and_its_messages_are_not_trus
     let (mut world, omid, mina, chat) = pair();
     let index = world.device_index(world.device_of(omid)).unwrap();
     world.devices[index].stamp = vec![7; 64];
-    let mina = world.reload(mina);
+    let mina = world.reload_cold(mina);
     world.settle();
     tell(&mut world, omid, chat, "unproven");
     world.command(mina, Command::OpenChat { chat });

@@ -146,6 +146,15 @@ server's `history_page` rows, and scrolling reads the platform's archive. See th
 account's key packages, which uses up one of this device's, and the next connect's top-up replaces
 it. No special case in the client or the server.
 
+**The snapshot carries a shelf, so a start with no network still shows the chats, chosen by the author.**
+Beside the keys, `Device` holds one opaque blob, written last so an older slot without it still loads: the
+last chat list with its previews, the accounts' names and keys, this account's username and every device
+whose stamp was checked. Core saves it whenever those change, and on loading emits `SignedIn`, `Account`,
+the `Chats` list and its previews from it, before any connection, so the archive's messages open with no
+server. The server's own list replaces it when it answers, and everything in it is checked again then.
+A shelf that cannot be read is ignored. It is cached ciphertext and names, in the snapshot the platform
+already keeps locked. `OpenChat` and `LoadOlder` already read the platform's archive, so they work offline.
+
 **Key packages are topped up on each connect, chosen by the author:** an empty post learns the count,
 then enough are uploaded to reach 10. No server change.
 

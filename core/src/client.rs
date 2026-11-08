@@ -982,6 +982,28 @@ struct KnownDevice {
     master: [u8; 32],
 }
 
+/// What the snapshot's shelf holds, as JSON: enough to show the chat list, its previews and every
+/// opened message with no network. Everything in it is checked again when the server answers.
+#[derive(Default, Serialize, Deserialize)]
+struct Shelf {
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    chat_list: Vec<ChatItem>,
+    #[serde(default)]
+    account_list: Vec<AccountInfo>,
+    #[serde(default)]
+    device_list: Vec<ShelfDevice>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ShelfDevice {
+    device: Ulid,
+    account: Ulid,
+    public: Bytes,
+    master: Bytes,
+}
+
 #[derive(Default, PartialEq, Eq)]
 enum Busy {
     #[default]
@@ -1115,6 +1137,8 @@ pub struct Client {
     asked_accounts: HashSet<Ulid>,
     /// Every device whose stamp has been checked.
     devices: HashMap<Ulid, KnownDevice>,
+    /// The last chat list the server sent, previews included, kept in the snapshot's shelf.
+    chat_cache: Vec<ChatItem>,
     /// Ending statements waiting for their account's master key.
     revocations: Vec<(Ulid, Ulid, Vec<u8>)>,
     uploads: HashMap<u64, Upload>,
@@ -1318,6 +1342,7 @@ impl Client {
             accounts: HashMap::new(),
             asked_accounts: HashSet::new(),
             devices: HashMap::new(),
+            chat_cache: Vec::new(),
             revocations: Vec::new(),
             uploads: HashMap::new(),
             next_upload: 0,
@@ -1522,9 +1547,27 @@ impl Client {
     }
 
     fn save_state(&mut self) {
+        let shelf = Shelf {
+            username: self.username.clone(),
+            chat_list: self.chat_cache.clone(),
+            account_list: self.accounts.values().cloned().collect(),
+            device_list: self
+                .devices
+                .iter()
+                .map(|(device, known)| ShelfDevice {
+                    device: *device,
+                    account: known.account,
+                    public: Bytes(known.public.to_vec()),
+                    master: Bytes(known.master.to_vec()),
+                })
+                .collect(),
+        };
         let Some(device) = self.device.as_mut() else {
             return;
         };
+        if let Ok(bytes) = serde_json::to_vec(&shelf) {
+            device.set_shelf(bytes);
+        }
         match device.export() {
             Ok(snapshot) => {
                 let id = self.next_id;
@@ -2582,6 +2625,7 @@ impl Client {
                 if self.auth == Auth::Token && self.token.is_none() {
                     return self.show_login();
                 }
+                self.unshelve();
                 if resume {
                     self.connect();
                 }
@@ -2590,6 +2634,80 @@ impl Client {
                 self.error("load_failed", &error.to_string());
                 self.show_login();
             }
+        }
+    }
+
+    /// Shows what the last run knew, before any network: the person's name, the chat list with its
+    /// previews, and the devices and names that open the archive's messages. The server's own list
+    /// replaces it as soon as it answers. A shelf that cannot be read is ignored.
+    fn unshelve(&mut self) {
+        let Some(device) = self.device.as_ref() else {
+            return;
+        };
+        let Ok(shelf) = serde_json::from_slice::<Shelf>(device.shelf()) else {
+            return;
+        };
+        let (Some(me), Some(own)) = (
+            self.account,
+            self.device.as_ref().map(|d| d.record().device),
+        ) else {
+            return;
+        };
+        for info in shelf.account_list {
+            self.event(Event::Account {
+                account: AccountBrief {
+                    id: info.id,
+                    username: info.username.clone(),
+                    display_name: info.display_name.clone(),
+                },
+            });
+            self.accounts.entry(info.id).or_insert(info);
+        }
+        for item in shelf.device_list {
+            if let (Some(public), Some(master)) =
+                (fixed::<32>(&item.public.0), fixed::<32>(&item.master.0))
+            {
+                self.devices.entry(item.device).or_insert(KnownDevice {
+                    account: item.account,
+                    public,
+                    master,
+                });
+            }
+        }
+        if self.username.is_none()
+            && let Some(username) = shelf.username
+        {
+            self.username = Some(username.clone());
+            self.event(Event::SignedIn {
+                account: me,
+                username,
+                device: Some(own),
+            });
+        }
+        self.chat_cache = shelf.chat_list.clone();
+        let mut shown = Vec::with_capacity(shelf.chat_list.len());
+        let mut preview_list = Vec::new();
+        for mut item in shelf.chat_list {
+            let state = self.chats.entry(item.chat).or_default();
+            state.chat_type = Some(item.chat_type);
+            let mut member_list = vec![me];
+            for mark in &item.mark_list {
+                if !member_list.contains(&mark.account) {
+                    member_list.push(mark.account);
+                }
+            }
+            if state.member_list.is_empty() || member_list.len() > 1 {
+                state.member_list = member_list;
+            }
+            if let Some(message) = item.last_content.take() {
+                preview_list.push(*message);
+            }
+            shown.push(item);
+        }
+        self.event(Event::Chats { chat_list: shown });
+        for message in preview_list {
+            let chat = message.chat;
+            self.open_list(chat, vec![message], false, false);
         }
     }
 
@@ -3768,6 +3886,8 @@ impl Client {
         let Some(me) = self.account else {
             return;
         };
+        self.chat_cache = chat_list.clone();
+        self.dirty = true;
         let mut shown = Vec::with_capacity(chat_list.len());
         let mut preview_list = Vec::new();
         let mut join_list = Vec::new();
@@ -4943,6 +5063,7 @@ impl Client {
             },
         });
         self.accounts.insert(info.id, info);
+        self.dirty = true;
         let mut pending = Vec::new();
         let mut index = 0;
         while index < self.revocations.len() {

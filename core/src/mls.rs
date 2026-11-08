@@ -251,6 +251,9 @@ pub struct Device {
     /// The server time of the last row the platform saved, where the next `sync` starts. Kept here
     /// so it never runs ahead of the commits this state has applied.
     since: Option<i64>,
+    /// The client's own cache of its chat list, names and devices, so a start with no network
+    /// still shows them. Written after everything else, so a slot without one still loads.
+    shelf: Vec<u8>,
 }
 
 /// The master key's stamp on this account's public key, published once when the words are set up.
@@ -561,11 +564,22 @@ impl Device {
             epoch_keys: HashMap::new(),
             chats: HashMap::new(),
             since: None,
+            shelf: Vec::new(),
         })
     }
 
     pub fn record(&self) -> &DeviceRecord {
         &self.record
+    }
+
+    /// What the client keeps beside the keys, so it can show its chats before the server answers.
+    /// Opaque here, and saved with the next snapshot.
+    pub fn shelf(&self) -> &[u8] {
+        &self.shelf
+    }
+
+    pub fn set_shelf(&mut self, shelf: Vec<u8>) {
+        self.shelf = shelf;
     }
 
     /// Where the next `sync` starts: the server time of the last row the platform saved.
@@ -1278,6 +1292,8 @@ impl Device {
             out.extend_from_slice(value);
         }
         drop(values);
+        out.extend_from_slice(&(self.shelf.len() as u32).to_be_bytes());
+        out.extend_from_slice(&self.shelf);
 
         let checksum = Sha256::digest(out.as_slice());
         out.extend_from_slice(checksum.as_slice());
@@ -1392,6 +1408,11 @@ impl Device {
                 values.insert(key, value);
             }
         }
+        let shelf = if reader.is_empty() {
+            Vec::new()
+        } else {
+            read_slice(&mut reader)?.to_vec()
+        };
 
         let signer = match SignatureKeyPair::read(
             provider.storage(),
@@ -1437,6 +1458,7 @@ impl Device {
             epoch_keys,
             chats,
             since,
+            shelf,
         })
     }
 
