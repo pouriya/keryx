@@ -1074,3 +1074,261 @@ fn a_client_that_stops_reading_a_reply_is_closed_after_send_timeout() {
     }
     assert!(total < size, "the whole file arrived, so nothing timed out");
 }
+
+/// A WebP's bytes: the RIFF header, then one chunk, padded to an even length.
+fn webp(fourcc: &[u8; 4], data: &[u8]) -> Vec<u8> {
+    let mut chunk = data.to_vec();
+    chunk.resize(data.len().max(12), 0);
+    let mut bytes = b"RIFF".to_vec();
+    bytes.extend_from_slice(&u32::try_from(4 + 8 + chunk.len()).unwrap().to_le_bytes());
+    bytes.extend_from_slice(b"WEBP");
+    bytes.extend_from_slice(fourcc);
+    bytes.extend_from_slice(&u32::try_from(chunk.len()).unwrap().to_le_bytes());
+    bytes.extend_from_slice(&chunk);
+    bytes
+}
+
+fn lossless(width: u32, height: u32) -> Vec<u8> {
+    let bits = (width - 1) | ((height - 1) << 14);
+    let mut data = vec![0x2f];
+    data.extend_from_slice(&bits.to_le_bytes());
+    webp(b"VP8L", &data)
+}
+
+fn lossy(width: u16, height: u16) -> Vec<u8> {
+    let mut data = vec![0, 0, 0, 0x9d, 0x01, 0x2a];
+    data.extend_from_slice(&width.to_le_bytes());
+    data.extend_from_slice(&height.to_le_bytes());
+    webp(b"VP8 ", &data)
+}
+
+fn animated(width: u32, height: u32) -> Vec<u8> {
+    let mut data = vec![0x02, 0, 0, 0];
+    data.extend_from_slice(&(width - 1).to_le_bytes()[..3]);
+    data.extend_from_slice(&(height - 1).to_le_bytes()[..3]);
+    webp(b"VP8X", &data)
+}
+
+fn upload(server: &Server, pack: &str, emoji: &str, bytes: &[u8]) -> (u16, Value) {
+    let route = format!("/api/v1/sticker_packs/{pack}/stickers{emoji}");
+    let (status, reply) = person::raw(server, "POST", &route, OPERATOR_TOKEN, Some(bytes));
+    (status, serde_json::from_slice(&reply).unwrap())
+}
+
+#[test]
+fn stickers_are_kept_in_packs_that_admins_manage_and_devices_use() {
+    let server = Server::start(
+        "",
+        "[registration]\nallow = true\n[limits.upload]\nsticker = \"1KiB\"\n",
+    );
+    let sara = sign_up(&server, "sara_x", SARA_WORDS);
+    let (status, reply) = server.call("GET", "/api/v1/stickers", Some(&sara.token), None);
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["data"]["pack_list"], json!([]));
+
+    // Only sticker.manage adds packs, and a name is unique and 1 to 64 characters.
+    let pack = json!({"name": "Cats"});
+    refused(
+        server.call(
+            "POST",
+            "/api/v1/sticker_packs",
+            Some(&sara.token),
+            Some(&pack),
+        ),
+        403,
+        "no_permission",
+    );
+    let (status, reply) = server.call(
+        "POST",
+        "/api/v1/sticker_packs",
+        Some(OPERATOR_TOKEN),
+        Some(&pack),
+    );
+    assert_eq!(status, 200, "{reply}");
+    let cats = reply["data"]["pack"].as_str().unwrap().to_string();
+    refused(
+        server.call(
+            "POST",
+            "/api/v1/sticker_packs",
+            Some(OPERATOR_TOKEN),
+            Some(&pack),
+        ),
+        409,
+        "name_taken",
+    );
+    for name in ["  ", &"x".repeat(65)] {
+        refused(
+            server.call(
+                "POST",
+                "/api/v1/sticker_packs",
+                Some(OPERATOR_TOKEN),
+                Some(&json!({"name": name})),
+            ),
+            400,
+            "bad_name",
+        );
+    }
+
+    // Each WebP form is read for its size, and anything else is refused.
+    let (status, reply) = upload(&server, &cats, "?emoji=%F0%9F%98%BA", &lossless(512, 300));
+    assert_eq!(status, 200, "{reply}");
+    let sticker = &reply["data"]["sticker"];
+    assert_eq!(
+        (sticker["width"].clone(), sticker["height"].clone()),
+        (json!(512), json!(300))
+    );
+    assert_eq!(sticker["emoji"], "😺");
+    let first = sticker["id"].as_str().unwrap().to_string();
+    let (status, reply) = upload(&server, &cats, "", &lossy(100, 64));
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["data"]["sticker"]["width"], 100);
+    assert!(reply["data"]["sticker"].get("emoji").is_none());
+    let second = reply["data"]["sticker"]["id"].as_str().unwrap().to_string();
+    let (status, reply) = upload(&server, &cats, "", &animated(48, 512));
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["data"]["sticker"]["height"], 512);
+    for bytes in [
+        lossless(513, 10),
+        animated(10, 513),
+        b"GIF89a, not a webp at all, long enough".to_vec(),
+        webp(b"ALPH", &[0; 12]),
+    ] {
+        let (status, reply) = upload(&server, &cats, "", &bytes);
+        assert_eq!(
+            (status, reply["code"].clone()),
+            (400, json!("bad_sticker")),
+            "{reply}"
+        );
+    }
+    let mut truncated = lossless(10, 10);
+    truncated.pop();
+    let (status, reply) = upload(&server, &cats, "", &truncated);
+    assert_eq!((status, reply["code"].clone()), (400, json!("bad_sticker")));
+    let (status, reply) = upload(&server, &cats, "", &webp(b"VP8L", &[0x2f; 2000]));
+    assert_eq!(
+        (status, reply["code"].clone()),
+        (413, json!("file_too_large"))
+    );
+    let (status, reply) = upload(&server, &Ulid::new().unwrap().to_string(), "", &lossy(1, 1));
+    assert_eq!(
+        (status, reply["code"].clone()),
+        (404, json!("no_such_pack"))
+    );
+    let (status, reply) = person::raw(
+        &server,
+        "POST",
+        &format!("/api/v1/sticker_packs/{cats}/stickers"),
+        &sara.token,
+        Some(&lossy(1, 1)),
+    );
+    assert_eq!(status, 403, "{}", String::from_utf8_lossy(&reply));
+
+    // A device lists them in order and fetches their bytes, which never change. So does the operator.
+    let (status, reply) = server.call("GET", "/api/v1/stickers", Some(&sara.token), None);
+    assert_eq!(status, 200, "{reply}");
+    let pack_list = reply["data"]["pack_list"].as_array().unwrap();
+    assert_eq!(pack_list.len(), 1);
+    assert_eq!(pack_list[0]["name"], "Cats");
+    let sticker_list = pack_list[0]["sticker_list"].as_array().unwrap();
+    assert_eq!(sticker_list.len(), 3);
+    assert_eq!(sticker_list[0]["id"], json!(first));
+    assert_eq!(sticker_list[1]["id"], json!(second));
+    let (status, _) = server.call("GET", "/api/v1/stickers", Some(OPERATOR_TOKEN), None);
+    assert_eq!(status, 200);
+    let response = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .new_agent()
+        .get(format!("{}/api/v1/stickers/{first}", server.origin))
+        .header("Authorization", &format!("Bearer {}", sara.token))
+        .call()
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["content-type"], "image/webp");
+    assert!(
+        response.headers()["cache-control"]
+            .to_str()
+            .unwrap()
+            .contains("immutable")
+    );
+    let (status, bytes) = person::raw(
+        &server,
+        "GET",
+        &format!("/api/v1/stickers/{first}"),
+        &sara.token,
+        None,
+    );
+    assert_eq!((status, bytes), (200, lossless(512, 300)));
+
+    // A session with no device sees nothing, and a stranger nothing at all.
+    let password_only = log_in(&server, "sara_x");
+    refused(
+        server.call("GET", "/api/v1/stickers", Some(&password_only), None),
+        403,
+        "no_device",
+    );
+    refused(
+        server.call("GET", "/api/v1/stickers", None, None),
+        401,
+        "not_logged_in",
+    );
+
+    // Removing a sticker, then its pack with the rest, takes the bytes too.
+    refused(
+        server.call(
+            "DELETE",
+            &format!("/api/v1/stickers/{first}"),
+            Some(&sara.token),
+            None,
+        ),
+        403,
+        "no_permission",
+    );
+    let (status, reply) = server.call(
+        "DELETE",
+        &format!("/api/v1/stickers/{first}"),
+        Some(OPERATOR_TOKEN),
+        None,
+    );
+    assert_eq!(status, 200, "{reply}");
+    refused(
+        server.call(
+            "DELETE",
+            &format!("/api/v1/stickers/{first}"),
+            Some(OPERATOR_TOKEN),
+            None,
+        ),
+        404,
+        "no_such_sticker",
+    );
+    let (status, _) = person::raw(
+        &server,
+        "GET",
+        &format!("/api/v1/stickers/{first}"),
+        &sara.token,
+        None,
+    );
+    assert_eq!(status, 404);
+    assert!(!server.path(&format!("files/stickers/{first}")).exists());
+    assert!(server.path(&format!("files/stickers/{second}")).exists());
+    let (status, reply) = server.call(
+        "DELETE",
+        &format!("/api/v1/sticker_packs/{cats}"),
+        Some(OPERATOR_TOKEN),
+        None,
+    );
+    assert_eq!(status, 200, "{reply}");
+    assert!(!server.path(&format!("files/stickers/{second}")).exists());
+    refused(
+        server.call(
+            "DELETE",
+            &format!("/api/v1/sticker_packs/{cats}"),
+            Some(OPERATOR_TOKEN),
+            None,
+        ),
+        404,
+        "no_such_pack",
+    );
+    let (_, reply) = server.call("GET", "/api/v1/stickers", Some(&sara.token), None);
+    assert_eq!(reply["data"]["pack_list"], json!([]));
+}

@@ -439,8 +439,10 @@ CREATE TABLE message (
     -- by the server even in an encrypted chat, so roles can allow or refuse each one:
     -- 0 text, 1 voice, 2 reaction, 3 image, 4 music (an MP3), 5 video, 6 doc, 7 file,
     -- 8 call (one per call, saved, and can be replied to; everything about it is in the call
-    -- table, and this row holds nothing more), 9 media_bundle (several images and videos in one message).
-    content_kind       INTEGER CHECK (content_kind BETWEEN 0 AND 9),
+    -- table, and this row holds nothing more), 9 media_bundle (several images and videos in one message),
+    -- 10 question (a tree of questions), 11 answer (one account's answer to one), 12 sticker (names
+    -- one of the server's stickers inside its encryption).
+    content_kind       INTEGER CHECK (content_kind BETWEEN 0 AND 12),
     -- [Unencrypted messages] the flag that tells a client how to read the body.
     encrypted          INTEGER CHECK (encrypted IN (0, 1)),
     -- [Restore, Commit order] the key this was encrypted under, and for a commit, the step it
@@ -627,6 +629,40 @@ CREATE INDEX file_account ON file (account_id) WHERE account_id IS NOT NULL;
 CREATE INDEX file_unused ON file (conversation_id, created_at) WHERE used_at IS NULL;
 -- [Retention] the sweep.
 CREATE INDEX file_expiry ON file (expires_at) WHERE expires_at IS NOT NULL;
+
+-- [Stickers] a named pack of the server's stickers, which everyone with a registered device can list
+-- and send. Added and removed with `sticker.manage`.
+CREATE TABLE sticker_pack (
+    -- [Stickers] what the routes and the command line name a pack by.
+    id               BLOB PRIMARY KEY,
+    -- [Stickers] unique, so two packs never look the same in a picker. 1 to 64 characters.
+    name             TEXT NOT NULL UNIQUE,
+    -- [Stickers] packs are listed oldest first.
+    created_at       INTEGER NOT NULL
+) WITHOUT ROWID, STRICT;
+
+-- [Stickers] one sticker: a static or animated WebP, not encrypted, whose bytes are under
+-- `[files] directory` in `stickers`, a file named by its id. An id is never reused, so its bytes never
+-- change. A sticker message names it inside its encryption, so nothing here says who sent which.
+CREATE TABLE sticker (
+    -- [Stickers] names the file on disk, and what a sticker message holds.
+    id               BLOB PRIMARY KEY,
+    -- [Stickers] removing a pack removes its stickers.
+    pack_id          BLOB NOT NULL REFERENCES sticker_pack (id) ON DELETE CASCADE,
+    -- [Stickers] one optional emoji, for search later.
+    emoji            TEXT,
+    -- [Stickers] read from its WebP header, at most 512 each, so a client draws its space first.
+    width            INTEGER NOT NULL CHECK (width BETWEEN 1 AND 512),
+    -- [Stickers] the same for its height.
+    height           INTEGER NOT NULL CHECK (height BETWEEN 1 AND 512),
+    -- [Stickers, Upload limits] its bytes, at most `[limits.upload] sticker`.
+    size             INTEGER NOT NULL CHECK (size > 0),
+    -- [Stickers] a pack's stickers are listed oldest first.
+    created_at       INTEGER NOT NULL
+) WITHOUT ROWID, STRICT;
+
+-- [Stickers] a pack's stickers, in order.
+CREATE INDEX sticker_in_pack ON sticker (pack_id, created_at);
 
 
 -- ---------------------------------------------------------------------------

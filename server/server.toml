@@ -72,6 +72,9 @@ doc = "16KiB"
 file = "16KiB"
 call = "16KiB"
 media_bundle = "64KiB"
+question = "64KiB"
+answer = "16KiB"
+sticker = "1KiB"
 draft = "64KiB"            # an account's sealed draft in one chat. Not a message
 
 [limits.upload]           # one file's encrypted bytes, by the type its uploader declares
@@ -81,6 +84,7 @@ music = "200MiB"
 video = "2GiB"
 doc = "100MiB"
 file = "2GiB"
+sticker = "256KiB"        # one sticker's WebP. Not encrypted: everyone on the server sees it
 
 # Without this section the server speaks plain HTTP, for local use or behind a reverse proxy.
 [tcp]

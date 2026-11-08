@@ -22,7 +22,7 @@ use axum::extract::ws::rejection::WebSocketUpgradeRejection;
 use axum::extract::ws::{CloseFrame, Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, DefaultBodyLimit, MatchedPath, Path, Query, Request, State};
 use axum::http::header::{
-    AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, ORIGIN, SERVER, SET_COOKIE,
+    AUTHORIZATION, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, ORIGIN, SERVER, SET_COOKIE,
 };
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
@@ -38,12 +38,12 @@ use keryx_core::mls::{
 use keryx_core::protocol::{
     AccountInfo, AccountKeysBody, AccountListReply, AccountReply, Bytes, ChallengeBody,
     ChallengeReply, ChatDeviceListReply, ChatMode, ChatReply, ClientFrame, ContentKind, CountReply,
-    CreateAccountBody, CreateChatBody, CreateFileBody, CreatedAccountReply, DeviceListReply,
-    DeviceReply, DevicesReply, DraftBody, DraftRequest, EmptyReply, FeaturesReply, FileReply,
-    FileStatusReply, GroupInfoReply, KeyPackageListReply, KeyPackagesBody, LoginBody, LoginReply,
-    ReducedDeviceItem, ReducedDeviceListReply, RegisterBody, RegisterDeviceBody, ResetBody,
-    SelfChatReply, ServerFrame, SessionListReply, SetupBody, SetupReply, SignedBody, TimesReply,
-    WrapListReply,
+    CreateAccountBody, CreateChatBody, CreateFileBody, CreatePackBody, CreatedAccountReply,
+    DeviceListReply, DeviceReply, DevicesReply, DraftBody, DraftRequest, EmptyReply, FeaturesReply,
+    FileReply, FileStatusReply, GroupInfoReply, KeyPackageListReply, KeyPackagesBody, LoginBody,
+    LoginReply, PackReply, ReducedDeviceItem, ReducedDeviceListReply, RegisterBody,
+    RegisterDeviceBody, ResetBody, SelfChatReply, ServerFrame, SessionListReply, SetupBody,
+    SetupReply, SignedBody, StickerItem, StickerListReply, StickerReply, TimesReply, WrapListReply,
 };
 use keryx_core::ulid::Ulid;
 use serde::de::DeserializeOwned;
@@ -63,8 +63,8 @@ use crate::file;
 use crate::moq;
 use crate::storage::sqlite::Sqlite;
 use crate::storage::{
-    self, BuiltInRole, NewAccount, NewDevice, NewFile, NewSession, Registered, Session, Storage,
-    StoredFile, SyncFrom,
+    self, BuiltInRole, NewAccount, NewDevice, NewFile, NewSession, NewSticker, Registered, Session,
+    Storage, StoredFile, SyncFrom,
 };
 
 pub const CHAT_CREATE_DIRECT: &str = "chat.create_direct";
@@ -74,6 +74,7 @@ pub const SEND_UNENCRYPTED: &str = "message.send.unencrypted";
 pub const MESSAGE_COMMIT: &str = "message.commit";
 pub const EDIT_OWN: &str = "message.edit.own";
 pub const DELETE_OWN: &str = "message.delete.own";
+pub const STICKER_MANAGE: &str = "sticker.manage";
 
 /// The closed list of permission names. A stored role holding any other name stops startup, so a
 /// typo in a role cannot silently grant nothing.
@@ -91,14 +92,18 @@ pub const PERMISSION_LIST: &[&str] = &[
     "message.send.file",
     "message.send.call",
     "message.send.media_bundle",
+    "message.send.question",
+    "message.send.answer",
+    "message.send.sticker",
     SEND_UNENCRYPTED,
     MESSAGE_COMMIT,
     EDIT_OWN,
     DELETE_OWN,
+    STICKER_MANAGE,
 ];
 
 /// Everyone's built-in roles hold the whole list, except these, which are the admin's alone.
-const ADMIN_ONLY: &[&str] = &[ACCOUNT_CREATE, SEND_UNENCRYPTED];
+const ADMIN_ONLY: &[&str] = &[ACCOUNT_CREATE, SEND_UNENCRYPTED, STICKER_MANAGE];
 
 /// The permission to send one content kind.
 pub fn send_permission(content_kind: ContentKind) -> &'static str {
@@ -113,6 +118,9 @@ pub fn send_permission(content_kind: ContentKind) -> &'static str {
         ContentKind::File => "message.send.file",
         ContentKind::Call => "message.send.call",
         ContentKind::MediaBundle => "message.send.media_bundle",
+        ContentKind::Question => "message.send.question",
+        ContentKind::Answer => "message.send.answer",
+        ContentKind::Sticker => "message.send.sticker",
     }
 }
 
@@ -299,6 +307,9 @@ pub struct BodyLimits {
     pub file: u64,
     pub call: u64,
     pub media_bundle: u64,
+    pub question: u64,
+    pub answer: u64,
+    pub sticker: u64,
     /// An account's sealed draft in one chat, which is not a message.
     pub draft: u64,
 }
@@ -316,6 +327,9 @@ impl Default for BodyLimits {
             file: 16 * 1024,
             call: 16 * 1024,
             media_bundle: 64 * 1024,
+            question: 64 * 1024,
+            answer: 16 * 1024,
+            sticker: 1024,
             draft: 64 * 1024,
         }
     }
@@ -334,6 +348,9 @@ impl BodyLimits {
             ContentKind::File => self.file,
             ContentKind::Call => self.call,
             ContentKind::MediaBundle => self.media_bundle,
+            ContentKind::Question => self.question,
+            ContentKind::Answer => self.answer,
+            ContentKind::Sticker => self.sticker,
         }
     }
 }
@@ -348,6 +365,8 @@ pub struct UploadLimits {
     pub video: u64,
     pub doc: u64,
     pub file: u64,
+    /// One sticker's WebP, which is not a chat's file.
+    pub sticker: u64,
 }
 
 impl Default for UploadLimits {
@@ -360,6 +379,7 @@ impl Default for UploadLimits {
             video: 2048 * MIB,
             doc: 100 * MIB,
             file: 2048 * MIB,
+            sticker: 256 * 1024,
         }
     }
 }
@@ -1685,6 +1705,149 @@ pub async fn run_get_chunk(
     file::read_chunk(app, stored.chat, id, n, length).await
 }
 
+/// The longest a sticker pack's name may be, in characters, fixed by the author.
+const PACK_NAME_CHARS: usize = 64;
+
+/// Every pack and its stickers, for a registered device or whoever may manage them.
+pub async fn run_sticker_list(app: &App, caller: &Caller) -> Result<StickerListReply, Refused> {
+    if check(app, caller, Need::Server(STICKER_MANAGE))
+        .await
+        .is_err()
+    {
+        check(app, caller, Need::Device).await?;
+    }
+    let pack_list = app.storage.sticker_list().await?;
+    Ok(StickerListReply { pack_list })
+}
+
+/// A sticker's WebP. Its bytes never change, as an id is never reused.
+pub async fn run_sticker_image(app: &App, caller: &Caller, id: Ulid) -> Result<Vec<u8>, Refused> {
+    check(app, caller, Need::Device).await?;
+    if app.storage.sticker(id).await?.is_none() {
+        return Err(refused(
+            404,
+            "no_such_sticker",
+            "That sticker does not exist",
+        ));
+    }
+    file::read_sticker(app, id).await
+}
+
+pub async fn run_create_pack(
+    app: &App,
+    caller: &Caller,
+    input: CreatePackBody,
+) -> Result<PackReply, Refused> {
+    check(app, caller, Need::Server(STICKER_MANAGE)).await?;
+    let name = input.name.trim().to_string();
+    let length = name.chars().count();
+    if length == 0 || length > PACK_NAME_CHARS {
+        return Err(refused(
+            400,
+            "bad_name",
+            "A pack's name is 1 to 64 characters",
+        ));
+    }
+    let id = new_id()?;
+    if !app.storage.create_pack(id, name, Ulid::now()).await? {
+        return Err(refused(409, "name_taken", "A pack already has that name"));
+    }
+    tracing::info!(msg = "Added a sticker pack", pack = %id);
+    Ok(PackReply { pack: id })
+}
+
+pub async fn run_remove_pack(app: &App, caller: &Caller, id: Ulid) -> Result<EmptyReply, Refused> {
+    check(app, caller, Need::Server(STICKER_MANAGE)).await?;
+    let Some(sticker_list) = app.storage.remove_pack(id).await? else {
+        return Err(refused(404, "no_such_pack", "That pack does not exist"));
+    };
+    for sticker in sticker_list {
+        file::remove_sticker(app, sticker).await;
+    }
+    tracing::info!(msg = "Removed a sticker pack", pack = %id);
+    Ok(EmptyReply {})
+}
+
+/// A WebP of at most 512x512 and `[limits.upload] sticker`, checked by its header.
+pub async fn run_add_sticker(
+    app: &App,
+    caller: &Caller,
+    pack: Ulid,
+    emoji: Option<String>,
+    bytes: Vec<u8>,
+) -> Result<StickerReply, Refused> {
+    check(app, caller, Need::Server(STICKER_MANAGE)).await?;
+    if bytes.len() as u64 > app.settings.limits.upload.sticker {
+        return Err(refused(413, "file_too_large", "That sticker is too large"));
+    }
+    let Some((width, height)) = file::webp_size(&bytes) else {
+        return Err(refused(400, "bad_sticker", "A sticker is a WebP"));
+    };
+    if width == 0 || height == 0 || width > file::STICKER_SIDE || height > file::STICKER_SIDE {
+        return Err(refused(400, "bad_sticker", "A sticker is at most 512x512"));
+    }
+    let emoji = match emoji {
+        Some(emoji) if emoji.trim().is_empty() => None,
+        Some(emoji) if emoji.chars().count() > 16 => {
+            return Err(refused(400, "bad_body", "That is not one emoji"));
+        }
+        other => other,
+    };
+    let id = new_id()?;
+    file::write_sticker(app, id, &bytes).await?;
+    let sticker = StickerItem {
+        id,
+        emoji: emoji.clone(),
+        width,
+        height,
+        size: bytes.len() as u64,
+    };
+    let added = app
+        .storage
+        .add_sticker(NewSticker {
+            id,
+            pack,
+            emoji,
+            width,
+            height,
+            size: sticker.size,
+            now: Ulid::now(),
+        })
+        .await;
+    match added {
+        Ok(true) => {
+            tracing::info!(msg = "Added a sticker", sticker = %id, pack = %pack);
+            Ok(StickerReply { sticker })
+        }
+        Ok(false) => {
+            file::remove_sticker(app, id).await;
+            Err(refused(404, "no_such_pack", "That pack does not exist"))
+        }
+        Err(error) => {
+            file::remove_sticker(app, id).await;
+            Err(error.into())
+        }
+    }
+}
+
+pub async fn run_remove_sticker(
+    app: &App,
+    caller: &Caller,
+    id: Ulid,
+) -> Result<EmptyReply, Refused> {
+    check(app, caller, Need::Server(STICKER_MANAGE)).await?;
+    if !app.storage.remove_sticker(id).await? {
+        return Err(refused(
+            404,
+            "no_such_sticker",
+            "That sticker does not exist",
+        ));
+    }
+    file::remove_sticker(app, id).await;
+    tracing::info!(msg = "Removed a sticker", sticker = %id);
+    Ok(EmptyReply {})
+}
+
 /// What a device's frames do: reads answer here, and everything else goes through the chat's task.
 pub async fn run_frame(
     app: &Arc<App>,
@@ -2279,6 +2442,83 @@ async fn get_chunk(
     }
 }
 
+async fn sticker_list(State(app): Shared, headers: HeaderMap) -> Response {
+    respond(operation!("StickerList", "sticker_list", async {
+        let caller = caller_of(&app, &headers).await?;
+        run_sticker_list(&app, &caller).await
+    }))
+}
+
+async fn sticker_image(State(app): Shared, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    let result = operation!("StickerImage", "sticker_image", async {
+        let caller = caller_of(&app, &headers).await?;
+        run_sticker_image(&app, &caller, path_id(&id)?).await
+    });
+    match result {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [
+                (CONTENT_TYPE, "image/webp"),
+                (CACHE_CONTROL, "private, max-age=31536000, immutable"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(refusal) => refusal.into_response(),
+    }
+}
+
+async fn create_pack(State(app): Shared, headers: HeaderMap, body: Body) -> Response {
+    respond(operation!("CreatePack", "create_pack", async {
+        let caller = caller_of(&app, &headers).await?;
+        run_create_pack(&app, &caller, parse(body)?).await
+    }))
+}
+
+async fn remove_pack(State(app): Shared, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    respond(operation!("RemovePack", "remove_pack", async {
+        let caller = caller_of(&app, &headers).await?;
+        run_remove_pack(&app, &caller, path_id(&id)?).await
+    }))
+}
+
+#[derive(Deserialize)]
+struct StickerQuery {
+    #[serde(default)]
+    emoji: Option<String>,
+}
+
+async fn add_sticker(
+    State(app): Shared,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(query): Query<StickerQuery>,
+    body: Body,
+) -> Response {
+    respond(operation!("AddSticker", "add_sticker", async {
+        let caller = caller_of(&app, &headers).await?;
+        let bytes = match body {
+            Ok(bytes) => bytes.to_vec(),
+            Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+                return Err(refused(413, "file_too_large", "That sticker is too large"));
+            }
+            Err(_) => return Err(refused(400, "bad_body", "That body could not be read")),
+        };
+        run_add_sticker(&app, &caller, path_id(&id)?, query.emoji, bytes).await
+    }))
+}
+
+async fn remove_sticker(
+    State(app): Shared,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    respond(operation!("RemoveSticker", "remove_sticker", async {
+        let caller = caller_of(&app, &headers).await?;
+        run_remove_sticker(&app, &caller, path_id(&id)?).await
+    }))
+}
+
 async fn nothing_here() -> Response {
     refused(404, "not_found", "There is nothing there").into_response()
 }
@@ -2641,6 +2881,7 @@ fn content_length(headers: &HeaderMap) -> u64 {
 fn router(app: Arc<App>, www: &FilePath) -> Router {
     let rest_body = app.settings.limits.rest_body;
     let chunk_body = usize::try_from(file::CHUNK + file::TAG).unwrap_or(usize::MAX);
+    let sticker_body = usize::try_from(app.settings.limits.upload.sticker).unwrap_or(usize::MAX);
     let files = ServeDir::new(www).fallback(ServeFile::new(www.join("index.html")));
     Router::new()
         .route("/api/v1", get(guide))
@@ -2684,6 +2925,17 @@ fn router(app: Arc<App>, www: &FilePath) -> Router {
             put(put_chunk)
                 .layer(DefaultBodyLimit::max(chunk_body))
                 .get(get_chunk),
+        )
+        .route("/api/v1/stickers", get(sticker_list))
+        .route(
+            "/api/v1/stickers/{id}",
+            get(sticker_image).delete(remove_sticker),
+        )
+        .route("/api/v1/sticker_packs", post(create_pack))
+        .route("/api/v1/sticker_packs/{id}", delete(remove_pack))
+        .route(
+            "/api/v1/sticker_packs/{id}/stickers",
+            post(add_sticker).layer(DefaultBodyLimit::max(sticker_body)),
         )
         .route("/api/v1/{*rest}", any(nothing_here))
         .method_not_allowed_fallback(wrong_method)

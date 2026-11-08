@@ -5,8 +5,8 @@ use std::future::Future;
 
 use keryx_core::protocol::{
     AccountBrief, CallEvent, ChatDevice, ChatItem, ChatMode, ChatType, ContentKind, DeviceItem,
-    DraftItem, KeyPackageItem, Kind, MarkItem, MessageFrame, SessionItem, SyncPosition, TimesItem,
-    WrapEntry,
+    DraftItem, KeyPackageItem, Kind, MarkItem, MessageFrame, SessionItem, StickerItem, StickerPack,
+    SyncPosition, TimesItem, WrapEntry,
 };
 use keryx_core::ulid::Ulid;
 
@@ -163,6 +163,17 @@ pub struct NewFile {
     pub size: u64,
     pub chunks: u64,
     pub device: Ulid,
+    pub now: i64,
+}
+
+/// A sticker whose bytes are already on disk, for its pack.
+pub struct NewSticker {
+    pub id: Ulid,
+    pub pack: Ulid,
+    pub emoji: Option<String>,
+    pub width: u32,
+    pub height: u32,
+    pub size: u64,
     pub now: i64,
 }
 
@@ -487,6 +498,24 @@ pub trait Storage: Send + Sync + 'static {
     /// Ends every call still open, one with no `end` row, as missed unless the other account joined,
     /// with an `end` from the caller's device. Nobody can be in one after a restart.
     fn end_open_calls(&self, now: i64) -> impl Future<Output = Result<()>> + Send;
+
+    /// A new sticker pack. False when its name is taken.
+    fn create_pack(
+        &self,
+        id: Ulid,
+        name: String,
+        now: i64,
+    ) -> impl Future<Output = Result<bool>> + Send;
+    /// Removes a pack and its stickers, giving the stickers' ids so their bytes can go, or `None` when
+    /// there is no such pack.
+    fn remove_pack(&self, id: Ulid) -> impl Future<Output = Result<Option<Vec<Ulid>>>> + Send;
+    /// False when its pack does not exist.
+    fn add_sticker(&self, sticker: NewSticker) -> impl Future<Output = Result<bool>> + Send;
+    /// False when there is no such sticker.
+    fn remove_sticker(&self, id: Ulid) -> impl Future<Output = Result<bool>> + Send;
+    /// Every pack with its stickers, each oldest first.
+    fn sticker_list(&self) -> impl Future<Output = Result<Vec<StickerPack>>> + Send;
+    fn sticker(&self, id: Ulid) -> impl Future<Output = Result<Option<StickerItem>>> + Send;
 
     fn create_file(&self, file: NewFile) -> impl Future<Output = Result<()>> + Send;
     /// A chat's file, removed or not. `None` for an account's file or none at all.

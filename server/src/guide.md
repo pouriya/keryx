@@ -62,6 +62,10 @@ good.
 
     POST /accounts               username, admin?, display_name? -> account, link
     GET  /accounts?search=       -> account_list
+    POST /sticker_packs          sticker.manage: name -> pack
+    DEL  /sticker_packs/{id}     sticker.manage: the pack and its stickers
+    POST /sticker_packs/{id}/stickers?emoji=   sticker.manage: the raw WebP -> sticker
+    DEL  /stickers/{id}          sticker.manage
 
 ## With a registered device, under the account's device limit
 
@@ -79,17 +83,26 @@ good.
     GET  /files/{id}                      -> size, chunks, received
     GET  /files/{id}/chunks/{n}           -> the encrypted chunk's raw bytes
     GET  /calls/{chat}/{seq}/moq          a WebSocket: the call's MoQ, while the call is open
+    GET  /stickers                        -> pack_list{id, name, sticker_list{id, emoji?, width, height,
+                                             size}}, also with sticker.manage
+    GET  /stickers/{id}                   -> the sticker's WebP, which never changes
 
 Claiming hands out one package per device and deletes it. `POST /chats` gives the pair's chat, and your
 own account id gives your self chat. The `/chats/{id}` routes need you to be in that chat. In
 `device_list`, a device with a `statement` has ended, and that is its signed revocation or logout.
 
 A file is encrypted by its sender in chunks of 1 MiB, each followed by its 16-byte tag. `kind` is the
-type that picks the upload limit (1 voice, 3 image, 4 video, 5 doc, 6 file), and `size` counts the
+type that picks the upload limit (1 voice, 3 image, 4 music, 5 video, 6 doc, 7 file), and `size` counts the
 encrypted bytes. Chunks go up in order, and sending the last one again is fine, so after a drop, ask
 `GET /files/{id}` and go on from `received`. Only the uploader's account puts chunks. A `send` keeps
 its files by listing them in `persist`, and until then only the uploader reads them. An edit or delete
 lists the files it drops in `remove`. An upload no sent message keeps is removed after a day.
+
+A sticker is a static or animated WebP of at most 512x512 and `[limits.upload] sticker`, kept in a pack
+whose name is unique. It is not encrypted, since everyone here can see it. A sticker message, content
+kind 12, names it inside its encryption as `{"sticker": "<id>"}`, and cannot be edited. A question
+message, kind 10, holds a tree of questions, and an answer, kind 11, one account's answer to it, both
+sealed like text, so the server reads neither.
 
 ## The WebSocket
 

@@ -67,7 +67,8 @@ src/lib.rs        The modules, as a library so that tests/ can reach them
 src/api.rs        Every operation, and the axum router: REST and WebSocket
 src/captcha.rs    The captcha: drawn, stored with its answer, checked, swept
 src/chat.rs       Chat logic: the per-chat task that serializes a chat's events
-src/file.rs       Files' bytes on disk under [files] directory: chunk writes and reads, removing unused uploads
+src/file.rs       Files' bytes on disk under [files] directory: chunk writes and reads, removing unused
+                  uploads, and stickers' WebP checked by its header
 src/mcp.rs        Admin MCP on the server, and the local client MCP
 src/moq.rs        The embedded relay: MoQ over qmux on a WebSocket, admitting each device to its call
 src/storage.rs    The storage trait: accounts, conversations, messages, wrapped keys
@@ -78,6 +79,8 @@ src/storage/sqlite.sql The schema, compiled in with include_str!, since SQLite t
 src/guide.md      The REST guide. Not code: prose, include_str!'d
 server.toml       The commented example configuration
 tests/            Integration tests. See tests/AGENTS.md
+examples/drive.rs Drives core as a real client against a running server, to send what a phone cannot,
+                  such as a question. Not a test
 Makefile          Every build and check entry point
 ```
 

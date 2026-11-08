@@ -727,6 +727,9 @@ async fn run_send(
                 if content_kind == ContentKind::Reaction {
                     return Err(refused(409, "cannot_edit", "A reaction cannot be edited"));
                 }
+                if content_kind == ContentKind::Sticker {
+                    return Err(refused(409, "cannot_edit", "A sticker cannot be edited"));
+                }
                 body_limit = Some(app.settings.limits.body.of(content_kind));
             } else {
                 if !matches!(target.kind, Kind::Content | Kind::DeviceNotice) {

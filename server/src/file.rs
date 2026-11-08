@@ -1,6 +1,8 @@
 //! Files' bytes on disk under `[files] directory`: a folder per chat named by its id, and one file per
 //! upload named by its id, holding its encrypted chunks back to back. Chunk writes and reads, and
-//! removing uploads no sent message named. The rows are in storage. See the root AGENTS.md.
+//! removing uploads no sent message named. Stickers live there too, in a `stickers` folder, a file
+//! per sticker named by its id, each a WebP checked by its header. The rows are in storage. See the
+//! root AGENTS.md.
 
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
@@ -122,4 +124,77 @@ pub async fn sweep(app: &App, chat: Option<Ulid>) -> Result<(), Refused> {
         remove(app, chat, file).await;
     }
     Ok(())
+}
+
+/// The largest a sticker may be on either side, fixed by the author.
+pub const STICKER_SIDE: u32 = 512;
+
+/// A sticker's width and height, read from its WebP header without decoding a pixel: a RIFF file of
+/// type WEBP whose first chunk is VP8 (lossy), VP8L (lossless) or VP8X (extended, which animation
+/// needs). `None` for anything else.
+pub fn webp_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 30 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WEBP" {
+        return None;
+    }
+    let riff = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    if usize::try_from(riff).ok()? + 8 != bytes.len() {
+        return None;
+    }
+    let data = &bytes[20..];
+    match &bytes[12..16] {
+        b"VP8 " => {
+            // A frame tag of 3 bytes, the start code, then 14-bit width and height.
+            if data[3..6] != [0x9d, 0x01, 0x2a] {
+                return None;
+            }
+            let width = u32::from(u16::from_le_bytes([data[6], data[7]]) & 0x3fff);
+            let height = u32::from(u16::from_le_bytes([data[8], data[9]]) & 0x3fff);
+            Some((width, height))
+        }
+        b"VP8L" => {
+            // The signature, then width - 1 and height - 1 in 14 bits each.
+            if data[0] != 0x2f {
+                return None;
+            }
+            let bits = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
+            Some(((bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1))
+        }
+        b"VP8X" => {
+            // Flags and 3 reserved bytes, then the canvas's width - 1 and height - 1 in 24 bits.
+            let width = u32::from_le_bytes([data[4], data[5], data[6], 0]) + 1;
+            let height = u32::from_le_bytes([data[7], data[8], data[9], 0]) + 1;
+            Some((width, height))
+        }
+        _ => None,
+    }
+}
+
+fn sticker_path(directory: &Path, sticker: Ulid) -> PathBuf {
+    directory.join("stickers").join(sticker.to_string())
+}
+
+/// Writes a sticker's bytes, and waits until they are on disk.
+pub async fn write_sticker(app: &App, sticker: Ulid, bytes: &[u8]) -> Result<(), Refused> {
+    let path = sticker_path(&app.settings.files.directory, sticker);
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await.map_err(failed)?;
+    }
+    let mut handle = tokio::fs::File::create(&path).await.map_err(failed)?;
+    handle.write_all(bytes).await.map_err(failed)?;
+    handle.sync_data().await.map_err(failed)
+}
+
+pub async fn read_sticker(app: &App, sticker: Ulid) -> Result<Vec<u8>, Refused> {
+    let path = sticker_path(&app.settings.files.directory, sticker);
+    tokio::fs::read(&path).await.map_err(failed)
+}
+
+/// Deletes a sticker's bytes. One already gone is fine.
+pub async fn remove_sticker(app: &App, sticker: Ulid) {
+    let path = sticker_path(&app.settings.files.directory, sticker);
+    match tokio::fs::remove_file(&path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => tracing::error!(msg = "Could not delete a sticker's bytes", error = %error),
+    }
 }

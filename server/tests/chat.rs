@@ -11,8 +11,9 @@ use keryx_core::client::{Command, Draft, Event, FileSpec, Pointer, Secret, Thumb
 use keryx_core::file;
 use keryx_core::mls::{AccountWrap, Commit, Device};
 use keryx_core::protocol::{
-    Bytes, CallEvent, CallEventKind, CallOutcome, ChatType, ClientFrame, ContentKind, Header, Kind,
-    MessageFrame, SendFrame, ServerFrame, SyncPosition, WelcomeItem, WrapItem,
+    Answer, Bytes, CallEvent, CallEventKind, CallOutcome, ChatType, ClientFrame, ContentKind,
+    Header, Kind, MessageFrame, Question, SendFrame, ServerFrame, SyncPosition, WelcomeItem,
+    WrapItem,
 };
 use keryx_core::ulid::Ulid;
 use person::{
@@ -3672,4 +3673,228 @@ fn a_dropped_call_socket_gets_the_grace() {
             (CallEventKind::End, 3)
         ]
     );
+}
+
+/// A lossless WebP of this size: the RIFF header, then a VP8L chunk with its signature and size.
+fn webp(width: u32, height: u32) -> Vec<u8> {
+    let bits = (width - 1) | ((height - 1) << 14);
+    let mut chunk = vec![0x2f];
+    chunk.extend_from_slice(&bits.to_le_bytes());
+    chunk.resize(12, 0);
+    let mut bytes = b"RIFF".to_vec();
+    bytes.extend_from_slice(&u32::try_from(4 + 8 + chunk.len()).unwrap().to_le_bytes());
+    bytes.extend_from_slice(b"WEBPVP8L");
+    bytes.extend_from_slice(&u32::try_from(chunk.len()).unwrap().to_le_bytes());
+    bytes.extend_from_slice(&chunk);
+    bytes
+}
+
+#[test]
+fn a_sticker_names_a_server_sticker_inside_its_encryption_and_cannot_be_edited() {
+    let server = open_server();
+    let (_, reply) = server.call(
+        "POST",
+        "/api/v1/sticker_packs",
+        Some(OPERATOR_TOKEN),
+        Some(&json!({"name": "Cats"})),
+    );
+    let pack = reply["data"]["pack"].as_str().unwrap().to_string();
+    let (status, reply) = raw(
+        &server,
+        "POST",
+        &format!("/api/v1/sticker_packs/{pack}/stickers"),
+        OPERATOR_TOKEN,
+        Some(&webp(64, 64)),
+    );
+    assert_eq!(status, 200);
+    let reply: Value = serde_json::from_slice(&reply).unwrap();
+    let sticker = ulid_of(&reply["data"]["sticker"]["id"]);
+
+    // Core lists the packs and fetches the image.
+    let (mut sara, mut babak, chat) = apps_on(&server);
+    sara.command(&server, Command::Stickers);
+    let Event::Stickers { pack_list } =
+        sara.wait(&server, |event| matches!(event, Event::Stickers { .. }))
+    else {
+        unreachable!();
+    };
+    assert_eq!(pack_list.len(), 1);
+    assert_eq!(pack_list[0].sticker_list[0].id, sticker);
+    sara.command(&server, Command::StickerImage { sticker });
+    let Event::StickerImage { bytes, .. } =
+        sara.wait(&server, |event| matches!(event, Event::StickerImage { .. }))
+    else {
+        unreachable!();
+    };
+    assert_eq!(bytes.0, webp(64, 64));
+    sara.command(
+        &server,
+        Command::StickerImage {
+            sticker: Ulid::new().unwrap(),
+        },
+    );
+    let Event::Error { code, .. } =
+        sara.wait(&server, |event| matches!(event, Event::Error { .. }))
+    else {
+        unreachable!();
+    };
+    assert_eq!(code, "no_such_sticker");
+
+    // Sent as a sticker, a reply to nothing, and the other side reads its id.
+    sara.command(
+        &server,
+        Command::SendSticker {
+            chat,
+            sticker,
+            reply: None,
+        },
+    );
+    let Event::Sent { seq, .. } = sara.wait(&server, |event| matches!(event, Event::Sent { .. }))
+    else {
+        unreachable!();
+    };
+    let message = shown(babak.wait(&server, |event| is_message(event, chat, seq)));
+    assert_eq!(message.content_kind, Some(ContentKind::Sticker));
+    assert_eq!(message.sticker, Some(sticker));
+    assert_eq!(message.text, None);
+    let stored = server.call(
+        "GET",
+        "/api/v1/stickers",
+        Some(sara.token.as_ref().unwrap()),
+        None,
+    );
+    assert_eq!(stored.0, 200);
+
+    // The server never sees which sticker, and refuses an edit of one.
+    let mut pair = pair();
+    let chat = pair.chat;
+    let body = format!("{{\"sticker\":\"{sticker}\"}}");
+    let frame = sealed_as(
+        &pair.sara,
+        chat,
+        Kind::Content,
+        Some(ContentKind::Sticker),
+        1,
+        None,
+        body.as_bytes(),
+    );
+    let sticker_seq = seq_of(post(&mut pair.sara_socket, frame));
+    let received = pair.babak_socket.message(chat, sticker_seq);
+    assert!(
+        !String::from_utf8_lossy(&received.body.unwrap().0).contains(&sticker.to_string()),
+        "sealed"
+    );
+    let edit = sealed(&pair.sara, chat, Kind::Edit, Some(sticker_seq), b"{}");
+    assert_refused(post(&mut pair.sara_socket, edit), "cannot_edit");
+}
+
+#[test]
+fn a_question_and_its_answer_are_sealed_checked_by_core_and_the_answer_can_change() {
+    let server = open_server();
+    let (mut sara, mut babak, chat) = apps_on(&server);
+    let question: Question = serde_json::from_value(json!({
+        "first": "size",
+        "nodes": [
+            {"id": "size", "text": "Which size?",
+             "choice": {"multi": false, "options": [{"id": "s", "text": "Small"}, {"id": "l", "text": "Large"}]},
+             "next": [{"picked": ["l"], "to": "much"}]},
+            {"id": "much", "text": "How many kilos?", "number": {"min": 1, "max": 9, "unit": "kg"}}
+        ]
+    }))
+    .unwrap();
+
+    // Core refuses a tree that does not hold together, and sends nothing.
+    let mut broken = question.clone();
+    broken.first = "nowhere".to_string();
+    sara.command(
+        &server,
+        Command::SendQuestion {
+            chat,
+            text: None,
+            question: broken,
+        },
+    );
+    let Event::Error { code, .. } =
+        sara.wait(&server, |event| matches!(event, Event::Error { .. }))
+    else {
+        unreachable!();
+    };
+    assert_eq!(code, "bad_question");
+
+    sara.command(
+        &server,
+        Command::SendQuestion {
+            chat,
+            text: Some(Secret("Lunch order".to_string())),
+            question: question.clone(),
+        },
+    );
+    let Event::Sent { seq, .. } = sara.wait(&server, |event| matches!(event, Event::Sent { .. }))
+    else {
+        unreachable!();
+    };
+    let asked = shown(babak.wait(&server, |event| is_message(event, chat, seq)));
+    assert_eq!(asked.content_kind, Some(ContentKind::Question));
+    assert_eq!(text_of(&asked), Some("Lunch order"));
+    assert_eq!(asked.question.as_ref(), Some(&question));
+
+    // An answer off the path is refused by core, and one along it reaches the asker.
+    let off: Answer = serde_json::from_value(json!({"question": seq, "answers": [
+        {"node": "size", "picked": ["s"]}, {"node": "much", "number": 2}]}))
+    .unwrap();
+    babak.command(
+        &server,
+        Command::SendAnswer {
+            chat,
+            question: question.clone(),
+            answer: off,
+        },
+    );
+    let Event::Error { code, .. } =
+        babak.wait(&server, |event| matches!(event, Event::Error { .. }))
+    else {
+        unreachable!();
+    };
+    assert_eq!(code, "bad_answer");
+    let large: Answer = serde_json::from_value(json!({"question": seq, "answers": [
+        {"node": "size", "picked": ["l"]}, {"node": "much", "number": 3}]}))
+    .unwrap();
+    babak.command(
+        &server,
+        Command::SendAnswer {
+            chat,
+            question: question.clone(),
+            answer: large.clone(),
+        },
+    );
+    let Event::Sent { seq: answered, .. } =
+        babak.wait(&server, |event| matches!(event, Event::Sent { .. }))
+    else {
+        unreachable!();
+    };
+    let answer = shown(sara.wait(&server, |event| is_message(event, chat, answered)));
+    assert_eq!(answer.content_kind, Some(ContentKind::Answer));
+    assert_eq!(answer.answer.as_ref(), Some(&large));
+
+    // Changing it is an edit, and skipping the whole form is an answer too.
+    let skipped: Answer =
+        serde_json::from_value(json!({"question": seq, "skipped": true})).unwrap();
+    babak.command(
+        &server,
+        Command::EditAnswer {
+            chat,
+            target: Pointer::Seq(answered),
+            question,
+            answer: skipped.clone(),
+        },
+    );
+    let Event::Edited {
+        message,
+        target_seq,
+    } = sara.wait(&server, |event| matches!(event, Event::Edited { .. }))
+    else {
+        unreachable!();
+    };
+    assert_eq!(target_seq, answered);
+    assert_eq!(message.answer.as_ref(), Some(&skipped));
 }

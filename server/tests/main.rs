@@ -31,6 +31,9 @@ fn bare_commands_print_their_long_help_and_exit_zero() {
     let group = keryx(&["user"]);
     assert!(group.status.success());
     assert!(text(&group.stdout).contains("add"));
+    let group = keryx(&["sticker"]);
+    assert!(group.status.success());
+    assert!(text(&group.stdout).contains("list"));
 }
 
 #[test]
@@ -533,4 +536,86 @@ fn every_command_accepts_insecure_anywhere_on_its_line() {
         let help = keryx(&["--insecure"]);
         assert!(help.status.success());
     }
+}
+
+/// A lossless WebP of this size: the RIFF header, then a VP8L chunk with its signature and size.
+fn webp(width: u32, height: u32) -> Vec<u8> {
+    let bits = (width - 1) | ((height - 1) << 14);
+    let mut chunk = vec![0x2f];
+    chunk.extend_from_slice(&bits.to_le_bytes());
+    chunk.resize(12, 0);
+    let mut bytes = b"RIFF".to_vec();
+    bytes.extend_from_slice(&u32::try_from(4 + 8 + chunk.len()).unwrap().to_le_bytes());
+    bytes.extend_from_slice(b"WEBPVP8L");
+    bytes.extend_from_slice(&u32::try_from(chunk.len()).unwrap().to_le_bytes());
+    bytes.extend_from_slice(&chunk);
+    bytes
+}
+
+#[test]
+fn sticker_commands_add_list_and_remove_packs_and_stickers() {
+    let server = Server::start("", "");
+    let config = config_of(&server);
+    let added = keryx(&["--config", &config, "sticker", "pack", "add", "Cats"]);
+    assert!(added.status.success(), "{}", text(&added.stderr));
+    let pack = text(&added.stdout).trim().to_string();
+    let again = keryx(&["--config", &config, "sticker", "pack", "add", "Cats"]);
+    assert!(!again.status.success());
+    assert!(text(&again.stderr).contains("A pack already has that name"));
+
+    let file = server.path("cat.webp");
+    fs::write(&file, webp(64, 32)).unwrap();
+    let file = file.to_string_lossy().to_string();
+    let added = keryx(&[
+        "--config", &config, "sticker", "add", &pack, &file, "--emoji", "😺",
+    ]);
+    assert!(added.status.success(), "{}", text(&added.stderr));
+    let sticker = text(&added.stdout).trim().to_string();
+    let not_webp = server.path("cat.gif");
+    fs::write(&not_webp, b"GIF89a, not a webp at all, long enough").unwrap();
+    let refused = keryx(&[
+        "--config",
+        &config,
+        "sticker",
+        "add",
+        &pack,
+        &not_webp.to_string_lossy(),
+        "--json",
+    ]);
+    assert!(!refused.status.success());
+    let reply: Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(reply["code"], "bad_sticker");
+    let missing = keryx(&[
+        "--config",
+        &config,
+        "sticker",
+        "add",
+        &pack,
+        "/nonexistent.webp",
+    ]);
+    assert!(!missing.status.success());
+
+    let listed = keryx(&["--config", &config, "sticker", "list"]);
+    assert!(listed.status.success(), "{}", text(&listed.stderr));
+    let listed = text(&listed.stdout);
+    assert!(listed.contains(&format!("{pack}  Cats")), "{listed}");
+    assert!(
+        listed.contains(&format!("  {sticker}  64x32  😺")),
+        "{listed}"
+    );
+    let listed = keryx(&["--config", &config, "sticker", "list", "--json"]);
+    let reply: Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(
+        reply["data"]["pack_list"][0]["sticker_list"][0]["id"],
+        json!(sticker)
+    );
+
+    let removed = keryx(&["--config", &config, "sticker", "remove", &sticker]);
+    assert!(removed.status.success(), "{}", text(&removed.stderr));
+    let removed = keryx(&["--config", &config, "sticker", "remove", &sticker]);
+    assert!(!removed.status.success());
+    let removed = keryx(&["--config", &config, "sticker", "pack", "remove", &pack]);
+    assert!(removed.status.success(), "{}", text(&removed.stderr));
+    let listed = keryx(&["--config", &config, "sticker", "list"]);
+    assert_eq!(text(&listed.stdout), "");
 }

@@ -12,16 +12,16 @@ use std::time::Duration;
 use keryx_core::protocol::{
     AccountBrief, Bytes, CallEvent, CallEventKind, ChatDevice, ChatItem, ChatMode, ChatType,
     ContentKind, DeviceItem, DeviceLogItem, DraftItem, KeyPackageItem, Kind, MarkItem,
-    MessageFrame, SessionItem, SyncPosition, TimesItem, WrapEntry,
+    MessageFrame, SessionItem, StickerItem, StickerPack, SyncPosition, TimesItem, WrapEntry,
 };
 use keryx_core::ulid::Ulid;
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
 use super::{
     Account, Appended, BuiltInRole, ChatAccess, DeviceKey, DeviceUsage, Error, GroupInfoPut,
-    MessageBrief, NewAccount, NewDevice, NewFile, NewMessage, NewSession, NewWrap, Position,
-    PositionReport, Registered, Result, Session, SetupLink, Storage, StoredFile, SyncFrom,
-    SyncPage,
+    MessageBrief, NewAccount, NewDevice, NewFile, NewMessage, NewSession, NewSticker, NewWrap,
+    Position, PositionReport, Registered, Result, Session, SetupLink, Storage, StoredFile,
+    SyncFrom, SyncPage,
 };
 
 /// How long a connection waits for a lock another process holds, such as a backup.
@@ -1883,6 +1883,134 @@ impl Storage for Sqlite {
                 ],
             )?;
             Ok(())
+        })
+        .await
+    }
+
+    async fn create_pack(&self, id: Ulid, name: String, now: i64) -> Result<bool> {
+        self.write(move |connection| {
+            let added = connection.execute(
+                "INSERT INTO sticker_pack (id, name, created_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (name) DO NOTHING",
+                params![id.bytes(), name, now],
+            )?;
+            Ok(added == 1)
+        })
+        .await
+    }
+
+    async fn remove_pack(&self, id: Ulid) -> Result<Option<Vec<Ulid>>> {
+        self.write(move |connection| {
+            let mut sticker_list = Vec::new();
+            {
+                let mut statement =
+                    connection.prepare("SELECT id FROM sticker WHERE pack_id = ?1")?;
+                for row in statement.query_map(params![id.bytes()], |row| row.get(0))? {
+                    sticker_list.push(Ulid::from_bytes(row?));
+                }
+            }
+            let removed = connection.execute(
+                "DELETE FROM sticker_pack WHERE id = ?1",
+                params![id.bytes()],
+            )?;
+            if removed == 0 {
+                return Ok(None);
+            }
+            Ok(Some(sticker_list))
+        })
+        .await
+    }
+
+    async fn add_sticker(&self, sticker: NewSticker) -> Result<bool> {
+        self.write(move |connection| {
+            let added = connection.execute(
+                "INSERT INTO sticker (id, pack_id, emoji, width, height, size, created_at)
+                 SELECT ?1, id, ?3, ?4, ?5, ?6, ?7 FROM sticker_pack WHERE id = ?2",
+                params![
+                    sticker.id.bytes(),
+                    sticker.pack.bytes(),
+                    sticker.emoji,
+                    sticker.width,
+                    sticker.height,
+                    int(sticker.size),
+                    sticker.now
+                ],
+            )?;
+            Ok(added == 1)
+        })
+        .await
+    }
+
+    async fn remove_sticker(&self, id: Ulid) -> Result<bool> {
+        self.write(move |connection| {
+            let removed =
+                connection.execute("DELETE FROM sticker WHERE id = ?1", params![id.bytes()])?;
+            Ok(removed == 1)
+        })
+        .await
+    }
+
+    async fn sticker_list(&self) -> Result<Vec<StickerPack>> {
+        self.read(move |connection| {
+            let mut pack_list: Vec<StickerPack> = Vec::new();
+            let mut statement =
+                connection.prepare("SELECT id, name FROM sticker_pack ORDER BY created_at, id")?;
+            let rows = statement.query_map([], |row| {
+                Ok(StickerPack {
+                    id: Ulid::from_bytes(row.get(0)?),
+                    name: row.get(1)?,
+                    sticker_list: Vec::new(),
+                })
+            })?;
+            for row in rows {
+                pack_list.push(row?);
+            }
+            let mut statement = connection.prepare(
+                "SELECT pack_id, id, emoji, width, height, size FROM sticker
+                 ORDER BY pack_id, created_at, id",
+            )?;
+            let rows = statement.query_map([], |row| {
+                let pack = Ulid::from_bytes(row.get(0)?);
+                let sticker = StickerItem {
+                    id: Ulid::from_bytes(row.get(1)?),
+                    emoji: row.get(2)?,
+                    width: row.get(3)?,
+                    height: row.get(4)?,
+                    size: unsigned(row.get(5)?),
+                };
+                Ok((pack, sticker))
+            })?;
+            for row in rows {
+                let (pack, sticker) = row?;
+                for item in &mut pack_list {
+                    if item.id == pack {
+                        item.sticker_list.push(sticker);
+                        break;
+                    }
+                }
+            }
+            Ok(pack_list)
+        })
+        .await
+    }
+
+    async fn sticker(&self, id: Ulid) -> Result<Option<StickerItem>> {
+        self.read(move |connection| {
+            connection
+                .query_row(
+                    "SELECT id, emoji, width, height, size FROM sticker WHERE id = ?1",
+                    params![id.bytes()],
+                    |row| {
+                        Ok(StickerItem {
+                            id: Ulid::from_bytes(row.get(0)?),
+                            emoji: row.get(1)?,
+                            width: row.get(2)?,
+                            height: row.get(3)?,
+                            size: unsigned(row.get(4)?),
+                        })
+                    },
+                )
+                .optional()
         })
         .await
     }

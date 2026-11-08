@@ -59,6 +59,62 @@ enum Command {
         #[command(subcommand)]
         command: Option<UserCommand>,
     },
+    /// Manage the server's sticker packs and stickers, on a running server.
+    Sticker {
+        /// The server, as HOST, HOST:PORT or https://HOST. The default is 127.0.0.1, with the port
+        /// from `listen` in the configuration.
+        #[arg(long, global = true, value_name = "HOST")]
+        remote: Option<String>,
+        /// Print the server's whole reply as JSON.
+        #[arg(long, global = true)]
+        json: bool,
+        #[command(subcommand)]
+        command: Option<StickerCommand>,
+    },
+}
+
+#[derive(Subcommand)]
+enum StickerCommand {
+    /// Print every pack's id and name, with its stickers' ids and emoji.
+    List,
+    /// Add or remove a pack.
+    Pack {
+        #[command(subcommand)]
+        command: PackCommand,
+    },
+    /// Add a WebP of at most 512x512 to a pack, and print the sticker's id.
+    Add {
+        /// The pack's id, from `pack add` or `list`.
+        pack: String,
+        /// A static or animated WebP.
+        file: PathBuf,
+        /// One emoji, for search later.
+        #[arg(long)]
+        emoji: Option<String>,
+    },
+    /// Remove a sticker. Messages that sent it show it as unavailable.
+    Remove {
+        /// The sticker's id, from `add` or `list`.
+        sticker: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum PackCommand {
+    /// Add a pack, and print its id. Its name is unique, 1 to 64 characters.
+    Add { name: String },
+    /// Remove a pack and every sticker in it.
+    Remove {
+        /// The pack's id, from `add` or `list`.
+        pack: String,
+    },
+}
+
+/// What a request to the server carries.
+enum Payload {
+    None,
+    Json(Value),
+    Bytes(Vec<u8>),
 }
 
 #[derive(Subcommand)]
@@ -90,6 +146,9 @@ fn read_configuration(path: &Path) -> anyhow::Result<Settings> {
         .optional("file", ByteSize::new())
         .optional("call", ByteSize::new())
         .optional("media_bundle", ByteSize::new())
+        .optional("question", ByteSize::new())
+        .optional("answer", ByteSize::new())
+        .optional("sticker", ByteSize::new())
         .optional("draft", ByteSize::new());
     let upload = StaticMap::new()
         .optional("voice", ByteSize::new())
@@ -97,7 +156,8 @@ fn read_configuration(path: &Path) -> anyhow::Result<Settings> {
         .optional("music", ByteSize::new())
         .optional("video", ByteSize::new())
         .optional("doc", ByteSize::new())
-        .optional("file", ByteSize::new());
+        .optional("file", ByteSize::new())
+        .optional("sticker", ByteSize::new());
     let schema = StaticMap::new()
         .required_any("listen")
         .required_any("public_url")
@@ -270,8 +330,9 @@ fn request_server(
     settings: &Settings,
     remote: Option<String>,
     insecure: bool,
+    method: &str,
     route: &str,
-    body: &Value,
+    payload: Payload,
 ) -> anyhow::Result<Value> {
     let Some(operator) = &settings.operator else {
         anyhow::bail!("The configuration has no [operator] token");
@@ -291,11 +352,25 @@ fn request_server(
     let span = tracing::info_span!("Client", op = "client");
     let _entered = span.enter();
     let started = std::time::Instant::now();
-    let mut response = agent
-        .post(&url)
-        .header("Authorization", &format!("Bearer {}", operator.token))
-        .send_json(body)
-        .with_context(|| format!("Could not reach {origin}"))?;
+    let bearer = format!("Bearer {}", operator.token);
+    let sent = match (method, payload) {
+        ("GET", _) => agent.get(&url).header("Authorization", &bearer).call(),
+        ("DELETE", _) => agent.delete(&url).header("Authorization", &bearer).call(),
+        (_, Payload::Json(body)) => agent
+            .post(&url)
+            .header("Authorization", &bearer)
+            .send_json(&body),
+        (_, Payload::Bytes(bytes)) => agent
+            .post(&url)
+            .header("Authorization", &bearer)
+            .header("Content-Type", "image/webp")
+            .send(&bytes[..]),
+        (_, Payload::None) => agent
+            .post(&url)
+            .header("Authorization", &bearer)
+            .send_empty(),
+    };
+    let mut response = sent.with_context(|| format!("Could not reach {origin}"))?;
     let status = response.status().as_u16();
     let trace = match response.headers().get("x-trace-id") {
         Some(value) => match value.to_str() {
@@ -306,7 +381,7 @@ fn request_server(
     };
     tracing::info!(
         msg = "HTTP client request",
-        http_method = "POST",
+        http_method = method,
         http_path = route,
         http_status = status,
         total_ms = started.elapsed().as_millis() as u64,
@@ -331,12 +406,13 @@ fn run_user_add(
         settings,
         remote,
         insecure,
+        "POST",
         "/api/v1/accounts",
-        &serde_json::to_value(CreateAccountBody {
+        Payload::Json(serde_json::to_value(CreateAccountBody {
             username,
             admin,
             display_name,
-        })?,
+        })?),
     )?;
     if json_output {
         println!("{}", serde_json::to_string_pretty(&reply)?);
@@ -357,17 +433,153 @@ fn run_user_add(
     Ok(())
 }
 
+/// Prints the reply whole with `--json`, and stops with the server's reason when it refused.
+fn answered(reply: &Value, json_output: bool) -> anyhow::Result<()> {
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(reply)?);
+    }
+    if reply["ok"] != json!(true) {
+        anyhow::bail!(
+            "The server refused: {}",
+            reply["message"].as_str().unwrap_or("no reason given")
+        );
+    }
+    Ok(())
+}
+
+fn run_sticker(
+    settings: &Settings,
+    remote: Option<String>,
+    insecure: bool,
+    json_output: bool,
+    command: StickerCommand,
+) -> anyhow::Result<()> {
+    match command {
+        StickerCommand::List => {
+            let reply = request_server(
+                settings,
+                remote,
+                insecure,
+                "GET",
+                "/api/v1/stickers",
+                Payload::None,
+            )?;
+            answered(&reply, json_output)?;
+            if json_output {
+                return Ok(());
+            }
+            let Some(pack_list) = reply["data"]["pack_list"].as_array() else {
+                anyhow::bail!("The server's reply has no packs");
+            };
+            for pack in pack_list {
+                println!(
+                    "{}  {}",
+                    pack["id"].as_str().unwrap_or(""),
+                    pack["name"].as_str().unwrap_or("")
+                );
+                if let Some(sticker_list) = pack["sticker_list"].as_array() {
+                    for sticker in sticker_list {
+                        println!(
+                            "  {}  {}x{}  {}",
+                            sticker["id"].as_str().unwrap_or(""),
+                            sticker["width"],
+                            sticker["height"],
+                            sticker["emoji"].as_str().unwrap_or("")
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+        StickerCommand::Pack {
+            command: PackCommand::Add { name },
+        } => {
+            let reply = request_server(
+                settings,
+                remote,
+                insecure,
+                "POST",
+                "/api/v1/sticker_packs",
+                Payload::Json(json!({ "name": name })),
+            )?;
+            answered(&reply, json_output)?;
+            if !json_output {
+                println!("{}", reply["data"]["pack"].as_str().unwrap_or(""));
+            }
+            Ok(())
+        }
+        StickerCommand::Pack {
+            command: PackCommand::Remove { pack },
+        } => {
+            let reply = request_server(
+                settings,
+                remote,
+                insecure,
+                "DELETE",
+                &format!("/api/v1/sticker_packs/{pack}"),
+                Payload::None,
+            )?;
+            answered(&reply, json_output)
+        }
+        StickerCommand::Add { pack, file, emoji } => {
+            let bytes = std::fs::read(&file)
+                .with_context(|| format!("Could not read {}", file.display()))?;
+            let mut route = format!("/api/v1/sticker_packs/{pack}/stickers");
+            if let Some(emoji) = emoji {
+                // An emoji is not a secret, so it may go in the query.
+                route.push_str("?emoji=");
+                for byte in emoji.bytes() {
+                    if byte.is_ascii_alphanumeric() {
+                        route.push(byte as char);
+                    } else {
+                        route.push_str(&format!("%{byte:02X}"));
+                    }
+                }
+            }
+            let reply = request_server(
+                settings,
+                remote,
+                insecure,
+                "POST",
+                &route,
+                Payload::Bytes(bytes),
+            )?;
+            answered(&reply, json_output)?;
+            if !json_output {
+                println!("{}", reply["data"]["sticker"]["id"].as_str().unwrap_or(""));
+            }
+            Ok(())
+        }
+        StickerCommand::Remove { sticker } => {
+            let reply = request_server(
+                settings,
+                remote,
+                insecure,
+                "DELETE",
+                &format!("/api/v1/stickers/{sticker}"),
+                Payload::None,
+            )?;
+            answered(&reply, json_output)
+        }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let settings = CommandLine::parse();
     let Some(command) = settings.command else {
         CommandLine::command().print_long_help()?;
         return Ok(());
     };
-    if let Command::User { command: None, .. } = command {
+    let bare = match &command {
+        Command::User { command: None, .. } => Some("user"),
+        Command::Sticker { command: None, .. } => Some("sticker"),
+        _ => None,
+    };
+    if let Some(name) = bare {
         let mut root = CommandLine::command();
         root.build();
-        match root.find_subcommand_mut("user") {
-            Some(user) => user.print_long_help()?,
+        match root.find_subcommand_mut(name) {
+            Some(subcommand) => subcommand.print_long_help()?,
             None => root.print_long_help()?,
         }
         return Ok(());
@@ -428,6 +640,14 @@ fn main() -> anyhow::Result<()> {
                 admin,
                 display_name,
             ),
+            None => Ok(()),
+        },
+        Command::Sticker {
+            remote,
+            json,
+            command,
+        } => match command {
+            Some(command) => run_sticker(&configuration, remote, settings.insecure, json, command),
             None => Ok(()),
         },
     }
