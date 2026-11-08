@@ -1438,6 +1438,63 @@ another device still holding the key.
 | Admin and operations: users, rooms, moderation, stats | The server | **Never encrypted content.** Unencrypted content only with a named permission |
 | MCP traffic between agents, tunnelled over chats | Both ends, on the client side | The endpoints only |
 
+## To fix
+
+Found in a review of the calls, sync and Android commits after `82cc9a6`. Each comes off this list in the
+change that fixes it. Fixes that need a decision are asked first, as everywhere.
+
+**Bugs**
+
+- **A replaced call socket can silence its device.** `moq-net` keeps a second broadcast at the same path
+  as a standby and hands over to it when the first finishes, which can take up to 10 seconds while the
+  old socket's close frame waits. The new connection's group numbers start again at 0, the relay copies
+  them as they are, and `keryx-moq` reads media with `next_group`, which skips any group at or below the
+  last it returned. Audio is one group per frame, so the device can stay silent for about as long as its
+  old connection ran. Not yet proven by a run: the replacement test checks events only, so a test that
+  sends media through a replacement comes with the fix, likely the relay numbering each device's groups
+  on across its connections.
+- **Android can ring for a call this account is already in.** Core hands out a `sync` page's call rows
+  before its messages, so a join from this account's other device is shown while nothing rings yet, then
+  the call's message arrives with no end and starts the ring. The same happens when a call's `end` lands
+  on the next page. Core should say whether a call rings, once the whole page is handled.
+- **A rekey can be lost while a call connects.** `android/ffi/`'s `callConnect` takes the pending join and
+  blocks up to 10 seconds. A `CallKey` arriving meanwhile finds no call and no join, and is dropped, so the
+  phone seals under the old epoch and a device that joined with only the new key cannot hear or see it.
+
+**Access**
+
+- **The call socket skips the device limit.** `moq.rs` checks `Need::Member` only, while every other chat
+  route and the chat's WebSocket also check `Need::Device`, so a device over a lowered limit can still join
+  calls.
+
+**Smaller**
+
+- **A failed call timer leaves the call open in the database.** If saving the end fails, the chat's task
+  drops the call from memory with no `end` row, its sockets close with 1006, clients see it open until a
+  restart, and a second call can start beside it. A call whose room could not be made does the same, though
+  its comment says it rings out.
+- **Call text's limit applies to its JSON frame**, whose body is base64, so text in a call may be about
+  three quarters of `[limits.body] text`, unlike in a chat.
+- **Call frames have no replay window.** A relay could replay a member's earlier frames within the epoch.
+  RFC 9605 recommends a replay check. A decision for the author: whether, and how large a window.
+- **`sync` without a chat sorts every matching row of the account's chats for each page**, which grows
+  slow for a new device on a large account. Not measured.
+- **`saved_now()` is taken before the writer's lock**, so a row can land with a time earlier than one
+  already handed out. The first page's 1-second step back covers a wait under a second, and online devices
+  get the row live anyway.
+
+**Docs and comments**
+
+- In `core/src/mls.rs`, `draft_data` sits under the **Permanent** doc comment that belongs to
+  `device_statement_bytes`.
+- `moq/src/lib.rs`'s `closed` says the server sends `qmux`'s application close, which it never does.
+- Calls above: "`keryx-moq` uses its `ws::Client`" contradicts the later decision that `keryx-moq` opens the
+  WebSocket itself, and "any other track name is refused" is not what the relay does: it ignores them.
+- Status says Android's call screen is next, but it is built.
+- A question for the author, not a bug: the words screen's Copy could mark the clip sensitive on Android
+  13 and later, so the clipboard preview hides it, and the words screen could set `FLAG_SECURE`, so
+  screenshots and the recent-apps thumbnail never hold the words.
+
 ## Open: do not decide these, ask
 
 **Whole repository**
