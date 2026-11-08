@@ -91,7 +91,8 @@ numbered!(
 numbered!(
     /// The numbers are the `message.content_kind` column's. `Call` is one call, with everything
     /// inside it kept beside it. `MediaBundle` is several images and videos in one message. `Music` is
-    /// an MP3, apart from `Voice`, which is a recorded note.
+    /// an MP3, apart from `Voice`, which is a recorded note. `Question` is a tree of questions and
+    /// `Answer` one account's answer to it. `Sticker` names one of the server's stickers.
     ContentKind {
         Text = 0,
         Voice = 1,
@@ -103,6 +104,9 @@ numbered!(
         File = 7,
         Call = 8,
         MediaBundle = 9,
+        Question = 10,
+        Answer = 11,
+        Sticker = 12,
     }
 );
 
@@ -404,6 +408,440 @@ pub struct CallText {
 pub struct CallBody {
     pub video: bool,
     pub voice: bool,
+}
+
+/// The longest a question's or an option's text may be, in characters, fixed by the author.
+pub const QUESTION_TEXT: usize = 500;
+/// The longest written-in text may be, in characters, fixed by the author.
+pub const OWN_TEXT: usize = 2000;
+/// The most nodes one question message holds, fixed by the author.
+pub const QUESTION_NODES: usize = 32;
+/// The longest path through a question message, in nodes, fixed by the author.
+pub const QUESTION_PATH: usize = 16;
+/// The most options one choice offers, beside the automatic "write your own", fixed by the author.
+pub const CHOICE_OPTIONS: usize = 8;
+
+/// A question message's tree, inside its encryption, beside its optional intro in `text`. Every
+/// question also takes written-in text, and any question can be skipped.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Question {
+    pub first: String,
+    pub nodes: Vec<QuestionNode>,
+}
+
+/// One question: a choice or a number, and where each kind of answer leads.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionNode {
+    pub id: String,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub choice: Option<Choice>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub number: Option<NumberRange>,
+    /// Tried in order, and the first match wins. No match ends the form.
+    #[serde(default)]
+    pub next: Vec<NextRule>,
+}
+
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Choice {
+    #[serde(default)]
+    pub multi: bool,
+    pub options: Vec<ChoiceOption>,
+}
+
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChoiceOption {
+    pub id: String,
+    pub text: String,
+}
+
+/// A number question's range, as decimals. `step` is 1 when unset, and 0.5 allows halves.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NumberRange {
+    #[cfg_attr(feature = "wasm", tsify(type = "number"))]
+    pub min: serde_json::Number,
+    #[cfg_attr(feature = "wasm", tsify(type = "number"))]
+    pub max: serde_json::Number,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "wasm", tsify(type = "number | undefined"))]
+    pub step: Option<serde_json::Number>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+}
+
+/// Where an answer leads. At most one condition is set, and none matches anything. `to` of `None`
+/// ends the form.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NextRule {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub picked: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "wasm", tsify(type = "[number, number] | undefined"))]
+    pub range: Option<(serde_json::Number, serde_json::Number)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub own: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped: Option<bool>,
+    pub to: Option<String>,
+}
+
+/// One account's answer, inside its encryption. `question` is the question's sequence id, kept
+/// inside like a reply's. `skipped` alone, with no answers, skips the whole form.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Answer {
+    pub question: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub answers: Vec<AnswerItem>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skipped: bool,
+}
+
+/// The answer to one question on the path actually taken, or its skip.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnswerItem {
+    pub node: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub picked: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub own: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "wasm", tsify(type = "number | undefined"))]
+    pub number: Option<serde_json::Number>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skipped: bool,
+}
+
+/// Why a question or an answer does not hold together.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum FormError {
+    #[error("A question message holds 1 to {QUESTION_NODES} questions")]
+    Nodes,
+    #[error("Two questions or two options share an id")]
+    Duplicate,
+    #[error("A question names a question that does not exist")]
+    Unknown,
+    #[error("A question is a choice or a number, never both or neither")]
+    Shape,
+    #[error("A choice has 1 to {CHOICE_OPTIONS} options")]
+    Options,
+    #[error("A text is too long")]
+    TooLong,
+    #[error("A number's range is not min <= max with a step above 0")]
+    Range,
+    #[error("A rule's condition does not fit its question")]
+    Rule,
+    #[error("The questions loop, or one is never reached")]
+    Path,
+    #[error("A path is longer than {QUESTION_PATH} questions")]
+    Deep,
+    #[error("An answer does not follow its question")]
+    Answer,
+}
+
+fn decimal(number: &serde_json::Number) -> f64 {
+    number.as_f64().unwrap_or(f64::NAN)
+}
+
+fn has_option(choice: &Choice, id: &str) -> bool {
+    for option in &choice.options {
+        if option.id == id {
+            return true;
+        }
+    }
+    false
+}
+
+fn too_long(text: &str, limit: usize) -> bool {
+    text.chars().count() > limit
+}
+
+impl Question {
+    fn node(&self, id: &str) -> Option<&QuestionNode> {
+        self.nodes.iter().find(|node| node.id == id)
+    }
+
+    /// Checks the tree against the limits fixed in core: ids, shapes, ranges, rules, no loop, no
+    /// question nothing reaches, and no path longer than [`QUESTION_PATH`].
+    pub fn check(&self) -> Result<(), FormError> {
+        if self.nodes.is_empty() || self.nodes.len() > QUESTION_NODES {
+            return Err(FormError::Nodes);
+        }
+        let mut ids = std::collections::HashSet::new();
+        for node in &self.nodes {
+            if !ids.insert(node.id.as_str()) {
+                return Err(FormError::Duplicate);
+            }
+        }
+        if !ids.contains(self.first.as_str()) {
+            return Err(FormError::Unknown);
+        }
+        for node in &self.nodes {
+            if too_long(&node.text, QUESTION_TEXT) {
+                return Err(FormError::TooLong);
+            }
+            match (&node.choice, &node.number) {
+                (Some(choice), None) => {
+                    if choice.options.is_empty() || choice.options.len() > CHOICE_OPTIONS {
+                        return Err(FormError::Options);
+                    }
+                    let mut option_ids = std::collections::HashSet::new();
+                    for option in &choice.options {
+                        if !option_ids.insert(option.id.as_str()) {
+                            return Err(FormError::Duplicate);
+                        }
+                        if too_long(&option.text, QUESTION_TEXT) {
+                            return Err(FormError::TooLong);
+                        }
+                    }
+                }
+                (None, Some(range)) => {
+                    let step = match &range.step {
+                        Some(step) => decimal(step),
+                        None => 1.0,
+                    };
+                    let (min, max) = (decimal(&range.min), decimal(&range.max));
+                    if !(min <= max && step > 0.0 && step.is_finite()) {
+                        return Err(FormError::Range);
+                    }
+                    if let Some(unit) = &range.unit
+                        && too_long(unit, QUESTION_TEXT)
+                    {
+                        return Err(FormError::TooLong);
+                    }
+                }
+                _ => return Err(FormError::Shape),
+            }
+            for rule in &node.next {
+                let conditions = usize::from(rule.picked.is_some())
+                    + usize::from(rule.range.is_some())
+                    + usize::from(rule.own.is_some())
+                    + usize::from(rule.skipped.is_some());
+                if conditions > 1 {
+                    return Err(FormError::Rule);
+                }
+                if let Some(picked) = &rule.picked {
+                    let Some(choice) = &node.choice else {
+                        return Err(FormError::Rule);
+                    };
+                    for id in picked {
+                        if !has_option(choice, id) {
+                            return Err(FormError::Rule);
+                        }
+                    }
+                }
+                if let Some((low, high)) = &rule.range
+                    && (node.number.is_none() || decimal(low) > decimal(high))
+                {
+                    return Err(FormError::Rule);
+                }
+                if let Some(to) = &rule.to
+                    && !ids.contains(to.as_str())
+                {
+                    return Err(FormError::Unknown);
+                }
+            }
+        }
+        // Depth-first from the start: a node met again on the current path is a loop, and the
+        // longest path is measured on the way.
+        let mut reached = std::collections::HashSet::new();
+        let mut longest = std::collections::HashMap::new();
+        if self.walk(&self.first, &mut Vec::new(), &mut reached, &mut longest)? > QUESTION_PATH {
+            return Err(FormError::Deep);
+        }
+        if reached.len() != self.nodes.len() {
+            return Err(FormError::Path);
+        }
+        Ok(())
+    }
+
+    /// The longest path from `id` in nodes, or a loop.
+    fn walk<'a>(
+        &'a self,
+        id: &'a str,
+        path: &mut Vec<&'a str>,
+        reached: &mut std::collections::HashSet<&'a str>,
+        longest: &mut std::collections::HashMap<&'a str, usize>,
+    ) -> Result<usize, FormError> {
+        if path.contains(&id) {
+            return Err(FormError::Path);
+        }
+        if let Some(length) = longest.get(id) {
+            return Ok(*length);
+        }
+        let Some(node) = self.node(id) else {
+            return Err(FormError::Unknown);
+        };
+        reached.insert(id);
+        path.push(id);
+        let mut deepest = 0;
+        for rule in &node.next {
+            if let Some(to) = &rule.to {
+                deepest = deepest.max(self.walk(to, path, reached, longest)?);
+            }
+        }
+        path.pop();
+        longest.insert(id, deepest + 1);
+        Ok(deepest + 1)
+    }
+
+    /// Where an answer to `node` leads: the first rule it matches, or the end.
+    pub fn next_of(&self, node: &QuestionNode, item: &AnswerItem) -> Option<String> {
+        for rule in &node.next {
+            let matched = if let Some(picked) = &rule.picked {
+                let mut any = false;
+                for id in picked {
+                    if item.picked.contains(id) {
+                        any = true;
+                    }
+                }
+                !item.skipped && any
+            } else if let Some((low, high)) = &rule.range {
+                match &item.number {
+                    Some(number) if !item.skipped => {
+                        let number = decimal(number);
+                        decimal(low) <= number && number <= decimal(high)
+                    }
+                    _ => false,
+                }
+            } else if rule.own.is_some() {
+                !item.skipped && item.own.is_some()
+            } else if rule.skipped.is_some() {
+                item.skipped
+            } else {
+                true
+            };
+            if matched {
+                return rule.to.clone();
+            }
+        }
+        None
+    }
+
+    /// Checks an answer follows this question: each item answers the question the path reached, in
+    /// order, within its options, range and limits, and the path ends with the last one.
+    pub fn check_answer(&self, answer: &Answer) -> Result<(), FormError> {
+        if answer.skipped {
+            if answer.answers.is_empty() {
+                return Ok(());
+            }
+            return Err(FormError::Answer);
+        }
+        let mut at = Some(self.first.clone());
+        for item in &answer.answers {
+            let Some(id) = at else {
+                return Err(FormError::Answer);
+            };
+            let Some(node) = self.node(&id) else {
+                return Err(FormError::Answer);
+            };
+            if item.node != node.id {
+                return Err(FormError::Answer);
+            }
+            if let Some(own) = &item.own
+                && too_long(own, OWN_TEXT)
+            {
+                return Err(FormError::TooLong);
+            }
+            if item.skipped {
+                if !item.picked.is_empty() || item.own.is_some() || item.number.is_some() {
+                    return Err(FormError::Answer);
+                }
+            } else {
+                match (&node.choice, &node.number) {
+                    (Some(choice), _) => {
+                        if item.number.is_some()
+                            || (item.picked.is_empty() && item.own.is_none())
+                            || (!choice.multi && item.picked.len() > 1)
+                        {
+                            return Err(FormError::Answer);
+                        }
+                        for id in &item.picked {
+                            if !has_option(choice, id) {
+                                return Err(FormError::Answer);
+                            }
+                        }
+                    }
+                    (None, Some(range)) => {
+                        if !item.picked.is_empty() {
+                            return Err(FormError::Answer);
+                        }
+                        if let Some(number) = &item.number {
+                            let number = decimal(number);
+                            let min = decimal(&range.min);
+                            let step = match &range.step {
+                                Some(step) => decimal(step),
+                                None => 1.0,
+                            };
+                            let steps = (number - min) / step;
+                            if number < min
+                                || number > decimal(&range.max)
+                                || (steps - steps.round()).abs() > 1e-9
+                            {
+                                return Err(FormError::Answer);
+                            }
+                        } else if item.own.is_none() {
+                            return Err(FormError::Answer);
+                        }
+                    }
+                    (None, None) => return Err(FormError::Answer),
+                }
+            }
+            at = self.next_of(node, item);
+        }
+        match at {
+            None => Ok(()),
+            Some(_) => Err(FormError::Answer),
+        }
+    }
+}
+
+/// One sticker the server keeps: a WebP of at most 512x512, in a pack.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StickerItem {
+    pub id: Ulid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emoji: Option<String>,
+    pub width: u32,
+    pub height: u32,
+    pub size: u64,
+}
+
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StickerPack {
+    pub id: Ulid,
+    pub name: String,
+    pub sticker_list: Vec<StickerItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StickerListReply {
+    pub pack_list: Vec<StickerPack>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreatePackBody {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackReply {
+    pub pack: Ulid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StickerReply {
+    pub sticker: StickerItem,
 }
 
 /// A stored message. **A removed one has only `chat`, `seq` and `server_saved_at`**, the time it was

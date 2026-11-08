@@ -148,7 +148,7 @@ the WASM build, because there is one `Cargo.lock`. Make targets stay inside
   `message.send.text` and so on through every kind, `message.send.unencrypted`,
   `message.commit`, `message.edit.own` and `message.delete.own`. The closed list comes from
   activeplano. Member, moderator and admin hold all of
-  them, except that `account.create` and `message.send.unencrypted` are admin's alone. A 1:1 chat
+  them, except that `account.create`, `message.send.unencrypted` and `sticker.manage` are admin's alone. A 1:1 chat
   has no chat-role rows: both people hold the built-in member role there.
 - **The check reads the role tables on every operation**, so a role change applies at once.
 - **`seen`, `typing` and reading history need chat membership and no named permission.** Being admin
@@ -185,7 +185,7 @@ the WASM build, because there is one `Cargo.lock`. Make targets stay inside
   `content_kind`, so roles can allow or refuse each one. **Music is an MP3, apart from voice, which
   is a recorded note, chosen by the author.** It is numbered 4, right after image, and every kind
   from video on moved up one, so the numbers are text 0, voice 1, reaction 2, image 3, music 4,
-  video 5, doc 6, file 7, call 8 and media_bundle 9.
+  video 5, doc 6, file 7, call 8, media_bundle 9, question 10, answer 11 and sticker 12.
 - **A reaction is content.** It does not affect the unread count, but it brings the chat up in
   the sorted list and shows as the preview, like "Sara reacted 👍", until the next message.
 - **A recording, when it is built, is saved at the lowest quality for now:**
@@ -730,14 +730,30 @@ Whatever is saved to show later gets the next number. Whatever is not saved gets
   nothing, so one that never reached the server is replaced by the next change. Its associated data is the label
   `keryx v1 draft`, the chat and the epoch, so it cannot pass for a message, and it carries no signature.
 - **Two new content kinds, `question` (10) and `answer` (11), chosen by the author**, each with its own body
-  limit and permission, `message.send.question` and `message.send.answer`. **Clients cannot create a question:**
-  no built-in role holds `message.send.question`, and an AI or agent account is given a role that does. Both are
-  encrypted and signed like text.
+  limit and permission, `message.send.question` and `message.send.answer`. **Both permissions work like every
+  other kind's, chosen by the author:** member, moderator and admin hold them. Clients simply have no way to
+  send a question, now or later: an AI or agent sends them. Nothing refuses one from a client. Both are
+  encrypted and signed like text, and both count as unread and move the chat up, like text.
 - **A question message is one tree, chosen by the author.** Each question is a choice (at most 8 options,
   single or multi-select) or a number (with a range), and every question also gets a "write your own" option.
   Which question shows next depends on the picked options, a number's range, or the written-in answer.
-  Limits on nodes and depth are fixed in core. Skipping, for the whole form or for some questions, is itself an
-  answer.
+  Skipping, for the whole form or for some questions, is itself an answer.
+- **Its plaintext, chosen by the author:** `{"text"?, "first", "nodes": [...]}`. `text` is an optional intro and
+  `first` names the starting node. A node is `{"id", "text", "choice": {"multi", "options": [{"id", "text"}]},
+  "next"}` or the same with `"number": {"min", "max", "step"?, "unit"?}` instead of `choice`. `next` is a list
+  of rules tried in order, and the first match wins: `{"picked": [...], "to"}` for a choice's options,
+  `{"range": [low, high], "to"}` for a number, `{"own": true, "to"}` for written-in text, `{"skipped": true,
+  "to"}` for a skip, and `{"to"}` alone for anything. No match, or `"to": null`, ends the form. Core refuses a
+  tree with a cycle, an unknown id, or a node nothing reaches.
+- **An answer's plaintext, chosen by the author:** `{"question": <seq>, "answers": [...]}`, the pointer
+  encrypted like a reply's. `answers` follows the path actually taken: `{"node", "picked"?: [...], "own"?,
+  "number"?}`, or `{"node", "skipped": true}` for a skipped question, whose path goes on by a rule with
+  `skipped` or one with no condition. Skipping the whole form is `{"question": <seq>, "skipped": true}` with no
+  answers. **Any question can be skipped**, since a skip is an answer.
+- **Limits, fixed in core, chosen by the author:** at most 32 nodes, a path at most 16 long, 1 to 8 options
+  per choice, a question's and an option's text at most 500 characters, written-in text at most 2,000. A number's
+  `min` and `max` are required, `step` is optional with 1 as its default and 0.5 allowing halves, `unit` is
+  optional, and all are decimals. `[limits.body] question` is 64 KiB and `answer` 16 KiB.
 - **An answer points at its question and is one live answer per account, chosen by the author.** Answering
   again means removing the old answer, which is an ordinary delete. An answer can be edited. The answer
   message always shows the question and each answer. On a question, tapping it shows a "show answer" key that
@@ -745,8 +761,54 @@ Whatever is saved to show later gets the next number. Whatever is not saved gets
 - **A question with an answer cannot be edited, enforced by clients only, chosen by the author**, so the
   pointer stays encrypted and the server learns no answer graph. It can be deleted, and then its answer shows
   "Message unavailable" for the question.
-- **A sticker is a content kind with its own number, 12, and no more, chosen by the author.** No pack, file
-  or image yet. Clients show a placeholder.
+- **Previews, chosen by the author:** a question shows its intro, or its first question without one, an answer
+  shows "Answered" and a sticker "Sticker".
+- **Android answers one question at a time, chosen by the author.** The question bubble shows its intro and an
+  Answer button, which opens a sheet with one question at a time along the branches: options as checkboxes or
+  radios, a number field with its range and unit, "Write your own", and Skip, Skip all, Back and Next. The last
+  step shows a summary and Send. Once answered, the question's menu has Show answer, which scrolls to it.
+  **Editing an answer reopens the same sheet filled in**, and Send sends an edit.
+- **A question reaches the phone for testing from `server/examples/drive.rs`, chosen by the author:** a small
+  program driving core as a real client, committed, with a command that logs in as a test account and sends a
+  sample tree to a chat, until an agent exists.
+
+### Stickers
+
+- **A sticker is content kind 12, and its message names one sticker kept on the server, chosen by the
+  author.** Its plaintext is `{"sticker": "<id>"}`, sealed and signed like text, so neither the server nor a
+  stolen database sees which sticker was sent; the server still sees the kind, and could guess from who fetches
+  which image. A reply goes inside as with text. It counts as unread and moves the chat up like text, and
+  **cannot be edited**, like a reaction: the server refuses with `cannot_edit`. Its body limit is
+  `[limits.body] sticker`, 1 KiB, and sending one needs `message.send.sticker`, which member, moderator and
+  admin hold.
+- **The server keeps stickers in named packs, which everyone with a registered device can list and use,
+  chosen by the author.** A new server permission, `sticker.manage`, which only admin holds by default, adds and
+  removes packs and stickers. A sticker carries one optional emoji, for search later and unused for now.
+- **A sticker is a static or animated WebP of at most 512x512 and `[limits.upload] sticker`, 256 KiB, chosen
+  by the author.** It is not encrypted, since everyone on the server can see it. The server checks its RIFF and
+  WebP header and reads its size from the VP8, VP8L or VP8X chunk in `server/src/file.rs`, never decoding its
+  pixels, and refuses anything else with `bad_sticker`. The bytes live under `[files] directory`, in a
+  `stickers` folder, a file per sticker named by its id.
+- **Its routes, chosen by the author.** A registered device lists and fetches; `sticker.manage` adds and
+  removes. A sticker's bytes never change, as an id is never reused, so they are sent as immutable:
+
+  ```
+  GET  /api/v1/stickers                      device or sticker.manage -> pack_list{id, name, sticker_list{id, emoji?, width, height, size}}
+  GET  /api/v1/stickers/{id}                 device -> the WebP bytes
+  POST /api/v1/sticker_packs                 sticker.manage: name -> pack
+  DEL  /api/v1/sticker_packs/{id}            sticker.manage: the pack and its stickers
+  POST /api/v1/sticker_packs/{id}/stickers   sticker.manage: the raw WebP, ?emoji= -> sticker
+  DEL  /api/v1/stickers/{id}                 sticker.manage
+  ```
+
+- **Operators add stickers from the command line, chosen by the author:** `keryx sticker pack add <name>`,
+  `keryx sticker add <pack id> <file.webp> [--emoji]`, `keryx sticker list`, and the matching remove commands,
+  over REST like `user add`. **`GET /api/v1/stickers` also admits `sticker.manage`**, which the operator's
+  token holds, so `list` can print each pack's id and name with its stickers' ids and emoji. **A pack's name is
+  unique on the server, 1 to 64 characters, chosen by the author**, so two packs never look the same in a
+  picker, and a taken one is refused with `name_taken`.
+  **Android sends and shows them, and has no management screens:** a sticker button by the text box opens the
+  packs, a sticker shows in the chat at 160 dp, and one removed from the server shows "Sticker unavailable".
 
 ### Read state
 
@@ -1030,7 +1092,7 @@ password rules below stand. **Ask the details when it starts:** what sign-up and
 whether the captcha stays on sign-up, and how lost words are replaced, by a still-registered device's
 signature or by the operator.
 
-**`keryx` has server commands only in this phase:** `serve` and `user add`,
+**`keryx` has server commands only in this phase:** `serve`, `user add`, and the `sticker` commands,
 with no terminal chat. Integration tests drive `keryx-core` directly as their client.
 
 **Multi-device is in from the start, not added later.** A 1:1 chat is an MLS group of
@@ -1127,6 +1189,9 @@ accepts the first for each step. The loser gets a rejection, catches up and retr
   file = "16KiB"
   call = "16KiB"
   media_bundle = "64KiB"
+  question = "64KiB"
+  answer = "16KiB"
+  sticker = "1KiB"
   draft = "64KiB" # an account's sealed draft in one chat. Not a message
 
   [limits.upload]           # one file's encrypted bytes, by the type its uploader declares
@@ -1136,6 +1201,7 @@ accepts the first for each step. The loser gets a rejection, catches up and retr
   video = "2GiB"
   doc = "100MiB"
   file = "2GiB"
+  sticker = "256KiB"        # one sticker's WebP. Not encrypted: everyone on the server sees it
 
   [tcp]
   send_timeout = "15s"      # no byte taken for this long: the connection closes. WebSocket and REST
@@ -1532,8 +1598,6 @@ change that fixes it. Fixes that need a decision are asked first, as everywhere.
 - A call chosen as recorded when neither device can encode H.264: the client should say so
   before it starts
 - Mute and pin
-- Questions and answers: exact body JSON, node and depth limits, body limits, how "skip" is shown and whether
-  it is per question or for the whole form, and what the number question's range holds
 - The client queue on disk, so unsent messages and unfinished uploads survive a restart: where it is
   kept on each platform and how it is locked
 - Whether a group or channel can be found and joined from outside, and how

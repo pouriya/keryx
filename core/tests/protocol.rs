@@ -1,7 +1,7 @@
 use keryx_core::mls::{Device, verify_message};
 use keryx_core::protocol::{
-    Bytes, ChatItem, ChatMode, ChatType, ClientFrame, ContentKind, Header, Kind, MarkItem,
-    MessageFrame, SendFrame, ServerFrame, SyncPosition, WelcomeItem, WrapItem,
+    Answer, Bytes, ChatItem, ChatMode, ChatType, ClientFrame, ContentKind, FormError, Header, Kind,
+    MarkItem, MessageFrame, Question, SendFrame, ServerFrame, SyncPosition, WelcomeItem, WrapItem,
 };
 use keryx_core::seed::derive;
 use keryx_core::ulid::Ulid;
@@ -111,6 +111,9 @@ fn kinds_match_the_schema() {
         ContentKind::File,
         ContentKind::Call,
         ContentKind::MediaBundle,
+        ContentKind::Question,
+        ContentKind::Answer,
+        ContentKind::Sticker,
     ];
     for (number, content_kind) in content_kinds.iter().enumerate() {
         assert_eq!(*content_kind as usize, number);
@@ -418,7 +421,7 @@ fn bad_frames_are_refused() {
     let good = to_value(ClientFrame::Send(Box::new(send_frame()))).unwrap();
     for (field, value) in [
         ("kind", json!(99)),
-        ("content_kind", json!(11)),
+        ("content_kind", json!(13)),
         ("body", json!("not base64!")),
         ("chat", json!("not a ulid")),
         ("type", json!("no_such_type")),
@@ -478,4 +481,215 @@ fn a_removed_message_has_no_header_and_a_stored_one_verifies_after_the_wire() {
 
     let removed: MessageFrame = from_str(&json!({"chat": CHAT, "seq": 5}).to_string()).unwrap();
     assert!(removed.header().is_none());
+}
+
+/// Two questions: how many, which leads on for 0 to 3 or a skip, then pick from three, where `a`
+/// leads to a last question and anything else ends.
+fn tree() -> serde_json::Value {
+    json!({
+        "first": "count",
+        "nodes": [
+            {"id": "count", "text": "How many?",
+             "number": {"min": 0, "max": 10, "step": 0.5, "unit": "kg"},
+             "next": [{"range": [0, 3], "to": "pick"}, {"skipped": true, "to": "pick"}]},
+            {"id": "pick", "text": "Which?",
+             "choice": {"multi": true, "options": [
+                 {"id": "a", "text": "A"}, {"id": "b", "text": "B"}, {"id": "c", "text": "C"}]},
+             "next": [{"picked": ["a"], "to": "last"}, {"own": true, "to": null}]},
+            {"id": "last", "text": "Anything else?",
+             "choice": {"options": [{"id": "no", "text": "No"}]}}
+        ]
+    })
+}
+
+fn question(value: serde_json::Value) -> Question {
+    serde_json::from_value(value).unwrap()
+}
+
+fn answer(value: serde_json::Value) -> Answer {
+    serde_json::from_value(value).unwrap()
+}
+
+#[test]
+fn a_question_tree_holds_together_or_is_refused() {
+    let good = question(tree());
+    assert_eq!(good.check(), Ok(()));
+    assert_eq!(
+        to_value(&good).unwrap()["nodes"][0]["number"]["step"],
+        json!(0.5)
+    );
+
+    let mut broken = tree();
+    broken["first"] = json!("nowhere");
+    assert_eq!(question(broken).check(), Err(FormError::Unknown));
+    let mut broken = tree();
+    broken["nodes"][1]["id"] = json!("count");
+    assert_eq!(question(broken).check(), Err(FormError::Duplicate));
+    let mut broken = tree();
+    broken["nodes"][1]["choice"]["options"][1]["id"] = json!("a");
+    assert_eq!(question(broken).check(), Err(FormError::Duplicate));
+    let mut broken = tree();
+    broken["nodes"][0]["choice"] = json!({"options": [{"id": "x", "text": "X"}]});
+    assert_eq!(question(broken).check(), Err(FormError::Shape));
+    let mut broken = tree();
+    broken["nodes"][2]["choice"]["options"] = json!([]);
+    assert_eq!(question(broken).check(), Err(FormError::Options));
+    let mut broken = tree();
+    let nine: Vec<_> = (0..9)
+        .map(|n| json!({"id": n.to_string(), "text": "x"}))
+        .collect();
+    broken["nodes"][2]["choice"]["options"] = json!(nine);
+    assert_eq!(question(broken).check(), Err(FormError::Options));
+    let mut broken = tree();
+    broken["nodes"][0]["text"] = json!("x".repeat(501));
+    assert_eq!(question(broken).check(), Err(FormError::TooLong));
+    let mut broken = tree();
+    broken["nodes"][1]["choice"]["options"][0]["text"] = json!("x".repeat(501));
+    assert_eq!(question(broken).check(), Err(FormError::TooLong));
+    let mut broken = tree();
+    broken["nodes"][0]["number"]["unit"] = json!("x".repeat(501));
+    assert_eq!(question(broken).check(), Err(FormError::TooLong));
+    let mut broken = tree();
+    broken["nodes"][0]["number"]["min"] = json!(11);
+    assert_eq!(question(broken).check(), Err(FormError::Range));
+    let mut broken = tree();
+    broken["nodes"][0]["number"]["step"] = json!(0);
+    assert_eq!(question(broken).check(), Err(FormError::Range));
+    let mut broken = tree();
+    broken["nodes"][0]["next"][0] = json!({"range": [0, 3], "own": true, "to": "pick"});
+    assert_eq!(question(broken).check(), Err(FormError::Rule));
+    let mut broken = tree();
+    broken["nodes"][0]["next"][0] = json!({"picked": ["a"], "to": "pick"});
+    assert_eq!(question(broken).check(), Err(FormError::Rule));
+    let mut broken = tree();
+    broken["nodes"][1]["next"][0] = json!({"picked": ["z"], "to": "last"});
+    assert_eq!(question(broken).check(), Err(FormError::Rule));
+    let mut broken = tree();
+    broken["nodes"][1]["next"][0] = json!({"range": [0, 1], "to": "last"});
+    assert_eq!(question(broken).check(), Err(FormError::Rule));
+    let mut broken = tree();
+    broken["nodes"][0]["next"][0] = json!({"range": [3, 0], "to": "pick"});
+    assert_eq!(question(broken).check(), Err(FormError::Rule));
+    let mut broken = tree();
+    broken["nodes"][1]["next"][1]["to"] = json!("gone");
+    assert_eq!(question(broken).check(), Err(FormError::Unknown));
+    let mut looped = tree();
+    looped["nodes"][2]["next"] = json!([{"to": "count"}]);
+    assert_eq!(question(looped).check(), Err(FormError::Path));
+    let mut unreached = tree();
+    unreached["nodes"][1]["next"][0]["to"] = json!(null);
+    assert_eq!(question(unreached).check(), Err(FormError::Path));
+    assert_eq!(
+        question(json!({"first": "x", "nodes": []})).check(),
+        Err(FormError::Nodes)
+    );
+
+    // 32 questions at most, and no path longer than 16.
+    let chain = |length: usize| {
+        let mut nodes = Vec::new();
+        for n in 0..length {
+            let to = if n + 1 < length {
+                json!(format!("q{}", n + 1))
+            } else {
+                json!(null)
+            };
+            nodes.push(json!({"id": format!("q{n}"), "text": "?",
+                "choice": {"options": [{"id": "y", "text": "Y"}]}, "next": [{"to": to}]}));
+        }
+        question(json!({"first": "q0", "nodes": nodes}))
+    };
+    assert_eq!(chain(16).check(), Ok(()));
+    assert_eq!(chain(17).check(), Err(FormError::Deep));
+    let mut wide = Vec::new();
+    let mut rules = Vec::new();
+    for n in 1..33 {
+        wide.push(json!({"id": format!("q{n}"), "text": "?",
+            "choice": {"options": [{"id": "y", "text": "Y"}]}}));
+        rules.push(json!({"to": format!("q{n}")}));
+    }
+    wide.push(
+        json!({"id": "q0", "text": "?", "choice": {"options": [{"id": "y", "text": "Y"}]},
+        "next": rules}),
+    );
+    assert_eq!(
+        question(json!({"first": "q0", "nodes": wide})).check(),
+        Err(FormError::Nodes)
+    );
+}
+
+#[test]
+fn an_answer_follows_its_question_along_the_path_taken() {
+    let tree = question(tree());
+    let check = |value| tree.check_answer(&answer(value));
+
+    // In range, then a pick that leads on, then the last question.
+    assert_eq!(
+        check(json!({"question": 5, "answers": [
+            {"node": "count", "number": 2.5},
+            {"node": "pick", "picked": ["a", "b"], "own": "and d"},
+            {"node": "last", "picked": ["no"]}]})),
+        Ok(())
+    );
+    // Written-in text alone ends the form.
+    assert_eq!(
+        check(json!({"question": 5, "answers": [
+            {"node": "count", "number": 0},
+            {"node": "pick", "own": "none of them"}]})),
+        Ok(())
+    );
+    // A skipped question goes on by the skip rule, and the whole form can be skipped.
+    assert_eq!(
+        check(json!({"question": 5, "answers": [
+            {"node": "count", "skipped": true},
+            {"node": "pick", "skipped": true}]})),
+        Ok(())
+    );
+    assert_eq!(check(json!({"question": 5, "skipped": true})), Ok(()));
+    // Out of range or off the step, and a number past every rule ends the form.
+    for number in [json!(11), json!(-1), json!(1.25)] {
+        assert_eq!(
+            check(json!({"question": 5, "answers": [{"node": "count", "number": number}]})),
+            Err(FormError::Answer)
+        );
+    }
+    assert_eq!(
+        check(json!({"question": 5, "answers": [{"node": "count", "number": 7}]})),
+        Ok(())
+    );
+    assert_eq!(
+        check(json!({"question": 5, "answers": [{"node": "count", "own": "about seven"}]})),
+        Ok(())
+    );
+    let wrong = [
+        // Not where the path is, or stopping before it ends.
+        json!([{"node": "pick", "picked": ["a"]}]),
+        json!([{"node": "count", "number": 1}]),
+        json!([{"node": "count", "number": 7}, {"node": "pick", "picked": ["a"]}]),
+        // Nothing given, a number on a choice, a pick on a number, an unknown option.
+        json!([{"node": "count"}]),
+        json!([{"node": "count", "picked": ["a"]}]),
+        json!([{"node": "count", "number": 1}, {"node": "pick", "number": 1}]),
+        json!([{"node": "count", "number": 1}, {"node": "pick", "picked": ["z"]}]),
+        json!([{"node": "count", "number": 1}, {"node": "pick"}]),
+        // A skip that carries an answer.
+        json!([{"node": "count", "skipped": true, "number": 1}]),
+        // One pick only where the choice is not multi.
+        json!([{"node": "count", "number": 1}, {"node": "pick", "picked": ["a"]},
+               {"node": "last", "picked": ["no", "no"]}]),
+    ];
+    for answers in wrong {
+        assert_eq!(
+            check(json!({"question": 5, "answers": answers})),
+            Err(FormError::Answer),
+            "{answers}"
+        );
+    }
+    assert_eq!(
+        check(json!({"question": 5, "answers": [{"node": "count", "own": "x".repeat(2001)}]})),
+        Err(FormError::TooLong)
+    );
+    assert_eq!(
+        check(json!({"question": 5, "skipped": true, "answers": [{"node": "count", "number": 1}]})),
+        Err(FormError::Answer)
+    );
 }

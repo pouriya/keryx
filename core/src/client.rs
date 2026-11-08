@@ -31,15 +31,15 @@ use crate::mls::{
     verify_message, verify_revocation,
 };
 use crate::protocol::{
-    AccountBrief, AccountInfo, AccountKeysBody, AccountListReply, AccountReply, Bytes, CallBody,
-    CallEvent, CallEventKind, CallOutcome, CallText, CaptchaAnswer, CaptchaReply, ChallengeBody,
-    ChallengeReply, ChatDevice, ChatDeviceListReply, ChatItem, ChatReply, ChatType, ClientFrame,
-    ContentKind, CountReply, CreateChatBody, CreateFileBody, DeviceProof, DeviceReply,
+    AccountBrief, AccountInfo, AccountKeysBody, AccountListReply, AccountReply, Answer, Bytes,
+    CallBody, CallEvent, CallEventKind, CallOutcome, CallText, CaptchaAnswer, CaptchaReply,
+    ChallengeBody, ChallengeReply, ChatDevice, ChatDeviceListReply, ChatItem, ChatReply, ChatType,
+    ClientFrame, ContentKind, CountReply, CreateChatBody, CreateFileBody, DeviceProof, DeviceReply,
     DevicesReply, DraftBody, DraftItem, EmptyReply, FeaturesReply, FileReply, GroupInfoReply,
     Header, KeyPackageItem, KeyPackageListReply, KeyPackagesBody, Kind, LoginBody, LoginReply,
-    MarkItem, MessageFrame, RefusedReply, RegisterBody, RegisterDeviceBody, SendFrame, ServerFrame,
-    SetupBody, SetupReply, SignedBody, SyncPosition, TimesItem, WelcomeItem, WrapEntry, WrapItem,
-    WrapListReply, call_text_header,
+    MarkItem, MessageFrame, Question, RefusedReply, RegisterBody, RegisterDeviceBody, SendFrame,
+    ServerFrame, SetupBody, SetupReply, SignedBody, StickerListReply, StickerPack, SyncPosition,
+    TimesItem, WelcomeItem, WrapEntry, WrapItem, WrapListReply, call_text_header,
 };
 use crate::queue::{Level, Queue, Target};
 use crate::seed::{self, AccountKeys};
@@ -295,6 +295,41 @@ pub enum Command {
         chat: Ulid,
         call_seq: u64,
         text: Secret,
+    },
+    /// One of the server's stickers, by its id, sealed so the server never sees which.
+    SendSticker {
+        chat: Ulid,
+        sticker: Ulid,
+        #[serde(default)]
+        reply: Option<Pointer>,
+    },
+    /// A tree of questions, with an optional intro. Clients have no screen for it: an agent sends
+    /// them. Refused here unless the tree holds together.
+    SendQuestion {
+        chat: Ulid,
+        #[serde(default)]
+        text: Option<Secret>,
+        question: Question,
+    },
+    /// This account's answer. `question` is the question as shown, checked here against the answer
+    /// before it goes.
+    SendAnswer {
+        chat: Ulid,
+        question: Question,
+        answer: Answer,
+    },
+    /// Replaces this account's answer, checked the same way.
+    EditAnswer {
+        chat: Ulid,
+        target: Pointer,
+        question: Question,
+        answer: Answer,
+    },
+    /// The server's sticker packs, answered as [`Event::Stickers`].
+    Stickers,
+    /// One sticker's WebP, answered as [`Event::StickerImage`].
+    StickerImage {
+        sticker: Ulid,
     },
 }
 
@@ -557,6 +592,15 @@ pub struct Shown {
     /// The `end` row's time.
     #[serde(default)]
     pub call_ended_at: Option<i64>,
+    /// A sticker message's sticker.
+    #[serde(default)]
+    pub sticker: Option<Ulid>,
+    /// A question message's tree, once it holds together. Its intro is `text`.
+    #[serde(default)]
+    pub question: Option<Question>,
+    /// An answer message's answer.
+    #[serde(default)]
+    pub answer: Option<Answer>,
     pub problem: Option<Problem>,
 }
 
@@ -705,6 +749,15 @@ pub enum Event {
         seq: u64,
         member_list: Vec<TimesItem>,
     },
+    /// The server's sticker packs.
+    Stickers {
+        pack_list: Vec<StickerPack>,
+    },
+    /// One sticker's WebP. Not encrypted: everyone on the server can see it.
+    StickerImage {
+        sticker: Ulid,
+        bytes: Bytes,
+    },
     Typing {
         chat: Ulid,
         account: Ulid,
@@ -772,6 +825,7 @@ enum Item {
         files: Vec<FileInfo>,
         remove: Vec<Ulid>,
         call: Option<CallBody>,
+        fields: Option<Secret>,
     },
     Typing {
         chat: Ulid,
@@ -881,6 +935,10 @@ enum Asked {
         n: u64,
     },
     Features,
+    Stickers,
+    StickerImage {
+        sticker: Ulid,
+    },
 }
 
 /// A REST request, kept until it is answered, to go again if nothing answered.
@@ -905,6 +963,8 @@ struct Content {
     remove: Vec<Ulid>,
     /// A call's start body.
     call: Option<CallBody>,
+    /// More of the plaintext's fields, as a JSON object: a sticker, a question's tree or an answer.
+    fields: Option<Secret>,
     /// The platform's handles for `files`, for its pending message.
     handles: Vec<u64>,
 }
@@ -1249,6 +1309,8 @@ fn background(asked: &Asked) -> bool {
             | Asked::Devices
             | Asked::Terminate { .. }
             | Asked::LogOut
+            | Asked::Stickers
+            | Asked::StickerImage { .. }
     )
 }
 
@@ -1271,10 +1333,15 @@ struct Opened {
     files: Vec<FileInfo>,
     call: Option<CallBody>,
     reply: Option<u64>,
+    sticker: Option<Ulid>,
+    question: Option<Question>,
+    answer: Option<Answer>,
 }
 
-/// A message's text and files, `{"text": "...", "files": [...]}`, each optional, or a call's start,
-/// `{"video": ..., "voice": ...}`.
+/// A message's text and files, `{"text": "...", "files": [...]}`, each optional, a call's start,
+/// `{"video": ..., "voice": ...}`, a sticker, `{"sticker": "..."}`, a question's tree, `{"text"?,
+/// "first", "nodes"}`, or an answer, `{"question", "answers", "skipped"?}`. A tree that does not hold
+/// together is left out.
 fn content_of(plaintext: &[u8]) -> Opened {
     #[derive(Deserialize)]
     struct Plain {
@@ -1288,17 +1355,52 @@ fn content_of(plaintext: &[u8]) -> Opened {
         voice: Option<bool>,
         #[serde(default)]
         reply: Option<u64>,
+        #[serde(default)]
+        sticker: Option<Ulid>,
+        #[serde(default)]
+        first: Option<String>,
+        #[serde(default)]
+        nodes: Option<Vec<crate::protocol::QuestionNode>>,
+        #[serde(default)]
+        question: Option<u64>,
+        #[serde(default)]
+        answers: Vec<crate::protocol::AnswerItem>,
+        #[serde(default)]
+        skipped: bool,
     }
     match serde_json::from_slice::<Plain>(plaintext) {
-        Ok(plain) => Opened {
-            reply: plain.reply,
-            text: plain.text.map(Secret),
-            files: plain.files,
-            call: match (plain.video, plain.voice) {
-                (Some(video), Some(voice)) => Some(CallBody { video, voice }),
+        Ok(plain) => {
+            let question = match (plain.first, plain.nodes) {
+                (Some(first), Some(nodes)) => {
+                    let question = Question { first, nodes };
+                    match question.check() {
+                        Ok(()) => Some(question),
+                        Err(_) => None,
+                    }
+                }
                 _ => None,
-            },
-        },
+            };
+            let answer = match plain.question {
+                Some(seq) => Some(Answer {
+                    question: seq,
+                    answers: plain.answers,
+                    skipped: plain.skipped,
+                }),
+                None => None,
+            };
+            Opened {
+                reply: plain.reply,
+                text: plain.text.map(Secret),
+                files: plain.files,
+                call: match (plain.video, plain.voice) {
+                    (Some(video), Some(voice)) => Some(CallBody { video, voice }),
+                    _ => None,
+                },
+                sticker: plain.sticker,
+                question,
+                answer,
+            }
+        }
         Err(_) => Opened::default(),
     }
 }
@@ -1336,6 +1438,9 @@ fn shown(
         files,
         call,
         reply,
+        sticker,
+        question,
+        answer,
     } = opened;
     Shown {
         chat: message.chat,
@@ -1353,6 +1458,9 @@ fn shown(
         call,
         call_outcome: end.map(|(outcome, _)| outcome),
         call_ended_at: end.map(|(_, at)| at),
+        sticker,
+        question,
+        answer,
         problem: None,
     }
 }
@@ -1837,6 +1945,68 @@ impl Client {
                 }
             }
             Command::Devices => self.get("/api/v1/devices".to_string(), Asked::Devices),
+            Command::SendSticker {
+                chat,
+                sticker,
+                reply,
+            } => {
+                let fields = serde_json::json!({ "sticker": sticker }).to_string();
+                self.push_content(
+                    chat,
+                    Kind::Content,
+                    reply,
+                    Content {
+                        content_kind: Some(ContentKind::Sticker),
+                        fields: Some(Secret(fields)),
+                        ..Content::default()
+                    },
+                );
+            }
+            Command::SendQuestion {
+                chat,
+                text,
+                question,
+            } => {
+                if let Err(error) = question.check() {
+                    return self.error("bad_question", &error.to_string());
+                }
+                let fields = match serde_json::to_string(&question) {
+                    Ok(fields) => fields,
+                    Err(_) => return self.error("internal", "Could not write the question"),
+                };
+                self.push_content(
+                    chat,
+                    Kind::Content,
+                    None,
+                    Content {
+                        content_kind: Some(ContentKind::Question),
+                        text,
+                        fields: Some(Secret(fields)),
+                        ..Content::default()
+                    },
+                );
+            }
+            Command::SendAnswer {
+                chat,
+                question,
+                answer,
+            } => self.answer(chat, None, &question, &answer),
+            Command::EditAnswer {
+                chat,
+                target,
+                question,
+                answer,
+            } => self.answer(chat, Some(target), &question, &answer),
+            Command::Stickers => self.get("/api/v1/stickers".to_string(), Asked::Stickers),
+            Command::StickerImage { sticker } => self.issue(Request {
+                method: "GET".to_string(),
+                path: format!("/api/v1/stickers/{sticker}"),
+                body: None,
+                bytes: None,
+                raw: true,
+                asked: Asked::StickerImage { sticker },
+                attempt: 0,
+            }),
             Command::StartCall { chat, video, voice } => self.push_content(
                 chat,
                 Kind::Content,
@@ -2090,6 +2260,37 @@ impl Client {
         );
     }
 
+    /// An answer, or an edit of one when `target` is set, once it follows its question.
+    fn answer(
+        &mut self,
+        chat: Ulid,
+        target: Option<Pointer>,
+        question: &Question,
+        answer: &Answer,
+    ) {
+        if let Err(error) = question.check_answer(answer) {
+            return self.error("bad_answer", &error.to_string());
+        }
+        let fields = match serde_json::to_string(answer) {
+            Ok(fields) => fields,
+            Err(_) => return self.error("internal", "Could not write the answer"),
+        };
+        let (kind, content_kind) = match target {
+            Some(_) => (Kind::Edit, None),
+            None => (Kind::Content, Some(ContentKind::Answer)),
+        };
+        self.push_content(
+            chat,
+            kind,
+            target,
+            Content {
+                content_kind,
+                fields: Some(Secret(fields)),
+                ..Content::default()
+            },
+        );
+    }
+
     fn push_content(&mut self, chat: Ulid, kind: Kind, target: Option<Pointer>, content: Content) {
         if self.device.is_none() {
             return self.error("no_device", "This client has no device");
@@ -2105,6 +2306,7 @@ impl Client {
             files,
             remove,
             call,
+            fields,
             handles,
         } = content;
         let item = Item::Content {
@@ -2115,6 +2317,7 @@ impl Client {
             files,
             remove,
             call,
+            fields,
         };
         let local = self.queue.push(Level::Content, item, queue_target);
         self.event(Event::Pending {
@@ -2357,6 +2560,7 @@ impl Client {
                 files,
                 remove: Vec::new(),
                 call: None,
+                fields: None,
                 handles,
             },
         );
@@ -2449,6 +2653,15 @@ impl Client {
         {
             self.asked.remove(&id);
             return self.chunk_got(handle, n, bytes);
+        }
+        if let Asked::StickerImage { sticker } = request.asked
+            && (200..300).contains(&status)
+        {
+            self.asked.remove(&id);
+            return self.event(Event::StickerImage {
+                sticker,
+                bytes: Bytes(bytes.to_vec()),
+            });
         }
         self.replied(id, status, &String::from_utf8_lossy(bytes));
     }
@@ -2912,6 +3125,7 @@ impl Client {
                     files,
                     remove,
                     call,
+                    fields,
                 } => match self.can_seal(chat) {
                     Seal::Now => {
                         let content = Content {
@@ -2920,6 +3134,7 @@ impl Client {
                             files,
                             remove,
                             call,
+                            fields,
                             handles: Vec::new(),
                         };
                         self.send_content(outgoing.id, chat, kind, outgoing.pointer_seq, content);
@@ -2980,6 +3195,7 @@ impl Client {
             files,
             remove,
             call,
+            fields,
             ..
         } = content;
         let Some(device) = self.device.as_ref() else {
@@ -3036,6 +3252,20 @@ impl Client {
                     match serde_json::to_value(&files) {
                         Ok(files) => {
                             plain.insert("files".to_string(), files);
+                        }
+                        Err(_) => return self.fail(chat, local, "internal"),
+                    }
+                }
+                if let Some(mut fields) = fields {
+                    let parsed = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
+                        &fields.0,
+                    );
+                    fields.0.zeroize();
+                    match parsed {
+                        Ok(more) => {
+                            for (key, value) in more {
+                                plain.insert(key, value);
+                            }
                         }
                         Err(_) => return self.fail(chat, local, "internal"),
                     }
@@ -5107,6 +5337,13 @@ impl Client {
                 };
                 self.wraps(chat, wrap_list);
             }
+            Asked::Stickers => {
+                if let Some(StickerListReply { pack_list }) = self.data(body) {
+                    self.event(Event::Stickers { pack_list });
+                }
+            }
+            // An image's reply arrives as `Fetched`, so only a refusal's text reaches here.
+            Asked::StickerImage { .. } => self.error("bad_reply", "The sticker could not be read"),
             Asked::Search => {
                 if let Some(AccountListReply { account_list }) = self.data(body) {
                     self.event(Event::SearchResults { account_list });
