@@ -2060,6 +2060,87 @@ fn a_device_comes_back_from_its_saved_state_and_logging_out_wipes_it() {
     assert!(back.client.device().is_none());
 }
 
+#[test]
+fn a_device_shows_its_chats_with_no_network() {
+    let server = open_server();
+    let (sara, mut babak, chat) = apps_on(&server);
+    babak.command(
+        &server,
+        Command::SendText {
+            chat,
+            text: Secret("kept for later".to_string()),
+        },
+    );
+    let Event::Sent { .. } = babak.wait(&server, |event| matches!(event, Event::Sent { .. }))
+    else {
+        unreachable!();
+    };
+    let [first, second] = sara.slots.clone();
+    drop(sara);
+
+    // Back online, the list comes with its preview, and the state is saved with it.
+    let mut back = App::new();
+    back.feed(
+        &server,
+        keryx_core::client::Input::Loaded {
+            first,
+            second,
+            resume: true,
+            token: None,
+        },
+    );
+    back.wait(&server, |event| matches!(event, Event::NeedLogin));
+    back.command(
+        &server,
+        Command::LogIn {
+            username: "sara_x".to_string(),
+            password: Secret(PASSWORD.to_string()),
+            captcha: None,
+        },
+    );
+    back.wait(&server, |event| {
+        matches!(event, Event::Message { message } if message.chat == chat
+            && text_of(message) == Some("kept for later"))
+    });
+    back.wait(&server, |event| matches!(event, Event::Online));
+    let [first, second] = back.slots.clone();
+    let token = back.token.clone().map(Secret);
+    drop(back);
+
+    // Opened again with the server out of reach, it still shows who it is, the list and the preview.
+    let mut offline = App::new();
+    offline.feed(
+        &server,
+        keryx_core::client::Input::Loaded {
+            first,
+            second,
+            resume: false,
+            token,
+        },
+    );
+    let events: Vec<&Event> = offline.events.iter().collect();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Event::SignedIn { username, .. } if username == "sara_x"))
+    );
+    assert!(events.iter().any(
+        |event| matches!(event, Event::Chats { chat_list } if chat_list.iter().any(|item| item.chat == chat))
+    ));
+    assert!(
+        events.iter().any(
+            |event| matches!(event, Event::Account { account } if account.username == "babak_x")
+        ),
+        "the other person's name is shown too"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Event::Message { message }
+        if message.chat == chat && text_of(message) == Some("kept for later")))
+    );
+}
+
 type TlsStream = rustls::StreamOwned<rustls::ClientConnection, TcpStream>;
 
 /// A client that does check the certificate, trusting only what it is given.
