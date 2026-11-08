@@ -12,6 +12,8 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.graphics.Bitmap
+import android.net.ConnectivityManager
+import android.net.Network
 import android.os.Build
 import android.os.Bundle
 import android.view.WindowManager
@@ -60,8 +62,8 @@ class MainActivity : ComponentActivity() {
     private lateinit var vault: Vault
     private val language = mutableStateOf("en")
 
-    /** Welcome, then account setup, then the test screen until the words screen is built. */
-    private enum class Place { Welcome, Setup, Words, Test }
+    /** Welcome, then account setup, then words, then the chat list. The test screen stays in the code. */
+    private enum class Place { Welcome, Setup, Words, Chats, Test }
 
     private enum class After { None, EnterSignUp, LogIn, SignUp, SetupLink }
 
@@ -98,12 +100,50 @@ class MainActivity : ComponentActivity() {
     private val wordsError = mutableStateOf<String?>(null)
     private var wordsBack: () -> Boolean = { false }
     private val chats = mutableStateListOf<ChatItem>()
+    private val list = ChatRows()
+    private val people = mutableStateMapOf<String, AccountBrief>()
+    private val me = mutableStateOf<String?>(null)
+    private val serverName = mutableStateOf<String?>(null)
+    private val linkState = mutableStateOf(Link.Connecting)
     private val unreadCounts = mutableStateMapOf<String, Int>()
+    private val found = mutableStateListOf<AccountBrief>()
+    private val foundFor = mutableStateOf("")
+    private var searches = 0
+    private var latestSearch = ""
     private val chosen = mutableStateOf<String?>(null)
     private val messages = mutableStateListOf<Shown>()
     private val happened = mutableStateListOf<String>()
     private var lookingFor: String? = null
     private lateinit var engine: Engine
+    private var netUp = true
+    private var probeGen = 0
+    private var leaving = false
+    private var watchingNet = false
+    private val connectivity by lazy { getSystemService(ConnectivityManager::class.java) }
+    private val netCallback =
+        object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                runOnUiThread {
+                    val back = !netUp
+                    netUp = true
+                    if (back && place.value == Place.Chats && linkState.value == Link.Waiting) {
+                        linkState.value = Link.Connecting
+                        engine.send(Command.NetworkBack)
+                        probe()
+                    }
+                }
+            }
+
+            override fun onLost(network: Network) {
+                runOnUiThread {
+                    netUp = false
+                    if (place.value == Place.Chats) {
+                        linkState.value = Link.Waiting
+                        probeGen++
+                    }
+                }
+            }
+        }
 
     /** The call ringing here, as its start message, until it is answered, declined or ended. */
     private val ringing = mutableStateOf<Shown?>(null)
@@ -170,15 +210,27 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                 },
+                { chat, seq, outcome ->
+                    runOnUiThread {
+                        val video = list.rows.firstOrNull { it.id == chat }?.callVideo ?: return@runOnUiThread
+                        list.callStatus(chat, seq, callLabel(video, outcome == 0))
+                    }
+                },
             )
+        netUp = connectivity.activeNetwork != null
+        runCatching {
+            connectivity.registerDefaultNetworkCallback(netCallback)
+            watchingNet = true
+        }
+        openSaved()
         setContent {
             val joined = session.value
-            BackHandler(enabled = joined == null && place.value != Place.Welcome) {
+            BackHandler(enabled = joined == null && place.value != Place.Welcome && place.value != Place.Chats) {
                 when (place.value) {
                     Place.Words -> if (!wordsBack()) place.value = Place.Setup
                     Place.Test -> place.value = Place.Setup
                     Place.Setup -> if (linkStage.value) closeLink() else place.value = Place.Welcome
-                    Place.Welcome -> Unit
+                    Place.Welcome, Place.Chats -> Unit
                 }
             }
             MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
@@ -259,6 +311,27 @@ class MainActivity : ComponentActivity() {
                                 onClearError = { wordsError.value = null },
                                 onBindBack = { wordsBack = it },
                             )
+                        Place.Chats ->
+                            Chats(
+                                link = linkState.value,
+                                serverName = serverName.value,
+                                host = hostOf(server.value),
+                                people = people,
+                                me = me.value,
+                                unread = unreadCounts,
+                                rows = list.rows,
+                                ringing = ringing.value,
+                                found = found,
+                                foundFor = foundFor.value,
+                                onSearch = ::searchPeople,
+                                onPerson = { account -> engine.send(Command.StartChat(account.id)) },
+                                onLogOut = ::logOut,
+                                onAnswer = ::answer,
+                                onDecline = { call ->
+                                    engine.send(Command.DeclineCall(call.chat, call.seq))
+                                    ringing.value = null
+                                },
+                            )
                         Place.Test -> Surface(Modifier.fillMaxSize()) { Bare() }
                     }
                 }
@@ -276,6 +349,122 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun normalized(raw: String) = raw.trim().trimEnd('/')
+
+    private fun hostOf(address: String): String {
+        val host = android.net.Uri.parse(address).host
+        return if (host.isNullOrEmpty()) address else host
+    }
+
+    /** The directory, for a name that is not already a chat. An empty query drops the last answer. */
+    private fun searchPeople(text: String) {
+        latestSearch = text
+        if (text.isEmpty()) {
+            searches = 0
+            found.clear()
+            foundFor.value = ""
+            return
+        }
+        searches++
+        engine.send(Command.Search(text))
+    }
+
+    private fun searchAnswered(accounts: List<AccountBrief>) {
+        searches = (searches - 1).coerceAtLeast(0)
+        if (searches > 0) return
+        found.clear()
+        found.addAll(accounts)
+        for (account in accounts) people[account.id] = account
+        foundFor.value = latestSearch
+    }
+
+    /**
+     * A kept login opens the list. The token is what was saved: without one, the welcome screen
+     * stays, and a rejected session still falls back to Log in.
+     */
+    private fun openSaved() {
+        val base = vault.note("server") ?: return
+        val last = vault.note("last") ?: return
+        if (last !in vault.usernames(base) || vault.get(base, last, "token") == null) return
+        username.value = last
+        place.value = Place.Chats
+        linkState.value = if (netUp) Link.Connecting else Link.Waiting
+        engine.openLast(base)
+        if (linkState.value == Link.Connecting) probe()
+    }
+
+    private fun logOut() {
+        leaving = true
+        engine.send(Command.LogOut)
+    }
+
+    /** The list closes with nothing said. The address stays. The name and the password do not. */
+    private fun leaveForLogin() {
+        probeGen++
+        leaving = false
+        username.value = ""
+        password.value = ""
+        formError.value = null
+        addressError.value = null
+        linkError.value = null
+        wordsError.value = null
+        signingUp.value = false
+        busy.value = false
+        place.value = Place.Setup
+    }
+
+    /** While the title is Connecting, ask features again. An answer that is not keryx leaves the list. */
+    private fun probe() {
+        if (place.value != Place.Chats || linkState.value != Link.Connecting || !netUp) return
+        val gen = ++probeGen
+        engine.look(server.value) { reach, name ->
+            runOnUiThread {
+                if (place.value != Place.Chats) {
+                    return@runOnUiThread
+                }
+                if (reach == Reach.Answers) {
+                    serverName.value = name
+                }
+                if (gen != probeGen || linkState.value != Link.Connecting) {
+                    return@runOnUiThread
+                }
+                if (reach == Reach.NotKeryx) {
+                    leaveForLogin()
+                } else {
+                    window.decorView.postDelayed({
+                        if (gen == probeGen && linkState.value == Link.Connecting) probe()
+                    }, 2000)
+                }
+            }
+        }
+    }
+
+    private fun previewOf(message: Shown): String {
+        val text = message.text?.takeIf { it.isNotBlank() }
+        return when (message.content_kind) {
+            1 -> getString(R.string.kind_voice)
+            2 -> text?.let { getString(R.string.kind_reacted, it) } ?: getString(R.string.kind_reacted, "").trim()
+            3 -> text ?: getString(R.string.kind_photo)
+            4 -> text ?: getString(R.string.kind_music)
+            5 -> text ?: getString(R.string.kind_video)
+            6 -> text ?: getString(R.string.kind_doc)
+            7 -> text ?: getString(R.string.kind_file)
+            8 -> callLabel(message.call?.video == true, message.call_outcome == 0)
+            9 -> text ?: getString(R.string.kind_bundle)
+            else -> text.orEmpty()
+        }
+    }
+
+    /** A call's preview: missed or not, and video when the caller had it on. */
+    private fun callLabel(
+        video: Boolean,
+        missed: Boolean,
+    ): String =
+        when {
+            missed && video -> getString(R.string.call_missed_video)
+            missed -> getString(R.string.call_missed_voice)
+            video -> getString(R.string.call_video)
+            else -> getString(R.string.call_voice)
+        }
 
     private fun onAddress(value: String) {
         address.value = value
@@ -551,6 +740,7 @@ class MainActivity : ComponentActivity() {
     private fun onFeatures(event: Event.Features) {
         registration.value = event.registration
         captchaOn.value = event.captcha
+        serverName.value = event.name?.trim()?.ifEmpty { null }
         if (event.captcha && captchaImage.value == null) {
             engine.send(Command.Captcha)
         }
@@ -642,6 +832,7 @@ class MainActivity : ComponentActivity() {
 
     /** Rotating keeps this activity, so this runs only when it really goes: nothing it started runs on. */
     override fun onDestroy() {
+        if (watchingNet) connectivity.unregisterNetworkCallback(netCallback)
         session.value?.close()
         session.value = null
         engine.close()
@@ -675,12 +866,34 @@ class MainActivity : ComponentActivity() {
                 }
             }
             is Event.SignedIn -> {
+                me.value = event.account
                 if (event.device != null) words.value = null
                 busy.value = false
                 afterCheck = After.None
-                if (place.value == Place.Words && event.device != null) place.value = Place.Test
-                if (place.value == Place.Setup) place.value = Place.Test
+                if (event.device != null && (place.value == Place.Words || place.value == Place.Setup)) {
+                    place.value = Place.Chats
+                    if (linkState.value != Link.Connected && linkState.value != Link.Updating) {
+                        linkState.value = if (netUp) Link.Connecting else Link.Waiting
+                        if (linkState.value == Link.Connecting) probe()
+                    } else {
+                        engine.look(server.value) { reach, name ->
+                            runOnUiThread {
+                                if (place.value == Place.Chats && reach == Reach.Answers) serverName.value = name
+                            }
+                        }
+                    }
+                }
             }
+            is Event.NeedLogin -> if (place.value == Place.Chats) leaveForLogin()
+            is Event.Online -> {
+                if (netUp) linkState.value = Link.Updating
+                probeGen++
+            }
+            is Event.Offline -> {
+                linkState.value = if (netUp) Link.Connecting else Link.Waiting
+                if (linkState.value == Link.Connecting && place.value == Place.Chats) probe()
+            }
+            is Event.Account -> people[event.account.id] = event.account
             is Event.NeedWords -> {
                 busy.value = false
                 afterCheck = After.None
@@ -693,9 +906,17 @@ class MainActivity : ComponentActivity() {
             is Event.Chats -> {
                 chats.clear()
                 chats.addAll(event.chat_list)
+                list.replace(event.chat_list)
+                if (netUp) {
+                    linkState.value = Link.Connected
+                    probeGen++
+                }
             }
             is Event.Message -> {
                 val message = event.message
+                val known = list.rows.any { it.id == message.chat }
+                list.message(message, previewOf(message))
+                if (!known) engine.send(Command.ChatList)
                 if (message.chat == chosen.value) messages.add(message)
                 if (message.call != null && !message.mine && message.call_outcome == null && message.call_ended_at == null &&
                     session.value == null
@@ -703,18 +924,24 @@ class MainActivity : ComponentActivity() {
                     ringing.value = message
                 }
             }
-            is Event.Pending ->
+            is Event.Pending -> {
                 if (event.chat == starting && event.text == null && event.handles.isEmpty()) {
                     startingLocal = event.local
                     starting = null
                 }
+                if (event.text != null || event.handles.isNotEmpty()) {
+                    list.pending(event.chat, event.text ?: getString(R.string.kind_file))
+                }
+            }
             is Event.Sent -> {
+                list.sent(event.chat, event.seq, event.saved_at)
                 if (event.local == startingLocal) {
                     startingLocal = null
                     engine.send(Command.JoinCall(event.chat, event.seq))
                 }
                 if (event.chat == chosen.value) choose(event.chat)
             }
+            is Event.Marks -> list.marks(event.chat, event.mark)
             is Event.Failed -> {
                 happened[0] = "Failed: ${event.code}"
                 if (event.local == startingLocal) startingLocal = null
@@ -725,10 +952,12 @@ class MainActivity : ComponentActivity() {
                 opening.remove(event.handle)?.let { mime -> open(event.handle, mime) }
             }
             is Event.TransferFailed -> transfers[event.handle] = "failed: ${event.code}"
-            is Event.SearchResults ->
+            is Event.SearchResults -> {
+                if (place.value == Place.Chats) searchAnswered(event.account_list)
                 event.account_list.firstOrNull { it.username == lookingFor }?.let {
                     engine.send(Command.StartChat(it.id))
                 }
+            }
             is Event.Started -> {
                 choose(event.chat)
                 engine.send(Command.ChatList)
@@ -736,26 +965,51 @@ class MainActivity : ComponentActivity() {
             is Event.Error -> {
                 happened[0] = "Error: ${event.code}"
                 busy.value = false
+                if (place.value == Place.Chats && searches > 0) searchAnswered(emptyList())
                 val shown = accountMessage(event.code, event.message)
                 if (place.value == Place.Words) wordsError.value = shown
                 if (place.value == Place.Setup) formError.value = shown
             }
             is Event.DeviceLimit -> {
                 busy.value = false
-                if (place.value == Place.Words) wordsError.value = event.message
-                if (place.value == Place.Setup) formError.value = event.message
+                if (place.value == Place.Chats) {
+                    leaveForLogin()
+                } else {
+                    if (place.value == Place.Words) wordsError.value = event.message
+                    if (place.value == Place.Setup) formError.value = event.message
+                }
             }
             is Event.LoggedOut -> {
                 chats.clear()
+                list.clear()
+                people.clear()
                 messages.clear()
                 unreadCounts.clear()
                 chosen.value = null
+                me.value = null
+                if (place.value != Place.Welcome) {
+                    val own = leaving
+                    leaving = false
+                    password.value = ""
+                    formError.value = null
+                    addressError.value = null
+                    signingUp.value = false
+                    busy.value = false
+                    if (!own) username.value = ""
+                    probeGen++
+                    place.value = Place.Setup
+                }
             }
             else -> Unit
         }
     }
 
     private fun callEvent(event: ShownCallEvent) {
+        val outcome = event.outcome
+        if (event.kind == 4 && outcome != null) {
+            val video = list.rows.firstOrNull { it.id == event.chat }?.callVideo
+            if (video != null) list.callStatus(event.chat, event.call_seq, callLabel(video, outcome == 0))
+        }
         ringing.value?.let {
             // An end or a decline stops the ring, and so does a join from this account's other device.
             val stops = event.kind == 4 || event.kind == 2 || (event.kind == 0 && event.mine)

@@ -118,10 +118,21 @@ class Archive private constructor(
         }
     }
 
-    /**
-     * Content after the seen position, not reactions and not this account's own. A call counts
-     * only when its end row says missed.
-     */
+    /** The call's end, when this archive has it: 0 missed, 1 answered. */
+    fun callOutcome(
+        chat: String,
+        seq: Long,
+    ): Int? {
+        db.rawQuery(
+            "SELECT outcome FROM call_row WHERE chat = ? AND call_seq = ? AND kind = 4 ORDER BY n DESC LIMIT 1",
+            arrayOf(chat, seq.toString()),
+        ).use { cursor ->
+            if (!cursor.moveToFirst() || cursor.isNull(0)) return null
+            return cursor.getInt(0)
+        }
+    }
+
+    /** Content after the seen position, not reactions, not calls, and not this account's own. */
     fun unread(): Map<String, Int> {
         val counts = LinkedHashMap<String, Int>()
         db.rawQuery(UNREAD, null).use { cursor ->
@@ -171,8 +182,6 @@ class Archive private constructor(
         private const val CONTENT = 0
         private const val REACTION = 2
         private const val CALL = 8
-        private const val END = 4
-        private const val MISSED = 0
 
         private const val KEEP_MESSAGE =
             "INSERT OR IGNORE INTO message (chat, seq, kind, content_kind, device, frame) VALUES (?, ?, ?, ?, ?, ?)"
@@ -192,18 +201,9 @@ class Archive private constructor(
             WHERE message.kind = $CONTENT
               AND message.content_kind IS NOT NULL
               AND message.content_kind != $REACTION
+              AND message.content_kind != $CALL
               AND message.seq > COALESCE(seen.seen_seq, 0)
               AND NOT EXISTS (SELECT 1 FROM own_device WHERE own_device.device = message.device)
-              AND (
-                message.content_kind != $CALL
-                OR EXISTS (
-                  SELECT 1 FROM call_row
-                  WHERE call_row.chat = message.chat
-                    AND call_row.call_seq = message.seq
-                    AND call_row.kind = $END
-                    AND call_row.outcome = $MISSED
-                )
-              )
             GROUP BY message.chat
             """.trimIndent()
 

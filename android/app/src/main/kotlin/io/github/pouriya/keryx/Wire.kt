@@ -631,6 +631,7 @@ data class ShownCallEvent(
     val mine: Boolean,
     val at: Long,
     val sent_at: Long? = null,
+    val outcome: Int? = null,
     val text: String? = null,
     val problem: String? = null,
 )
@@ -682,6 +683,7 @@ sealed interface Event {
     data class Features(
         val registration: Boolean,
         val captcha: Boolean,
+        val name: String? = null,
     ) : Event
 
     @Serializable

@@ -124,6 +124,7 @@ class Engine(
     private val show: (Event) -> Unit,
     private val calls: (Output) -> Unit,
     private val unread: (Map<String, Int>) -> Unit,
+    private val callEnded: (String, Long, Int) -> Unit,
 ) {
     private val thread = Executors.newSingleThreadScheduledExecutor()
     private val http = OkHttpClient()
@@ -367,17 +368,33 @@ class Engine(
         address: String,
         answer: (Reach) -> Unit,
     ) {
+        look(address) { reach, _ ->
+            if (reach == Reach.Answers) {
+                thread.execute { start(address.trim().trimEnd('/')) }
+            }
+            answer(reach)
+        }
+    }
+
+    /**
+     * The same features check as [use], without starting a client. [Reach.NotKeryx] answered as
+     * something else. [Reach.Unreachable] did not answer, so a later try can.
+     */
+    fun look(
+        address: String,
+        answer: (Reach, String?) -> Unit,
+    ) {
         val base = address.trim().trimEnd('/')
         val scheme = base.substringBefore("://", "").lowercase()
         if (scheme != "http" && scheme != "https") {
-            answer(Reach.NotAddress)
+            answer(Reach.NotAddress, null)
             return
         }
         val request =
             try {
                 Request.Builder().url("$base/api/v1/public/features").build()
             } catch (_: IllegalArgumentException) {
-                answer(Reach.NotAddress)
+                answer(Reach.NotAddress, null)
                 return
             }
         http.newCall(request).enqueue(
@@ -385,25 +402,34 @@ class Engine(
                 override fun onFailure(
                     call: Call,
                     e: IOException,
-                ) = answer(Reach.Unreachable)
+                ) = answer(Reach.Unreachable, null)
 
                 override fun onResponse(
                     call: Call,
                     response: Response,
                 ) {
-                    val fine = response.use { it.isSuccessful && (it.body?.string() ?: "").contains("\"ok\":true") }
-                    if (fine) {
-                        thread.execute { start(base) }
-                        answer(Reach.Answers)
-                    } else {
-                        answer(Reach.NotKeryx)
-                    }
+                    val body = response.use { if (it.isSuccessful) it.body?.string().orEmpty() else "" }
+                    val fine = body.contains("\"ok\":true")
+                    answer(if (fine) Reach.Answers else Reach.NotKeryx, if (fine) readName(body) else null)
                 }
             },
         )
     }
 
+    /** The server's name from a features body. Missing or blank means the client shows the host. */
+    private fun readName(body: String): String? =
+        try {
+            org.json.JSONObject(body).optJSONObject("data")?.optString("name")?.trim()?.ifEmpty { null }
+        } catch (_: org.json.JSONException) {
+            null
+        }
+
     fun send(command: Command) = thread.execute { handle(command) }
+
+    /** Opens the last account kept for this server. The name check stays with the list. */
+    fun openLast(address: String) {
+        thread.execute { start(address.trim().trimEnd('/')) }
+    }
 
     /**
      * Stops for good once its screen is gone: the socket closes and the client is dropped. The
@@ -708,7 +734,8 @@ class Engine(
             is Output.SaveRows -> saveRows(output)
             is Output.ReadRows -> readRows(output)
             is Output.Show -> {
-                when (val event = output.event) {
+                val showing = rememberedCall(output.event)
+                when (val event = showing) {
                     is Event.SignedIn -> {
                         bound = event.username
                         vault.setNote("last", event.username)
@@ -735,7 +762,7 @@ class Engine(
                     is Event.TransferFailed -> doneReading(event.handle)
                     else -> Unit
                 }
-                show(output.event)
+                show(showing)
             }
         }
     }
@@ -785,8 +812,35 @@ class Engine(
             return
         }
         reportUnread()
+        for (row in asked.call_list) {
+            val outcome = row.outcome
+            if (row.kind == 4 && outcome != null) callEnded(row.chat, row.call_seq, outcome)
+        }
         feed(Input.RowsSaved(asked.id))
     }
+
+    /** A call opened before its end was noticed keeps the end this archive already has. */
+    private fun rememberedCall(event: Event): Event {
+        if (event is Event.Message && event.message.content_kind == 8 && event.message.call_outcome == null) {
+            val outcome = storedCall(event.message.chat, event.message.seq) ?: return event
+            return event.copy(message = event.message.copy(call_outcome = outcome))
+        }
+        if (event is Event.CallEvent && event.event.kind == 4 && event.event.outcome == null) {
+            val outcome = storedCall(event.event.chat, event.event.call_seq) ?: return event
+            return event.copy(event = event.event.copy(outcome = outcome))
+        }
+        return event
+    }
+
+    private fun storedCall(
+        chat: String,
+        seq: Long,
+    ): Int? =
+        try {
+            archive?.callOutcome(chat, seq)
+        } catch (_: android.database.SQLException) {
+            null
+        }
 
     private fun readRows(asked: Output.ReadRows) {
         val read =
