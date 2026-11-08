@@ -112,6 +112,9 @@ class MainActivity : ComponentActivity() {
     private var latestSearch = ""
     private val chosen = mutableStateOf<String?>(null)
     private val messages = mutableStateListOf<Shown>()
+    private val talk = Talk()
+    private val timesAnswer = mutableStateOf<TimesAnswer?>(null)
+    private var loadingOlder = false
     private val happened = mutableStateListOf<String>()
     private var lookingFor: String? = null
     private lateinit var engine: Engine
@@ -312,26 +315,31 @@ class MainActivity : ComponentActivity() {
                                 onBindBack = { wordsBack = it },
                             )
                         Place.Chats ->
-                            Chats(
-                                link = linkState.value,
-                                serverName = serverName.value,
-                                host = hostOf(server.value),
-                                people = people,
-                                me = me.value,
-                                unread = unreadCounts,
-                                rows = list.rows,
-                                ringing = ringing.value,
-                                found = found,
-                                foundFor = foundFor.value,
-                                onSearch = ::searchPeople,
-                                onPerson = { account -> engine.send(Command.StartChat(account.id)) },
-                                onLogOut = ::logOut,
-                                onAnswer = ::answer,
-                                onDecline = { call ->
-                                    engine.send(Command.DeclineCall(call.chat, call.seq))
-                                    ringing.value = null
-                                },
-                            )
+                            if (talk.chat != null) {
+                                OpenedChat()
+                            } else {
+                                Chats(
+                                    link = linkState.value,
+                                    serverName = serverName.value,
+                                    host = hostOf(server.value),
+                                    people = people,
+                                    me = me.value,
+                                    unread = unreadCounts,
+                                    rows = list.rows,
+                                    ringing = ringing.value,
+                                    found = found,
+                                    foundFor = foundFor.value,
+                                    onSearch = ::searchPeople,
+                                    onPerson = { account -> engine.send(Command.StartChat(account.id)) },
+                                    onOpen = { row -> openChat(row.id) },
+                                    onLogOut = ::logOut,
+                                    onAnswer = ::answer,
+                                    onDecline = { call ->
+                                        engine.send(Command.DeclineCall(call.chat, call.seq))
+                                        ringing.value = null
+                                    },
+                                )
+                            }
                         Place.Test -> Surface(Modifier.fillMaxSize()) { Bare() }
                     }
                 }
@@ -435,6 +443,22 @@ class MainActivity : ComponentActivity() {
                     }, 2000)
                 }
             }
+        }
+    }
+
+    private fun previewOfBubble(bubble: Bubble): String {
+        val text = bubble.text?.takeIf { it.isNotBlank() }
+        return when (bubble.kind) {
+            1 -> getString(R.string.kind_voice)
+            2 -> text?.let { getString(R.string.kind_reacted, it) } ?: getString(R.string.kind_reacted, "").trim()
+            3 -> text ?: getString(R.string.kind_photo)
+            4 -> text ?: getString(R.string.kind_music)
+            5 -> text ?: getString(R.string.kind_video)
+            6 -> text ?: getString(R.string.kind_doc)
+            7 -> text ?: getString(R.string.kind_file)
+            8 -> callLabel(bubble.call?.video == true, bubble.callOutcome == 0)
+            9 -> text ?: getString(R.string.kind_bundle)
+            else -> text.orEmpty()
         }
     }
 
@@ -918,6 +942,7 @@ class MainActivity : ComponentActivity() {
                 val message = event.message
                 val known = list.rows.any { it.id == message.chat }
                 list.message(message, previewOf(message))
+                talk.message(message)
                 if (!known) engine.send(Command.ChatList)
                 if (message.chat == chosen.value) messages.add(message)
                 // A call kept from the last run is not ringing: only one that arrives live is.
@@ -929,6 +954,7 @@ class MainActivity : ComponentActivity() {
                 }
             }
             is Event.Pending -> {
+                talk.pending(event)
                 if (event.chat == starting && event.text == null && event.handles.isEmpty()) {
                     startingLocal = event.local
                     starting = null
@@ -938,15 +964,32 @@ class MainActivity : ComponentActivity() {
                 }
             }
             is Event.Sent -> {
+                talk.sent(event)
                 list.sent(event.chat, event.seq, event.saved_at)
                 if (event.local == startingLocal) {
                     startingLocal = null
                     engine.send(Command.JoinCall(event.chat, event.seq))
                 }
-                if (event.chat == chosen.value) choose(event.chat)
+                if (event.chat == chosen.value && place.value == Place.Test) choose(event.chat)
+                list.walkBack(event.chat, talk, ::previewOfBubble)
             }
             is Event.Marks -> list.marks(event.chat, event.mark)
+            is Event.Edited -> talk.edited(event)
+            is Event.Deleted -> {
+                talk.deleted(event.target_seq)
+                talk.chat?.let { list.walkBack(it, talk, ::previewOfBubble) }
+            }
+            is Event.Removed -> {
+                talk.removed(event.seq)
+                talk.chat?.let { list.walkBack(it, talk, ::previewOfBubble) }
+            }
+            is Event.PageLoaded -> {
+                if (event.chat == talk.chat) talk.page(event.has_older)
+                loadingOlder = false
+            }
+            is Event.Times -> timesAnswer.value = TimesAnswer(event.seq, event.member_list)
             is Event.Failed -> {
+                talk.failed(event)
                 happened[0] = "Failed: ${event.code}"
                 if (event.local == startingLocal) startingLocal = null
             }
@@ -963,11 +1006,12 @@ class MainActivity : ComponentActivity() {
                 }
             }
             is Event.Started -> {
-                choose(event.chat)
+                if (place.value == Place.Chats) openChat(event.chat) else choose(event.chat)
                 engine.send(Command.ChatList)
             }
             is Event.Error -> {
                 happened[0] = "Error: ${event.code}"
+                timesAnswer.value?.let { if (it.member_list == null) timesAnswer.value = it.copy(member_list = emptyList()) }
                 busy.value = false
                 if (place.value == Place.Chats && searches > 0) searchAnswered(emptyList())
                 val shown = accountMessage(event.code, event.message)
@@ -988,6 +1032,7 @@ class MainActivity : ComponentActivity() {
                 list.clear()
                 people.clear()
                 messages.clear()
+                talk.close()
                 unreadCounts.clear()
                 chosen.value = null
                 me.value = null
@@ -1195,6 +1240,50 @@ class MainActivity : ComponentActivity() {
             wantVideo = video && has(Manifest.permission.CAMERA)
             engine.send(Command.JoinCall(call.chat, call.seq))
         }
+    }
+
+    private fun openChat(chat: String) {
+        timesAnswer.value = null
+        loadingOlder = false
+        talk.open(chat)
+        engine.send(Command.OpenChat(chat))
+    }
+
+    private fun pointer(bubble: Bubble) = Pointer(seq = bubble.seq, local = bubble.local)
+
+    @Composable
+    private fun OpenedChat() {
+        val chat = talk.chat ?: return
+        val row = list.rows.firstOrNull { it.id == chat }
+        val saved = getString(R.string.saved_messages)
+        ChatScreen(
+            talk = talk,
+            title = row?.let { label(it, people, saved) }.orEmpty(),
+            link = linkState.value,
+            type = row?.type ?: 1,
+            me = me.value,
+            people = people,
+            marks = row?.marks ?: emptyList(),
+            times = timesAnswer.value,
+            onBack = { talk.close() },
+            onSend = { text, reply -> engine.send(Command.SendText(chat, text, reply?.let(::pointer))) },
+            onEdit = { bubble, text -> engine.send(Command.Edit(chat, pointer(bubble), text)) },
+            onDelete = { list ->
+                for (bubble in list) engine.send(Command.Delete(chat, pointer(bubble), bubble.files.map { it.id }))
+            },
+            onTimes = { seq ->
+                timesAnswer.value = TimesAnswer(seq, null)
+                engine.send(Command.Times(chat, seq))
+            },
+            onOlder = {
+                if (!loadingOlder) {
+                    loadingOlder = true
+                    engine.send(Command.LoadOlder(chat))
+                }
+            },
+            onSeen = { seq -> engine.send(Command.Seen(chat, seq)) },
+            onFile = ::fetch,
+        )
     }
 
     private fun choose(chat: String) {

@@ -243,6 +243,32 @@ internal class ChatRows {
         rows[index] = row.copy(marks = marks)
     }
 
+    /** The last message was removed: the row falls back to the newest one still shown, or to none. */
+    fun walkBack(
+        chat: String,
+        talk: Talk,
+        preview: (Bubble) -> String,
+    ) {
+        val index = rows.indexOfFirst { it.id == chat }
+        if (index < 0) return
+        val row = rows[index]
+        val last = row.lastSeq ?: return
+        if (talk.gone[last] != true) return
+        val previous = talk.bubbles.lastOrNull { it.seq != null && it.seq < last && it.kind != null }
+        rows[index] =
+            if (previous == null) {
+                row.copy(lastSeq = null, preview = "", mine = false, waiting = false, callVideo = null)
+            } else {
+                row.copy(
+                    lastSeq = previous.seq,
+                    preview = preview(previous),
+                    mine = previous.mine,
+                    waiting = false,
+                    callVideo = if (previous.kind == CALL) previous.call?.video == true else null,
+                )
+            }
+    }
+
     fun clear() = rows.clear()
 }
 
@@ -268,6 +294,7 @@ internal fun Chats(
     foundFor: String,
     onSearch: (String) -> Unit,
     onPerson: (AccountBrief) -> Unit,
+    onOpen: (ChatRow) -> Unit,
     onLogOut: () -> Unit,
     onAnswer: (Shown) -> Unit,
     onDecline: (Shown) -> Unit,
@@ -350,7 +377,7 @@ internal fun Chats(
                     }
                 }
                 items(shown, key = { it.id }) { row ->
-                    Conversation(row, label(row, people, saved), me, unread[row.id] ?: 0, ink, accentText)
+                    Conversation(row, label(row, people, saved), me, unread[row.id] ?: 0, ink, accentText) { onOpen(row) }
                 }
                 items(strangers, key = { "person-${it.id}" }) { account ->
                     PersonRow(account, ink) {
@@ -381,7 +408,7 @@ internal fun Chats(
 }
 
 @Composable
-private fun statusText(link: Link) =
+internal fun statusText(link: Link) =
     stringResource(
         when (link) {
             Link.Waiting -> R.string.waiting_network
@@ -502,10 +529,14 @@ private fun Conversation(
     unread: Int,
     ink: Ink,
     accentText: Color,
+    onClick: () -> Unit,
 ) {
     val letter = name.firstOrNull()?.uppercaseChar()?.toString() ?: ""
     val timeColor = if (unread > 0) accentText else ink.muted
-    Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+    Row(
+        Modifier.fillMaxWidth().clickable(role = Role.Button, onClick = onClick).padding(horizontal = 16.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
         Box(
             Modifier.size(48.dp).clip(CircleShape).background(tile),
             contentAlignment = Alignment.Center,
@@ -605,7 +636,7 @@ private fun MenuItem(
 }
 
 @Composable
-private fun IconButton(
+internal fun IconButton(
     label: String,
     onClick: () -> Unit,
     mark: @Composable () -> Unit,
@@ -620,7 +651,7 @@ private fun IconButton(
     ) { mark() }
 }
 
-private fun label(
+internal fun label(
     row: ChatRow,
     people: Map<String, AccountBrief>,
     saved: String,
@@ -691,7 +722,7 @@ private fun Tick(
 
 /** One check, or the same pair as before, with the right check's long arm the same length as the left check's. */
 @Composable
-private fun Checks(
+internal fun Checks(
     color: Color,
     two: Boolean,
 ) {
@@ -727,7 +758,7 @@ private fun Checks(
 }
 
 @Composable
-private fun Clock(color: Color) {
+internal fun Clock(color: Color) {
     Canvas(Modifier.size(18.dp)) {
         val stroke = Stroke(width = 2.dp.toPx(), cap = StrokeCap.Round)
         drawCircle(color, radius = size.minDimension * 0.34f, style = stroke)
@@ -757,7 +788,7 @@ private fun Glass(color: Color) {
 }
 
 @Composable
-private fun BackMark(
+internal fun BackMark(
     color: Color,
     rtl: Boolean,
 ) {
@@ -772,7 +803,7 @@ private fun BackMark(
 }
 
 @Composable
-private fun Cross(color: Color) {
+internal fun Cross(color: Color) {
     Canvas(Modifier.size(18.dp)) {
         val stroke = Stroke(width = 2.dp.toPx(), cap = StrokeCap.Round)
         drawLine(color, Offset(size.width * 0.25f, size.height * 0.25f), Offset(size.width * 0.75f, size.height * 0.75f), stroke.width)

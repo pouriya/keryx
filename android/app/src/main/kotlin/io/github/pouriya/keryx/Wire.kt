@@ -172,6 +172,15 @@ sealed interface Command {
     data class SendText(
         val chat: String,
         val text: String,
+        val reply: Pointer? = null,
+    ) : Command
+
+    /** When each other member received and saw one message, answered as `Event.Times`. */
+    @Serializable
+    @SerialName("times")
+    data class Times(
+        val chat: String,
+        val seq: Long,
     ) : Command
 
     /** One file, or up to 20 images and videos as a bundle, with an optional caption. */
@@ -204,6 +213,7 @@ sealed interface Command {
     data class Delete(
         val chat: String,
         val target: Pointer,
+        val remove: List<String> = emptyList(),
     ) : Command
 
     @Serializable
@@ -541,6 +551,13 @@ data class AccountBrief(
 )
 
 @Serializable
+data class TimesItem(
+    val account: String,
+    val received_at: Long? = null,
+    val seen_at: Long? = null,
+)
+
+@Serializable
 data class MarkItem(
     val account: String,
     val received_seq: Long,
@@ -606,6 +623,7 @@ data class Shown(
     val sent_at: Long,
     val saved_at: Long,
     val text: String? = null,
+    val reply: Long? = null,
     val files: List<FileInfo> = emptyList(),
     val call: CallBody? = null,
     val call_outcome: Int? = null,
@@ -822,6 +840,14 @@ sealed interface Event {
     data class Marks(
         val chat: String,
         val mark: MarkItem,
+    ) : Event
+
+    @Serializable
+    @SerialName("times")
+    data class Times(
+        val chat: String,
+        val seq: Long,
+        val member_list: List<TimesItem>,
     ) : Event
 
     @Serializable
