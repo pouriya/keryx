@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use keryx_core::protocol::{
     AccountBrief, Bytes, CallEvent, CallEventKind, ChatDevice, ChatItem, ChatMode, ChatType,
-    DeviceItem, DeviceLogItem, KeyPackageItem, Kind, MarkItem, MessageFrame, SessionItem,
-    SyncPosition, WrapEntry,
+    ContentKind, DeviceItem, DeviceLogItem, KeyPackageItem, Kind, MarkItem, MessageFrame,
+    SessionItem, SyncPosition, WrapEntry,
 };
 use keryx_core::ulid::Ulid;
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
@@ -1398,10 +1398,19 @@ impl Storage for Sqlite {
             }
             match message.kind {
                 Kind::Content => {
-                    connection.execute(
-                        "UPDATE conversation SET last_at = ?2, last_content_seq = ?3 WHERE id = ?1",
-                        params![chat.bytes(), message.now, seq],
-                    )?;
+                    // A call is the preview, and it leaves the chat's time where it was.
+                    if message.content_kind == Some(ContentKind::Call) {
+                        connection.execute(
+                            "UPDATE conversation SET last_content_seq = ?2 WHERE id = ?1",
+                            params![chat.bytes(), seq],
+                        )?;
+                    } else {
+                        connection.execute(
+                            "UPDATE conversation SET last_at = ?2, last_content_seq = ?3
+                             WHERE id = ?1",
+                            params![chat.bytes(), message.now, seq],
+                        )?;
+                    }
                 }
                 Kind::Delete => {
                     connection.execute(

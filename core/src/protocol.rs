@@ -107,8 +107,8 @@ numbered!(
 );
 
 numbered!(
-    /// The numbers are the `call.outcome` column's, on a call's `end` row only. Readable, because a
-    /// missed call counts as unread and an answered one does not.
+    /// The numbers are the `call.outcome` column's, on a call's `end` row only. Readable, so a
+    /// client can show a missed call and an answered one differently. A call does not count as unread.
     CallOutcome {
         Missed = 0,
         Answered = 1,
@@ -562,11 +562,14 @@ pub enum ServerFrame {
 pub struct EmptyReply {}
 
 /// What anyone can read before an account exists. `registration` is `[registration] allow`.
-/// `captcha` is whether a `[captcha]` section is set.
+/// `captcha` is whether a `[captcha]` section is set. `name` is the optional server name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeaturesReply {
     pub registration: bool,
     pub captcha: bool,
+    /// Absent when the server has no name. A blank name is stored as absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

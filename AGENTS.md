@@ -172,7 +172,8 @@ the WASM build, because there is one `Cargo.lock`. Make targets stay inside
   editing a chat's last messages.
 - **Only content moves a chat up the list:** content including reactions, and the new-device notice,
   set `last_at`. Edits, deletes and commits do not, so a key rotation never reorders anyone's list. A
-  call's own messages do not either. When the newest content is deleted, `last_at` walks back with the
+  call's own messages do not either: the call is the preview, and the chat's time stays where it was.
+  When the newest content is deleted, `last_at` walks back with the
   preview, to the chat's creation time if nothing is left.
 - **A message either has content or is an action, and may carry a pointer.** A delete
   or edit points at its target, a reply at the message replied to, and a reaction at
@@ -203,8 +204,8 @@ the WASM build, because there is one `Cargo.lock`. Make targets stay inside
 - **After a call, clients show the recordings that exist, and both people can remove one or two
   of them.** This is the one case where someone can remove what another device uploaded.
 - **The ringing screen says the call will be recorded**, and the person can answer or decline.
-- **A call's outcome (missed or answered) is readable**, because a missed call counts as unread
-  and an answered one does not. Any recording's file key stays encrypted.
+- **A call's outcome (missed or answered) is readable**, so the list can show which. A call does not
+  count in the unread number. Any recording's file key stays encrypted.
 - **The server can read delete and edit pointers only**, because it removes targets,
   updates conversation state and checks ownership. Reply and reaction pointers stay
   encrypted, so neither the server nor a stolen database holds the reply and reaction
@@ -227,8 +228,8 @@ the WASM build, because there is one `Cargo.lock`. Make targets stay inside
   the save is confirmed asks for the next**, and only then does its `since` move. **`history` and the
   call replay route are gone, chosen by the author:** `sync` is the one read path, scrolling reads the
   client's own archive, and core's commit catch-up uses `sync`. The unread count is the content
-  messages after this member's seen position in the archive. A reaction does not count, and neither does
-  one of this account's own messages, which core marks `mine`. See [core/AGENTS.md](core/AGENTS.md).
+  messages after this member's seen position in the archive. A reaction does not count, a call does not
+  count, and neither does one of this account's own messages, which core marks `mine`. See [core/AGENTS.md](core/AGENTS.md).
 - **Saved server times never go back, chosen by the author.** Every one is the larger of the clock and
   the last one written, server-wide, seeded at startup from the newest row. A clock that steps back,
   from NTP or a moved VM, could otherwise hide a row from "after time T" and from the page cursor.
@@ -398,7 +399,9 @@ so groups and channels fit later; recording comes after the phone test.
   holds nothing more about the call, chosen by the author:** no outcome and no end time, there or in its
   frame. **Everything else lives in one `call` table, with many rows per call, chosen by the author:**
   joins, leaves, declines, the text typed in it and its end, keyed by chat, `call_seq` and `n`, the
-  call row pointing at its message. None of them count as unread or move the preview.
+  call row pointing at its message. None of them count as unread or move the preview. **The call's
+  message is the list preview, chosen by the author:** its status, missed or not, and voice or video.
+  The unread number does not include it.
 - **Starting a call sends that message, and its delivery over the chat's WebSocket is the ring.** Joining
   needs membership only, like `seen`. **Its encrypted body says what the caller has on, chosen by the
   author:** `{"video": true|false, "voice": true|false}`, so the ring can say video or voice call.
@@ -892,7 +895,7 @@ ULID text. The cookie is called `keryx_session`.
 ```
 Anyone
 GET  /api/v1                        the guide, as plain text
-GET  /api/v1/public/features        -> registration, captcha. Anyone, before an account.
+GET  /api/v1/public/features        -> registration, captcha, and name when one is set. Anyone, before an account.
                                     The login screen reads it and offers sign up only when
                                     registration is true
 GET  /api/v1/captcha                -> id, image
@@ -1032,6 +1035,7 @@ accepts the first for each step. The loser gets a rejection, catches up and retr
   ```toml
   listen = "127.0.0.1:7777"
   public_url = "http://127.0.0.1:7777"
+  # name = "North"       # unset, or blank: a client shows the host, with no port
   # max_devices = 8      # unset: unlimited
 
   [database]
@@ -1111,6 +1115,9 @@ accepts the first for each step. The loser gets a rejection, catches up and retr
   Postgres is a different `[database]`: `type = "postgres"`, `uri`, `pool_size` and
   `connection_retry_timeout`. Postgres is the answer if SQLite ever becomes too slow. Retention's key
   joins the template when retention is built.
+- **`name` is optional, chosen by the author.** Set, it is the name a client shows for this server,
+  returned by `GET /api/v1/public/features`. Unset or blank, the client shows the host with no port.
+  It is not on the WebSocket `features` frame, which stays the ping settings.
 - **There is no setup command.** The operator writes the config, and `serve` creates the database at
   `path` the first time it starts, with its tables and built-in roles.
 - **When registration is off, an operator creates accounts** with

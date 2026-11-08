@@ -2908,9 +2908,22 @@ fn a_chat_has_one_open_call_and_a_decline_ends_it_as_missed() {
     let sara_device = pair.sara.device.record().device;
     let babak_device = pair.babak.device.record().device;
 
+    // The call is the preview, and the chat's time stays on the message before it.
+    seq_of(post(
+        &mut pair.sara_socket,
+        sealed(&pair.sara, chat, Kind::Content, None, b"hello"),
+    ));
+    let before_at = chat_item(&mut pair.sara_socket, chat).last_at;
     let call_seq = seq_of(post(&mut pair.sara_socket, call_frame(&pair.sara, chat)));
     let ring = pair.babak_socket.message(chat, call_seq);
     assert_eq!(ring.content_kind, Some(ContentKind::Call));
+    let item = chat_item(&mut pair.sara_socket, chat);
+    assert_eq!(item.last_content_seq, Some(call_seq));
+    assert_eq!(item.last_at, before_at);
+    assert_eq!(
+        item.last_content.as_ref().map(|message| message.seq),
+        Some(call_seq)
+    );
 
     // Calling back while it rings meets the open call, and the refusal names it.
     match post(&mut pair.babak_socket, call_frame(&pair.babak, chat)) {

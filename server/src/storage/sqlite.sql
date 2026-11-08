@@ -510,8 +510,8 @@ CREATE TABLE call (
     epoch              INTEGER,
     signature          BLOB,
     body               BLOB,
-    -- [Calls, Chat list] an end's only: 0 missed, 1 answered. Readable because a missed call counts as
-    -- unread and an answered one does not.
+    -- [Calls, Chat list] an end's only: 0 missed, 1 answered. Readable so the list can show which.
+    -- A call does not count as unread.
     outcome            INTEGER CHECK (outcome IN (0, 1)),
     PRIMARY KEY (conversation_id, call_seq, n),
     FOREIGN KEY (conversation_id, call_seq) REFERENCES message (conversation_id, seq)

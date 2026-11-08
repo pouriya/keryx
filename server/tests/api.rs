@@ -109,6 +109,17 @@ fn features_say_whether_registration_and_a_captcha_are_on() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["data"]["registration"], true);
     assert_eq!(body["data"]["captcha"], true);
+    assert!(body["data"].get("name").is_none(), "{body}");
+
+    let named = Server::start("name = \"North\"\n", "");
+    let (status, body) = named.call("GET", "/api/v1/public/features", None, None);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["data"]["name"], "North");
+
+    let blank = Server::start("name = \"  \"\n", "");
+    let (status, body) = blank.call("GET", "/api/v1/public/features", None, None);
+    assert_eq!(status, 200, "{body}");
+    assert!(body["data"].get("name").is_none(), "{body}");
 }
 
 #[test]

@@ -614,13 +614,14 @@ fn the_login_screen_reads_what_the_server_allows() {
     let out = ok(
         &mut client,
         asked,
-        json!({"registration": false, "captcha": true}),
+        json!({"registration": false, "captcha": true, "name": "North"}),
     );
     assert_eq!(
         events(&out),
         vec![Event::Features {
             registration: false,
             captcha: true,
+            name: Some("North".to_string()),
         }]
     );
 }

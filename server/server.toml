@@ -8,6 +8,9 @@ listen = "127.0.0.1:7777"
 # cookie is Secure, and the WebSocket's Origin must match it.
 public_url = "http://127.0.0.1:7777"
 
+# The name a client shows for this server. Unset, or blank: the client shows the host, with no port.
+# name = "North"
+
 # How many devices an account may have. Unset: unlimited. A role can raise it for its holders.
 # max_devices = 8
 

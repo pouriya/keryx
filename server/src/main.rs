@@ -100,6 +100,7 @@ fn read_configuration(path: &Path) -> anyhow::Result<Settings> {
     let schema = StaticMap::new()
         .required_any("listen")
         .required_any("public_url")
+        .optional_any("name")
         .optional_any("max_devices")
         .required(
             "database",

@@ -543,6 +543,8 @@ pub struct ShownCallEvent {
     pub at: i64,
     /// Text's own clock, as sent.
     pub sent_at: Option<i64>,
+    /// An end's missed or answered. The list names the call from this.
+    pub outcome: Option<CallOutcome>,
     pub text: Option<Secret>,
     pub problem: Option<Problem>,
 }
@@ -558,9 +560,11 @@ pub enum Event {
     },
     NeedLogin,
     /// What `GET /api/v1/public/features` said. Sign up is offered only when `registration` is set.
+    /// `name` is the server's name, when one is set.
     Features {
         registration: bool,
         captcha: bool,
+        name: Option<String>,
     },
     /// A captcha image. `id` is what the answer is sent back with.
     Captcha {
@@ -3333,6 +3337,7 @@ impl Client {
             mine: account.is_some() && account == self.account,
             at: event.server_at,
             sent_at: event.client_at,
+            outcome: event.outcome,
             text: None,
             problem: None,
         };
@@ -4846,11 +4851,13 @@ impl Client {
                 if let Some(FeaturesReply {
                     registration,
                     captcha,
+                    name,
                 }) = self.data(body)
                 {
                     self.event(Event::Features {
                         registration,
                         captcha,
+                        name,
                     });
                 }
             }

@@ -147,6 +147,9 @@ const REQUEST_QUEUE: usize = 64;
 pub struct Settings {
     pub listen: SocketAddr,
     pub public_url: String,
+    /// The name a client may show. Blank is the same as unset.
+    #[serde(default)]
+    pub name: Option<String>,
     pub max_devices: Option<u64>,
     pub database: DatabaseSettings,
     pub operator: Option<OperatorSettings>,
@@ -735,6 +738,13 @@ pub async fn run_features(app: &App, caller: &Caller) -> Result<FeaturesReply, R
     Ok(FeaturesReply {
         registration: app.settings.registration.allow,
         captcha: app.settings.captcha.is_some(),
+        name: app
+            .settings
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string),
     })
 }
 

@@ -19,7 +19,7 @@ Lines measured by `cargo-llvm-cov`, per file and in total.
 | File | Lines | Covered | Coverage |
 |------|------:|--------:|---------:|
 | `src/call.rs` | 106 | 98 | 92.45% |
-| `src/client.rs` | 3333 | 3128 | 93.85% |
+| `src/client.rs` | 3336 | 3131 | 93.85% |
 | `src/file.rs` | 75 | 72 | 96.00% |
 | `src/mls.rs` | 1123 | 1051 | 93.59% |
 | `src/protocol.rs` | 81 | 80 | 98.77% |
@@ -27,7 +27,7 @@ Lines measured by `cargo-llvm-cov`, per file and in total.
 | `src/seed.rs` | 66 | 60 | 90.91% |
 | `src/ulid.rs` | 81 | 77 | 95.06% |
 | `src/wrap.rs` | 104 | 99 | 95.19% |
-| **Total** | **5101** | **4793** | **93.96%** |
+| **Total** | **5104** | **4796** | **93.97%** |
 <!-- coverage:end -->
 
 ## ⚠️ To do later, marked very important by the author
