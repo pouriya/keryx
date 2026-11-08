@@ -39,10 +39,11 @@ use keryx_core::protocol::{
     AccountInfo, AccountKeysBody, AccountListReply, AccountReply, Bytes, ChallengeBody,
     ChallengeReply, ChatDeviceListReply, ChatMode, ChatReply, ClientFrame, ContentKind, CountReply,
     CreateAccountBody, CreateChatBody, CreateFileBody, CreatedAccountReply, DeviceListReply,
-    DeviceReply, DevicesReply, EmptyReply, FeaturesReply, FileReply, FileStatusReply,
-    GroupInfoReply, KeyPackageListReply, KeyPackagesBody, LoginBody, LoginReply, ReducedDeviceItem,
-    ReducedDeviceListReply, RegisterBody, RegisterDeviceBody, ResetBody, SelfChatReply,
-    ServerFrame, SessionListReply, SetupBody, SetupReply, SignedBody, TimesReply, WrapListReply,
+    DeviceReply, DevicesReply, DraftBody, DraftRequest, EmptyReply, FeaturesReply, FileReply,
+    FileStatusReply, GroupInfoReply, KeyPackageListReply, KeyPackagesBody, LoginBody, LoginReply,
+    ReducedDeviceItem, ReducedDeviceListReply, RegisterBody, RegisterDeviceBody, ResetBody,
+    SelfChatReply, ServerFrame, SessionListReply, SetupBody, SetupReply, SignedBody, TimesReply,
+    WrapListReply,
 };
 use keryx_core::ulid::Ulid;
 use serde::de::DeserializeOwned;
@@ -298,6 +299,8 @@ pub struct BodyLimits {
     pub file: u64,
     pub call: u64,
     pub media_bundle: u64,
+    /// An account's sealed draft in one chat, which is not a message.
+    pub draft: u64,
 }
 
 impl Default for BodyLimits {
@@ -313,6 +316,7 @@ impl Default for BodyLimits {
             file: 16 * 1024,
             call: 16 * 1024,
             media_bundle: 64 * 1024,
+            draft: 64 * 1024,
         }
     }
 }
@@ -1501,6 +1505,44 @@ pub async fn run_message_times(
     }
 }
 
+/// Keeps or clears this account's draft in a chat, and tells its other online devices. A draft is
+/// not a message: it takes no sequence id, no chat task and no content permission, only
+/// membership.
+pub async fn run_put_draft(
+    app: &App,
+    caller: &Caller,
+    chat: Ulid,
+    draft: Option<DraftBody>,
+) -> Result<EmptyReply, Refused> {
+    check(app, caller, Need::Device).await?;
+    check(app, caller, Need::Member(chat)).await?;
+    let session = caller.session()?;
+    if let Some(draft) = &draft
+        && draft.body.0.len() as u64 > app.settings.limits.body.draft
+    {
+        return Err(refused(
+            413,
+            "body_too_large",
+            "That draft is larger than this server keeps",
+        ));
+    }
+    let kept = app
+        .storage
+        .put_draft(
+            chat,
+            session.account,
+            draft.map(|draft| (draft.epoch, draft.body.0)),
+            Ulid::now(),
+        )
+        .await?;
+    app.hub.deliver(
+        &[session.account],
+        session.device,
+        &ServerFrame::Draft { chat, draft: kept },
+    );
+    Ok(EmptyReply {})
+}
+
 pub async fn run_chat_wraps(
     app: &App,
     caller: &Caller,
@@ -1665,6 +1707,18 @@ pub async fn run_frame(
                     seq: reply.seq,
                     member_list: reply.member_list,
                 })
+            });
+            return Some(answer_of(reference, result));
+        }
+        ClientFrame::Draft {
+            reference,
+            chat,
+            draft,
+        } => {
+            let (reference, chat, draft) = (*reference, *chat, draft.clone());
+            let result = operation!("Draft", "draft", async {
+                run_put_draft(app, &caller, chat, draft).await?;
+                Ok(ServerFrame::Done { reference })
             });
             return Some(answer_of(reference, result));
         }
@@ -2140,6 +2194,19 @@ async fn message_times(
     }))
 }
 
+async fn put_draft(
+    State(app): Shared,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Body,
+) -> Response {
+    respond(operation!("PutDraft", "put_draft", async {
+        let caller = caller_of(&app, &headers).await?;
+        let request: DraftRequest = parse(body)?;
+        run_put_draft(&app, &caller, path_id(&id)?, request.draft).await
+    }))
+}
+
 async fn chat_wraps(State(app): Shared, headers: HeaderMap, Path(id): Path<String>) -> Response {
     respond(operation!("ChatWraps", "chat_wraps", async {
         let caller = caller_of(&app, &headers).await?;
@@ -2609,6 +2676,7 @@ fn router(app: Arc<App>, www: &FilePath) -> Router {
             get(message_times),
         )
         .route("/api/v1/chats/{id}/wraps", get(chat_wraps))
+        .route("/api/v1/chats/{id}/draft", put(put_draft))
         .route("/api/v1/chats/{id}/files", post(create_file))
         .route("/api/v1/files/{id}", get(file_status))
         .route(

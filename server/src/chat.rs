@@ -601,6 +601,7 @@ async fn handle(app: &Arc<App>, state: &mut ChatState, job: Job) {
                     Some(answer_of(reference, result))
                 }
                 ClientFrame::Sync { reference, .. }
+                | ClientFrame::Draft { reference, .. }
                 | ClientFrame::Times { reference, .. }
                 | ClientFrame::Ping { reference } => Some(answer_of(
                     reference,

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{OPERATOR_TOKEN, Server};
-use keryx_core::client::{Command, Event, FileSpec, Pointer, Secret, Thumbnail};
+use keryx_core::client::{Command, Draft, Event, FileSpec, Pointer, Secret, Thumbnail};
 use keryx_core::file;
 use keryx_core::mls::{AccountWrap, Commit, Device};
 use keryx_core::protocol::{
@@ -2011,6 +2011,111 @@ fn a_reply_is_a_message_with_a_target_inside_its_encryption_and_times_show_each_
         stranger.token.as_deref(),
         None,
     );
+    assert_eq!((status, &reply["code"]), (404, &json!("not_member")));
+}
+
+#[test]
+fn a_draft_belongs_to_its_chat_is_kept_sealed_and_comes_back_in_the_list() {
+    let server = open_server();
+    let (mut sara, mut babak, chat) = apps_on(&server);
+    sara.command(
+        &server,
+        Command::Draft {
+            chat,
+            draft: Some(Draft {
+                text: Secret("half a thought".to_string()),
+                reply: Some(1),
+                edit: None,
+            }),
+        },
+    );
+    // The draft went first on the same socket, so a list asked now includes it.
+    sara.command(&server, Command::ChatList);
+    let Event::Draft { draft, .. } = sara.wait(
+        &server,
+        |event| matches!(event, Event::Draft { chat: c, .. } if *c == chat),
+    ) else {
+        unreachable!();
+    };
+    let draft = draft.unwrap();
+    assert_eq!(draft.text.0, "half a thought");
+    assert_eq!(draft.reply, Some(1));
+    assert_eq!(draft.edit, None);
+
+    // It is no one else's: the other member's list has none, and nothing was stored as a message.
+    babak.command(&server, Command::ChatList);
+    babak.wait(&server, |event| matches!(event, Event::Chats { .. }));
+    let mut socket = connect(&server, sara.token.as_deref().unwrap());
+    let (rows, _) = sync_chat(&mut socket, chat);
+    assert!(rows.iter().all(|row| row.content_kind.is_none()));
+
+    // The server holds it sealed, and clearing it leaves none.
+    let held = |socket: &mut Socket| {
+        let wanted = reference();
+        let answer = socket.request(
+            &ClientFrame::Sync {
+                reference: wanted,
+                since: None,
+                after: None,
+                chat: Some(chat),
+            },
+            wanted,
+        );
+        let ServerFrame::Chats { chat_list, .. } = answer else {
+            panic!("Wanted a sync page, and got {answer:?}");
+        };
+        chat_list
+            .into_iter()
+            .find(|item| item.chat == chat)
+            .unwrap()
+            .draft
+    };
+    let sealed = held(&mut socket).unwrap();
+    assert!(
+        !sealed
+            .body
+            .0
+            .windows(14)
+            .any(|part| part == b"half a thought")
+    );
+    sara.command(&server, Command::Draft { chat, draft: None });
+    for _ in 0..5 {
+        sara.read_once(&server);
+    }
+    // A second connection from the same device replaces the app's, so the clear goes by hand.
+    let wanted = reference();
+    let answer = socket.request(
+        &ClientFrame::Draft {
+            reference: wanted,
+            chat,
+            draft: None,
+        },
+        wanted,
+    );
+    assert!(matches!(answer, ServerFrame::Done { .. }), "{answer:?}");
+    assert!(held(&mut socket).is_none());
+
+    // REST keeps and clears one, refuses a large one, and needs membership.
+    let path = format!("/api/v1/chats/{chat}/draft");
+    let (status, reply) = server.call(
+        "PUT",
+        &path,
+        sara.token.as_deref(),
+        Some(&json!({"draft": {"epoch": 0, "body": "AAAA"}})),
+    );
+    assert_eq!(status, 200, "{reply}");
+    let (status, reply) = server.call("PUT", &path, sara.token.as_deref(), Some(&json!({})));
+    assert_eq!(status, 200, "{reply}");
+    let large = "A".repeat(100_000);
+    let (status, reply) = server.call(
+        "PUT",
+        &path,
+        sara.token.as_deref(),
+        Some(&json!({"draft": {"epoch": 0, "body": large}})),
+    );
+    assert_eq!((status, &reply["code"]), (413, &json!("body_too_large")));
+    let stranger = App::sign_up(&server, "mina_x", SARA_WORDS);
+    let (status, reply) = server.call("PUT", &path, stranger.token.as_deref(), Some(&json!({})));
     assert_eq!((status, &reply["code"]), (404, &json!("not_member")));
 }
 

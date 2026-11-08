@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use keryx_core::protocol::{
     AccountBrief, Bytes, CallEvent, CallEventKind, ChatDevice, ChatItem, ChatMode, ChatType,
-    ContentKind, DeviceItem, DeviceLogItem, KeyPackageItem, Kind, MarkItem, MessageFrame,
-    SessionItem, SyncPosition, TimesItem, WrapEntry,
+    ContentKind, DeviceItem, DeviceLogItem, DraftItem, KeyPackageItem, Kind, MarkItem,
+    MessageFrame, SessionItem, SyncPosition, TimesItem, WrapEntry,
 };
 use keryx_core::ulid::Ulid;
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
@@ -1198,7 +1198,7 @@ impl Storage for Sqlite {
         self.read(move |connection| {
             let mut statement = connection.prepare(
                 "SELECT c.id, c.type, c.mode, c.last_seq, c.last_kind, c.last_at, c.last_content_seq,
-                 g.epoch, m.seen_seq
+                 g.epoch, m.seen_seq, m.draft, m.draft_epoch, m.draft_at
                  FROM member m JOIN conversation c ON c.id = m.conversation_id
                  LEFT JOIN mls_group g ON g.conversation_id = c.id
                  WHERE m.account_id = ?1
@@ -1222,6 +1222,19 @@ impl Storage for Sqlite {
                     last_content: None,
                     mark_list: Vec::new(),
                     seen_seq: Some(unsigned(row.get(8)?)),
+                    draft: {
+                        let body: Option<Vec<u8>> = row.get(9)?;
+                        let epoch: Option<i64> = row.get(10)?;
+                        let saved_at: Option<i64> = row.get(11)?;
+                        match (body, epoch, saved_at) {
+                            (Some(body), Some(epoch), Some(saved_at)) => Some(DraftItem {
+                                epoch: unsigned(epoch),
+                                body: Bytes(body),
+                                saved_at,
+                            }),
+                            _ => None,
+                        }
+                    },
                 })
             })?;
             let mut chat_list = Vec::new();
@@ -1261,6 +1274,32 @@ impl Storage for Sqlite {
                 }
             }
             Ok(chat_list)
+        })
+        .await
+    }
+
+    async fn put_draft(
+        &self,
+        chat: Ulid,
+        account: Ulid,
+        draft: Option<(u64, Vec<u8>)>,
+        now: i64,
+    ) -> Result<Option<DraftItem>> {
+        self.write(move |connection| {
+            let (body, epoch, saved_at) = match &draft {
+                Some((epoch, body)) => (Some(body.as_slice()), Some(int(*epoch)), Some(now)),
+                None => (None, None, None),
+            };
+            connection.execute(
+                "UPDATE member SET draft = ?3, draft_epoch = ?4, draft_at = ?5
+                 WHERE conversation_id = ?1 AND account_id = ?2",
+                params![chat.bytes(), account.bytes(), body, epoch, saved_at],
+            )?;
+            Ok(draft.map(|(epoch, body)| DraftItem {
+                epoch,
+                body: Bytes(body),
+                saved_at: now,
+            }))
         })
         .await
     }

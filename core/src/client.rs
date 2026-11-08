@@ -35,11 +35,11 @@ use crate::protocol::{
     CallEvent, CallEventKind, CallOutcome, CallText, CaptchaAnswer, CaptchaReply, ChallengeBody,
     ChallengeReply, ChatDevice, ChatDeviceListReply, ChatItem, ChatReply, ChatType, ClientFrame,
     ContentKind, CountReply, CreateChatBody, CreateFileBody, DeviceProof, DeviceReply,
-    DevicesReply, EmptyReply, FeaturesReply, FileReply, GroupInfoReply, Header, KeyPackageItem,
-    KeyPackageListReply, KeyPackagesBody, Kind, LoginBody, LoginReply, MarkItem, MessageFrame,
-    RefusedReply, RegisterBody, RegisterDeviceBody, SendFrame, ServerFrame, SetupBody, SetupReply,
-    SignedBody, SyncPosition, TimesItem, WelcomeItem, WrapEntry, WrapItem, WrapListReply,
-    call_text_header,
+    DevicesReply, DraftBody, DraftItem, EmptyReply, FeaturesReply, FileReply, GroupInfoReply,
+    Header, KeyPackageItem, KeyPackageListReply, KeyPackagesBody, Kind, LoginBody, LoginReply,
+    MarkItem, MessageFrame, RefusedReply, RegisterBody, RegisterDeviceBody, SendFrame, ServerFrame,
+    SetupBody, SetupReply, SignedBody, SyncPosition, TimesItem, WelcomeItem, WrapEntry, WrapItem,
+    WrapListReply, call_text_header,
 };
 use crate::queue::{Level, Queue, Target};
 use crate::seed::{self, AccountKeys};
@@ -249,6 +249,12 @@ pub enum Command {
     Typing {
         chat: Ulid,
         on: bool,
+    },
+    /// Keeps this chat's draft, or clears it with none. Nothing is queued: a draft is best effort,
+    /// and one the connection could not carry is dropped, as the next change replaces it.
+    Draft {
+        chat: Ulid,
+        draft: Option<Draft>,
     },
     /// When each other member received and saw one message, answered as [`Event::Times`].
     Times {
@@ -506,6 +512,17 @@ pub enum Problem {
     Malformed,
 }
 
+/// Unsent text in a chat, with the message it replies to or edits, if any.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify), tsify(missing_as_null))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Draft {
+    pub text: Secret,
+    #[serde(default)]
+    pub reply: Option<u64>,
+    #[serde(default)]
+    pub edit: Option<u64>,
+}
+
 /// A message to show.
 #[cfg_attr(feature = "wasm", derive(tsify::Tsify), tsify(missing_as_null))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -674,6 +691,13 @@ pub enum Event {
     Marks {
         chat: Ulid,
         mark: MarkItem,
+    },
+    /// This chat's draft, from the list or from another of this account's devices, or none once
+    /// it was cleared. `saved_at` is the server's time, so a device keeps the newer one.
+    Draft {
+        chat: Ulid,
+        draft: Option<Draft>,
+        saved_at: i64,
     },
     /// The answer to `Times`: each member but the sender, by the server's clock.
     Times {
@@ -1800,6 +1824,7 @@ impl Client {
                         .push(Level::Typing, Item::Typing { chat, on }, Target::None);
                 }
             }
+            Command::Draft { chat, draft } => self.keep_draft(chat, draft),
             Command::Times { chat, seq } => {
                 let reference = reference();
                 let frame = ClientFrame::Times {
@@ -3603,6 +3628,7 @@ impl Client {
                 self.event(Event::Typing { chat, account, on })
             }
             ServerFrame::Marks { chat, mark } => self.event(Event::Marks { chat, mark }),
+            ServerFrame::Draft { chat, draft } => self.show_draft(chat, draft),
             ServerFrame::Times {
                 reference,
                 chat,
@@ -3944,6 +3970,82 @@ impl Client {
         }
     }
 
+    /// Seals a draft and sends it, or clears it. A draft is best effort, so nothing waits for an
+    /// answer, and a chat this device cannot seal for keeps no draft on the server.
+    fn keep_draft(&mut self, chat: Ulid, draft: Option<Draft>) {
+        let body = match draft {
+            None => None,
+            Some(draft) => {
+                let Some(device) = self.device.as_ref() else {
+                    return;
+                };
+                let mut plain = serde_json::Map::new();
+                plain.insert(
+                    "text".to_string(),
+                    serde_json::Value::String(draft.text.0.clone()),
+                );
+                if let Some(reply) = draft.reply {
+                    plain.insert("reply".to_string(), reply.into());
+                }
+                if let Some(edit) = draft.edit {
+                    plain.insert("edit".to_string(), edit.into());
+                }
+                let Ok(plaintext) = serde_json::to_vec(&plain).map(zeroize::Zeroizing::new) else {
+                    return;
+                };
+                let Ok((epoch, body)) = device.seal_draft(chat, &plaintext) else {
+                    return;
+                };
+                Some(DraftBody {
+                    epoch,
+                    body: Bytes(body),
+                })
+            }
+        };
+        let reference = reference();
+        let frame = ClientFrame::Draft {
+            reference,
+            chat,
+            draft: body,
+        };
+        self.ask(frame, reference, Waiting::Done);
+    }
+
+    /// Opens a draft the server holds, for the platform to show. One this device cannot open, for
+    /// want of the epoch's key, is not shown.
+    fn show_draft(&mut self, chat: Ulid, item: Option<DraftItem>) {
+        let Some(item) = item else {
+            self.event(Event::Draft {
+                chat,
+                draft: None,
+                saved_at: self.now,
+            });
+            return;
+        };
+        let Some(device) = self.device.as_ref() else {
+            return;
+        };
+        let Ok(plaintext) = device.open_draft(chat, item.epoch, &item.body.0) else {
+            return;
+        };
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&plaintext) else {
+            return;
+        };
+        let Some(text) = value.get("text").and_then(serde_json::Value::as_str) else {
+            return;
+        };
+        let draft = Draft {
+            text: Secret(text.to_string()),
+            reply: value.get("reply").and_then(serde_json::Value::as_u64),
+            edit: value.get("edit").and_then(serde_json::Value::as_u64),
+        };
+        self.event(Event::Draft {
+            chat,
+            draft: Some(draft),
+            saved_at: item.saved_at,
+        });
+    }
+
     fn chats_listed(&mut self, chat_list: Vec<ChatItem>) {
         let Some(me) = self.account else {
             return;
@@ -3952,6 +4054,7 @@ impl Client {
         self.dirty = true;
         let mut shown = Vec::with_capacity(chat_list.len());
         let mut preview_list = Vec::new();
+        let mut draft_list = Vec::new();
         let mut join_list = Vec::new();
         for mut item in chat_list {
             let own_epoch = match self.device.as_ref() {
@@ -3972,6 +4075,9 @@ impl Client {
             if let Some(message) = item.last_content.take() {
                 preview_list.push(*message);
             }
+            if let Some(draft) = item.draft.take() {
+                draft_list.push((item.chat, draft));
+            }
             match (own_epoch, item.epoch) {
                 // The `sync` this list came with brings the commits; any still missing once it
                 // ends mean this device rejoins.
@@ -3989,6 +4095,9 @@ impl Client {
             shown.push(item);
         }
         self.event(Event::Chats { chat_list: shown });
+        for (chat, draft) in draft_list {
+            self.show_draft(chat, Some(draft));
+        }
         if self.keys.is_some() {
             for chat in &join_list {
                 self.restoring.insert(*chat);

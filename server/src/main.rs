@@ -89,7 +89,8 @@ fn read_configuration(path: &Path) -> anyhow::Result<Settings> {
         .optional("doc", ByteSize::new())
         .optional("file", ByteSize::new())
         .optional("call", ByteSize::new())
-        .optional("media_bundle", ByteSize::new());
+        .optional("media_bundle", ByteSize::new())
+        .optional("draft", ByteSize::new());
     let upload = StaticMap::new()
         .optional("voice", ByteSize::new())
         .optional("image", ByteSize::new())

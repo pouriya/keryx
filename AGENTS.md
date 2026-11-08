@@ -683,8 +683,8 @@ holds it in memory only for that request and sends it back in its answer, so req
 match over one socket: a `send` gets its sequence id this way, and a `sync` its pages. **The
 server never stores a client's ULID, and it is not in the signed header.** What is saved goes by
 its sequence id, from 1. REST carries the same bodies. A client sends `send`,
-`seen`, `received`, `typing`, `sync`, `group_info`, `wraps`, `call_event` and `ping`. The server sends `features`, `sent`, `done`,
-`refused`, `message`, `chats`, `welcome`, `typing`, `marks`, `revoked` and `call_event`. `group_info` and `wraps` are not
+`seen`, `received`, `typing`, `sync`, `group_info`, `wraps`, `call_event`, `times`, `draft` and `ping`. The server sends `features`, `sent`, `done`,
+`refused`, `message`, `chats`, `welcome`, `typing`, `marks`, `revoked`, `call_event`, `times` and `draft`. `group_info` and `wraps` are not
 messages, so they take no sequence id and stay out of history, and what has no sequence id is
 answered with `done`. Binary fields are standard base64 with padding, through `base64ct`, which is
 already in the tree and constant-time. Kinds and modes are the schema's numbers. **A commit is a `send` with kind 3 plus its wraps, welcomes,
@@ -705,6 +705,48 @@ sequence id decides order, not the client's clock.
 
 **A conversation has one sequence, assigned by the server, starting at 1 and growing.**
 Whatever is saved to show later gets the next number. Whatever is not saved gets none.
+
+### Replies, times, drafts, questions and stickers
+
+- **A reply is a property inside the encrypted plaintext, chosen by the author:** `{"text": "...", "reply": <seq>}`.
+  The signed header's `pointer_seq` stays empty for content, so the server never sees the reply graph. The queue
+  holds a reply to a pending message until that message has its sequence id.
+- **A message's times are server times only, chosen by the author.** A `times` frame {ref, chat, seq} is
+  answered with `times` {ref, chat, seq, member_list: [{account, received_at?, seen_at?}]}, and REST has the same
+  at `GET /api/v1/chats/{id}/messages/{seq}/times`. It needs a registered device and membership, with no new
+  named permission. It lists every member but the sender, and hides `seen_at` for an account with receipts off.
+  An unknown message is `not_found`, and a stranger gets `not_member`.
+- **Seen is sent only while the list is at its end, chosen by the author.** A message arriving while the
+  reader is scrolled up does not move the view or send `seen`: a down button with a count shows it.
+- **A draft belongs to the conversation, not to messages, chosen by the author.** It is one blob per account
+  and chat, sealed by the client under the chat's key at the epoch the blob names, so the server never reads
+  it. It sits in three columns of `member` (`draft`, `draft_epoch`, `draft_at`) and syncs to the account's
+  devices. It holds text, plus the message being replied to or edited. **It travels both ways, chosen by the
+  author:** a `draft` frame over the WebSocket, answered with `done`, and `PUT /api/v1/chats/{id}/draft`, with
+  none to clear it. The server sends the other online devices of the account a `draft` frame, and every `chats`
+  entry carries the account's own in `draft`. It needs membership only, takes no sequence id and no chat task,
+  and is limited by `[limits.body] draft`, 64 KiB. **A device sends it 5 seconds after typing stops, chosen by
+  the author**, and clears it when the message is sent or the text emptied. A draft is best effort: core queues
+  nothing, so one that never reached the server is replaced by the next change. Its associated data is the label
+  `keryx v1 draft`, the chat and the epoch, so it cannot pass for a message, and it carries no signature.
+- **Two new content kinds, `question` (10) and `answer` (11), chosen by the author**, each with its own body
+  limit and permission, `message.send.question` and `message.send.answer`. **Clients cannot create a question:**
+  no built-in role holds `message.send.question`, and an AI or agent account is given a role that does. Both are
+  encrypted and signed like text.
+- **A question message is one tree, chosen by the author.** Each question is a choice (at most 8 options,
+  single or multi-select) or a number (with a range), and every question also gets a "write your own" option.
+  Which question shows next depends on the picked options, a number's range, or the written-in answer.
+  Limits on nodes and depth are fixed in core. Skipping, for the whole form or for some questions, is itself an
+  answer.
+- **An answer points at its question and is one live answer per account, chosen by the author.** Answering
+  again means removing the old answer, which is an ordinary delete. An answer can be edited. The answer
+  message always shows the question and each answer. On a question, tapping it shows a "show answer" key that
+  moves the chat to the answer. **Direct chats only for now**: groups, with many answers, are designed later.
+- **A question with an answer cannot be edited, enforced by clients only, chosen by the author**, so the
+  pointer stays encrypted and the server learns no answer graph. It can be deleted, and then its answer shows
+  "Message unavailable" for the question.
+- **A sticker is a content kind with its own number, 12, and no more, chosen by the author.** No pack, file
+  or image yet. Clients show a placeholder.
 
 ### Read state
 
@@ -1085,6 +1127,7 @@ accepts the first for each step. The loser gets a rejection, catches up and retr
   file = "16KiB"
   call = "16KiB"
   media_bundle = "64KiB"
+  draft = "64KiB" # an account's sealed draft in one chat. Not a message
 
   [limits.upload]           # one file's encrypted bytes, by the type its uploader declares
   voice = "50MiB"
@@ -1432,6 +1475,8 @@ another device still holding the key.
 - A call chosen as recorded when neither device can encode H.264: the client should say so
   before it starts
 - Mute and pin
+- Questions and answers: exact body JSON, node and depth limits, body limits, how "skip" is shown and whether
+  it is per question or for the whole form, and what the number question's range holds
 - The client queue on disk, so unsent messages and unfinished uploads survive a restart: where it is
   kept on each platform and how it is locked
 - Whether a group or channel can be found and joined from outside, and how

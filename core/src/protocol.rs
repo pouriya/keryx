@@ -258,6 +258,15 @@ pub enum ClientFrame {
         up_to_seq: u64,
         client_received_at: i64,
     },
+    /// Keeps this account's draft in a chat, or clears it with none. Answered with `done`, and the
+    /// account's other online devices get it as `draft`.
+    Draft {
+        #[serde(rename = "ref")]
+        reference: Ulid,
+        chat: Ulid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        draft: Option<DraftBody>,
+    },
     /// When each other member's device received and saw one message, answered with `times`.
     Times {
         #[serde(rename = "ref")]
@@ -476,6 +485,34 @@ pub struct ChatItem {
     /// not send the count.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seen_seq: Option<u64>,
+    /// This account's draft in the chat, still sealed, so a reload and a new device show it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft: Option<DraftItem>,
+}
+
+/// An account's unsent text in one chat, sealed under the chat's key at `epoch`. The server holds
+/// the blob and never reads it. `saved_at` is the server's time, so a device keeps the newer one.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DraftItem {
+    pub epoch: u64,
+    pub body: Bytes,
+    #[serde(default)]
+    pub saved_at: i64,
+}
+
+/// A draft as a device sends it: sealed under the chat's key at `epoch`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DraftBody {
+    pub epoch: u64,
+    pub body: Bytes,
+}
+
+/// `PUT /api/v1/chats/{id}/draft`: the draft to keep, or none to clear it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DraftRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft: Option<DraftBody>,
 }
 
 /// When one member's devices first received and first saw a message, by the server's clock. Each is
@@ -570,6 +607,12 @@ pub enum ServerFrame {
         chat: Ulid,
         account: Ulid,
         on: bool,
+    },
+    /// This account's draft changed on another of its devices. None means it was cleared.
+    Draft {
+        chat: Ulid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        draft: Option<DraftItem>,
     },
     /// A member's received or seen position rose, sent to the other members' online devices.
     Marks {

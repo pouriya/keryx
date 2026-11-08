@@ -40,6 +40,7 @@ const REVOKE_LABEL: &[u8] = b"keryx v1 revoke device";
 const LOGOUT_LABEL: &[u8] = b"keryx v1 logout";
 const PASSWORD_RESET_LABEL: &[u8] = b"keryx v1 password reset";
 const DEVICE_LOGIN_LABEL: &[u8] = b"keryx v1 device login";
+const DRAFT_LABEL: &[u8] = b"keryx v1 draft";
 const BODY_VERSION: u8 = 1;
 /// The account id, device id, master public key and stamp.
 const CREDENTIAL_SIZE: usize = 128;
@@ -400,6 +401,14 @@ fn verify(
 
 /// **Permanent:** stored statements depend on it, and `tests/mls.rs` pins the exact bytes through
 /// signatures from a known key.
+fn draft_data(chat: Ulid, epoch: u64) -> Vec<u8> {
+    let mut data = Vec::with_capacity(DRAFT_LABEL.len() + 24);
+    data.extend_from_slice(DRAFT_LABEL);
+    data.extend_from_slice(chat.bytes());
+    data.extend_from_slice(&epoch.to_be_bytes());
+    data
+}
+
 fn device_statement_bytes(label: &[u8], account: &Ulid, device: &Ulid) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(label.len() + 64);
     bytes.extend_from_slice(label);
@@ -1165,6 +1174,60 @@ impl Device {
         body.extend_from_slice(&sealed);
         let signature = self.sign(header, &body)?;
         Ok((body, signature))
+    }
+
+    /// Seal an unsent draft under the chat's current key, with no signature: only this account
+    /// reads it back. Returns the epoch it is sealed at. The associated data is the draft label, the
+    /// chat and the epoch, so a draft cannot pass for a message.
+    pub fn seal_draft(&self, chat: Ulid, plaintext: &[u8]) -> Result<(u64, Vec<u8>), MlsError> {
+        let epoch = self.epoch(chat)?;
+        let cipher = self.message_cipher(chat, epoch)?;
+        let mut nonce = [0u8; 12];
+        if let Err(source) = getrandom::fill(&mut nonce) {
+            return Err(MlsError::Random { source });
+        }
+        let data = draft_data(chat, epoch);
+        let payload = Payload {
+            msg: plaintext,
+            aad: &data,
+        };
+        let sealed = match cipher.encrypt(Nonce::from_slice(&nonce), payload) {
+            Ok(sealed) => sealed,
+            Err(_) => return Err(MlsError::Encrypt),
+        };
+        let mut body = Vec::with_capacity(13 + sealed.len());
+        body.push(BODY_VERSION);
+        body.extend_from_slice(&nonce);
+        body.extend_from_slice(&sealed);
+        Ok((epoch, body))
+    }
+
+    /// Open a draft sealed at `epoch`, which needs that epoch's key.
+    pub fn open_draft(
+        &self,
+        chat: Ulid,
+        epoch: u64,
+        body: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>, MlsError> {
+        if body.is_empty() {
+            return Err(MlsError::BodyShort);
+        }
+        if body[0] != BODY_VERSION {
+            return Err(MlsError::BodyVersion { version: body[0] });
+        }
+        if body.len() < 29 {
+            return Err(MlsError::BodyShort);
+        }
+        let cipher = self.message_cipher(chat, epoch)?;
+        let data = draft_data(chat, epoch);
+        let payload = Payload {
+            msg: &body[13..],
+            aad: &data,
+        };
+        match cipher.decrypt(Nonce::from_slice(&body[1..13]), payload) {
+            Ok(plaintext) => Ok(Zeroizing::new(plaintext)),
+            Err(_) => Err(MlsError::Decrypt),
+        }
     }
 
     /// Sign an unencrypted message, whose body is its content.

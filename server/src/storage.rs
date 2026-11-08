@@ -5,7 +5,8 @@ use std::future::Future;
 
 use keryx_core::protocol::{
     AccountBrief, CallEvent, ChatDevice, ChatItem, ChatMode, ChatType, ContentKind, DeviceItem,
-    KeyPackageItem, Kind, MarkItem, MessageFrame, SessionItem, SyncPosition, TimesItem, WrapEntry,
+    DraftItem, KeyPackageItem, Kind, MarkItem, MessageFrame, SessionItem, SyncPosition, TimesItem,
+    WrapEntry,
 };
 use keryx_core::ulid::Ulid;
 
@@ -412,6 +413,15 @@ pub trait Storage: Send + Sync + 'static {
     fn member_accounts(&self, chat: Ulid) -> impl Future<Output = Result<Vec<Ulid>>> + Send;
     fn chat_list(&self, account: Ulid) -> impl Future<Output = Result<Vec<ChatItem>>> + Send;
     fn chat_devices(&self, chat: Ulid) -> impl Future<Output = Result<Vec<ChatDevice>>> + Send;
+    /// Keeps this account's sealed draft in the chat as it is, or clears it with `None`, and gives
+    /// what is now kept. The server never reads it.
+    fn put_draft(
+        &self,
+        chat: Ulid,
+        account: Ulid,
+        draft: Option<(u64, Vec<u8>)>,
+        now: i64,
+    ) -> impl Future<Output = Result<Option<DraftItem>>> + Send;
     /// When each member but the message's sender first received and first saw it, by the server's
     /// clock, or `None` if there is no such message. A member with receipts off has no `seen_at`.
     fn message_times(

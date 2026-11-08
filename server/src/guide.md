@@ -72,6 +72,8 @@ good.
     GET  /chats/{id}/devices              -> device_list{account, device, public_key, stamp,
                                              master_public, statement?}
     GET  /chats/{id}/wraps                -> wrap_list{epoch, account, wrapped}
+    GET  /chats/{id}/messages/{seq}/times -> member_list{account, received_at?, seen_at?}
+    PUT  /chats/{id}/draft                {draft?: {epoch, body}}: keeps your sealed draft, or clears it
     POST /chats/{id}/files                kind, size, chunks -> file
     PUT  /files/{id}/chunks/{n}           the encrypted chunk's raw bytes -> size, chunks, received
     GET  /files/{id}                      -> size, chunks, received
@@ -103,15 +105,21 @@ itself. To check the server yourself, send a WebSocket ping, or a `ping` frame, 
 
 Every frame is JSON with a `type`. A request's `ref` is a ULID you make, which comes back in its answer.
 
-You send: `send`, `seen`, `received`, `typing`, `sync`, `group_info`, `wraps`, `call_event`, `ping`.
+You send: `send`, `seen`, `received`, `typing`, `sync`, `group_info`, `wraps`, `call_event`, `times`, `draft`, `ping`.
 
 The server sends: `features`, `sent`, `done`, `refused`, `message`, `chats`, `welcome`, `typing`,
-`marks`, `revoked`, `call_event`.
+`marks`, `revoked`, `call_event`, `times`, `draft`.
 
 `received` and `seen` each carry `chat` and `up_to_seq`, and the server keeps the highest of each. When
 one rises, the other members' online devices get `marks` with the `account`, its `received_seq` and its
 `seen_seq`. Each `chats` entry carries the same positions in `mark_list`, and its newest content
 message in `last_content`. Neither goes out in a channel.
+
+`draft` carries `chat` and `draft`, `{epoch, body}` sealed by your client, or none to clear it, and is
+answered with `done`. The server keeps one per account and chat, never reads it, and sends it as `draft`
+to your other online devices. Each `chats` entry carries yours in `draft`, with `saved_at`.
+`times` carries `chat` and `seq` and is answered with `times`: `member_list` of each member but the
+sender, with the server's time for `received_at` and `seen_at`.
 
 `sync` answers with `chats`: your chats in `chat_list`, then every message in `message_list` and call
 row in `call_list` saved since `since`, the server time in milliseconds of the newest row you hold,

@@ -72,6 +72,7 @@ doc = "16KiB"
 file = "16KiB"
 call = "16KiB"
 media_bundle = "64KiB"
+draft = "64KiB"            # an account's sealed draft in one chat. Not a message
 
 [limits.upload]           # one file's encrypted bytes, by the type its uploader declares
 voice = "50MiB"

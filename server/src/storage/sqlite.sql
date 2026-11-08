@@ -382,6 +382,14 @@ CREATE TABLE member (
     -- except messages already removed. If both members have it, the chat and all its rows go, so
     -- the next message starts a new chat. Groups and channels use leaving instead.
     removed_seq      INTEGER,
+    -- [Drafts] this account's unsent text in the chat, sealed by its client under the chat's key at
+    -- `draft_epoch`. The server never reads it. NULL means no draft.
+    draft            BLOB,
+    -- [Drafts] the epoch the draft is sealed at.
+    draft_epoch      INTEGER,
+    -- [Drafts] the server time it was saved, so a device keeps the newer one.
+    draft_at         INTEGER,
+    CHECK ((draft IS NULL) = (draft_epoch IS NULL) AND (draft IS NULL) = (draft_at IS NULL)),
     PRIMARY KEY (conversation_id, account_id)
 ) WITHOUT ROWID, STRICT;
 

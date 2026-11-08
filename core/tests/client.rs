@@ -4,15 +4,15 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use keryx_core::client::{
-    Auth, Client, Command, Event, FileSpec, Input, Output, Platform, Pointer, Problem, Secret,
-    ShownCallEvent, Thumbnail,
+    Auth, Client, Command, Draft, Event, FileSpec, Input, Output, Platform, Pointer, Problem,
+    Secret, ShownCallEvent, Thumbnail,
 };
 use keryx_core::file::{self, FileInfo};
 use keryx_core::mls::{AccountKey, Device, sign_revocation, stamp_account_key};
 use keryx_core::protocol::{
     AccountKeysBody, Bytes, CallBody, CallEvent, CallEventKind, CaptchaAnswer, ChatItem, ChatMode,
-    ChatType, ClientFrame, ContentKind, Kind, MarkItem, MessageFrame, SendFrame, ServerFrame,
-    SyncPosition, WrapEntry,
+    ChatType, ClientFrame, ContentKind, DraftItem, Kind, MarkItem, MessageFrame, SendFrame,
+    ServerFrame, SyncPosition, WrapEntry,
 };
 use keryx_core::seed::derive;
 use keryx_core::ulid::Ulid;
@@ -973,6 +973,7 @@ struct HubChat {
     group_info: Option<(u64, Vec<u8>)>,
     wrap_list: Vec<WrapEntry>,
     position_list: Vec<MarkItem>,
+    draft_list: Vec<(Ulid, DraftItem)>,
 }
 
 struct HubFile {
@@ -1110,6 +1111,7 @@ fn kind_of(frame: &ClientFrame) -> &'static str {
         ClientFrame::Typing { .. } => "typing",
         ClientFrame::Sync { .. } => "sync",
         ClientFrame::Times { .. } => "times",
+        ClientFrame::Draft { .. } => "draft",
         ClientFrame::GroupInfo { .. } => "group_info",
         ClientFrame::Ping { .. } => "ping",
         ClientFrame::Wraps { .. } => "wraps",
@@ -1124,6 +1126,7 @@ fn reference_of(frame: &ClientFrame) -> Ulid {
         | ClientFrame::Received { reference, .. }
         | ClientFrame::Sync { reference, .. }
         | ClientFrame::Times { reference, .. }
+        | ClientFrame::Draft { reference, .. }
         | ClientFrame::GroupInfo { reference, .. }
         | ClientFrame::Ping { reference }
         | ClientFrame::Wraps { reference, .. }
@@ -1902,6 +1905,7 @@ impl World {
             group_info: None,
             wrap_list: Vec::new(),
             position_list: Vec::new(),
+            draft_list: Vec::new(),
         });
         chat
     }
@@ -2462,6 +2466,29 @@ impl World {
                 seq,
                 member_list: Vec::new(),
             }),
+            ClientFrame::Draft {
+                reference,
+                chat,
+                draft,
+            } => {
+                let index = self.chat_index(chat).unwrap();
+                let hub = &mut self.chats[index];
+                hub.draft_list.retain(|(account, _)| *account != me);
+                let kept = draft.map(|draft| DraftItem {
+                    epoch: draft.epoch,
+                    body: draft.body,
+                    saved_at: 1,
+                });
+                if let Some(kept) = &kept {
+                    hub.draft_list.push((me, kept.clone()));
+                }
+                self.deliver(
+                    &[me],
+                    Some(device),
+                    &ServerFrame::Draft { chat, draft: kept },
+                );
+                Some(ServerFrame::Done { reference })
+            }
             ClientFrame::Typing { chat, on } => {
                 let member_list = self.hub_chat(chat).member_list.clone();
                 self.deliver(
@@ -2795,6 +2822,11 @@ impl World {
                 last_content,
                 mark_list,
                 seen_seq: Some(seen_seq),
+                draft: chat
+                    .draft_list
+                    .iter()
+                    .find(|(account, _)| *account == me)
+                    .map(|(_, draft)| draft.clone()),
             });
         }
         chat_list
@@ -3014,6 +3046,50 @@ fn what_needs_the_socket_is_kept_and_typing_is_not() {
     assert_eq!(world.sent_frames(omid, "group_info"), uploads);
     let hub = world.hub_chat(chat);
     assert_eq!(hub.group_info.as_ref().map(|(epoch, _)| *epoch), hub.epoch);
+}
+
+#[test]
+fn a_draft_is_sealed_sent_and_comes_back_in_the_list_but_is_not_kept_offline() {
+    let (mut world, omid, mina, chat) = pair();
+    tell(&mut world, omid, chat, "there");
+    let draft = |text: &str| Command::Draft {
+        chat,
+        draft: Some(Draft {
+            text: Secret(text.to_string()),
+            reply: Some(1),
+            edit: None,
+        }),
+    };
+    world.command(mina, draft("half"));
+    world.settle();
+    assert_eq!(world.sent_frames(mina, "draft"), 1);
+    let held = &world.hub_chat(chat).draft_list;
+    assert_eq!(held.len(), 1);
+    assert!(!held[0].1.body.0.windows(4).any(|part| part == b"half"));
+    // The list brings it back, opened.
+    world.phones[mina].events.clear();
+    world.command(mina, Command::ChatList);
+    world.settle();
+    let shown = world.phones[mina]
+        .events
+        .iter()
+        .find_map(|event| match event {
+            Event::Draft { draft, .. } => draft
+                .as_ref()
+                .map(|draft| (draft.text.0.clone(), draft.reply)),
+            _ => None,
+        });
+    assert_eq!(shown, Some(("half".to_string(), Some(1))));
+    // Clearing sends none.
+    world.command(mina, Command::Draft { chat, draft: None });
+    world.settle();
+    assert!(world.hub_chat(chat).draft_list.is_empty());
+    // Offline, nothing waits to be sent.
+    world.offline(mina);
+    world.command(mina, draft("later"));
+    world.settle();
+    world.online(mina);
+    assert_eq!(world.sent_frames(mina, "draft"), 2);
 }
 
 #[test]
