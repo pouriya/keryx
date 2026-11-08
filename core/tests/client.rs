@@ -557,6 +557,7 @@ fn what_cannot_be_read_or_done_is_an_error_event() {
         Command::SendText {
             chat,
             text: Secret("hello".to_string()),
+            reply: None,
         },
     );
     let mut local = None;
@@ -1108,6 +1109,7 @@ fn kind_of(frame: &ClientFrame) -> &'static str {
         ClientFrame::Received { .. } => "received",
         ClientFrame::Typing { .. } => "typing",
         ClientFrame::Sync { .. } => "sync",
+        ClientFrame::Times { .. } => "times",
         ClientFrame::GroupInfo { .. } => "group_info",
         ClientFrame::Ping { .. } => "ping",
         ClientFrame::Wraps { .. } => "wraps",
@@ -1121,6 +1123,7 @@ fn reference_of(frame: &ClientFrame) -> Ulid {
         ClientFrame::Seen { reference, .. }
         | ClientFrame::Received { reference, .. }
         | ClientFrame::Sync { reference, .. }
+        | ClientFrame::Times { reference, .. }
         | ClientFrame::GroupInfo { reference, .. }
         | ClientFrame::Ping { reference }
         | ClientFrame::Wraps { reference, .. }
@@ -1693,6 +1696,7 @@ impl World {
             Command::SendText {
                 chat,
                 text: Secret(text.to_string()),
+                reply: None,
             },
         );
         let mut local = None;
@@ -2448,6 +2452,16 @@ impl World {
                 up_to_seq,
                 ..
             } => Some(self.position(me, reference, chat, up_to_seq, true)),
+            ClientFrame::Times {
+                reference,
+                chat,
+                seq,
+            } => Some(ServerFrame::Times {
+                reference,
+                chat,
+                seq,
+                member_list: Vec::new(),
+            }),
             ClientFrame::Typing { chat, on } => {
                 let member_list = self.hub_chat(chat).member_list.clone();
                 self.deliver(

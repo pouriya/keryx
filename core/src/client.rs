@@ -38,7 +38,8 @@ use crate::protocol::{
     DevicesReply, EmptyReply, FeaturesReply, FileReply, GroupInfoReply, Header, KeyPackageItem,
     KeyPackageListReply, KeyPackagesBody, Kind, LoginBody, LoginReply, MarkItem, MessageFrame,
     RefusedReply, RegisterBody, RegisterDeviceBody, SendFrame, ServerFrame, SetupBody, SetupReply,
-    SignedBody, SyncPosition, WelcomeItem, WrapEntry, WrapItem, WrapListReply, call_text_header,
+    SignedBody, SyncPosition, TimesItem, WelcomeItem, WrapEntry, WrapItem, WrapListReply,
+    call_text_header,
 };
 use crate::queue::{Level, Queue, Target};
 use crate::seed::{self, AccountKeys};
@@ -202,9 +203,13 @@ pub enum Command {
     Search {
         text: String,
     },
+    /// `reply` names the message answered, by its sequence id or its pending local id. The message
+    /// then waits for that id if it has none yet, and carries it inside its encryption.
     SendText {
         chat: Ulid,
         text: Secret,
+        #[serde(default)]
+        reply: Option<Pointer>,
     },
     /// One file, or several images and videos as a bundle, with an optional caption. Each goes up
     /// first, and the message joins the queue once all are up.
@@ -244,6 +249,11 @@ pub enum Command {
     Typing {
         chat: Ulid,
         on: bool,
+    },
+    /// When each other member received and saw one message, answered as [`Event::Times`].
+    Times {
+        chat: Ulid,
+        seq: u64,
     },
     Devices,
     /// Needs the words, from any device.
@@ -514,6 +524,10 @@ pub struct Shown {
     /// exist, it was sent while this account was out of the chat. A file message's caption, so
     /// with files and no caption it is `None` too, and `files` says it was opened.
     pub text: Option<Secret>,
+    /// The sequence id of the message this one answers, from inside its encryption, so the server
+    /// never sees who replied to what.
+    #[serde(default)]
+    pub reply: Option<u64>,
     /// A file message's files, or a bundle's.
     #[serde(default)]
     pub files: Vec<FileInfo>,
@@ -660,6 +674,12 @@ pub enum Event {
     Marks {
         chat: Ulid,
         mark: MarkItem,
+    },
+    /// The answer to `Times`: each member but the sender, by the server's clock.
+    Times {
+        chat: Ulid,
+        seq: u64,
+        member_list: Vec<TimesItem>,
     },
     Typing {
         chat: Ulid,
@@ -1226,6 +1246,7 @@ struct Opened {
     text: Option<Secret>,
     files: Vec<FileInfo>,
     call: Option<CallBody>,
+    reply: Option<u64>,
 }
 
 /// A message's text and files, `{"text": "...", "files": [...]}`, each optional, or a call's start,
@@ -1241,9 +1262,12 @@ fn content_of(plaintext: &[u8]) -> Opened {
         video: Option<bool>,
         #[serde(default)]
         voice: Option<bool>,
+        #[serde(default)]
+        reply: Option<u64>,
     }
     match serde_json::from_slice::<Plain>(plaintext) {
         Ok(plain) => Opened {
+            reply: plain.reply,
             text: plain.text.map(Secret),
             files: plain.files,
             call: match (plain.video, plain.voice) {
@@ -1283,7 +1307,12 @@ fn shown(
     opened: Opened,
     end: Option<(CallOutcome, i64)>,
 ) -> Shown {
-    let Opened { text, files, call } = opened;
+    let Opened {
+        text,
+        files,
+        call,
+        reply,
+    } = opened;
     Shown {
         chat: message.chat,
         seq: message.seq,
@@ -1295,6 +1324,7 @@ fn shown(
         sent_at: message.client_sent_at.unwrap_or(0),
         saved_at: message.server_saved_at.unwrap_or(0),
         text,
+        reply,
         files,
         call,
         call_outcome: end.map(|(outcome, _)| outcome),
@@ -1712,10 +1742,10 @@ impl Client {
                 }
                 self.get(format!("/api/v1/accounts?search={encoded}"), Asked::Search);
             }
-            Command::SendText { chat, text } => self.push_content(
+            Command::SendText { chat, text, reply } => self.push_content(
                 chat,
                 Kind::Content,
-                None,
+                reply,
                 Content {
                     content_kind: Some(ContentKind::Text),
                     text: Some(text),
@@ -1768,6 +1798,17 @@ impl Client {
                 if self.socket == Socket::Up {
                     self.queue
                         .push(Level::Typing, Item::Typing { chat, on }, Target::None);
+                }
+            }
+            Command::Times { chat, seq } => {
+                let reference = reference();
+                let frame = ClientFrame::Times {
+                    reference,
+                    chat,
+                    seq,
+                };
+                if !self.ask(frame, reference, Waiting::Done) {
+                    self.error("offline", "Not connected, so the times could not be read");
                 }
             }
             Command::Devices => self.get("/api/v1/devices".to_string(), Asked::Devices),
@@ -2935,7 +2976,12 @@ impl Client {
             content_kind,
             encrypted: true,
             epoch: Some(epoch),
-            pointer_seq,
+            // A reply's target is inside the encryption: the server must not hold the reply graph.
+            pointer_seq: if kind == Kind::Content {
+                None
+            } else {
+                pointer_seq
+            },
             call_seq: None,
             client_sent_at: self.now,
         };
@@ -2954,6 +3000,9 @@ impl Client {
             }
             (Kind::Content | Kind::Edit, text) => {
                 let mut plain = serde_json::Map::new();
+                if let (Kind::Content, Some(reply)) = (kind, pointer_seq) {
+                    plain.insert("reply".to_string(), serde_json::Value::from(reply));
+                }
                 if let Some(mut text) = text {
                     let text = std::mem::take(&mut text.0);
                     plain.insert("text".to_string(), serde_json::Value::String(text));
@@ -2989,7 +3038,7 @@ impl Client {
             content_kind,
             encrypted: true,
             epoch: Some(epoch),
-            pointer_seq,
+            pointer_seq: header.pointer_seq,
             client_sent_at: self.now,
             body: Bytes(body),
             signature: Bytes(signature.to_vec()),
@@ -3554,6 +3603,19 @@ impl Client {
                 self.event(Event::Typing { chat, account, on })
             }
             ServerFrame::Marks { chat, mark } => self.event(Event::Marks { chat, mark }),
+            ServerFrame::Times {
+                reference,
+                chat,
+                seq,
+                member_list,
+            } => {
+                self.waiting.remove(&reference);
+                self.event(Event::Times {
+                    chat,
+                    seq,
+                    member_list,
+                });
+            }
             ServerFrame::Revoked {
                 account,
                 device,

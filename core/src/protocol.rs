@@ -258,6 +258,13 @@ pub enum ClientFrame {
         up_to_seq: u64,
         client_received_at: i64,
     },
+    /// When each other member's device received and saw one message, answered with `times`.
+    Times {
+        #[serde(rename = "ref")]
+        reference: Ulid,
+        chat: Ulid,
+        seq: u64,
+    },
     /// Not saved and not answered, so it has no `ref` and no sequence id.
     Typing {
         chat: Ulid,
@@ -471,6 +478,27 @@ pub struct ChatItem {
     pub seen_seq: Option<u64>,
 }
 
+/// When one member's devices first received and first saw a message, by the server's clock. Each is
+/// missing until it has happened, and `seen_at` is also missing for a member with receipts off.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimesItem {
+    pub account: Ulid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub received_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seen_at: Option<i64>,
+}
+
+/// `GET /api/v1/chats/{id}/messages/{seq}/times`: the same list `times` answers with, for every
+/// member but the message's sender.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimesReply {
+    pub chat: Ulid,
+    pub seq: u64,
+    pub member_list: Vec<TimesItem>,
+}
+
 /// How far one member's devices have received and seen a chat. No `seen_seq` for someone with
 /// receipts off.
 #[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
@@ -515,6 +543,14 @@ pub enum ServerFrame {
         call_seq: Option<u64>,
     },
     Message(Box<MessageFrame>),
+    /// A `times` request's answer: who got and saw the message, and when.
+    Times {
+        #[serde(rename = "ref")]
+        reference: Ulid,
+        chat: Ulid,
+        seq: u64,
+        member_list: Vec<TimesItem>,
+    },
     /// A `sync`'s answer: the chats list on its first page only, then up to `[limits] history_page`
     /// messages and call rows, ordered by server time, chat, sequence id and `n`, where a message's
     /// `n` is 0. `more` says another page follows: ask again with `after` at this one's last row.
