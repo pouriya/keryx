@@ -907,7 +907,9 @@ class MainActivity : ComponentActivity() {
                 chats.clear()
                 chats.addAll(event.chat_list)
                 list.replace(event.chat_list)
-                if (netUp) {
+                // The first list comes from what this device kept, before any connection: only one
+                // that follows `Online` says the server was reached.
+                if (netUp && linkState.value == Link.Updating) {
                     linkState.value = Link.Connected
                     probeGen++
                 }
@@ -918,8 +920,10 @@ class MainActivity : ComponentActivity() {
                 list.message(message, previewOf(message))
                 if (!known) engine.send(Command.ChatList)
                 if (message.chat == chosen.value) messages.add(message)
-                if (message.call != null && !message.mine && message.call_outcome == null && message.call_ended_at == null &&
-                    session.value == null
+                // A call kept from the last run is not ringing: only one that arrives live is.
+                val live = linkState.value == Link.Updating || linkState.value == Link.Connected
+                if (live && message.call != null && !message.mine && message.call_outcome == null &&
+                    message.call_ended_at == null && session.value == null
                 ) {
                     ringing.value = message
                 }
