@@ -987,6 +987,7 @@ class MainActivity : ComponentActivity() {
                 if (event.chat == talk.chat) talk.page(event.has_older)
                 loadingOlder = false
             }
+            is Event.Draft -> talk.drafted(event)
             is Event.Times -> timesAnswer.value = TimesAnswer(event.seq, event.member_list)
             is Event.Failed -> {
                 talk.failed(event)
@@ -1282,6 +1283,10 @@ class MainActivity : ComponentActivity() {
                 }
             },
             onSeen = { seq -> engine.send(Command.Seen(chat, seq)) },
+            onDraft = { text ->
+                talk.keep(chat, text)
+                engine.send(Command.Draft(chat, text))
+            },
             onFile = ::fetch,
         )
     }

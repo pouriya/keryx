@@ -37,6 +37,7 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
@@ -45,6 +46,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -95,6 +97,9 @@ private val onAccent = Color(0xFFFFFFFF)
 private val SEEN = Color(0xFF6CB0FF)
 private val RED = Color(0xFFC93C3C)
 private const val SWIPE_AT = 72f
+
+/** How long typing must stop before the draft goes to the server. */
+private const val DRAFT_AFTER_MS = 5000L
 
 /** What the screen is showing in front of the thread. */
 private sealed interface Modal {
@@ -148,6 +153,7 @@ internal fun ChatScreen(
     onTimes: (Long) -> Unit,
     onOlder: () -> Unit,
     onSeen: (Long) -> Unit,
+    onDraft: (DraftText?) -> Unit,
     onFile: (FileInfo) -> Unit,
 ) {
     val dark = isSystemInDarkTheme()
@@ -187,6 +193,40 @@ internal fun ChatScreen(
     }
     LaunchedEffect(replying, editing) {
         if (replying != null || editing != null) runCatching { focus.requestFocus() }
+    }
+
+    // A draft is kept on the server 5 seconds after typing stops, and cleared when the text goes.
+    val latest by rememberUpdatedState(
+        if (draft.isBlank()) {
+            null
+        } else {
+            DraftText(draft, replying?.seq, editing?.seq)
+        },
+    )
+    var kept by remember { mutableStateOf<DraftText?>(null) }
+    LaunchedEffect(draft, replying, editing) {
+        val wanted = latest
+        if (wanted == kept) return@LaunchedEffect
+        if (wanted != null) delay(DRAFT_AFTER_MS)
+        kept = wanted
+        onDraft(wanted)
+    }
+    DisposableEffect(Unit) {
+        onDispose {
+            if (latest != kept) onDraft(latest)
+        }
+    }
+    // The draft the server holds for this chat comes back once, if nothing was typed meanwhile.
+    LaunchedEffect(talk.restored, talk.bubbles.size) {
+        val saved = talk.restored ?: return@LaunchedEffect
+        if (saved.reply != null && talk.bySeq(saved.reply) == null && talk.hasOlder) return@LaunchedEffect
+        if (draft.isEmpty()) {
+            draft = saved.text
+            replying = saved.reply?.let { talk.bySeq(it) }
+            editing = saved.edit?.let { talk.bySeq(it) }
+            kept = DraftText(saved.text, saved.reply, saved.edit)
+        }
+        talk.taken()
     }
     LaunchedEffect(toast) {
         if (toast != null) {

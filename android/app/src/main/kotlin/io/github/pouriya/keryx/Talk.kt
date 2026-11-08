@@ -48,6 +48,10 @@ internal class Talk {
     var hasOlder by mutableStateOf(false)
         private set
 
+    /** A draft the server sent for the open chat, waiting for the screen to take it. */
+    var restored by mutableStateOf<DraftText?>(null)
+        private set
+
     /** A reply's original that is being looked for above the loaded page. */
     var seeking by mutableStateOf<Long?>(null)
 
@@ -59,14 +63,35 @@ internal class Talk {
         gone.clear()
         hasOlder = false
         seeking = null
+        restored = drafts[chat]
     }
 
     fun close() {
         chat = null
+        restored = null
         bubbles.clear()
         selected.clear()
         gone.clear()
         seeking = null
+    }
+
+    /** The newest draft known for each chat, so reopening one brings it back. */
+    private val drafts = mutableMapOf<String, DraftText>()
+
+    fun drafted(event: Event.Draft) {
+        keep(event.chat, event.draft)
+        if (event.chat == chat && event.draft != null) restored = event.draft
+    }
+
+    fun keep(
+        chat: String,
+        draft: DraftText?,
+    ) {
+        if (draft == null) drafts.remove(chat) else drafts[chat] = draft
+    }
+
+    fun taken() {
+        restored = null
     }
 
     fun bySeq(seq: Long): Bubble? = bubbles.firstOrNull { it.seq == seq }

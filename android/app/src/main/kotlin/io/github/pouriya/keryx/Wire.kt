@@ -175,6 +175,14 @@ sealed interface Command {
         val reply: Pointer? = null,
     ) : Command
 
+    /** Keeps this chat's draft, or clears it with none. Best effort: nothing waits to be sent. */
+    @Serializable
+    @SerialName("draft")
+    data class Draft(
+        val chat: String,
+        val draft: DraftText? = null,
+    ) : Command
+
     /** When each other member received and saw one message, answered as `Event.Times`. */
     @Serializable
     @SerialName("times")
@@ -550,6 +558,14 @@ data class AccountBrief(
     val display_name: String? = null,
 )
 
+/** Unsent text, with the message it replies to or edits, if any. */
+@Serializable
+data class DraftText(
+    val text: String,
+    val reply: Long? = null,
+    val edit: Long? = null,
+)
+
 @Serializable
 data class TimesItem(
     val account: String,
@@ -848,6 +864,15 @@ sealed interface Event {
         val chat: String,
         val seq: Long,
         val member_list: List<TimesItem>,
+    ) : Event
+
+    /** This chat's draft, from the list or from another device, or none once cleared. */
+    @Serializable
+    @SerialName("draft")
+    data class Draft(
+        val chat: String,
+        val draft: DraftText? = null,
+        val saved_at: Long = 0,
     ) : Event
 
     @Serializable
