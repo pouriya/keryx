@@ -763,6 +763,10 @@ fn a_password_only_session_sees_a_reduced_list_and_cannot_message() {
         ("GET", &format!("/api/v1/chats/{}/devices", sara.self_chat)),
         (
             "GET",
+            &format!("/api/v1/chats/{}/messages/1/times", sara.self_chat),
+        ),
+        (
+            "GET",
             &format!("/api/v1/chats/{}/group_info", sara.self_chat),
         ),
     ] {

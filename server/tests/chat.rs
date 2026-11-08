@@ -475,6 +475,7 @@ fn two_people_exchange_encrypted_text_the_server_cannot_read() {
         Command::SendText {
             chat,
             text: Secret("سلام".to_string()),
+            reply: None,
         },
     );
     let Event::Pending { local, .. } =
@@ -505,6 +506,7 @@ fn two_people_exchange_encrypted_text_the_server_cannot_read() {
         Command::SendText {
             chat,
             text: Secret("hello".to_string()),
+            reply: None,
         },
     );
     let Event::Sent { seq: reply_seq, .. } =
@@ -581,6 +583,7 @@ fn a_new_device_gets_everything_with_only_the_words() {
         Command::SendText {
             chat,
             text: Secret("before".to_string()),
+            reply: None,
         },
     );
     let Event::Sent { seq, .. } = babak.wait(&server, |event| matches!(event, Event::Sent { .. }))
@@ -656,6 +659,7 @@ fn a_new_device_gets_everything_with_only_the_words() {
         Command::SendText {
             chat,
             text: Secret("from the new one".to_string()),
+            reply: None,
         },
     );
     let Event::Sent { seq, .. } = new.wait(&server, |event| matches!(event, Event::Sent { .. }))
@@ -1800,6 +1804,7 @@ fn a_welcome_waits_for_an_offline_device() {
         Command::SendText {
             chat,
             text: Secret("you are back".to_string()),
+            reply: None,
         },
     );
     let Event::Sent { seq, .. } = sara.wait(&server, |event| matches!(event, Event::Sent { .. }))
@@ -1819,6 +1824,7 @@ fn marks_reach_the_sender_and_typing_reaches_the_other() {
         Command::SendText {
             chat,
             text: Secret("x".to_string()),
+            reply: None,
         },
     );
     let Event::Sent { seq, .. } = sara.wait(&server, |event| matches!(event, Event::Sent { .. }))
@@ -1881,6 +1887,134 @@ fn marks_reach_the_sender_and_typing_reaches_the_other() {
 }
 
 #[test]
+fn a_reply_is_a_message_with_a_target_inside_its_encryption_and_times_show_each_members_clock() {
+    let server = open_server();
+    let (mut sara, mut babak, chat) = apps_on(&server);
+    sara.command(
+        &server,
+        Command::SendText {
+            chat,
+            text: Secret("first".to_string()),
+            reply: None,
+        },
+    );
+    let Event::Pending { local, .. } =
+        sara.wait(&server, |event| matches!(event, Event::Pending { .. }))
+    else {
+        unreachable!();
+    };
+    // A reply to a message still waiting for its sequence id waits for it too.
+    sara.command(
+        &server,
+        Command::SendText {
+            chat,
+            text: Secret("second".to_string()),
+            reply: Some(Pointer::Local(local)),
+        },
+    );
+    let Event::Sent { seq: first, .. } =
+        sara.wait(&server, |event| matches!(event, Event::Sent { .. }))
+    else {
+        unreachable!();
+    };
+    let Event::Sent { seq: second, .. } =
+        sara.wait(&server, |event| matches!(event, Event::Sent { .. }))
+    else {
+        unreachable!();
+    };
+    assert_eq!(second, first + 1);
+    let message = shown(babak.wait(&server, |event| is_message(event, chat, second)));
+    assert_eq!(text_of(&message), Some("second"));
+    assert_eq!(message.reply, Some(first));
+    let plain = shown(babak.wait(&server, |event| is_message(event, chat, first)));
+    assert_eq!(plain.reply, None);
+
+    // The server holds no pointer for it: the target is only in the ciphertext.
+    let mut socket = connect(&server, sara.token.as_deref().unwrap());
+    let (rows, _) = sync_chat(&mut socket, chat);
+    for row in rows {
+        if row.seq == second {
+            assert_eq!(row.pointer_seq, None);
+        }
+    }
+
+    // A reply to a message already stored carries its sequence id.
+    babak.command(
+        &server,
+        Command::SendText {
+            chat,
+            text: Secret("third".to_string()),
+            reply: Some(Pointer::Seq(first)),
+        },
+    );
+    let Event::Sent { seq: third, .. } =
+        babak.wait(&server, |event| matches!(event, Event::Sent { .. }))
+    else {
+        unreachable!();
+    };
+    let message = shown(sara.wait(&server, |event| is_message(event, chat, third)));
+    assert_eq!(message.reply, Some(first));
+
+    // Times: nobody but the sender's counterpart is listed, and "seen" stays empty until it is.
+    sara.command(&server, Command::Times { chat, seq: first });
+    let Event::Times { member_list, .. } =
+        sara.wait(&server, |event| matches!(event, Event::Times { .. }))
+    else {
+        unreachable!();
+    };
+    assert_eq!(member_list.len(), 1);
+    assert_eq!(member_list[0].account, babak.id());
+    assert!(member_list[0].received_at.is_some());
+    assert_eq!(member_list[0].seen_at, None);
+    babak.command(
+        &server,
+        Command::Seen {
+            chat,
+            up_to_seq: third,
+        },
+    );
+    sara.wait(
+        &server,
+        |event| matches!(event, Event::Marks { mark, .. } if mark.seen_seq == Some(third)),
+    );
+    let (status, reply) = server.call(
+        "GET",
+        &format!("/api/v1/chats/{chat}/messages/{first}/times"),
+        sara.token.as_deref(),
+        None,
+    );
+    assert_eq!(status, 200, "{reply}");
+    assert!(reply["data"]["member_list"][0]["seen_at"].is_i64());
+    // Someone else's message lists the other members, with the asker included.
+    let (_, theirs) = server.call(
+        "GET",
+        &format!("/api/v1/chats/{chat}/messages/{third}/times"),
+        sara.token.as_deref(),
+        None,
+    );
+    assert_eq!(
+        theirs["data"]["member_list"][0]["account"],
+        json!(sara.id())
+    );
+    // A message that is not there, and a stranger.
+    let (status, reply) = server.call(
+        "GET",
+        &format!("/api/v1/chats/{chat}/messages/999/times"),
+        sara.token.as_deref(),
+        None,
+    );
+    assert_eq!((status, &reply["code"]), (404, &json!("not_found")));
+    let stranger = App::sign_up(&server, "mina_x", SARA_WORDS);
+    let (status, reply) = server.call(
+        "GET",
+        &format!("/api/v1/chats/{chat}/messages/{first}/times"),
+        stranger.token.as_deref(),
+        None,
+    );
+    assert_eq!((status, &reply["code"]), (404, &json!("not_member")));
+}
+
+#[test]
 fn a_chat_opens_on_its_newest_page_and_older_pages_load_upwards() {
     let server = open_server();
     let (mut sara, mut babak, chat) = apps_on(&server);
@@ -1891,6 +2025,7 @@ fn a_chat_opens_on_its_newest_page_and_older_pages_load_upwards() {
             Command::SendText {
                 chat,
                 text: Secret(format!("{number}")),
+                reply: None,
             },
         );
         let Event::Sent { seq, .. } =
@@ -1956,6 +2091,7 @@ fn an_edit_or_delete_can_point_at_a_message_still_waiting() {
         Command::SendText {
             chat,
             text: Secret("frist".to_string()),
+            reply: None,
         },
     );
     let Event::Pending { local, .. } =
@@ -2044,6 +2180,7 @@ fn a_device_comes_back_from_its_saved_state_and_logging_out_wipes_it() {
         Command::SendText {
             chat,
             text: Secret("still me".to_string()),
+            reply: None,
         },
     );
     let Event::Sent { seq, .. } = back.wait(&server, |event| matches!(event, Event::Sent { .. }))
@@ -2069,6 +2206,7 @@ fn a_device_shows_its_chats_with_no_network() {
         Command::SendText {
             chat,
             text: Secret("kept for later".to_string()),
+            reply: None,
         },
     );
     let Event::Sent { .. } = babak.wait(&server, |event| matches!(event, Event::Sent { .. }))

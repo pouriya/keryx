@@ -5,7 +5,7 @@ use std::future::Future;
 
 use keryx_core::protocol::{
     AccountBrief, CallEvent, ChatDevice, ChatItem, ChatMode, ChatType, ContentKind, DeviceItem,
-    KeyPackageItem, Kind, MarkItem, MessageFrame, SessionItem, SyncPosition, WrapEntry,
+    KeyPackageItem, Kind, MarkItem, MessageFrame, SessionItem, SyncPosition, TimesItem, WrapEntry,
 };
 use keryx_core::ulid::Ulid;
 
@@ -412,6 +412,13 @@ pub trait Storage: Send + Sync + 'static {
     fn member_accounts(&self, chat: Ulid) -> impl Future<Output = Result<Vec<Ulid>>> + Send;
     fn chat_list(&self, account: Ulid) -> impl Future<Output = Result<Vec<ChatItem>>> + Send;
     fn chat_devices(&self, chat: Ulid) -> impl Future<Output = Result<Vec<ChatDevice>>> + Send;
+    /// When each member but the message's sender first received and first saw it, by the server's
+    /// clock, or `None` if there is no such message. A member with receipts off has no `seen_at`.
+    fn message_times(
+        &self,
+        chat: Ulid,
+        seq: u64,
+    ) -> impl Future<Output = Result<Option<Vec<TimesItem>>>> + Send;
 
     fn message_brief(
         &self,

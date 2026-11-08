@@ -42,7 +42,7 @@ use keryx_core::protocol::{
     DeviceReply, DevicesReply, EmptyReply, FeaturesReply, FileReply, FileStatusReply,
     GroupInfoReply, KeyPackageListReply, KeyPackagesBody, LoginBody, LoginReply, ReducedDeviceItem,
     ReducedDeviceListReply, RegisterBody, RegisterDeviceBody, ResetBody, SelfChatReply,
-    ServerFrame, SessionListReply, SetupBody, SetupReply, SignedBody, WrapListReply,
+    ServerFrame, SessionListReply, SetupBody, SetupReply, SignedBody, TimesReply, WrapListReply,
 };
 use keryx_core::ulid::Ulid;
 use serde::de::DeserializeOwned;
@@ -1481,6 +1481,26 @@ pub async fn run_chat_devices(
     Ok(ChatDeviceListReply { device_list })
 }
 
+/// When each member but the sender got and saw one message. Membership is all it needs, since a
+/// direct chat's members are the two people, and nobody else can ask.
+pub async fn run_message_times(
+    app: &App,
+    caller: &Caller,
+    chat: Ulid,
+    seq: u64,
+) -> Result<TimesReply, Refused> {
+    check(app, caller, Need::Device).await?;
+    check(app, caller, Need::Member(chat)).await?;
+    match app.storage.message_times(chat, seq).await? {
+        Some(member_list) => Ok(TimesReply {
+            chat,
+            seq,
+            member_list,
+        }),
+        None => Err(refused(404, "not_found", "There is no such message")),
+    }
+}
+
 pub async fn run_chat_wraps(
     app: &App,
     caller: &Caller,
@@ -1631,6 +1651,23 @@ pub async fn run_frame(
 ) -> Option<ServerFrame> {
     let caller = Caller::Session(session);
     let (chat, reference) = match &frame {
+        ClientFrame::Times {
+            reference,
+            chat,
+            seq,
+        } => {
+            let reference = *reference;
+            let result = operation!("Times", "times", async {
+                let reply = run_message_times(app, &caller, *chat, *seq).await?;
+                Ok(ServerFrame::Times {
+                    reference,
+                    chat: reply.chat,
+                    seq: reply.seq,
+                    member_list: reply.member_list,
+                })
+            });
+            return Some(answer_of(reference, result));
+        }
         ClientFrame::Sync {
             reference,
             since,
@@ -2089,6 +2126,17 @@ async fn chat_devices(State(app): Shared, headers: HeaderMap, Path(id): Path<Str
     respond(operation!("ChatDevices", "chat_devices", async {
         let caller = caller_of(&app, &headers).await?;
         run_chat_devices(&app, &caller, path_id(&id)?).await
+    }))
+}
+
+async fn message_times(
+    State(app): Shared,
+    headers: HeaderMap,
+    Path((id, seq)): Path<(String, String)>,
+) -> Response {
+    respond(operation!("MessageTimes", "message_times", async {
+        let caller = caller_of(&app, &headers).await?;
+        run_message_times(&app, &caller, path_id(&id)?, chunk_number(&seq)?).await
     }))
 }
 
@@ -2556,6 +2604,10 @@ fn router(app: Arc<App>, www: &FilePath) -> Router {
         .route("/api/v1/chats", post(create_chat))
         .route("/api/v1/chats/{id}/group_info", get(group_info))
         .route("/api/v1/chats/{id}/devices", get(chat_devices))
+        .route(
+            "/api/v1/chats/{id}/messages/{seq}/times",
+            get(message_times),
+        )
         .route("/api/v1/chats/{id}/wraps", get(chat_wraps))
         .route("/api/v1/chats/{id}/files", post(create_file))
         .route("/api/v1/files/{id}", get(file_status))

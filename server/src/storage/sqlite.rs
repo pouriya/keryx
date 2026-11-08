@@ -12,7 +12,7 @@ use std::time::Duration;
 use keryx_core::protocol::{
     AccountBrief, Bytes, CallEvent, CallEventKind, ChatDevice, ChatItem, ChatMode, ChatType,
     ContentKind, DeviceItem, DeviceLogItem, KeyPackageItem, Kind, MarkItem, MessageFrame,
-    SessionItem, SyncPosition, WrapEntry,
+    SessionItem, SyncPosition, TimesItem, WrapEntry,
 };
 use keryx_core::ulid::Ulid;
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
@@ -1290,6 +1290,64 @@ impl Storage for Sqlite {
                 device_list.push(device?);
             }
             Ok(device_list)
+        })
+        .await
+    }
+
+    async fn message_times(&self, chat: Ulid, seq: u64) -> Result<Option<Vec<TimesItem>>> {
+        self.read(move |connection| {
+            let sender: Option<[u8; 16]> = connection
+                .query_row(
+                    "SELECT d.account_id FROM message m JOIN device d ON d.id = m.device_id
+                     WHERE m.conversation_id = ?1 AND m.seq = ?2",
+                    params![chat.bytes(), int(seq)],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(sender) = sender else {
+                return Ok(None);
+            };
+            let mut members = connection.prepare(
+                "SELECT m.account_id, a.receipts_enabled FROM member m
+                 JOIN account a ON a.id = m.account_id
+                 WHERE m.conversation_id = ?1 AND m.account_id != ?2 ORDER BY m.account_id",
+            )?;
+            let rows = members.query_map(params![chat.bytes(), sender], |row| {
+                Ok((row.get::<_, [u8; 16]>(0)?, row.get::<_, i64>(1)? == 1))
+            })?;
+            let mut member_list = Vec::new();
+            for row in rows {
+                let (account, receipts) = row?;
+                // The first row reaching this message is the one with the smallest position.
+                let received_at: Option<i64> = connection
+                    .query_row(
+                        "SELECT server_received_at FROM received
+                         WHERE conversation_id = ?1 AND account_id = ?2 AND up_to_seq >= ?3
+                         ORDER BY up_to_seq LIMIT 1",
+                        params![chat.bytes(), account, int(seq)],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let seen_at: Option<i64> = if receipts {
+                    connection
+                        .query_row(
+                            "SELECT server_seen_at FROM seen
+                             WHERE conversation_id = ?1 AND account_id = ?2 AND up_to_seq >= ?3
+                             ORDER BY up_to_seq LIMIT 1",
+                            params![chat.bytes(), account, int(seq)],
+                            |row| row.get(0),
+                        )
+                        .optional()?
+                } else {
+                    None
+                };
+                member_list.push(TimesItem {
+                    account: Ulid::from_bytes(account),
+                    received_at,
+                    seen_at,
+                });
+            }
+            Ok(Some(member_list))
         })
         .await
     }

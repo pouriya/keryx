@@ -600,12 +600,12 @@ async fn handle(app: &Arc<App>, state: &mut ChatState, job: Job) {
                     );
                     Some(answer_of(reference, result))
                 }
-                ClientFrame::Sync { reference, .. } | ClientFrame::Ping { reference } => {
-                    Some(answer_of(
-                        reference,
-                        Err(refused(500, "internal", "This event has no chat's task")),
-                    ))
-                }
+                ClientFrame::Sync { reference, .. }
+                | ClientFrame::Times { reference, .. }
+                | ClientFrame::Ping { reference } => Some(answer_of(
+                    reference,
+                    Err(refused(500, "internal", "This event has no chat's task")),
+                )),
             }
         })
         .await;
