@@ -87,3 +87,7 @@ Playwright, Vitest or a browser of its own.
 - The folder layout and code style, once the first slice works
 - How the built client reaches `[www] directory`, together with Docker
 - Whether the espai checks are written down as repeatable steps, and whether any of them joins a gate
+- **Naming the IndexedDB database by account id, not username.** A username can now change, so Android
+  keeps each account's state by account id, found with `POST /api/v1/challenge` before logging in, as
+  core's `Open` and `Opened` do. The web stays one database per username for now, chosen by the author,
+  and answers `Open` with nothing kept

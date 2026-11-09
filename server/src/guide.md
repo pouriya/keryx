@@ -25,7 +25,7 @@ else logs in with `POST /login/token`, which returns a token, and sends it as
                                  -> account, device?
     POST /login/token            the same -> account, device?, token
     POST /setup                  token, password -> account, username
-    POST /challenge              username, purpose -> challenge
+    POST /challenge              username, purpose -> challenge, account
     POST /password/reset         username, challenge, new_password, signature
 
 `purpose` is `password_reset` or `device_login`. A challenge lasts 5 minutes and works once. A

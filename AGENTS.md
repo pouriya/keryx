@@ -1091,7 +1091,7 @@ POST /api/v1/login                  username, password, captcha?, device?{id, ch
                                     -> account, device?, and sets the cookie
 POST /api/v1/login/token            the same -> account, device?, token, and no cookie
 POST /api/v1/setup                  token, password -> account, username
-POST /api/v1/challenge              username, purpose (password_reset | device_login) -> challenge
+POST /api/v1/challenge              username, purpose (password_reset | device_login) -> challenge, account
 POST /api/v1/password/reset         username, challenge, new_password, signature
 
 Any session
@@ -1570,6 +1570,9 @@ another device still holding the key.
   headers itself. A thief could make their device look like it is somewhere else, so
   the IP in the device list and log is a hint, not evidence, unless a proxy overwrites
   those headers.
+- **Anyone who knows a username learns its account id, without logging in**, since the challenge
+  answers with it so a phone can find that account's folder. The id is a ULID, so it also shows when the
+  account was made. The challenge already said whether a username exists.
 - **Whoever can read a browser profile can read that person's keys**, since IndexedDB
   holds them unprotected between visits.
 - **The server operator can change the web client.** The browser runs whatever the

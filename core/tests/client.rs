@@ -104,6 +104,34 @@ fn frames(outputs: &[Output]) -> Vec<ClientFrame> {
     list
 }
 
+/// The challenge every login asks first, answered for this account, then the platform's answer
+/// that it keeps no slots for it: what comes back is the login itself.
+fn challenged(client: &mut Client, out: &[Output], account: Ulid) -> Vec<Output> {
+    let (asked, method, path, body) = request(out);
+    assert_eq!(
+        (method.as_str(), path.as_str()),
+        ("POST", "/api/v1/challenge")
+    );
+    assert_eq!(body["purpose"], "device_login");
+    let out = ok(
+        client,
+        asked,
+        json!({"challenge": Bytes(vec![7; 32]), "account": account}),
+    );
+    assert!(
+        out.iter()
+            .any(|output| matches!(output, Output::Open { account: opened } if *opened == account)),
+        "{out:?}"
+    );
+    client.step(
+        Input::Opened {
+            first: None,
+            second: None,
+        },
+        NOW,
+    )
+}
+
 fn frame(client: &mut Client, frame: &ServerFrame, now: i64) -> Vec<Output> {
     client.step(
         Input::Frame {
@@ -126,6 +154,7 @@ fn ready() -> (Client, Ulid, Ulid) {
             captcha: None,
         },
     );
+    let out = challenged(&mut client, &out, account);
     let (asked, method, path, body) = request(&out);
     assert_eq!(
         (method.as_str(), path.as_str()),
@@ -210,7 +239,9 @@ fn signing_up_registers_then_logs_in_and_new_words_set_up_a_device() {
     let (asked, _, path, body) = request(&out);
     assert_eq!(path, "/api/v1/register");
     assert_eq!(body["display_name"], "Sara");
-    let out = ok(&mut client, asked, json!({"account": id()}));
+    let account = id();
+    let out = ok(&mut client, asked, json!({"account": account}));
+    let out = challenged(&mut client, &out, account);
     let (_, _, path, _) = request(&out);
     assert_eq!(
         path, "/api/v1/login",
@@ -234,11 +265,13 @@ fn signing_up_registers_then_logs_in_and_new_words_set_up_a_device() {
     let (asked, _, path, body) = request(&out);
     assert_eq!(path, "/api/v1/setup");
     assert_eq!(body["token"], "from-the-link");
+    let account = id();
     let out = ok(
         &mut setup,
         asked,
-        json!({"account": id(), "username": "sara_x"}),
+        json!({"account": account, "username": "sara_x"}),
     );
+    let out = challenged(&mut setup, &out, account);
     assert_eq!(request(&out).2, "/api/v1/login");
 
     ready();
@@ -292,6 +325,7 @@ fn restoring_needs_this_accounts_own_words() {
             captcha: None,
         },
     );
+    let out = challenged(&mut client, &out, account);
     let out = ok(
         &mut client,
         request(&out).0,
@@ -698,7 +732,7 @@ fn loading_saved_state_comes_back_or_asks_to_log_in() {
     assert!(matches!(&events(&out)[0], Event::Error { code, .. } if code == "load_failed"));
 
     // What a device saved loads back, and a browser connects with its cookie at once.
-    let (saver, _, _) = ready();
+    let (saver, account, _) = ready();
     let saved = saver
         .into_device()
         .unwrap()
@@ -723,7 +757,7 @@ fn loading_saved_state_comes_back_or_asks_to_log_in() {
     let mut app = Client::new(Auth::Token, platform());
     let out = app.step(
         Input::Loaded {
-            first: Some(saved),
+            first: Some(saved.clone()),
             second: None,
             resume: true,
             token: None,
@@ -748,15 +782,98 @@ fn loading_saved_state_comes_back_or_asks_to_log_in() {
     let (asked, _, path, body) = request(&out);
     assert_eq!(path, "/api/v1/challenge");
     assert_eq!(body["purpose"], "device_login");
-    let challenge = keryx_core::protocol::Bytes(vec![7; 32]);
-    let out = ok(&mut app, asked, json!({"challenge": challenge}));
+    let challenge = Bytes(vec![7; 32]);
+    let out = ok(
+        &mut app,
+        asked,
+        json!({"challenge": challenge, "account": account}),
+    );
+    assert!(
+        !out.iter()
+            .any(|output| matches!(output, Output::Open { .. })),
+        "a loaded device needs no folder opened"
+    );
     let (_, _, path, body) = request(&out);
     assert_eq!(path, "/api/v1/login/token");
-    assert_eq!(
-        body["device"]["id"],
-        json!(app.device().unwrap().record().device)
-    );
+    let device = app.device().unwrap().record().device;
+    assert_eq!(body["device"]["id"], json!(device));
     assert_eq!(body["device"]["signature"].as_str().unwrap().len(), 88);
+
+    // A phone keeps slots by account id: the challenge names the account, the phone opens that
+    // folder, and the login proves the device it held.
+    let log_in = |client: &mut Client| {
+        command(
+            client,
+            Command::LogIn {
+                username: "sara_x".to_string(),
+                password: Secret("a long enough password".to_string()),
+                captcha: None,
+            },
+        )
+    };
+    let opened = |client: &mut Client, first: Option<Vec<u8>>, of: Ulid| {
+        let out = log_in(client);
+        let out = ok(
+            client,
+            request(&out).0,
+            json!({"challenge": challenge, "account": of}),
+        );
+        assert!(
+            out.iter()
+                .any(|output| matches!(output, Output::Open { account: asked } if *asked == of))
+        );
+        client.step(
+            Input::Opened {
+                first,
+                second: None,
+            },
+            NOW,
+        )
+    };
+    let mut phone = Client::new(Auth::Token, platform());
+    let out = opened(&mut phone, Some(saved.clone()), account);
+    let (_, _, path, body) = request(&out);
+    assert_eq!(path, "/api/v1/login/token");
+    assert_eq!(body["device"]["id"], json!(device));
+
+    // A folder that does not load is said, and the login goes on as a new device.
+    let mut phone = Client::new(Auth::Token, platform());
+    let out = opened(&mut phone, Some(vec![1, 2, 3]), account);
+    assert!(matches!(&events(&out)[0], Event::Error { code, .. } if code == "load_failed"));
+    let (_, _, path, body) = request(&out);
+    assert_eq!(path, "/api/v1/login/token");
+    assert!(body.get("device").is_none());
+
+    // So does one holding another account's device.
+    let mut phone = Client::new(Auth::Token, platform());
+    let out = opened(&mut phone, Some(saved), id());
+    assert!(matches!(&events(&out)[0], Event::Error { code, .. } if code == "wrong_account"));
+    assert!(phone.device().is_none());
+    assert!(request(&out).3.get("device").is_none());
+
+    // An Opened nobody waits for does nothing.
+    let out = phone.step(
+        Input::Opened {
+            first: None,
+            second: None,
+        },
+        NOW,
+    );
+    assert!(out.is_empty(), "{out:?}");
+
+    // A username nobody has is said as a wrong login, as before the challenge came first.
+    let mut phone = Client::new(Auth::Token, platform());
+    let out = log_in(&mut phone);
+    let out = phone.step(
+        Input::Reply {
+            id: request(&out).0,
+            status: 404,
+            body: json!({"ok": false, "code": "no_such_account", "message": "That account does not exist"})
+                .to_string(),
+        },
+        NOW,
+    );
+    assert!(matches!(&events(&out)[0], Event::Error { code, .. } if code == "bad_login"));
 }
 
 #[test]
@@ -1302,6 +1419,7 @@ impl World {
     fn input(&mut self, p: usize, input: Input) {
         let out = self.phones[p].client.step(input, self.now);
         let phone = &mut self.phones[p];
+        let mut opened = None;
         for output in out {
             match output {
                 Output::Send { text } => {
@@ -1365,7 +1483,15 @@ impl World {
                     }
                     held[start..start + bytes.len()].copy_from_slice(&bytes);
                 }
+                // One account per phone here, so its kept slots are that account's.
+                Output::Open { .. } => {
+                    let [first, second] = phone.slots.clone();
+                    opened = Some(Input::Opened { first, second });
+                }
             }
+        }
+        if let Some(input) = opened {
+            self.input(p, input);
         }
     }
 
@@ -2207,7 +2333,14 @@ impl World {
                 self.phones[p].device = device;
                 reply_ok(json!({"account": account, "device": device, "token": "t"}))
             }
-            ("POST", ["challenge"]) => reply_ok(json!({ "challenge": Bytes(vec![7; 32]) })),
+            ("POST", ["challenge"]) => {
+                let username = body["username"].as_str().unwrap();
+                let Some(account) = self.accounts.iter().find(|item| item.username == username)
+                else {
+                    return reply_no(404, "no_such_account");
+                };
+                reply_ok(json!({ "challenge": Bytes(vec![7; 32]), "account": account.id }))
+            }
             ("GET", ["accounts", account]) => {
                 let index = self.account_index(parse(account));
                 let account = &self.accounts[index];

@@ -221,6 +221,11 @@ function run(output: Output) {
         void store?.remove(slot);
       }
       break;
+    // The web keeps its database by username and loads it before a login, so a login that
+    // reaches this has nothing kept for the account.
+    case "open":
+      feed({ type: "opened", first: null, second: null });
+      break;
     case "wake_at":
       clearTimeout(timer);
       timer = setTimeout(() => feed({ type: "timer" }), Math.max(0, output.at - Date.now()));

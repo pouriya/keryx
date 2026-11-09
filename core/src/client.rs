@@ -399,6 +399,16 @@ pub enum Input {
         #[serde(default)]
         token: Option<Secret>,
     },
+    /// The two snapshot slots kept for the account an [`Output::Open`] named, or none when this
+    /// platform keeps none for it. The login it waited for goes on.
+    Opened {
+        #[serde(with = "serde_bytes")]
+        #[cfg_attr(feature = "wasm", tsify(type = "Uint8Array | null"))]
+        first: Option<Vec<u8>>,
+        #[serde(with = "serde_bytes")]
+        #[cfg_attr(feature = "wasm", tsify(type = "Uint8Array | null"))]
+        second: Option<Vec<u8>>,
+    },
     Saved {
         id: u64,
     },
@@ -491,6 +501,11 @@ pub enum Output {
     },
     /// Delete both slots: this device has ended.
     Wipe,
+    /// A login with no device loaded found its account: load that account's slots, if this
+    /// platform keeps any, and answer with [`Input::Opened`].
+    Open {
+        account: Ulid,
+    },
     /// Call `step` with [`Input::Timer`] at this time. A later one replaces it.
     WakeAt {
         at: i64,
@@ -965,6 +980,15 @@ enum Plan {
 }
 
 /// What a REST request was for.
+/// A login that found its account and waits for the platform to load that account's slots.
+struct Opening {
+    account: Ulid,
+    username: String,
+    password: Secret,
+    captcha: Option<CaptchaAnswer>,
+    challenge: Bytes,
+}
+
 enum Asked {
     Register {
         username: String,
@@ -1407,6 +1431,8 @@ pub struct Client {
     profile_shared: HashSet<(Ulid, u64)>,
     /// Keys pushed for a chat this device has not joined yet, opened once it is ready.
     profile_keys_waiting: HashMap<Ulid, Vec<ProfileKeyItem>>,
+    /// A login waiting for [`Input::Opened`], once [`Output::Open`] went out.
+    opening: Option<Opening>,
     dirty: bool,
     now: i64,
     out: Vec<Output>,
@@ -1699,6 +1725,7 @@ impl Client {
             photo_asked: HashSet::new(),
             profile_shared: HashSet::new(),
             profile_keys_waiting: HashMap::new(),
+            opening: None,
             dirty: false,
             now: 0,
             out: Vec::new(),
@@ -1730,6 +1757,7 @@ impl Client {
                 resume,
                 token,
             } => self.loaded(first, second, resume, token),
+            Input::Opened { first, second } => self.opened(first, second),
             Input::Saved { id } => self.saved(id),
             Input::SaveFailed { id } => self.save_failed(id),
             Input::Connected => self.connected(),
@@ -2329,25 +2357,83 @@ impl Client {
         }
     }
 
+    /// Asks for a challenge first, even with no device loaded, since its answer names the account
+    /// whose slots a platform keeps by account id.
     fn log_in(&mut self, username: String, password: Secret, captcha: Option<CaptchaAnswer>) {
-        if self.device.is_some() {
-            let body = ChallengeBody {
-                username: username.clone(),
-                purpose: "device_login".to_string(),
-            };
-            self.request(
-                "POST",
-                "/api/v1/challenge".to_string(),
-                Some(&body),
-                Asked::Challenge {
-                    username,
-                    password,
-                    captcha,
-                },
-            );
+        self.opening = None;
+        let body = ChallengeBody {
+            username: username.clone(),
+            purpose: "device_login".to_string(),
+        };
+        self.request(
+            "POST",
+            "/api/v1/challenge".to_string(),
+            Some(&body),
+            Asked::Challenge {
+                username,
+                password,
+                captcha,
+            },
+        );
+    }
+
+    /// Logs in proving the loaded device with the challenge, or with no device.
+    fn prove_and_log_in(
+        &mut self,
+        username: String,
+        password: Secret,
+        captcha: Option<CaptchaAnswer>,
+        challenge: Bytes,
+    ) {
+        let Some(device) = self.device.as_ref() else {
+            return self.post_login(username, password, captcha, None);
+        };
+        let Some(fixed_challenge) = fixed::<32>(&challenge.0) else {
+            return self.error("bad_reply", "The challenge is not 32 bytes");
+        };
+        let signature = match device.sign_device_login(&fixed_challenge) {
+            Ok(signature) => signature,
+            Err(error) => return self.error("sign_failed", &error.to_string()),
+        };
+        let proof = DeviceProof {
+            id: device.record().device,
+            challenge,
+            signature: Bytes(signature.to_vec()),
+        };
+        self.post_login(username, password, captcha, Some(proof));
+    }
+
+    /// The slots for the account a login found. A device that does not load is reported, and
+    /// the login goes on without it, as a new device.
+    fn opened(&mut self, first: Option<Vec<u8>>, second: Option<Vec<u8>>) {
+        let Some(Opening {
+            account,
+            username,
+            password,
+            captcha,
+            challenge,
+        }) = self.opening.take()
+        else {
             return;
+        };
+        if first.is_some() || second.is_some() {
+            match Device::import(first.as_deref(), second.as_deref()) {
+                Ok(mut imported) if imported.device.record().account == account => {
+                    // The queue that held any commit still waiting is gone with the last run.
+                    match imported.device.drop_pending_commits() {
+                        Ok(dropped) => self.dirty = dropped,
+                        Err(error) => self.error("load_failed", &error.to_string()),
+                    }
+                    self.account = Some(account);
+                    self.since = imported.device.since();
+                    self.device = Some(imported.device);
+                    self.unshelve();
+                }
+                Ok(_) => self.error("wrong_account", "This device belongs to another account"),
+                Err(error) => self.error("load_failed", &error.to_string()),
+            }
         }
-        self.post_login(username, password, captcha, None);
+        self.prove_and_log_in(username, password, captcha, challenge);
     }
 
     fn post_login(
@@ -5849,25 +5935,21 @@ impl Client {
                 password,
                 captcha,
             } => {
-                let Some(ChallengeReply { challenge }) = self.data(body) else {
+                let Some(ChallengeReply { challenge, account }) = self.data(body) else {
                     return;
                 };
-                let Some(device) = self.device.as_ref() else {
-                    return;
-                };
-                let Some(fixed_challenge) = fixed::<32>(&challenge.0) else {
-                    return self.error("bad_reply", "The challenge is not 32 bytes");
-                };
-                let signature = match device.sign_device_login(&fixed_challenge) {
-                    Ok(signature) => signature,
-                    Err(error) => return self.error("sign_failed", &error.to_string()),
-                };
-                let proof = DeviceProof {
-                    id: device.record().device,
+                if self.device.is_some() {
+                    return self.prove_and_log_in(username, password, captcha, challenge);
+                }
+                // The platform loads this account's slots, if it keeps any, and answers.
+                self.opening = Some(Opening {
+                    account,
+                    username,
+                    password,
+                    captcha,
                     challenge,
-                    signature: Bytes(signature.to_vec()),
-                };
-                self.post_login(username, password, captcha, Some(proof));
+                });
+                self.out.push(Output::Open { account });
             }
             Asked::Login { username, .. } => {
                 let Some(LoginReply {
@@ -6276,6 +6358,10 @@ impl Client {
                 self.device = None;
                 self.out.push(Output::Wipe);
                 self.post_login(username, password, None, None);
+            }
+            // Said as the login says it, so asking first shows the same as before.
+            Asked::Challenge { .. } if code == "no_such_account" => {
+                self.error("bad_login", "That username or password is wrong")
             }
             Asked::Register { .. }
             | Asked::Setup { .. }

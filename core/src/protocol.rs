@@ -1324,6 +1324,8 @@ pub struct ChallengeBody {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChallengeReply {
     pub challenge: Bytes,
+    /// The account the username names, so a phone finds its folder before logging in.
+    pub account: Ulid,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

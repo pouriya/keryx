@@ -95,15 +95,22 @@ Android uses the same list. The first list, which grows as the code needs:
   read goes out when the person is asked to log in, and again after a logout, and sign up is offered
   only when `registration` is set.
 - The platform's own, in: a server frame, a REST reply with its id, connected, closed, the timer,
-  saved, save failed, and the two loaded snapshot slots. Out: a frame to send, a REST request with an
-  id, connect, disconnect, save to a slot, and wake at a time.
+  saved, save failed, the two loaded snapshot slots, and the slots opened for a login's account. Out: a
+  frame to send, a REST request with an id, connect, disconnect, save to a slot, open an account's
+  slots, and wake at a time.
 
 **How it logs in is set when the `Client` is made, chosen by the author:** cookie or token. With a
 token, it keeps it in memory and puts it on its requests as `Bearer`. With a cookie, it never sees
 one, so a browser can never be sent down the token route by accident. **Loading a snapshot takes
 `resume`.** A reload resumes, and a cookie client connects at once. A login for one username loads
 that username's snapshot with `resume` false, so the socket stays down until that login and another
-account's device is not sent with the password.
+account's device is not sent with the password. **Every login asks `POST /api/v1/challenge` first,
+chosen by the author**, whose answer names the account. With a device loaded it signs the challenge,
+as before. With none, it says `Open {account}`, and the platform answers `Opened {first, second}` with
+that account's slots, or none, since a phone keeps them by account id: a username can change. A
+device that does not load, or belongs to another account, is reported as an error, and the login goes
+on as a new device. A username nobody has comes back from the challenge as `no_such_account`, which
+core says as the login's own `bad_login`, so asking first shows the same as before.
 
 **It keeps no timeline, chosen by the author.** It holds only what it needs to work: the chat list's
 state, each chat's last sequence id, the queue and the MLS state. Each opened message, edit or delete
@@ -135,8 +142,8 @@ breaks both sides at compile time.
 
 **`serde_json` is a real dependency, chosen by the author**, for the plaintext and REST bodies.
 
-**`serde_bytes` marks the snapshot slots as bytes, chosen by the author**, on `Loaded` and `Save`, so
-they reach JavaScript as a `Uint8Array` rather than an array of numbers. It was already in
+**`serde_bytes` marks the snapshot slots as bytes, chosen by the author**, on `Loaded`, `Opened` and
+`Save`, so they reach JavaScript as a `Uint8Array` rather than an array of numbers. It was already in
 `Cargo.lock`, and JSON comes out the same.
 
 **History pages are gone, chosen by the author:** `sync` is the one read path, with pages of the

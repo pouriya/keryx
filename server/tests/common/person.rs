@@ -220,6 +220,11 @@ impl App {
                     self.slots = [None, None];
                     None
                 }
+                // One account per client here, so its kept slots are that account's.
+                Output::Open { .. } => {
+                    let [first, second] = self.slots.clone();
+                    Some(Input::Opened { first, second })
+                }
                 Output::WakeAt { at } => {
                     self.wake_at = Some(at);
                     None

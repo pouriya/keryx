@@ -1023,6 +1023,7 @@ pub async fn run_challenge(
         .await?;
     Ok(ChallengeReply {
         challenge: Bytes(challenge.to_vec()),
+        account: account.id,
     })
 }
 
