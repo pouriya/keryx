@@ -646,6 +646,15 @@ class Engine(
             else -> Unit
         }
         feed(Input.Run(command))
+        // The server sends no list back for this device's own seen, so the count drops here.
+        if (command is Command.Seen) {
+            try {
+                archive?.seenUpTo(command.chat, command.up_to_seq)
+            } catch (_: android.database.SQLException) {
+                return
+            }
+            reportUnread()
+        }
     }
 
     private fun feed(input: Input) {

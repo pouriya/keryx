@@ -82,6 +82,18 @@ class Archive private constructor(
         return messages to calls
     }
 
+    /** This device's own seen, kept until the next chat list says where the server has it. Never goes back. */
+    fun seenUpTo(
+        chat: String,
+        seq: Long,
+    ) {
+        db.execSQL(
+            "INSERT INTO seen (chat, seen_seq) VALUES (?, ?) " +
+                "ON CONFLICT(chat) DO UPDATE SET seen_seq = MAX(seen_seq, excluded.seen_seq)",
+            arrayOf<Any>(chat, seq),
+        )
+    }
+
     /** This member's seen position, from the chat list. Missing means nothing has been seen. */
     fun seen(chats: List<ChatItem>) {
         db.beginTransaction()

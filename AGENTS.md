@@ -1636,8 +1636,6 @@ first, as everywhere.
   phone seals under the old epoch and a device that joined with only the new key cannot hear or see it.
 - **Android's down button can count a message that is already on screen.** In the stickers and questions
   phone test, it showed 1 after 15 messages had arrived. Not chased yet.
-- **Android's chat list can show an unread count for the chat that is open.** In the same test, it showed 1
-  while that chat was open and at its end. Not chased yet.
 - **`a_frame_over_call_frame_closes_its_socket_as_a_leave` is flaky.** Once under `make coverage` it saw
   `(1, "")` where it wanted `(4403, "frame_too_large")`, and passed on the next run. Not chased yet.
 
