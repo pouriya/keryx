@@ -438,7 +438,7 @@ internal fun ChatScreen(
                         } else {
                             stringResource(R.string.chat_replying_to, nameOf(note, me, people))
                         },
-                    line = firstLine(note.text.orEmpty()),
+                    line = quoteLine(note),
                     ink = ink,
                 ) {
                     replying = null
