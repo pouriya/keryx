@@ -6618,6 +6618,8 @@ impl Client {
             }
             self.restore_done(chat);
             self.release(chat);
+            // Profile keys shared at an epoch before this device joined open only now.
+            self.profile_pass(chat);
         }
         let Some(device) = self.device.as_mut() else {
             return;

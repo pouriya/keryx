@@ -4183,4 +4183,30 @@ fn a_profile_is_sealed_to_those_sharing_a_chat_and_changes_reach_them_live() {
         .join("accounts")
         .join(sara_id.to_string());
     assert_eq!(std::fs::read_dir(folder).unwrap().count(), 0);
+
+    // A new device of Babak's, with only his words, opens Sara's profile, though her key was
+    // shared at an epoch before it joined.
+    let mut new = App::new();
+    new.command(
+        &server,
+        Command::LogIn {
+            username: "b".to_string(),
+            password: Secret(PASSWORD.to_string()),
+            captcha: None,
+        },
+    );
+    new.wait(&server, |event| {
+        matches!(event, Event::NeedWords { restore: true })
+    });
+    new.command(
+        &server,
+        Command::Restore {
+            words: Secret(BABAK_WORDS.to_string()),
+        },
+    );
+    new.wait(&server, |event| {
+        is_profile(event, sara_id, |profile| {
+            profile.bio.as_deref() == Some("Hello")
+        })
+    });
 }
