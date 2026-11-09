@@ -398,10 +398,14 @@ own and others' shown wherever a person is. Groups and channels come with them.
 - **Android's profile page, chosen by the author:** the photo, display name, bio and links, the username
   shown with tap to copy, and Devices and Log out, which move there from the chat list's menu. Others'
   photos show in the chat list and the chat's header, and tapping the header opens their profile. **Tapping
-  a photo in the chat list opens that person's profile, not the chat, chosen by the author.** **It is
+  a photo in the chat list opens that person's profile, not the chat, chosen by the author.** **Saved
+  messages shows your own photo, in the list and its header, and tapping it opens your profile, chosen by
+  the author.** **The page's photo is 128 dp, on your own page and others', chosen by the author.**
+  **Tapping someone else's photo opens it whole, chosen by the author:** as large as fits on black, with a
+  back arrow, and no zoom; Back or the arrow returns to their profile. **It is
   drawn in `tmp/design/profile.html` and approved as drawn, chosen by the author:** the menu button opens
-  the profile; each line opens its own editor, saved with a check in the bar; the name and @username show
-  under the photo and as lines; a taken username shows on save as "That username is taken."; a link's
+  the profile; each line opens its own editor, saved with a check in the bar; others' name and @username show
+  under the photo, and your own page shows them only as lines, chosen by the author; a taken username shows on save as "That username is taken."; a link's
   address starts with `https://` or `http://`, its name is at most 32 characters and its address 512, and
   tapping one opens the browser; someone with no photo keeps the letter, and one still loading shows its
   BlurHash; Remove photo asks nothing; the photo uploads when Done is tapped, under a turning ring.

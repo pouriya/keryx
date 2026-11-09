@@ -332,7 +332,68 @@ sealed interface Command {
     data class StickerImage(
         val sticker: String,
     ) : Command
+
+    /** An account's profile, answered as `Event.Profile`: at once, and again once the server's opens. */
+    @Serializable
+    @SerialName("profile")
+    data class Profile(
+        val account: String,
+    ) : Command
+
+    /** The photo a shown profile names, opened, answered as `Event.Photo`. */
+    @Serializable
+    @SerialName("photo")
+    data class Photo(
+        val account: String,
+    ) : Command
+
+    /** This account's bio and links, keeping its photo. A new photo goes through `Engine.setPhoto`. */
+    @Serializable
+    @SerialName("save_profile")
+    data class SaveProfile(
+        val bio: String? = null,
+        val link_list: List<ProfileLink> = emptyList(),
+    ) : Command
+
+    @Serializable
+    @SerialName("remove_photo")
+    data object RemovePhoto : Command
+
+    /** This account's display name, username or both. A new username needs the password. */
+    @Serializable
+    @SerialName("set_names")
+    data class SetNames(
+        val display_name: String? = null,
+        val username: String? = null,
+        val password: String? = null,
+    ) : Command
 }
+
+/** One link on a profile: its name, and an address starting with https:// or http://. */
+@Serializable
+data class ProfileLink(
+    val name: String,
+    val url: String,
+)
+
+/** The photo a profile names, and its BlurHash to draw while it is fetched. */
+@Serializable
+data class ShownPhoto(
+    val id: String,
+    val blurhash: String,
+)
+
+/** An account's profile as far as this device can open it. */
+@Serializable
+data class ShownProfile(
+    val account: String,
+    val username: String,
+    val display_name: String? = null,
+    val version: Long = 0,
+    val bio: String? = null,
+    val link_list: List<ProfileLink> = emptyList(),
+    val photo: ShownPhoto? = null,
+)
 
 /** A question message's tree: each node a choice or a number, and rules saying which comes next. */
 @Serializable
@@ -474,6 +535,13 @@ sealed interface Input {
     ) : Input
 
     @Serializable
+    @SerialName("opened")
+    data class Opened(
+        @Serializable(with = Octets::class) val first: ByteArray?,
+        @Serializable(with = Octets::class) val second: ByteArray?,
+    ) : Input
+
+    @Serializable
     @SerialName("saved")
     data class Saved(
         val id: Long,
@@ -586,6 +654,12 @@ sealed interface Output {
     data object Wipe : Output
 
     @Serializable
+    @SerialName("open")
+    data class Open(
+        val account: String,
+    ) : Output
+
+    @Serializable
     @SerialName("wake_at")
     data class WakeAt(
         val at: Long,
@@ -621,11 +695,12 @@ sealed interface Output {
         val length: Long,
     ) : Output
 
-    /** A PUT of the bytes `Core.chunk` hands over, answered with `reply`. */
+    /** A PUT or POST of the bytes `Core.chunk` hands over, answered with `reply`. */
     @Serializable
     @SerialName("put_chunk")
     data class PutChunk(
         val id: Long,
+        val method: String,
         val path: String,
         val bearer: String? = null,
         val chunk: Long,
@@ -1083,6 +1158,27 @@ sealed interface Event {
     data class StickerMissing(
         val sticker: String,
     ) : Event
+
+    /** An account's profile, sent again whenever it changes. */
+    @Serializable
+    @SerialName("profile")
+    data class Profile(
+        val profile: ShownProfile,
+    ) : Event
+
+    /** The opened JPEG of the photo a profile names, as base64. */
+    @Serializable
+    @SerialName("photo")
+    data class Photo(
+        val account: String,
+        val photo: String,
+        val bytes: String,
+    ) : Event
+
+    /** This account's profile, photo or names were saved. */
+    @Serializable
+    @SerialName("profile_saved")
+    data object ProfileSaved : Event
 
     /** `done` of `total` chunks of `handle`, going up or coming down. */
     @Serializable

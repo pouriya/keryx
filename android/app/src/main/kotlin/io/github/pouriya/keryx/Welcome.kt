@@ -9,7 +9,6 @@ import android.content.ContextWrapper
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -61,7 +60,7 @@ fun Welcome(
     onLanguage: (String) -> Unit,
     onConnect: () -> Unit,
 ) {
-    val dark = isSystemInDarkTheme()
+    val dark = isDark()
     val ink =
         if (dark) {
             Page(Color(0xFF141B24), Color(0xFFF4F6F8), Color(0xFF93A0B0))

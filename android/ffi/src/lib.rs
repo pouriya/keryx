@@ -1,10 +1,10 @@
 //! The hand-written JNI glue around `keryx-core`'s client and `keryx-moq`'s call, and nothing else:
 //! `Core.create`, `Core.step`, `Core.stepBytes`, `Core.chunk`, `Core.blurhash` and `Core.drop`,
 //! then `Core.callConnect`, `Core.callAudio`, `Core.callVideo`, `Core.callState` and
-//! `Core.callNext` on the Kotlin side. The flow is in `core/src/client.rs`. Inputs and outputs cross as JSON text in
-//! core's own serde shapes, and media and file chunks as raw bytes. The app does the socket, the
-//! requests, the locked files, the timer and the call's capture and codecs, and feeds back what
-//! happened. See android/AGENTS.md.
+//! `Core.callNext` on the Kotlin side. The flow is in `core/src/client.rs`. Inputs and outputs
+//! cross as JSON text in core's own serde shapes, and media, file chunks and a new photo as raw
+//! bytes. The app does the socket, the requests, the locked files, the timer and the call's capture
+//! and codecs, and feeds back what happened. See android/AGENTS.md.
 //!
 //! **A call's key never crosses JNI.** `step()` keeps `JoinCall`'s path, token, key and indexes
 //! here and hands Kotlin only `{chat, call_seq}`, and `CallKey` and `CallText` go straight to the
@@ -22,7 +22,7 @@ use jni::objects::{JByteArray, JClass, JString};
 use jni::sys::{jboolean, jint, jlong};
 use jni::{Env, EnvUnowned, jni_str};
 use keryx_core::call::{CallIndex, CallKey, State};
-use keryx_core::client::{Auth, Client, Input, Output, Platform, Secret};
+use keryx_core::client::{Auth, Client, Command, Input, Output, Platform, Secret, Thumbnail};
 use keryx_core::file;
 use keryx_core::ulid::Ulid;
 use keryx_moq::{Call, Event};
@@ -141,8 +141,9 @@ pub extern "system" fn Java_io_github_pouriya_keryx_Core_step<'caller>(
         .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
 }
 
-/// `step()` for the two inputs that carry bytes: `{"type": "chunk_read", "handle", "n"}` or
-/// `{"type": "fetched", "id", "status"}`, with the bytes beside them, as android/AGENTS.md chose.
+/// `step()` for the inputs that carry bytes: `{"type": "chunk_read", "handle", "n"}`,
+/// `{"type": "fetched", "id", "status"}` or `{"type": "set_photo", "thumbnail"}`, the last a new
+/// photo's JPEG, with the bytes beside them, as android/AGENTS.md chose.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_pouriya_keryx_Core_stepBytes<'caller>(
     mut unowned: EnvUnowned<'caller>,
@@ -170,6 +171,15 @@ pub extern "system" fn Java_io_github_pouriya_keryx_Core_stepBytes<'caller>(
                             id: number("id")?,
                             status: u16::try_from(number("status")?).ok()?,
                             bytes,
+                        }),
+                        "set_photo" => Some(Input::Command {
+                            command: Command::SetPhoto {
+                                jpeg: bytes,
+                                thumbnail: serde_json::from_value::<Thumbnail>(
+                                    input.get("thumbnail")?.clone(),
+                                )
+                                .ok()?,
+                            },
                         }),
                         _ => None,
                     }

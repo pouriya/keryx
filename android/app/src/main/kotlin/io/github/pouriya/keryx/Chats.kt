@@ -5,8 +5,6 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.interaction.MutableInteractionSource
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -31,6 +29,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
@@ -273,10 +272,10 @@ internal class ChatRows {
 }
 
 private const val CALL = 8
+private const val SELF = 0
 private const val DIRECT = 1
 private const val GROUP = 2
 private const val FILTER_AFTER = 300L
-private val tile = Color(0xFF2A436B)
 private val accent = Color(0xFF4576C4)
 private val onAccent = Color(0xFFFFFFFF)
 
@@ -295,15 +294,14 @@ internal fun Chats(
     onSearch: (String) -> Unit,
     onPerson: (AccountBrief) -> Unit,
     onOpen: (ChatRow) -> Unit,
-    onLogOut: () -> Unit,
+    onProfile: (String) -> Unit,
     onAnswer: (Shown) -> Unit,
     onDecline: (Shown) -> Unit,
 ) {
-    val dark = isSystemInDarkTheme()
+    val dark = isDark()
     val ink = ink()
     val accentText = if (dark) Color(0xFFC5D4E8) else accent
     var open by remember { mutableStateOf(false) }
-    var menu by remember { mutableStateOf(false) }
     var query by remember { mutableStateOf("") }
     var applied by remember { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }
@@ -333,9 +331,7 @@ internal fun Chats(
         applied = ""
         busy = false
     }
-    BackHandler(enabled = open || menu) {
-        if (menu) menu = false else closeSearch()
-    }
+    BackHandler(enabled = open) { closeSearch() }
     Bars(ink.page, dark)
     val connected = link == Link.Connected
     val saved = stringResource(R.string.saved_messages)
@@ -360,7 +356,7 @@ internal fun Chats(
             if (open) {
                 SearchRow(query, busy, ink, focus, { query = it }, ::closeSearch)
             } else {
-                TitleRow(title, connected, ink, { menu = !menu }) { open = true }
+                TitleRow(title, connected, ink, { me?.let(onProfile) }) { open = true }
             }
             ringing?.let { call ->
                 Incoming(call, { onAnswer(call) }, { onDecline(call) })
@@ -377,7 +373,9 @@ internal fun Chats(
                     }
                 }
                 items(shown, key = { it.id }) { row ->
-                    Conversation(row, label(row, people, saved), me, unread[row.id] ?: 0, ink, accentText) { onOpen(row) }
+                    Conversation(row, label(row, people, saved), me, unread[row.id] ?: 0, ink, accentText, onProfile) {
+                        onOpen(row)
+                    }
                 }
                 items(strangers, key = { "person-${it.id}" }) { account ->
                     PersonRow(account, ink) {
@@ -387,36 +385,26 @@ internal fun Chats(
                 }
             }
         }
-        if (menu) {
-            val scrim = remember { MutableInteractionSource() }
-            Box(Modifier.fillMaxSize().clickable(scrim, null) { menu = false })
-            Column(
-                Modifier
-                    .padding(start = 12.dp, top = 52.dp)
-                    .clip(RoundedCornerShape(12.dp))
-                    .background(ink.page)
-                    .border(1.dp, ink.line, RoundedCornerShape(12.dp)),
-            ) {
-                MenuItem(stringResource(R.string.devices), ink) { menu = false }
-                MenuItem(stringResource(R.string.log_out), ink) {
-                    menu = false
-                    onLogOut()
-                }
-            }
-        }
     }
 }
 
+/** True for a moment as each connection try starts. */
+internal val LocalTrying = compositionLocalOf { false }
+
+/** Connecting… loses its dots for a moment at each try, so a retry shows, chosen by the author. */
 @Composable
-internal fun statusText(link: Link) =
-    stringResource(
-        when (link) {
-            Link.Waiting -> R.string.waiting_network
-            Link.Connecting -> R.string.connecting
-            Link.Updating -> R.string.updating
-            Link.Connected -> R.string.connecting
-        },
-    )
+internal fun statusText(link: Link): String {
+    val text =
+        stringResource(
+            when (link) {
+                Link.Waiting -> R.string.waiting_network
+                Link.Connecting -> R.string.connecting
+                Link.Updating -> R.string.updating
+                Link.Connected -> R.string.connecting
+            },
+        )
+    return if (link == Link.Connecting && LocalTrying.current) text.removeSuffix("…") else text
+}
 
 @Composable
 private fun TitleRow(
@@ -427,7 +415,7 @@ private fun TitleRow(
     onSearch: () -> Unit,
 ) {
     Row(Modifier.fillMaxWidth().height(56.dp).padding(start = 4.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-        IconButton(stringResource(R.string.menu), onMenu) { MenuMark(ink.text) }
+        IconButton(stringResource(R.string.profile_title), onMenu) { MenuMark(ink.text) }
         Text(
             title,
             Modifier.weight(1f).padding(horizontal = 4.dp),
@@ -497,17 +485,11 @@ private fun PersonRow(
     onClick: () -> Unit,
 ) {
     val name = account.display_name?.takeIf { it.isNotBlank() } ?: account.username
-    val letter = name.firstOrNull()?.uppercaseChar()?.toString() ?: ""
     Row(
         Modifier.fillMaxWidth().clickable(role = Role.Button, onClick = onClick).padding(horizontal = 16.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Box(
-            Modifier.size(48.dp).clip(CircleShape).background(tile),
-            contentAlignment = Alignment.Center,
-        ) {
-            Text(letter, color = onAccent, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
-        }
+        Avatar(account.id, name, 48.dp)
         Column(Modifier.padding(start = 12.dp).weight(1f)) {
             Text(name, color = ink.text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
             Text(
@@ -529,20 +511,32 @@ private fun Conversation(
     unread: Int,
     ink: Ink,
     accentText: Color,
+    onProfile: (String) -> Unit,
     onClick: () -> Unit,
 ) {
-    val letter = name.firstOrNull()?.uppercaseChar()?.toString() ?: ""
     val timeColor = if (unread > 0) accentText else ink.muted
+    // A direct chat's photo opens that person's profile, not the chat, as root AGENTS.md chose, and
+    // Saved messages shows your own photo, which opens your profile.
+    val person =
+        when (row.type) {
+            DIRECT -> other(row, me)?.account
+            SELF -> me
+            else -> null
+        }
     Row(
         Modifier.fillMaxWidth().clickable(role = Role.Button, onClick = onClick).padding(horizontal = 16.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Box(
-            Modifier.size(48.dp).clip(CircleShape).background(tile),
-            contentAlignment = Alignment.Center,
-        ) {
-            Text(letter, color = onAccent, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
-        }
+        Avatar(
+            person,
+            name,
+            48.dp,
+            if (person != null) {
+                Modifier.clip(CircleShape).clickable(role = Role.Button) { onProfile(person) }
+            } else {
+                Modifier
+            },
+        )
         Column(Modifier.padding(start = 12.dp).weight(1f)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
@@ -619,20 +613,6 @@ private fun Incoming(
             fontWeight = FontWeight.Bold,
         )
     }
-}
-
-@Composable
-private fun MenuItem(
-    label: String,
-    ink: Ink,
-    onClick: () -> Unit,
-) {
-    Text(
-        label,
-        Modifier.clickable(role = Role.Button, onClick = onClick).padding(horizontal = 16.dp, vertical = 14.dp).fillMaxWidth(),
-        color = ink.text,
-        fontSize = 16.sp,
-    )
 }
 
 @Composable

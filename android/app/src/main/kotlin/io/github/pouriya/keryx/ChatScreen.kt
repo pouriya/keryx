@@ -3,6 +3,7 @@ package io.github.pouriya.keryx
 import android.graphics.ImageDecoder
 import android.graphics.drawable.AnimatedImageDrawable
 import android.graphics.drawable.Drawable
+import android.os.Build
 import android.widget.ImageView
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Canvas
@@ -13,7 +14,6 @@ import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -23,6 +23,7 @@ import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -103,6 +104,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.text.style.TextDirection
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.Dp
@@ -190,8 +192,9 @@ internal fun ChatScreen(
     onStickers: () -> Unit,
     onSticker: (id: String, reply: Bubble?) -> Unit,
     onAnswer: (question: Bubble, answer: Answer, editing: Bubble?) -> Unit,
+    onProfile: (String) -> Unit,
 ) {
-    val dark = isSystemInDarkTheme()
+    val dark = isDark()
     val ink = ink()
     val clipboard = LocalClipboardManager.current
     var draft by remember { mutableStateOf("") }
@@ -238,7 +241,8 @@ internal fun ChatScreen(
 
     fun copy(text: String) {
         clipboard.setText(AnnotatedString(text))
-        toast = copied
+        // Android 13 and later says it was copied itself.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) toast = copied
     }
 
     val rows = rowsOf(talk.bubbles.toList()).asReversed()
@@ -380,7 +384,14 @@ internal fun ChatScreen(
             if (selecting) {
                 SelectionBar(talk.selected.size, ink) { talk.selected.clear() }
             } else {
-                TopBar(title, if (link == Link.Connected) null else statusText(link), ink, onBack)
+                // A direct chat's header shows the other person, and opens their profile; Saved
+                // messages shows your own photo and opens your profile, as the author chose.
+                val other = if (type == 1) marks.firstOrNull { it.account != me }?.account else null
+                val person = if (type == 0) me else other
+                val handle = other?.let { people[it]?.username }?.let { "@$it" }
+                TopBar(title, person, if (link == Link.Connected) handle else statusText(link), ink, onBack) {
+                    person?.let(onProfile)
+                }
             }
             LazyColumn(
                 Modifier.weight(1f).fillMaxWidth(),
@@ -654,27 +665,42 @@ private fun nameOf(
 @Composable
 private fun TopBar(
     title: String,
+    person: String?,
     status: String?,
     ink: Ink,
     onBack: () -> Unit,
+    onPerson: () -> Unit,
 ) {
     val rtl = LocalLayoutDirection.current == LayoutDirection.Rtl
-    Row(Modifier.fillMaxWidth().height(56.dp).padding(start = 4.dp, end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+    Row(Modifier.fillMaxWidth().height(60.dp).padding(start = 4.dp, end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
         IconButton(stringResource(R.string.back), onBack) { BackMark(ink.text, rtl) }
-        Box(
-            Modifier.padding(start = 2.dp, end = 10.dp).size(36.dp).clip(CircleShape).background(tile),
-            contentAlignment = Alignment.Center,
+        Row(
+            Modifier
+                .weight(1f)
+                .fillMaxHeight()
+                .then(if (person != null) Modifier.clickable(role = Role.Button, onClick = onPerson) else Modifier),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            Text(
-                title.firstOrNull()?.uppercaseChar()?.toString() ?: "",
-                color = onAccent,
-                fontSize = 15.sp,
-                fontWeight = FontWeight.Bold,
-            )
-        }
-        Column(Modifier.weight(1f)) {
-            Text(title, color = ink.text, fontSize = 16.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            if (status != null) Text(status, color = ink.muted, fontSize = 12.sp, maxLines = 1)
+            Avatar(person, title, 40.dp, Modifier.padding(start = 2.dp, end = 10.dp))
+            Column(Modifier.weight(1f)) {
+                Text(
+                    title,
+                    color = ink.text,
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                if (status != null) {
+                    Text(
+                        status,
+                        color = ink.muted,
+                        fontSize = 12.sp,
+                        maxLines = 1,
+                        style = TextStyle(textDirection = TextDirection.Content),
+                    )
+                }
+            }
         }
     }
 }

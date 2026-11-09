@@ -38,7 +38,7 @@ import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 
-/** How long a sticker's fetch is left to answer before it may be asked for again. */
+/** How long a sticker's or photo's fetch is left to answer before it may be asked for again. */
 private const val STICKER_RETRY_MS = 30_000L
 
 /** What pickers call an MP3, which goes as music: android/AGENTS.md. */
@@ -112,6 +112,22 @@ object Core {
     ): ByteArray?
 }
 
+/** A small bitmap's pixels as RGBA, from which core makes a BlurHash. */
+internal fun thumbnailOf(bitmap: Bitmap): Thumbnail {
+    val width = bitmap.width
+    val height = bitmap.height
+    val pixels = IntArray(width * height)
+    bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
+    val rgba = ByteArray(pixels.size * 4)
+    for ((at, pixel) in pixels.withIndex()) {
+        rgba[at * 4] = (pixel shr 16).toByte()
+        rgba[at * 4 + 1] = (pixel shr 8).toByte()
+        rgba[at * 4 + 2] = pixel.toByte()
+        rgba[at * 4 + 3] = (pixel ushr 24).toByte()
+    }
+    return Thumbnail(width, height, rgba)
+}
+
 /** What asking a server for its public features found. */
 enum class Reach {
     Answers,
@@ -128,6 +144,7 @@ class Engine(
     private val calls: (Output) -> Unit,
     private val unread: (Map<String, Int>) -> Unit,
     private val callEnded: (String, Long, Int) -> Unit,
+    private val trying: () -> Unit,
 ) {
     private val thread = Executors.newSingleThreadScheduledExecutor()
     private val http = OkHttpClient()
@@ -192,6 +209,94 @@ class Engine(
             part.renameTo(target)
         } catch (_: Exception) {
             false
+        }
+    }
+
+    /** Photos asked for and not yet answered, by id, with when: on the engine's thread. */
+    private val photosAsked = HashMap<String, Long>()
+
+    /** This account, its photo when the upload began, the JPEG going up, and the photo its save named. */
+    private var account: String? = null
+    private var ownPhoto: String? = null
+    private var uploadFrom: String? = null
+    private var uploading: ByteArray? = null
+    private var savedPhoto: String? = null
+
+    /**
+     * Where an opened photo is kept, in the cache folder, as android/AGENTS.md chose. A photo id is
+     * never reused, so it is fetched again only if Android cleared the cache.
+     */
+    fun photoFile(id: String) = File(File(context.cacheDir, "photos"), "$id.jpg")
+
+    /** Fetches and opens the photo a shown profile names, unless it is kept or was just asked for. */
+    fun photo(
+        account: String,
+        id: String,
+    ) = thread.execute {
+        val now = System.currentTimeMillis()
+        if (photoFile(id).exists() || (photosAsked[id] ?: 0L) > now - STICKER_RETRY_MS) return@execute
+        photosAsked[id] = now
+        handle(Command.Photo(account))
+    }
+
+    /** Keeps bytes as a file, written whole or not at all. */
+    private fun keep(
+        target: File,
+        bytes: ByteArray,
+    ): Boolean =
+        try {
+            target.parentFile?.mkdirs()
+            val part = File(target.parentFile, "${target.name}.part")
+            part.writeBytes(bytes)
+            part.renameTo(target)
+        } catch (_: Exception) {
+            false
+        }
+
+    /**
+     * Sends a new photo: a square JPEG and its small pixels, which cross JNI as bytes beside the
+     * JSON. Once its save names it, the JPEG is kept as that photo, so it is never fetched back.
+     */
+    fun setPhoto(
+        jpeg: ByteArray,
+        thumbnail: Thumbnail,
+    ) = thread.execute {
+        uploadFrom = ownPhoto
+        uploading = jpeg
+        savedPhoto = null
+        feedBytes(
+            buildJsonObject {
+                put("type", "set_photo")
+                put("thumbnail", wire.encodeToJsonElement(Thumbnail.serializer(), thumbnail))
+            },
+            jpeg,
+        )
+    }
+
+    /** Follows this account's own photo, and keeps an upload once its save named it. */
+    private fun ownProfile(event: Event) {
+        when (event) {
+            is Event.SignedIn -> account = event.account
+            is Event.Profile ->
+                if (event.profile.account == account) {
+                    ownPhoto = event.profile.photo?.id
+                    savedPhoto = ownPhoto
+                }
+            is Event.ProfileSaved -> {
+                val jpeg = uploading
+                val named = savedPhoto
+                if (jpeg != null && named != null && named != uploadFrom) {
+                    keep(photoFile(named), jpeg)
+                    uploading = null
+                }
+            }
+            is Event.Error -> uploading = null
+            is Event.LoggedOut -> {
+                account = null
+                ownPhoto = null
+                uploading = null
+            }
+            else -> Unit
         }
     }
 
@@ -346,7 +451,7 @@ class Engine(
                 decoder.setTargetSize(small, smallHeight)
                 decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
             }
-        return Triple(width, height, thumbnail(bitmap))
+        return Triple(width, height, thumbnailOf(bitmap))
     }
 
     /** A video's size as shown, and its first frame small for the BlurHash. */
@@ -361,7 +466,7 @@ class Engine(
             val (width, height) = if (turned) high to wide else wide to high
             val frame = retriever.getFrameAtTime(0) ?: return null
             val (small, smallHeight) = fit(frame.width, frame.height)
-            return Triple(width, height, thumbnail(Bitmap.createScaledBitmap(frame, small, smallHeight, true)))
+            return Triple(width, height, thumbnailOf(Bitmap.createScaledBitmap(frame, small, smallHeight, true)))
         } finally {
             retriever.release()
         }
@@ -377,21 +482,6 @@ class Engine(
         }
         val longer = maxOf(width, height)
         return maxOf(1, width * 32 / longer) to maxOf(1, height * 32 / longer)
-    }
-
-    private fun thumbnail(bitmap: Bitmap): Thumbnail {
-        val width = bitmap.width
-        val height = bitmap.height
-        val pixels = IntArray(width * height)
-        bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
-        val rgba = ByteArray(pixels.size * 4)
-        for ((at, pixel) in pixels.withIndex()) {
-            rgba[at * 4] = (pixel shr 16).toByte()
-            rgba[at * 4 + 1] = (pixel shr 8).toByte()
-            rgba[at * 4 + 2] = pixel.toByte()
-            rgba[at * 4 + 3] = (pixel ushr 24).toByte()
-        }
-        return Thumbnail(width, height, rgba)
     }
 
     /**
@@ -504,7 +594,7 @@ class Engine(
         server = base
         release()
         val last = vault.note("last")
-        if (last != null && last in vault.usernames(base)) {
+        if (last != null && last in vault.accounts(base)) {
             bind(last, true)
         } else {
             feed(Input.Loaded(null, null, true, null))
@@ -528,31 +618,31 @@ class Engine(
         generation += 1
     }
 
-    /** Loads this username's own snapshot. A login does not connect until that login. */
+    /** Resumes the last account's own snapshot, kept by its id, at start. */
     private fun bind(
-        username: String,
+        account: String,
         resume: Boolean,
     ) {
         val base = server ?: return
-        if (bound == username) {
-            vault.setNote("last", username)
-            return
-        }
-        release()
-        if (username !in vault.usernames(base)) {
-            return
-        }
-        bound = username
-        vault.setNote("last", username)
-        openArchive(base, username)
-        val token = vault.get(base, username, "token")?.toString(Charsets.UTF_8)
-        feed(Input.Loaded(vault.get(base, username, "slot0"), vault.get(base, username, "slot1"), resume, token))
+        bound = account
+        vault.setNote("last", account)
+        openArchive(base, account)
+        val token = vault.get(base, account, "token")?.toString(Charsets.UTF_8)
+        feed(Input.Loaded(vault.get(base, account, "slot0"), vault.get(base, account, "slot1"), resume, token))
+    }
+
+    /** A login found its account: hands core that account's snapshot, if this phone keeps one. */
+    private fun open(account: String) {
+        val base = server ?: return
+        bound = account
+        if (account in vault.accounts(base)) openArchive(base, account)
+        feed(Input.Opened(vault.get(base, account, "slot0"), vault.get(base, account, "slot1")))
     }
 
     private fun handle(command: Command) {
         when (command) {
-            is Command.LogIn -> bind(command.username, false)
-            is Command.SignUp, is Command.Setup -> release()
+            // Core asks the server which account this is, then says which folder to open.
+            is Command.LogIn, is Command.SignUp, is Command.Setup -> release()
             else -> Unit
         }
         feed(Input.Run(command))
@@ -660,7 +750,7 @@ class Engine(
             Request
                 .Builder()
                 .url(base + asked.path)
-                .put(bytes.toRequestBody("application/octet-stream".toMediaType()))
+                .method(asked.method, bytes.toRequestBody("application/octet-stream".toMediaType()))
         asked.bearer?.let { builder.header("Authorization", "Bearer $it") }
         http.newCall(builder.build()).enqueue(
             object : Callback {
@@ -734,23 +824,24 @@ class Engine(
                 closing?.close(1000, null)
             }
             is Output.Save -> {
-                val username = bound
+                val account = bound
                 try {
-                    if (username == null) {
+                    if (account == null) {
                         throw IOException("no account")
                     }
-                    vault.put(base, username, "slot${output.slot}", output.bytes)
+                    vault.put(base, account, "slot${output.slot}", output.bytes)
                     feed(Input.Saved(output.id))
                 } catch (_: Exception) {
                     feed(Input.SaveFailed(output.id))
                 }
             }
             is Output.Wipe -> {
-                bound?.let { username ->
-                    vault.remove(base, username, "slot0")
-                    vault.remove(base, username, "slot1")
+                bound?.let { account ->
+                    vault.remove(base, account, "slot0")
+                    vault.remove(base, account, "slot1")
                 }
             }
+            is Output.Open -> open(output.account)
             is Output.WakeAt -> {
                 timer?.cancel(false)
                 val meant = generation
@@ -770,11 +861,12 @@ class Engine(
             is Output.ReadRows -> readRows(output)
             is Output.Show -> {
                 val showing = rememberedCall(output.event)
+                ownProfile(showing)
                 when (val event = showing) {
                     is Event.SignedIn -> {
-                        bound = event.username
-                        vault.setNote("last", event.username)
-                        if (archive == null) openArchive(base, event.username)
+                        bound = event.account
+                        vault.setNote("last", event.account)
+                        if (archive == null) openArchive(base, event.account)
                     }
                     is Event.Chats -> {
                         archive?.seen(event.chat_list)
@@ -785,15 +877,25 @@ class Engine(
                         reportUnread()
                     }
                     is Event.Token ->
-                        bound?.let { username ->
+                        bound?.let { account ->
                             val token = event.token
                             if (token == null) {
-                                vault.remove(base, username, "token")
+                                vault.remove(base, account, "token")
                             } else {
-                                vault.put(base, username, "token", token.toByteArray())
+                                vault.put(base, account, "token", token.toByteArray())
                             }
                         }
                     is Event.StickerImage -> if (!keepSticker(event)) return
+                    is Event.Photo -> {
+                        photosAsked.remove(event.photo)
+                        val opened =
+                            try {
+                                java.util.Base64.getDecoder().decode(event.bytes)
+                            } catch (_: IllegalArgumentException) {
+                                return
+                            }
+                        if (!keep(photoFile(event.photo), opened)) return
+                    }
                     is Event.StickerMissing -> stickersAsked.remove(event.sticker)
                     is Event.Progress -> if (event.done >= event.total) doneReading(event.handle)
                     is Event.TransferFailed -> doneReading(event.handle)
@@ -806,11 +908,11 @@ class Engine(
 
     private fun openArchive(
         base: String,
-        username: String,
+        account: String,
     ) {
         archive?.close()
         archive = null
-        val dir = vault.accountDir(base, username)
+        val dir = vault.accountDir(base, account)
         dir.mkdirs()
         archive =
             try {
@@ -938,6 +1040,7 @@ class Engine(
     ) {
         socket?.close(1000, null)
         val meant = generation
+        trying()
         val url = base.replaceFirst("http", "ws") + "/api/v1/ws"
         val builder = Request.Builder().url(url).header("Sec-WebSocket-Protocol", "keryx.v1")
         bearer?.let { builder.header("Authorization", "Bearer $it") }

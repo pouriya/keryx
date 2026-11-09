@@ -1,7 +1,7 @@
 // The device's state on the phone: each account's two snapshot slots and its token, as files in the
 // app's private storage, encrypted with an AES key that lives in the Android Keystore and never
-// leaves it. Each server and username has its own folder, and the one left behind is kept, as on
-// the web. Nothing here logs, since what passes through holds keys and the token.
+// leaves it. Each server and account id has its own folder, since a username can change, and the
+// one left behind is kept. Nothing here logs, since what passes through holds keys and the token.
 
 package io.github.pouriya.keryx
 
@@ -38,7 +38,7 @@ class Vault(
             }
     }
 
-    /** The server address and the last username: not secret, so kept as plain text. */
+    /** The server address and the last account id: not secret, so kept as plain text. */
     fun note(name: String): String? = File(plain, name).takeIf { it.exists() }?.readText()
 
     fun setNote(
@@ -49,21 +49,21 @@ class Vault(
         write(File(plain, name), value.toByteArray())
     }
 
-    /** The usernames that have something kept for this server. */
-    fun usernames(server: String): List<String> = folder(server, null).list()?.sorted() ?: emptyList()
+    /** The account ids that have something kept for this server. */
+    fun accounts(server: String): List<String> = folder(server, null).list()?.sorted() ?: emptyList()
 
     /** This account's folder: the snapshot, the token and the archive, apart per server. */
     fun accountDir(
         server: String,
-        username: String,
-    ): File = folder(server, username)
+        account: String,
+    ): File = folder(server, account)
 
     fun get(
         server: String,
-        username: String,
+        account: String,
         name: String,
     ): ByteArray? {
-        val file = File(folder(server, username), name)
+        val file = File(folder(server, account), name)
         if (!file.exists()) {
             return null
         }
@@ -80,31 +80,31 @@ class Vault(
     /** One write that lands whole or not at all: a sealed copy beside it, then a rename. */
     fun put(
         server: String,
-        username: String,
+        account: String,
         name: String,
         bytes: ByteArray,
     ) {
         val cipher = Cipher.getInstance(CIPHER)
         cipher.init(Cipher.ENCRYPT_MODE, key)
-        val folder = folder(server, username)
+        val folder = folder(server, account)
         folder.mkdirs()
         write(File(folder, name), cipher.iv + cipher.doFinal(bytes))
     }
 
     fun remove(
         server: String,
-        username: String,
+        account: String,
         name: String,
     ) {
-        File(folder(server, username), name).delete()
+        File(folder(server, account), name).delete()
     }
 
     private fun folder(
         server: String,
-        username: String?,
+        account: String?,
     ): File {
         val byServer = File(root, URLEncoder.encode(server, "UTF-8"))
-        return if (username == null) byServer else File(byServer, username)
+        return if (account == null) byServer else File(byServer, account)
     }
 
     private fun write(

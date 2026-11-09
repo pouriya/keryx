@@ -43,6 +43,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -92,9 +93,16 @@ internal data class Ink(
     val reached: Color,
 )
 
+/** The open account's theme: true dark, false light, null while it has chosen none. */
+internal val LocalDark = compositionLocalOf<Boolean?> { null }
+
+/** Dark or light: the open account's choice, or the phone's while it has none, chosen by the author. */
+@Composable
+internal fun isDark(): Boolean = LocalDark.current ?: isSystemInDarkTheme()
+
 @Composable
 internal fun ink(): Ink {
-    val dark = isSystemInDarkTheme()
+    val dark = isDark()
     return if (dark) {
         Ink(
             Color(0xFF141B24),
@@ -149,7 +157,7 @@ fun Setup(
     onQuiet: () -> Unit,
     onLink: () -> Unit,
 ) {
-    val dark = isSystemInDarkTheme()
+    val dark = isDark()
     val ink = ink()
     val addressFocus = remember { FocusRequester() }
     val usernameFocus = remember { FocusRequester() }

@@ -23,8 +23,8 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
@@ -44,6 +44,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
@@ -103,6 +104,13 @@ class MainActivity : ComponentActivity() {
     private val list = ChatRows()
     private val people = mutableStateMapOf<String, AccountBrief>()
     private val me = mutableStateOf<String?>(null)
+
+    /** The open account's theme, kept in its folder: true dark, false light, null the phone's. */
+    private val theme = mutableStateOf<Boolean?>(null)
+
+    /** True for a moment as each connection try starts, so Connecting… drops its dots and shows a retry. */
+    private val trying = mutableStateOf(false)
+    private var blinkGen = 0
     private val serverName = mutableStateOf<String?>(null)
     private val linkState = mutableStateOf(Link.Connecting)
     private val unreadCounts = mutableStateMapOf<String, Int>()
@@ -123,6 +131,10 @@ class MainActivity : ComponentActivity() {
     private val happened = mutableStateListOf<String>()
     private var lookingFor: String? = null
     private lateinit var engine: Engine
+    private lateinit var profiles: Profiles
+
+    /** Whose profile is open over the list or the chat, if anyone's. */
+    private val profileOf = mutableStateOf<String?>(null)
     private var netUp = true
     private var probeGen = 0
     private var leaving = false
@@ -224,7 +236,9 @@ class MainActivity : ComponentActivity() {
                         list.callStatus(chat, seq, callLabel(video, outcome == 0))
                     }
                 },
+                { runOnUiThread { blink() } },
             )
+        profiles = Profiles(engine)
         netUp = connectivity.activeNetwork != null
         runCatching {
             connectivity.registerDefaultNetworkCallback(netCallback)
@@ -241,113 +255,133 @@ class MainActivity : ComponentActivity() {
                     Place.Welcome, Place.Chats -> Unit
                 }
             }
-            MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
-                if (joined != null) {
-                    Surface(Modifier.fillMaxSize()) {
-                        CallScreen(
-                            joined,
-                            {
-                                    on ->
-                                if (on) {
-                                    withPermissions(
-                                        Manifest.permission.CAMERA,
-                                    ) { joined.video(has(Manifest.permission.CAMERA)) }
-                                } else {
-                                    joined.video(false)
-                                }
-                            },
-                            { said -> if (said.isNotBlank()) engine.send(Command.CallText(joined.chat, joined.callSeq, said)) },
-                            { engine.send(Command.LeaveCall(joined.chat)) },
-                        )
-                    }
-                } else {
-                    when (place.value) {
-                        Place.Welcome -> Welcome(language.value, ::chooseLanguage) { place.value = Place.Setup }
-                        Place.Setup ->
-                            Setup(
-                                link = linkStage.value,
-                                signingUp = signingUp.value,
-                                address = address.value,
-                                onAddress = ::onAddress,
-                                onAddressBlur = { ensureServer(After.None) },
-                                username = username.value,
-                                onUsername = ::onUsername,
-                                password = password.value,
-                                onPassword = ::onPassword,
-                                setupLink = setupPaste.value,
-                                onSetupLink = ::onSetupPaste,
-                                onSetupLinkBlur = { prepareLink(false) },
-                                checking = checking.value,
-                                reached = reached.value,
-                                addressError = addressError.value?.let { getString(it) },
-                                linkError = linkError.value?.let { getString(it) },
-                                formError = formError.value,
-                                showCaptcha = captchaOn.value,
-                                captchaImage = captchaImage.value,
-                                captchaAnswer = captchaAnswer.value,
-                                onCaptcha = ::onCaptcha,
-                                onRefreshCaptcha = ::refreshCaptcha,
-                                gap = gapField.value,
-                                focusNonce = focusNonce.value,
-                                busy = busy.value,
-                                onPrimary = ::onPrimary,
-                                onQuiet = ::onQuiet,
-                                onLink = ::openLink,
-                            )
-                        Place.Words ->
-                            Words(
-                                server = normalized(address.value),
-                                username = username.value.trim().lowercase(),
-                                phrase = words.value,
-                                restore = wordsRestore.value,
-                                error = wordsError.value,
-                                busy = busy.value,
-                                onGenerate = { count ->
-                                    wordsError.value = null
-                                    engine.send(Command.GenerateWords(count))
-                                },
-                                onSet = { phrase ->
-                                    wordsError.value = null
-                                    busy.value = true
-                                    engine.send(Command.SetWords(phrase))
-                                },
-                                onRestore = { phrase ->
-                                    wordsError.value = null
-                                    busy.value = true
-                                    engine.send(Command.Restore(phrase))
-                                },
-                                onClearError = { wordsError.value = null },
-                                onBindBack = { wordsBack = it },
-                            )
-                        Place.Chats ->
-                            if (talk.chat != null) {
-                                OpenedChat()
-                            } else {
-                                Chats(
-                                    link = linkState.value,
-                                    serverName = serverName.value,
-                                    host = hostOf(server.value),
-                                    people = people,
-                                    me = me.value,
-                                    unread = unreadCounts,
-                                    rows = list.rows,
-                                    ringing = ringing.value,
-                                    found = found,
-                                    foundFor = foundFor.value,
-                                    onSearch = ::searchPeople,
-                                    onPerson = { account -> engine.send(Command.StartChat(account.id)) },
-                                    onOpen = { row -> openChat(row.id) },
-                                    onLogOut = ::logOut,
-                                    onAnswer = ::answer,
-                                    onDecline = { call ->
-                                        engine.send(Command.DeclineCall(call.chat, call.seq))
-                                        ringing.value = null
-                                    },
-                                )
-                            }
-                        Place.Test -> Surface(Modifier.fillMaxSize()) { Bare() }
-                    }
+            CompositionLocalProvider(LocalDark provides theme.value, LocalTrying provides trying.value) {
+                MaterialTheme(colorScheme = if (isDark()) darkColorScheme() else lightColorScheme()) {
+                    CompositionLocalProvider(LocalProfiles provides profiles) { Screen(joined) }
                 }
+            }
+        }
+    }
+
+    @Composable
+    private fun Screen(joined: CallSession?) {
+        if (joined != null) {
+            Surface(Modifier.fillMaxSize()) {
+                CallScreen(
+                    joined,
+                    {
+                            on ->
+                        if (on) {
+                            withPermissions(
+                                Manifest.permission.CAMERA,
+                            ) { joined.video(has(Manifest.permission.CAMERA)) }
+                        } else {
+                            joined.video(false)
+                        }
+                    },
+                    { said -> if (said.isNotBlank()) engine.send(Command.CallText(joined.chat, joined.callSeq, said)) },
+                    { engine.send(Command.LeaveCall(joined.chat)) },
+                )
+            }
+        } else {
+            when (place.value) {
+                Place.Welcome -> Welcome(language.value, ::chooseLanguage) { place.value = Place.Setup }
+                Place.Setup ->
+                    Setup(
+                        link = linkStage.value,
+                        signingUp = signingUp.value,
+                        address = address.value,
+                        onAddress = ::onAddress,
+                        onAddressBlur = { ensureServer(After.None) },
+                        username = username.value,
+                        onUsername = ::onUsername,
+                        password = password.value,
+                        onPassword = ::onPassword,
+                        setupLink = setupPaste.value,
+                        onSetupLink = ::onSetupPaste,
+                        onSetupLinkBlur = { prepareLink(false) },
+                        checking = checking.value,
+                        reached = reached.value,
+                        addressError = addressError.value?.let { getString(it) },
+                        linkError = linkError.value?.let { getString(it) },
+                        formError = formError.value,
+                        showCaptcha = captchaOn.value,
+                        captchaImage = captchaImage.value,
+                        captchaAnswer = captchaAnswer.value,
+                        onCaptcha = ::onCaptcha,
+                        onRefreshCaptcha = ::refreshCaptcha,
+                        gap = gapField.value,
+                        focusNonce = focusNonce.value,
+                        busy = busy.value,
+                        onPrimary = ::onPrimary,
+                        onQuiet = ::onQuiet,
+                        onLink = ::openLink,
+                    )
+                Place.Words ->
+                    Words(
+                        server = normalized(address.value),
+                        username = username.value.trim().lowercase(),
+                        phrase = words.value,
+                        restore = wordsRestore.value,
+                        error = wordsError.value,
+                        busy = busy.value,
+                        onGenerate = { count ->
+                            wordsError.value = null
+                            engine.send(Command.GenerateWords(count))
+                        },
+                        onSet = { phrase ->
+                            wordsError.value = null
+                            busy.value = true
+                            engine.send(Command.SetWords(phrase))
+                        },
+                        onRestore = { phrase ->
+                            wordsError.value = null
+                            busy.value = true
+                            engine.send(Command.Restore(phrase))
+                        },
+                        onClearError = { wordsError.value = null },
+                        onBindBack = { wordsBack = it },
+                    )
+                Place.Chats ->
+                    Box(Modifier.fillMaxSize()) {
+                        if (talk.chat != null) {
+                            OpenedChat()
+                        } else {
+                            Chats(
+                                link = linkState.value,
+                                serverName = serverName.value,
+                                host = hostOf(server.value),
+                                people = people,
+                                me = me.value,
+                                unread = unreadCounts,
+                                rows = list.rows,
+                                ringing = ringing.value,
+                                found = found,
+                                foundFor = foundFor.value,
+                                onSearch = ::searchPeople,
+                                onPerson = { account -> engine.send(Command.StartChat(account.id)) },
+                                onOpen = { row -> openChat(row.id) },
+                                onProfile = { profileOf.value = it },
+                                onAnswer = ::answer,
+                                onDecline = { call ->
+                                    engine.send(Command.DeclineCall(call.chat, call.seq))
+                                    ringing.value = null
+                                },
+                            )
+                        }
+                        profileOf.value?.let { account ->
+                            ProfileScreen(
+                                account = account,
+                                mine = account == me.value,
+                                brief = people[account],
+                                onBack = { profileOf.value = null },
+                                onDevices = {},
+                                onLogOut = ::logOut,
+                                onTheme = ::setTheme,
+                            )
+                        }
+                    }
+                Place.Test -> Surface(Modifier.fillMaxSize()) { Bare() }
             }
         }
     }
@@ -397,12 +431,34 @@ class MainActivity : ComponentActivity() {
     private fun openSaved() {
         val base = vault.note("server") ?: return
         val last = vault.note("last") ?: return
-        if (last !in vault.usernames(base) || vault.get(base, last, "token") == null) return
-        username.value = last
+        if (last !in vault.accounts(base) || vault.get(base, last, "token") == null) return
+        loadTheme(base, last)
         place.value = Place.Chats
         linkState.value = if (netUp) Link.Connecting else Link.Waiting
         engine.openLast(base)
         if (linkState.value == Link.Connecting) probe()
+    }
+
+    /** This account's theme from its folder, so the list opens in it before the engine says who it is. */
+    private fun loadTheme(
+        base: String,
+        account: String?,
+    ) {
+        theme.value = account?.let { vault.get(base, it, "theme") }?.singleOrNull()?.let { it == DARK }
+    }
+
+    /** The switch on your own profile: saved for this account only, on this phone. */
+    private fun setTheme(dark: Boolean) {
+        val account = me.value ?: return
+        vault.put(server.value, account, "theme", byteArrayOf(if (dark) DARK else LIGHT))
+        theme.value = dark
+    }
+
+    /** Each try drops the title's dots for half a second, chosen by the author. */
+    private fun blink() {
+        val gen = ++blinkGen
+        trying.value = true
+        window.decorView.postDelayed({ if (gen == blinkGen) trying.value = false }, 500)
     }
 
     private fun logOut() {
@@ -412,6 +468,8 @@ class MainActivity : ComponentActivity() {
 
     /** The list closes with nothing said. The address stays. The name and the password do not. */
     private fun leaveForLogin() {
+        profileOf.value = null
+        theme.value = null
         probeGen++
         leaving = false
         username.value = ""
@@ -879,6 +937,7 @@ class MainActivity : ComponentActivity() {
             transfers[event.handle] = "${event.done} of ${event.total} chunks"
             return
         }
+        profiles.apply(event)
         happened.add(0, event::class.simpleName ?: "?")
         if (happened.size > 40) {
             happened.removeAt(happened.lastIndex)
@@ -902,6 +961,7 @@ class MainActivity : ComponentActivity() {
             }
             is Event.SignedIn -> {
                 me.value = event.account
+                loadTheme(server.value, event.account)
                 if (event.device != null) words.value = null
                 busy.value = false
                 afterCheck = After.None
@@ -1047,6 +1107,7 @@ class MainActivity : ComponentActivity() {
                 }
             }
             is Event.LoggedOut -> {
+                profileOf.value = null
                 chats.clear()
                 list.clear()
                 people.clear()
@@ -1055,6 +1116,7 @@ class MainActivity : ComponentActivity() {
                 unreadCounts.clear()
                 chosen.value = null
                 me.value = null
+                theme.value = null
                 if (place.value != Place.Welcome) {
                     val own = leaving
                     leaving = false
@@ -1337,6 +1399,7 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             },
+            onProfile = { profileOf.value = it },
         )
     }
 
@@ -1467,3 +1530,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 }
+
+/** How a theme is kept in the account's folder: one byte. */
+private const val DARK: Byte = 1
+private const val LIGHT: Byte = 0
