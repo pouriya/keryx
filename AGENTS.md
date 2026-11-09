@@ -394,6 +394,10 @@ own and others' shown wherever a person is. Groups and channels come with them.
   address starts with `https://` or `http://`, its name is at most 32 characters and its address 512, and
   tapping one opens the browser; someone with no photo keeps the letter, and one still loading shows its
   BlurHash; Remove photo asks nothing; the photo uploads when Done is tapped, under a turning ring.
+- **The other side of the phone test gets its profile from `server/examples/drive.rs`, chosen by the
+  author:** `bio <text>`, `link <name> <url>` and `photo <file.jpg>`, through core's own commands, so one
+  phone sees someone else's photo, bio and links. The photo's BlurHash there is a flat colour, since
+  `drive.rs` decodes no images.
 
 ### Files
 

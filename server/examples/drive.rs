@@ -1,15 +1,18 @@
 //! Drives core as a real client against a running server, for the phone test: it sends what a phone
 //! cannot, such as a question. Not part of the server, and not a test. Reads one command per line on
 //! stdin: `signup` or `login` with a username, password and words, `find <username>`, `say <text>`,
-//! `many <n>`, `seen`, `call`, `question`, `pump <ms>` and `quit`.
+//! `many <n>`, `seen`, `call`, `question`, `bio <text>`, `link <name> <url>`, `photo <file.jpg>`,
+//! `pump <ms>` and `quit`.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
-use keryx_core::client::{Auth, Client, Command, Event, Input, Output, Platform, Secret};
-use keryx_core::protocol::{ChatType, MessageFrame};
+use keryx_core::client::{
+    Auth, Client, Command, Event, Input, Output, Platform, Secret, Thumbnail,
+};
+use keryx_core::protocol::{ChatType, MessageFrame, ProfileLink};
 use keryx_core::ulid::Ulid;
 use serde_json::{Value, json};
 use tungstenite::stream::MaybeTlsStream;
@@ -26,6 +29,9 @@ struct App {
     events: Vec<Event>,
     archive: BTreeMap<(Ulid, u64), MessageFrame>,
     chat: Option<Ulid>,
+    /// This account's bio and links as last saved here, since saving one sends both.
+    bio: Option<String>,
+    link_list: Vec<ProfileLink>,
 }
 
 fn agent() -> ureq::Agent {
@@ -85,6 +91,8 @@ impl App {
             events: Vec::new(),
             archive: BTreeMap::new(),
             chat: None,
+            bio: None,
+            link_list: Vec::new(),
         }
     }
 
@@ -184,10 +192,32 @@ impl App {
                     self.wake_at = Some(at);
                     None
                 }
-                Output::ReadChunk { .. }
-                | Output::PutChunk { .. }
-                | Output::GetChunk { .. }
-                | Output::WriteChunk { .. } => None,
+                // Only a photo goes up from here, as the raw sealed bytes.
+                Output::PutChunk {
+                    id,
+                    method,
+                    path,
+                    bearer,
+                    bytes,
+                } => {
+                    let url = format!("{ORIGIN}{path}");
+                    let mut request = if method == "PUT" {
+                        agent().put(&url)
+                    } else {
+                        agent().post(&url)
+                    };
+                    request = request.header("Content-Type", "application/octet-stream");
+                    if let Some(bearer) = &bearer {
+                        request = request.header("Authorization", format!("Bearer {}", bearer.0));
+                    }
+                    let mut response = request.send(&bytes[..]).unwrap();
+                    let status = response.status().as_u16();
+                    let body = response.body_mut().read_to_string().unwrap();
+                    Some(Input::Reply { id, status, body })
+                }
+                Output::ReadChunk { .. } | Output::GetChunk { .. } | Output::WriteChunk { .. } => {
+                    None
+                }
                 Output::JoinCall { .. }
                 | Output::CallKey { .. }
                 | Output::LeaveCall { .. }
@@ -453,6 +483,46 @@ fn main() {
                     unreachable!()
                 };
                 println!("asked {seq}");
+            }
+            "bio" => {
+                app.bio = Some(rest.to_string());
+                app.command(Command::SaveProfile {
+                    bio: app.bio.clone(),
+                    link_list: app.link_list.clone(),
+                });
+                app.wait(|event| matches!(event, Event::ProfileSaved));
+                println!("saved");
+            }
+            "link" => {
+                let (name, url) = rest.rsplit_once(' ').expect("link <name> <url>");
+                app.link_list.push(ProfileLink {
+                    name: name.to_string(),
+                    url: url.to_string(),
+                });
+                app.command(Command::SaveProfile {
+                    bio: app.bio.clone(),
+                    link_list: app.link_list.clone(),
+                });
+                app.wait(|event| matches!(event, Event::ProfileSaved));
+                println!("saved");
+            }
+            // The JPEG goes as it is, and its BlurHash is a flat blue, as nothing here decodes it.
+            "photo" => {
+                let jpeg = std::fs::read(rest).unwrap();
+                let mut rgba = Vec::new();
+                for _ in 0..16 {
+                    rgba.extend_from_slice(&[0x45, 0x76, 0xC4, 0xFF]);
+                }
+                app.command(Command::SetPhoto {
+                    jpeg,
+                    thumbnail: Thumbnail {
+                        width: 4,
+                        height: 4,
+                        rgba,
+                    },
+                });
+                app.wait(|event| matches!(event, Event::ProfileSaved));
+                println!("saved");
             }
             "pump" => {
                 let ms: u64 = rest.parse().unwrap_or(1000);
