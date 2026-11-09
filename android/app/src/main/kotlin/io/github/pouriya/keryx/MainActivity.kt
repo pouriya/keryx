@@ -367,6 +367,11 @@ class MainActivity : ComponentActivity() {
                                     engine.send(Command.DeclineCall(call.chat, call.seq))
                                     ringing.value = null
                                 },
+                                // Shown at once here, as core's own Pins event will say again.
+                                onPins = { order ->
+                                    list.pins(order)
+                                    engine.send(Command.Pins(order))
+                                },
                             )
                         }
                         profileOf.value?.let { account ->
@@ -1066,6 +1071,7 @@ class MainActivity : ComponentActivity() {
                 loadingOlder = false
             }
             is Event.Draft -> talk.drafted(event)
+            is Event.Pins -> list.pins(event.chat_list)
             is Event.Times -> timesAnswer.value = TimesAnswer(event.seq, event.member_list)
             is Event.Failed -> {
                 talk.failed(event)

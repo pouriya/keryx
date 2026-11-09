@@ -1380,6 +1380,9 @@ internal object Glyphs {
     val trash = listOf("M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13")
     val plus = listOf("M12 5v14M5 12h14")
     val moon = listOf("M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5z")
+    val pin = listOf("M9 4h6l-1 6 3 3H7l3-3z", "M12 13v7")
+    val unpin = listOf("M9 4h6l-1 6 3 3H7l3-3z", "M12 13v7", "M4 4l16 16")
+    val handle = listOf("M5 9h14M5 12h14M5 15h14")
 }
 
 @Composable

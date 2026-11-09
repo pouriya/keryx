@@ -58,6 +58,10 @@
     <string name="saved_messages">پیام‌های ذخیره‌شده</string>
     <string name="no_messages">هنوز پیامی نیست</string>
     <string name="no_chats">گفتگویی نیست</string>
+    <string name="chats_pin">سنجاق کردن</string>
+    <string name="chats_unpin">برداشتن سنجاق</string>
+    <string name="chats_pinned">سنجاق‌شده</string>
+    <string name="chats_move">جابه‌جا کردن</string>
     <string name="devices">دستگاه‌ها</string>
     <string name="log_out">خروج</string>
     <string name="yesterday">دیروز</string>

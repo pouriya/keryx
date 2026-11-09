@@ -183,6 +183,13 @@ sealed interface Command {
         val draft: DraftText? = null,
     ) : Command
 
+    /** The whole pinned order, first on top. Every chat it leaves out is unpinned. */
+    @Serializable
+    @SerialName("pins")
+    data class Pins(
+        val chat_list: List<String>,
+    ) : Command
+
     /** When each other member received and saw one message, answered as `Event.Times`. */
     @Serializable
     @SerialName("times")
@@ -819,6 +826,8 @@ data class ChatItem(
     val last_content: MessageFrame? = null,
     val mark_list: List<MarkItem> = emptyList(),
     val seen_seq: Long? = null,
+    /** Its place among this account's pinned chats, from 0 on top, or none. */
+    val pin: Int? = null,
 )
 
 @Serializable
@@ -1073,6 +1082,13 @@ sealed interface Event {
         val chat: String,
         val draft: DraftText? = null,
         val saved_at: Long = 0,
+    ) : Event
+
+    /** This account's pinned chats changed, here or on another device: the whole order, first on top. */
+    @Serializable
+    @SerialName("pins")
+    data class Pins(
+        val chat_list: List<String>,
     ) : Event
 
     @Serializable

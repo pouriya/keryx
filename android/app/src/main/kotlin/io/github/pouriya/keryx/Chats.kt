@@ -2,9 +2,12 @@ package io.github.pouriya.keryx
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -21,6 +24,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
@@ -31,9 +35,12 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -46,6 +53,9 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
@@ -59,6 +69,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.zIndex
 import kotlinx.coroutines.delay
 import java.time.Instant
 import java.time.LocalDate
@@ -82,11 +93,44 @@ internal data class ChatRow(
     val waiting: Boolean,
     /** Set when the preview is a call: video, or voice. */
     val callVideo: Boolean? = null,
+    /** Its place among the pinned chats, from 0 on top, or none. */
+    val pin: Int? = null,
 )
 
-/** The conversations on screen, newest first, updated as messages and marks arrive. */
+/** The conversations on screen: the pinned ones first in their order, then the rest newest first. */
 internal class ChatRows {
     val rows = mutableStateListOf<ChatRow>()
+
+    /** The pinned chats in their order, first on top. */
+    fun pinned(): List<String> = rows.filter { it.pin != null }.sortedBy { it.pin }.map { it.id }
+
+    /** The whole pinned order, here or from another device: every chat it leaves out is unpinned. */
+    fun pins(order: List<String>) {
+        val unpinned = mutableListOf<ChatRow>()
+        for (index in rows.indices) {
+            val place = order.indexOf(rows[index].id).takeIf { it >= 0 }
+            if (rows[index].pin != null && place == null) {
+                unpinned.add(rows[index].copy(pin = null))
+            } else if (rows[index].pin != place) {
+                rows[index] = rows[index].copy(pin = place)
+            }
+        }
+        rows.removeAll { row -> unpinned.any { it.id == row.id } }
+        settle()
+        // A chat that loses its pin goes back among the rest by its time, not where its pin held it.
+        for (row in unpinned) {
+            val at = rows.indexOfFirst { it.pin == null && (it.lastAt ?: 0) < (row.lastAt ?: 0) }
+            rows.add(if (at < 0) rows.size else at, row)
+        }
+    }
+
+    /** Pinned rows go to the top in their order. The rest keep theirs, which is newest first. */
+    private fun settle() {
+        val sorted = rows.sortedBy { it.pin ?: Int.MAX_VALUE }
+        if (sorted == rows.toList()) return
+        rows.clear()
+        rows.addAll(sorted)
+    }
 
     fun replace(list: List<ChatItem>) {
         val previous = rows.associateBy { it.id }
@@ -105,9 +149,11 @@ internal class ChatRows {
                     mine = if (old != null && kept) old.mine else false,
                     waiting = if (old != null && kept) old.waiting else false,
                     callVideo = if (old != null && kept) old.callVideo else null,
+                    pin = item.pin,
                 ),
             )
         }
+        settle()
     }
 
     fun message(
@@ -134,6 +180,7 @@ internal class ChatRows {
                     waiting = false,
                 ),
             )
+            settle()
             return
         }
         val row = rows[index]
@@ -151,6 +198,7 @@ internal class ChatRows {
         if (newer) {
             rows.removeAt(index)
             rows.add(0, next)
+            settle()
         } else {
             rows[index] = next
         }
@@ -166,6 +214,7 @@ internal class ChatRows {
         val next = row.copy(preview = text ?: row.preview, mine = true, waiting = true, callVideo = null)
         rows.removeAt(index)
         rows.add(0, next)
+        settle()
     }
 
     fun sent(
@@ -202,6 +251,7 @@ internal class ChatRows {
                     callVideo = video,
                 ),
             )
+            settle()
             return
         }
         val row = rows[index]
@@ -297,6 +347,7 @@ internal fun Chats(
     onProfile: (String) -> Unit,
     onAnswer: (Shown) -> Unit,
     onDecline: (Shown) -> Unit,
+    onPins: (List<String>) -> Unit,
 ) {
     val dark = isDark()
     val ink = ink()
@@ -332,11 +383,25 @@ internal fun Chats(
         busy = false
     }
     BackHandler(enabled = open) { closeSearch() }
+    // A long press on a row, not its photo, starts selecting, as messages do, chosen by the author.
+    val selected = remember { mutableStateListOf<String>() }
+    val selecting = selected.isNotEmpty()
+    BackHandler(enabled = selecting) { selected.clear() }
+    LaunchedEffect(rows.map { it.id }) { selected.retainAll(rows.map { it.id }.toSet()) }
+    // While a pinned row is dragged, the pinned order as it stands under the finger.
+    var dragOrder by remember { mutableStateOf<List<String>?>(null) }
+    var dragId by remember { mutableStateOf<String?>(null) }
+    var dragBy by remember { mutableFloatStateOf(0f) }
+    var rowHeight by remember { mutableIntStateOf(0) }
+    val current by rememberUpdatedState(rows)
+    val listState = rememberLazyListState()
     Bars(ink.page, dark)
     val connected = link == Link.Connected
     val saved = stringResource(R.string.saved_messages)
     val title = if (connected) serverName?.takeIf { it.isNotBlank() } ?: host else statusText(link)
     val filtering = open && !busy && applied.isNotEmpty()
+    val ordered =
+        dragOrder?.let { order -> rows.sortedBy { row -> order.indexOf(row.id).takeIf { it >= 0 } ?: Int.MAX_VALUE } } ?: rows
     val shown =
         if (filtering) {
             val matched = rows.filter { label(it, people, saved).startsWith(applied, ignoreCase = true) }
@@ -347,13 +412,65 @@ internal fun Chats(
                 matched
             }
         } else {
-            rows
+            ordered
         }
+    // Every pinned row gets a handle while selecting, once two or more are pinned, chosen by the author.
+    val pinnedCount = rows.count { it.pin != null }
+    val handles = selecting && !filtering && pinnedCount >= 2
+
+    fun finishDrag(keep: Boolean) {
+        val order = dragOrder
+        if (keep && order != null && order != current.filter { it.pin != null }.sortedBy { it.pin }.map { it.id }) onPins(order)
+        dragId = null
+        dragBy = 0f
+        dragOrder = null
+    }
+
+    fun dragStep() {
+        val order = dragOrder ?: return
+        val id = dragId ?: return
+        val at = order.indexOf(id)
+        val height = rowHeight.toFloat().takeIf { it > 0f } ?: return
+        val to =
+            when {
+                dragBy > height / 2 && at < order.lastIndex -> at + 1
+                dragBy < -height / 2 && at > 0 -> at - 1
+                else -> {
+                    if (at == 0) dragBy = dragBy.coerceAtLeast(0f)
+                    if (at == order.lastIndex) dragBy = dragBy.coerceAtMost(0f)
+                    return
+                }
+            }
+        // Keep the list where it is: a lazy list follows its first visible row when that row moves.
+        val first = listState.firstVisibleItemIndex
+        val offset = listState.firstVisibleItemScrollOffset
+        dragOrder = order.toMutableList().apply { add(to, removeAt(at)) }
+        dragBy += if (to > at) -height else height
+        listState.requestScrollToItem(first, offset)
+    }
     val known = rows.flatMap { row -> row.marks.map { it.account } }.toSet()
     val strangers = if (filtering) found.filter { it.id != me && it.id !in known } else emptyList()
     Box(Modifier.fillMaxSize().background(ink.page).windowInsetsPadding(WindowInsets.statusBars)) {
         Column(Modifier.fillMaxSize()) {
-            if (open) {
+            if (selecting) {
+                PinBar(
+                    selected.size,
+                    ink,
+                    onClose = { selected.clear() },
+                    // New pins go under the ones already pinned, in the list's order, chosen by the author.
+                    onPin = {
+                        val pinned = rows.filter { it.pin != null }.sortedBy { it.pin }.map { it.id }
+                        val added = rows.filter { it.id in selected && it.pin == null }.map { it.id }
+                        if (added.isNotEmpty()) onPins(pinned + added)
+                        selected.clear()
+                    },
+                    onUnpin = {
+                        val pinned = rows.filter { it.pin != null }.sortedBy { it.pin }.map { it.id }
+                        if (pinned.any { it in selected }) onPins(pinned.filter { it !in selected })
+                        selected.clear()
+                    },
+                )
+            } else if (open) {
                 SearchRow(query, busy, ink, focus, { query = it }, ::closeSearch)
             } else {
                 TitleRow(title, connected, ink, { me?.let(onProfile) }) { open = true }
@@ -361,7 +478,7 @@ internal fun Chats(
             ringing?.let { call ->
                 Incoming(call, { onAnswer(call) }, { onDecline(call) })
             }
-            LazyColumn(Modifier.weight(1f).windowInsetsPadding(WindowInsets.navigationBars)) {
+            LazyColumn(Modifier.weight(1f).windowInsetsPadding(WindowInsets.navigationBars), state = listState) {
                 if (shown.isEmpty() && strangers.isEmpty()) {
                     item {
                         Text(
@@ -373,8 +490,52 @@ internal fun Chats(
                     }
                 }
                 items(shown, key = { it.id }) { row ->
-                    Conversation(row, label(row, people, saved), me, unread[row.id] ?: 0, ink, accentText, onProfile) {
-                        onOpen(row)
+                    val dragging = row.id == dragId
+                    val place =
+                        when {
+                            dragging -> Modifier.zIndex(1f).graphicsLayer { translationY = dragBy }
+                            selecting -> Modifier.animateItem(fadeInSpec = null, fadeOutSpec = null)
+                            else -> Modifier
+                        }
+                    val handle =
+                        if (handles && row.pin != null) {
+                            Modifier.pointerInput(row.id) {
+                                detectVerticalDragGestures(
+                                    onDragStart = {
+                                        dragOrder = current.filter { it.pin != null }.sortedBy { it.pin }.map { it.id }
+                                        dragId = row.id
+                                        dragBy = 0f
+                                    },
+                                    onDragEnd = { finishDrag(true) },
+                                    onDragCancel = { finishDrag(false) },
+                                ) { change, amount ->
+                                    change.consume()
+                                    dragBy += amount
+                                    dragStep()
+                                }
+                            }
+                        } else {
+                            null
+                        }
+                    Conversation(
+                        row,
+                        label(row, people, saved),
+                        me,
+                        unread[row.id] ?: 0,
+                        ink,
+                        accentText,
+                        selecting,
+                        row.id in selected,
+                        handle,
+                        place.onSizeChanged { if (dragging || rowHeight == 0) rowHeight = it.height },
+                        onProfile,
+                        onLongClick = { if (row.id !in selected) selected.add(row.id) },
+                    ) {
+                        if (selecting) {
+                            if (row.id in selected) selected.remove(row.id) else selected.add(row.id)
+                        } else {
+                            onOpen(row)
+                        }
                     }
                 }
                 items(strangers, key = { "person-${it.id}" }) { account ->
@@ -503,6 +664,7 @@ private fun PersonRow(
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun Conversation(
     row: ChatRow,
@@ -511,7 +673,12 @@ private fun Conversation(
     unread: Int,
     ink: Ink,
     accentText: Color,
+    selecting: Boolean,
+    selected: Boolean,
+    handle: Modifier?,
+    modifier: Modifier,
     onProfile: (String) -> Unit,
+    onLongClick: () -> Unit,
     onClick: () -> Unit,
 ) {
     val timeColor = if (unread > 0) accentText else ink.muted
@@ -524,19 +691,36 @@ private fun Conversation(
             else -> null
         }
     Row(
-        Modifier.fillMaxWidth().clickable(role = Role.Button, onClick = onClick).padding(horizontal = 16.dp, vertical = 10.dp),
+        modifier
+            .fillMaxWidth()
+            .background(if (selected) accent.copy(alpha = 0.20f) else ink.page)
+            .combinedClickable(role = Role.Button, onLongClick = onLongClick, onClick = onClick)
+            .padding(start = 16.dp, end = if (handle != null) 4.dp else 16.dp, top = 10.dp, bottom = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Avatar(
-            person,
-            name,
-            48.dp,
-            if (person != null) {
-                Modifier.clip(CircleShape).clickable(role = Role.Button) { onProfile(person) }
-            } else {
-                Modifier
-            },
-        )
+        Box {
+            Avatar(
+                person,
+                name,
+                48.dp,
+                if (person != null) {
+                    Modifier.clip(CircleShape).combinedClickable(role = Role.Button, onLongClick = {}) { onProfile(person) }
+                } else {
+                    Modifier
+                },
+            )
+            if (selecting && selected) {
+                Box(
+                    Modifier
+                        .align(Alignment.BottomEnd)
+                        .size(20.dp)
+                        .clip(CircleShape)
+                        .background(accent)
+                        .border(2.dp, ink.page, CircleShape),
+                    contentAlignment = Alignment.Center,
+                ) { Glyph(Glyphs.check, onAccent, size = 12.dp, width = 3f) }
+            }
+        }
         Column(Modifier.padding(start = 12.dp).weight(1f)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
@@ -576,9 +760,44 @@ private fun Conversation(
                         fontWeight = FontWeight.SemiBold,
                         textAlign = TextAlign.Center,
                     )
+                } else if (row.pin != null) {
+                    val pinned = stringResource(R.string.chats_pinned)
+                    Box(Modifier.padding(start = 8.dp).semantics { contentDescription = pinned }) {
+                        Glyph(Glyphs.pin, ink.muted, 16.dp)
+                    }
                 }
             }
         }
+        if (handle != null) {
+            val move = stringResource(R.string.chats_move)
+            Box(
+                Modifier.padding(start = 4.dp).size(40.dp).semantics { contentDescription = move }.then(handle),
+                contentAlignment = Alignment.Center,
+            ) { Glyph(Glyphs.handle, ink.muted) }
+        }
+    }
+}
+
+/** The list's header while selecting: the count, then Pin and Unpin at the top right. */
+@Composable
+private fun PinBar(
+    count: Int,
+    ink: Ink,
+    onClose: () -> Unit,
+    onPin: () -> Unit,
+    onUnpin: () -> Unit,
+) {
+    Row(Modifier.fillMaxWidth().height(56.dp).padding(start = 4.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+        IconButton(stringResource(R.string.chat_cancel), onClose) { Cross(ink.text) }
+        Text(
+            stringResource(R.string.chat_selected, count),
+            Modifier.weight(1f).padding(start = 6.dp),
+            color = ink.text,
+            fontSize = 18.sp,
+            fontWeight = FontWeight.Bold,
+        )
+        IconButton(stringResource(R.string.chats_pin), onPin) { Glyph(Glyphs.pin, ink.text) }
+        IconButton(stringResource(R.string.chats_unpin), onUnpin) { Glyph(Glyphs.unpin, ink.text) }
     }
 }
 

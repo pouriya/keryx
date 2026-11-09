@@ -58,6 +58,10 @@
     <string name="saved_messages">Saved messages</string>
     <string name="no_messages">No messages yet</string>
     <string name="no_chats">No chats</string>
+    <string name="chats_pin">Pin</string>
+    <string name="chats_unpin">Unpin</string>
+    <string name="chats_pinned">Pinned</string>
+    <string name="chats_move">Move</string>
     <string name="devices">Devices</string>
     <string name="log_out">Log out</string>
     <string name="yesterday">Yesterday</string>
