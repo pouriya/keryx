@@ -114,6 +114,11 @@ class MainActivity : ComponentActivity() {
     private val messages = mutableStateListOf<Shown>()
     private val talk = Talk()
     private val timesAnswer = mutableStateOf<TimesAnswer?>(null)
+
+    /** The server's sticker packs, once asked for; stickers kept on disk; stickers the server no longer has. */
+    private val stickerPacks = mutableStateOf<List<StickerPack>?>(null)
+    private val stickersKept = mutableStateMapOf<String, Boolean>()
+    private val stickersGone = mutableStateMapOf<String, Boolean>()
     private var loadingOlder = false
     private val happened = mutableStateListOf<String>()
     private var lookingFor: String? = null
@@ -458,6 +463,9 @@ class MainActivity : ComponentActivity() {
             7 -> text ?: getString(R.string.kind_file)
             8 -> callLabel(bubble.call?.video == true, bubble.callOutcome == 0)
             9 -> text ?: getString(R.string.kind_bundle)
+            CONTENT_QUESTION -> text ?: bubble.question?.let(::firstQuestion).orEmpty()
+            CONTENT_ANSWER -> getString(R.string.kind_answered)
+            CONTENT_STICKER -> getString(R.string.kind_sticker)
             else -> text.orEmpty()
         }
     }
@@ -474,6 +482,9 @@ class MainActivity : ComponentActivity() {
             7 -> text ?: getString(R.string.kind_file)
             8 -> callLabel(message.call?.video == true, message.call_outcome == 0)
             9 -> text ?: getString(R.string.kind_bundle)
+            CONTENT_QUESTION -> text ?: message.question?.let(::firstQuestion).orEmpty()
+            CONTENT_ANSWER -> getString(R.string.kind_answered)
+            CONTENT_STICKER -> getString(R.string.kind_sticker)
             else -> text.orEmpty()
         }
     }
@@ -955,14 +966,21 @@ class MainActivity : ComponentActivity() {
             }
             is Event.Pending -> {
                 talk.pending(event)
-                if (event.chat == starting && event.text == null && event.handles.isEmpty()) {
+                if (event.chat == starting && event.content_kind == CONTENT_CALL) {
                     startingLocal = event.local
                     starting = null
                 }
                 if (event.text != null || event.handles.isNotEmpty()) {
                     list.pending(event.chat, event.text ?: getString(R.string.kind_file))
+                } else if (event.kind == 0 && event.sticker != null) {
+                    list.pending(event.chat, getString(R.string.kind_sticker))
+                } else if (event.kind == 0 && event.answer != null) {
+                    list.pending(event.chat, getString(R.string.kind_answered))
                 }
             }
+            is Event.Stickers -> stickerPacks.value = event.pack_list
+            is Event.StickerImage -> stickersKept[event.sticker] = true
+            is Event.StickerMissing -> stickersGone[event.sticker] = true
             is Event.Sent -> {
                 talk.sent(event)
                 list.sent(event.chat, event.seq, event.saved_at)
@@ -1288,6 +1306,37 @@ class MainActivity : ComponentActivity() {
                 engine.send(Command.Draft(chat, text))
             },
             onFile = ::fetch,
+            stickers =
+                Stickers(
+                    packs = stickerPacks.value,
+                    file = { id ->
+                        // Read so a sticker that arrives draws itself.
+                        stickersKept[id]
+                        val file = engine.stickerFile(id)
+                        if (file.exists()) {
+                            file
+                        } else {
+                            engine.sticker(id)
+                            null
+                        }
+                    },
+                    gone = { id ->
+                        val packs = stickerPacks.value
+                        stickersGone[id] == true || (packs != null && packs.none { pack -> pack.sticker_list.any { it.id == id } })
+                    },
+                ),
+            onStickers = { engine.send(Command.Stickers) },
+            onSticker = { id, reply -> engine.send(Command.SendSticker(chat, id, reply?.let(::pointer))) },
+            onAnswer = { question, answer, editing ->
+                val tree = question.question
+                if (tree != null) {
+                    if (editing != null) {
+                        engine.send(Command.EditAnswer(chat, pointer(editing), tree, answer))
+                    } else {
+                        engine.send(Command.SendAnswer(chat, tree, answer))
+                    }
+                }
+            },
         )
     }
 

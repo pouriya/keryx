@@ -38,6 +38,9 @@ import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 
+/** How long a sticker's fetch is left to answer before it may be asked for again. */
+private const val STICKER_RETRY_MS = 30_000L
+
 /** What pickers call an MP3, which goes as music: android/AGENTS.md. */
 private val MP3_TYPES = setOf("audio/mpeg", "audio/mp3", "audio/mpeg3")
 
@@ -159,6 +162,38 @@ class Engine(
 
     /** Where a download is written, once asked for. */
     fun downloadedFile(handle: Long): File? = downloads[handle]
+
+    /** Stickers asked for and not yet answered, by id, with when: on the engine's thread. */
+    private val stickersAsked = HashMap<String, Long>()
+
+    /**
+     * Where a sticker's WebP is kept once fetched, in the cache folder. A sticker's bytes never change,
+     * as an id is never reused, so it is fetched again only if Android cleared the cache.
+     */
+    fun stickerFile(id: String) = File(File(context.cacheDir, "stickers"), "$id.webp")
+
+    /** Fetches a sticker unless it is kept, or was asked for in the last 30 seconds. */
+    fun sticker(id: String) =
+        thread.execute {
+            val now = System.currentTimeMillis()
+            if (stickerFile(id).exists() || (stickersAsked[id] ?: 0L) > now - STICKER_RETRY_MS) return@execute
+            stickersAsked[id] = now
+            handle(Command.StickerImage(id))
+        }
+
+    /** Keeps a fetched sticker's WebP, written whole or not at all. */
+    private fun keepSticker(event: Event.StickerImage): Boolean {
+        stickersAsked.remove(event.sticker)
+        val target = stickerFile(event.sticker)
+        return try {
+            target.parentFile?.mkdirs()
+            val part = File(target.parentFile, "${event.sticker}.part")
+            part.writeBytes(java.util.Base64.getDecoder().decode(event.bytes))
+            part.renameTo(target)
+        } catch (_: Exception) {
+            false
+        }
+    }
 
     /**
      * Sends the picked files as one message, with the caption unless it is blank. One file's kind
@@ -758,6 +793,8 @@ class Engine(
                                 vault.put(base, username, "token", token.toByteArray())
                             }
                         }
+                    is Event.StickerImage -> if (!keepSticker(event)) return
+                    is Event.StickerMissing -> stickersAsked.remove(event.sticker)
                     is Event.Progress -> if (event.done >= event.total) doneReading(event.handle)
                     is Event.TransferFailed -> doneReading(event.handle)
                     else -> Unit

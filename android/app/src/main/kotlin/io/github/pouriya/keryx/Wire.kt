@@ -292,7 +292,126 @@ sealed interface Command {
         val call_seq: Long,
         val text: String,
     ) : Command
+
+    /** One of the server's stickers, sealed so the server never sees which. */
+    @Serializable
+    @SerialName("send_sticker")
+    data class SendSticker(
+        val chat: String,
+        val sticker: String,
+        val reply: Pointer? = null,
+    ) : Command
+
+    /** This account's answer, checked by core against the question as shown. */
+    @Serializable
+    @SerialName("send_answer")
+    data class SendAnswer(
+        val chat: String,
+        val question: Question,
+        val answer: Answer,
+    ) : Command
+
+    /** Replaces this account's answer, checked the same way. */
+    @Serializable
+    @SerialName("edit_answer")
+    data class EditAnswer(
+        val chat: String,
+        val target: Pointer,
+        val question: Question,
+        val answer: Answer,
+    ) : Command
+
+    /** The server's sticker packs, answered as `Event.Stickers`. */
+    @Serializable
+    @SerialName("stickers")
+    data object Stickers : Command
+
+    /** One sticker's WebP, answered as `Event.StickerImage`. */
+    @Serializable
+    @SerialName("sticker_image")
+    data class StickerImage(
+        val sticker: String,
+    ) : Command
 }
+
+/** A question message's tree: each node a choice or a number, and rules saying which comes next. */
+@Serializable
+data class Question(
+    val first: String,
+    val nodes: List<QuestionNode>,
+)
+
+@Serializable
+data class QuestionNode(
+    val id: String,
+    val text: String,
+    val choice: Choice? = null,
+    val number: NumberRange? = null,
+    val next: List<NextRule> = emptyList(),
+)
+
+@Serializable
+data class Choice(
+    val multi: Boolean = false,
+    val options: List<ChoiceOption>,
+)
+
+@Serializable
+data class ChoiceOption(
+    val id: String,
+    val text: String,
+)
+
+@Serializable
+data class NumberRange(
+    val min: Double,
+    val max: Double,
+    val step: Double? = null,
+    val unit: String? = null,
+)
+
+/** Tried in order, and the first that matches names the next question: none, or `to` null, ends the form. */
+@Serializable
+data class NextRule(
+    val picked: List<String>? = null,
+    val range: List<Double>? = null,
+    val own: Boolean? = null,
+    val skipped: Boolean? = null,
+    val to: String? = null,
+)
+
+/** One account's answer: the path it took, or the whole form skipped. */
+@Serializable
+data class Answer(
+    val question: Long,
+    val answers: List<AnswerItem> = emptyList(),
+    val skipped: Boolean = false,
+)
+
+@Serializable
+data class AnswerItem(
+    val node: String,
+    val picked: List<String> = emptyList(),
+    val own: String? = null,
+    val number: Double? = null,
+    val skipped: Boolean = false,
+)
+
+@Serializable
+data class StickerItem(
+    val id: String,
+    val emoji: String? = null,
+    val width: Int,
+    val height: Int,
+    val size: Long,
+)
+
+@Serializable
+data class StickerPack(
+    val id: String,
+    val name: String,
+    val sticker_list: List<StickerItem>,
+)
 
 /** A picture's small pixels, from which core makes its BlurHash. */
 @Serializable
@@ -644,6 +763,9 @@ data class Shown(
     val call: CallBody? = null,
     val call_outcome: Int? = null,
     val call_ended_at: Long? = null,
+    val sticker: String? = null,
+    val question: Question? = null,
+    val answer: Answer? = null,
     val problem: String? = null,
 )
 
@@ -830,8 +952,11 @@ sealed interface Event {
         val local: Long,
         val kind: Int,
         val target: Pointer? = null,
+        val content_kind: Int? = null,
         val text: String? = null,
         val handles: List<Long> = emptyList(),
+        val sticker: String? = null,
+        val answer: Answer? = null,
     ) : Event
 
     @Serializable
@@ -936,6 +1061,27 @@ sealed interface Event {
     @SerialName("call_event")
     data class CallEvent(
         val event: ShownCallEvent,
+    ) : Event
+
+    @Serializable
+    @SerialName("stickers")
+    data class Stickers(
+        val pack_list: List<StickerPack>,
+    ) : Event
+
+    /** One sticker's WebP, as base64. Not encrypted: everyone on the server can see it. */
+    @Serializable
+    @SerialName("sticker_image")
+    data class StickerImage(
+        val sticker: String,
+        val bytes: String,
+    ) : Event
+
+    /** A sticker the server no longer has: its messages show Sticker unavailable. */
+    @Serializable
+    @SerialName("sticker_missing")
+    data class StickerMissing(
+        val sticker: String,
     ) : Event
 
     /** `done` of `total` chunks of `handle`, going up or coming down. */
