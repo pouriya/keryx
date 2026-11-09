@@ -716,10 +716,19 @@ pub enum Event {
         local: u64,
         kind: Kind,
         target: Option<Pointer>,
+        /// What kind of content it is, and none for an edit or a delete.
+        #[serde(default)]
+        content_kind: Option<ContentKind>,
         text: Option<Secret>,
         /// A file message's files, by the platform's handles.
         #[serde(default)]
         handles: Vec<u64>,
+        /// A sticker message's sticker.
+        #[serde(default)]
+        sticker: Option<Ulid>,
+        /// An answer, or an answer's edit.
+        #[serde(default)]
+        answer: Option<Answer>,
     },
     Sent {
         chat: Ulid,
@@ -757,6 +766,10 @@ pub enum Event {
     StickerImage {
         sticker: Ulid,
         bytes: Bytes,
+    },
+    /// A sticker the server no longer has.
+    StickerMissing {
+        sticker: Ulid,
     },
     Typing {
         chat: Ulid,
@@ -967,6 +980,10 @@ struct Content {
     fields: Option<Secret>,
     /// The platform's handles for `files`, for its pending message.
     handles: Vec<u64>,
+    /// A sticker message's sticker, for its pending message.
+    sticker: Option<Ulid>,
+    /// An answer or an answer's edit, for its pending message.
+    answer: Option<Answer>,
 }
 
 /// The call this device has joined.
@@ -1958,6 +1975,7 @@ impl Client {
                     Content {
                         content_kind: Some(ContentKind::Sticker),
                         fields: Some(Secret(fields)),
+                        sticker: Some(sticker),
                         ..Content::default()
                     },
                 );
@@ -2286,6 +2304,7 @@ impl Client {
             Content {
                 content_kind,
                 fields: Some(Secret(fields)),
+                answer: Some(answer.clone()),
                 ..Content::default()
             },
         );
@@ -2308,6 +2327,8 @@ impl Client {
             call,
             fields,
             handles,
+            sticker,
+            answer,
         } = content;
         let item = Item::Content {
             chat,
@@ -2325,8 +2346,11 @@ impl Client {
             local,
             kind,
             target,
+            content_kind,
             text,
             handles,
+            sticker,
+            answer,
         });
     }
 
@@ -2562,6 +2586,8 @@ impl Client {
                 call: None,
                 fields: None,
                 handles,
+                sticker: None,
+                answer: None,
             },
         );
     }
@@ -2654,14 +2680,19 @@ impl Client {
             self.asked.remove(&id);
             return self.chunk_got(handle, n, bytes);
         }
-        if let Asked::StickerImage { sticker } = request.asked
-            && (200..300).contains(&status)
-        {
-            self.asked.remove(&id);
-            return self.event(Event::StickerImage {
-                sticker,
-                bytes: Bytes(bytes.to_vec()),
-            });
+        if let Asked::StickerImage { sticker } = request.asked {
+            if (200..300).contains(&status) {
+                self.asked.remove(&id);
+                return self.event(Event::StickerImage {
+                    sticker,
+                    bytes: Bytes(bytes.to_vec()),
+                });
+            }
+            // Removed from the server, so its messages show it as unavailable.
+            if status == 404 {
+                self.asked.remove(&id);
+                return self.event(Event::StickerMissing { sticker });
+            }
         }
         self.replied(id, status, &String::from_utf8_lossy(bytes));
     }
@@ -3136,6 +3167,8 @@ impl Client {
                             call,
                             fields,
                             handles: Vec::new(),
+                            sticker: None,
+                            answer: None,
                         };
                         self.send_content(outgoing.id, chat, kind, outgoing.pointer_seq, content);
                     }

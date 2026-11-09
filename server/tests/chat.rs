@@ -3727,18 +3727,14 @@ fn a_sticker_names_a_server_sticker_inside_its_encryption_and_cannot_be_edited()
         unreachable!();
     };
     assert_eq!(bytes.0, webp(64, 64));
-    sara.command(
-        &server,
-        Command::StickerImage {
-            sticker: Ulid::new().unwrap(),
-        },
-    );
-    let Event::Error { code, .. } =
-        sara.wait(&server, |event| matches!(event, Event::Error { .. }))
-    else {
+    let missing = Ulid::new().unwrap();
+    sara.command(&server, Command::StickerImage { sticker: missing });
+    let Event::StickerMissing { sticker: gone } = sara.wait(&server, |event| {
+        matches!(event, Event::StickerMissing { .. })
+    }) else {
         unreachable!();
     };
-    assert_eq!(code, "no_such_sticker");
+    assert_eq!(gone, missing);
 
     // Sent as a sticker, a reply to nothing, and the other side reads its id.
     sara.command(
@@ -3749,6 +3745,17 @@ fn a_sticker_names_a_server_sticker_inside_its_encryption_and_cannot_be_edited()
             reply: None,
         },
     );
+    // The pending message names the sticker, so the sender can draw it at once.
+    let Event::Pending {
+        content_kind,
+        sticker: pending,
+        ..
+    } = sara.wait(&server, |event| matches!(event, Event::Pending { .. }))
+    else {
+        unreachable!();
+    };
+    assert_eq!(content_kind, Some(ContentKind::Sticker));
+    assert_eq!(pending, Some(sticker));
     let Event::Sent { seq, .. } = sara.wait(&server, |event| matches!(event, Event::Sent { .. }))
     else {
         unreachable!();
@@ -3867,6 +3874,13 @@ fn a_question_and_its_answer_are_sealed_checked_by_core_and_the_answer_can_chang
             answer: large.clone(),
         },
     );
+    let Event::Pending {
+        answer: pending, ..
+    } = babak.wait(&server, |event| matches!(event, Event::Pending { .. }))
+    else {
+        unreachable!();
+    };
+    assert_eq!(pending.as_ref(), Some(&large));
     let Event::Sent { seq: answered, .. } =
         babak.wait(&server, |event| matches!(event, Event::Sent { .. }))
     else {
@@ -3888,6 +3902,16 @@ fn a_question_and_its_answer_are_sealed_checked_by_core_and_the_answer_can_chang
             answer: skipped.clone(),
         },
     );
+    let Event::Pending {
+        kind,
+        answer: pending,
+        ..
+    } = babak.wait(&server, |event| matches!(event, Event::Pending { .. }))
+    else {
+        unreachable!();
+    };
+    assert_eq!(kind, Kind::Edit);
+    assert_eq!(pending.as_ref(), Some(&skipped));
     let Event::Edited {
         message,
         target_seq,
