@@ -264,6 +264,12 @@ pub enum Command {
         chat: Ulid,
         draft: Option<Draft>,
     },
+    /// This account's pinned chats, the whole order at once, first on top: every chat it leaves out
+    /// is unpinned. Shown at once as [`Event::Pins`], and kept until the server takes it, so one
+    /// made offline goes on the next connection and wins over what other devices did meanwhile.
+    Pins {
+        chat_list: Vec<Ulid>,
+    },
     /// When each other member received and saw one message, answered as [`Event::Times`].
     Times {
         chat: Ulid,
@@ -811,6 +817,11 @@ pub enum Event {
         draft: Option<Draft>,
         saved_at: i64,
     },
+    /// This account's pinned chats changed, here or on another of its devices: the whole order,
+    /// first on top. The list's own `pin` places say the same after a `Chats`.
+    Pins {
+        chat_list: Vec<Ulid>,
+    },
     /// The answer to `Times`: each member but the sender, by the server's clock.
     Times {
         chat: Ulid,
@@ -1185,6 +1196,10 @@ enum Waiting {
         which: Which,
         up_to: u64,
     },
+    /// A `pins` frame: kept until the server takes this order.
+    Pins {
+        chat_list: Vec<Ulid>,
+    },
     Done,
 }
 
@@ -1252,6 +1267,9 @@ struct Shelf {
     device_list: Vec<ShelfDevice>,
     #[serde(default)]
     profile_list: Vec<ProfileState>,
+    /// A pinned order the server has not taken yet.
+    #[serde(default)]
+    pins_out: Option<Vec<Ulid>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1397,6 +1415,8 @@ pub struct Client {
     devices: HashMap<Ulid, KnownDevice>,
     /// The last chat list the server sent, previews included, kept in the snapshot's shelf.
     chat_cache: Vec<ChatItem>,
+    /// A pinned order the server has not taken yet, sent on every connection until it is.
+    pins_out: Option<Vec<Ulid>>,
     /// Ending statements waiting for their account's master key.
     revocations: Vec<(Ulid, Ulid, Vec<u8>)>,
     uploads: HashMap<u64, Upload>,
@@ -1449,6 +1469,14 @@ fn reference() -> Ulid {
         Ok(id) => id,
         Err(_) => Ulid::from_bytes([0; 16]),
     }
+}
+
+/// A chat's place in a pinned order, from 0 on top.
+fn place_of(chat_list: &[Ulid], chat: Ulid) -> Option<u32> {
+    chat_list
+        .iter()
+        .position(|pinned| *pinned == chat)
+        .and_then(|place| u32::try_from(place).ok())
 }
 
 /// When to try again after `attempt` earlier tries, with a little randomness so clients spread out.
@@ -1705,6 +1733,7 @@ impl Client {
             asked_accounts: HashSet::new(),
             devices: HashMap::new(),
             chat_cache: Vec::new(),
+            pins_out: None,
             revocations: Vec::new(),
             uploads: HashMap::new(),
             next_upload: 0,
@@ -1932,6 +1961,7 @@ impl Client {
                 })
                 .collect(),
             profile_list: self.profiles.values().cloned().collect(),
+            pins_out: self.pins_out.clone(),
         };
         let Some(device) = self.device.as_mut() else {
             return;
@@ -2142,6 +2172,15 @@ impl Client {
                 }
             }
             Command::Draft { chat, draft } => self.keep_draft(chat, draft),
+            Command::Pins { chat_list } => {
+                self.place_pins(&chat_list);
+                self.pins_out = Some(chat_list.clone());
+                self.dirty = true;
+                self.event(Event::Pins {
+                    chat_list: chat_list.clone(),
+                });
+                self.send_pins();
+            }
             Command::Times { chat, seq } => {
                 let reference = reference();
                 let frame = ClientFrame::Times {
@@ -3488,6 +3527,8 @@ impl Client {
             self.verifying += 1;
         }
         self.sync_next.clear();
+        // Before the `sync`, so the list it brings already holds this order.
+        self.send_pins();
         self.start_sync(None, since);
         let mut chat_list: Vec<Ulid> = self.chats.keys().copied().collect();
         chat_list.sort();
@@ -3746,6 +3787,10 @@ impl Client {
             self.show_profile(account);
         }
         self.chat_cache = shelf.chat_list.clone();
+        self.pins_out = shelf.pins_out.clone();
+        if let Some(chat_list) = self.pins_out.clone() {
+            self.place_pins(&chat_list);
+        }
         let mut shown = Vec::with_capacity(shelf.chat_list.len());
         let mut preview_list = Vec::new();
         for mut item in shelf.chat_list {
@@ -4657,6 +4702,13 @@ impl Client {
             }
             ServerFrame::Marks { chat, mark } => self.event(Event::Marks { chat, mark }),
             ServerFrame::Draft { chat, draft } => self.show_draft(chat, draft),
+            // An order of this device's own still waiting wins, and goes when it can.
+            ServerFrame::Pins { chat_list } if self.pins_out.is_none() => {
+                self.place_pins(&chat_list);
+                self.dirty = true;
+                self.event(Event::Pins { chat_list });
+            }
+            ServerFrame::Pins { .. } => {}
             ServerFrame::Times {
                 reference,
                 chat,
@@ -4842,6 +4894,10 @@ impl Client {
                 self.send_outs(chat);
             }
             Waiting::Position { chat, which, up_to } => self.position_done(chat, which, up_to),
+            Waiting::Pins { chat_list } if self.pins_out.as_ref() == Some(&chat_list) => {
+                self.pins_out = None;
+                self.dirty = true;
+            }
             _ => {}
         }
     }
@@ -4971,6 +5027,15 @@ impl Client {
                 self.error(code, message);
                 self.position_done(chat, which, up_to);
             }
+            // Refused, such as for a chat left meanwhile, it would be refused again, so it goes, and
+            // the next list puts back what the server holds.
+            Waiting::Pins { chat_list } => {
+                if self.pins_out.as_ref() == Some(&chat_list) {
+                    self.pins_out = None;
+                    self.dirty = true;
+                }
+                self.error(code, message);
+            }
             Waiting::Done => self.error(code, message),
         }
     }
@@ -5089,10 +5154,36 @@ impl Client {
         });
     }
 
+    /// Sends the pinned order still waiting, if connected. Offline, the next connection sends it.
+    fn send_pins(&mut self) {
+        let Some(chat_list) = self.pins_out.clone() else {
+            return;
+        };
+        let reference = reference();
+        let frame = ClientFrame::Pins {
+            reference,
+            chat_list: chat_list.clone(),
+        };
+        self.ask(frame, reference, Waiting::Pins { chat_list });
+    }
+
+    /// Puts this pinned order into the kept list, so a start with no network shows it.
+    fn place_pins(&mut self, chat_list: &[Ulid]) {
+        for item in &mut self.chat_cache {
+            item.pin = place_of(chat_list, item.chat);
+        }
+    }
+
     fn chats_listed(&mut self, chat_list: Vec<ChatItem>) {
         let Some(me) = self.account else {
             return;
         };
+        let mut chat_list = chat_list;
+        if let Some(pins) = &self.pins_out {
+            for item in &mut chat_list {
+                item.pin = place_of(pins, item.chat);
+            }
+        }
         self.chat_cache = chat_list.clone();
         self.dirty = true;
         let mut shown = Vec::with_capacity(chat_list.len());

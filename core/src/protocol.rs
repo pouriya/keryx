@@ -274,6 +274,14 @@ pub enum ClientFrame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         draft: Option<DraftBody>,
     },
+    /// This account's pinned chats, the whole order at once, first on top. Every chat it does not
+    /// name is unpinned. Answered with `done`, and the account's other online devices get it as
+    /// `pins`.
+    Pins {
+        #[serde(rename = "ref")]
+        reference: Ulid,
+        chat_list: Vec<Ulid>,
+    },
     /// When each other member's device received and saw one message, answered with `times`.
     Times {
         #[serde(rename = "ref")]
@@ -1053,6 +1061,9 @@ pub struct ChatItem {
     /// Every member's profile version and sealed profile key, this account's too.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub profile_key_list: Vec<ProfileKeyItem>,
+    /// This chat's place among this account's pinned chats, from 0 on top. None: not pinned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin: Option<u32>,
 }
 
 /// An account's unsent text in one chat, sealed under the chat's key at `epoch`. The server holds
@@ -1078,6 +1089,12 @@ pub struct DraftBody {
 pub struct DraftRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft: Option<DraftBody>,
+}
+
+/// `PUT /api/v1/pins`: this account's pinned chats, the whole order at once, first on top.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PinsRequest {
+    pub chat_list: Vec<Ulid>,
 }
 
 /// When one member's devices first received and first saw a message, by the server's clock. Each is
@@ -1178,6 +1195,10 @@ pub enum ServerFrame {
         chat: Ulid,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         draft: Option<DraftItem>,
+    },
+    /// This account's pinned chats changed on another of its devices: the whole order, first on top.
+    Pins {
+        chat_list: Vec<Ulid>,
     },
     /// A member's received or seen position rose, sent to the other members' online devices.
     Marks {

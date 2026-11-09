@@ -41,9 +41,9 @@ use keryx_core::protocol::{
     CreateAccountBody, CreateChatBody, CreateFileBody, CreatePackBody, CreatedAccountReply,
     DeviceListReply, DeviceReply, DevicesReply, DraftBody, DraftRequest, EmptyReply, FeaturesReply,
     FileReply, FileStatusReply, GroupInfoReply, KeyPackageListReply, KeyPackagesBody, LoginBody,
-    LoginReply, NamesBody, PackReply, PhotoReply, ProfileReply, PutProfileBody, ReducedDeviceItem,
-    ReducedDeviceListReply, RegisterBody, RegisterDeviceBody, ResetBody, SelfChatReply,
-    ServerFrame, SessionListReply, SetupBody, SetupReply, SignedBody, StickerItem,
+    LoginReply, NamesBody, PackReply, PhotoReply, PinsRequest, ProfileReply, PutProfileBody,
+    ReducedDeviceItem, ReducedDeviceListReply, RegisterBody, RegisterDeviceBody, ResetBody,
+    SelfChatReply, ServerFrame, SessionListReply, SetupBody, SetupReply, SignedBody, StickerItem,
     StickerListReply, StickerReply, TimesReply, VersionReply, WrapListReply,
 };
 use keryx_core::ulid::Ulid;
@@ -1584,6 +1584,34 @@ pub async fn run_put_draft(
     Ok(EmptyReply {})
 }
 
+/// Keeps this account's pinned chats, the whole order at once, and tells its other online devices.
+/// Each must be a chat this account is in, named once. Like a draft it takes no chat task and no
+/// named permission, only membership.
+pub async fn run_put_pins(
+    app: &App,
+    caller: &Caller,
+    chat_list: Vec<Ulid>,
+) -> Result<EmptyReply, Refused> {
+    check(app, caller, Need::Device).await?;
+    let session = caller.session()?;
+    let mut named = HashSet::new();
+    for chat in &chat_list {
+        if !named.insert(*chat) {
+            return Err(refused(400, "bad_body", "A chat is pinned twice"));
+        }
+        check(app, caller, Need::Member(*chat)).await?;
+    }
+    app.storage
+        .put_pins(session.account, chat_list.clone())
+        .await?;
+    app.hub.deliver(
+        &[session.account],
+        session.device,
+        &ServerFrame::Pins { chat_list },
+    );
+    Ok(EmptyReply {})
+}
+
 pub async fn run_chat_wraps(
     app: &App,
     caller: &Caller,
@@ -2216,6 +2244,17 @@ pub async fn run_frame(
             });
             return Some(answer_of(reference, result));
         }
+        ClientFrame::Pins {
+            reference,
+            chat_list,
+        } => {
+            let (reference, chat_list) = (*reference, chat_list.clone());
+            let result = operation!("Pins", "pins", async {
+                run_put_pins(app, &caller, chat_list).await?;
+                Ok(ServerFrame::Done { reference })
+            });
+            return Some(answer_of(reference, result));
+        }
         ClientFrame::Sync {
             reference,
             since,
@@ -2688,6 +2727,14 @@ async fn message_times(
     respond(operation!("MessageTimes", "message_times", async {
         let caller = caller_of(&app, &headers).await?;
         run_message_times(&app, &caller, path_id(&id)?, chunk_number(&seq)?).await
+    }))
+}
+
+async fn put_pins(State(app): Shared, headers: HeaderMap, body: Body) -> Response {
+    respond(operation!("PutPins", "put_pins", async {
+        let caller = caller_of(&app, &headers).await?;
+        let request: PinsRequest = parse(body)?;
+        run_put_pins(&app, &caller, request.chat_list).await
     }))
 }
 
@@ -3340,6 +3387,7 @@ fn router(app: Arc<App>, www: &FilePath) -> Router {
         )
         .route("/api/v1/chats/{id}/wraps", get(chat_wraps))
         .route("/api/v1/chats/{id}/draft", put(put_draft))
+        .route("/api/v1/pins", put(put_pins))
         .route("/api/v1/chats/{id}/files", post(create_file))
         .route("/api/v1/files/{id}", get(file_status))
         .route(

@@ -1193,6 +1193,8 @@ struct World {
     garble_chunks: bool,
     /// What happened inside each call, by chat and the call's sequence id.
     call_events: HashMap<(Ulid, u64), Vec<CallEvent>>,
+    /// Each account's pinned chats, in order.
+    pin_list: Vec<(Ulid, Vec<Ulid>)>,
 }
 
 fn reply_ok(data: Value) -> (u16, String) {
@@ -1229,6 +1231,7 @@ fn kind_of(frame: &ClientFrame) -> &'static str {
         ClientFrame::Sync { .. } => "sync",
         ClientFrame::Times { .. } => "times",
         ClientFrame::Draft { .. } => "draft",
+        ClientFrame::Pins { .. } => "pins",
         ClientFrame::GroupInfo { .. } => "group_info",
         ClientFrame::Ping { .. } => "ping",
         ClientFrame::Wraps { .. } => "wraps",
@@ -1245,6 +1248,7 @@ fn reference_of(frame: &ClientFrame) -> Ulid {
         | ClientFrame::Sync { reference, .. }
         | ClientFrame::Times { reference, .. }
         | ClientFrame::Draft { reference, .. }
+        | ClientFrame::Pins { reference, .. }
         | ClientFrame::GroupInfo { reference, .. }
         | ClientFrame::Ping { reference }
         | ClientFrame::Wraps { reference, .. }
@@ -1369,6 +1373,7 @@ impl World {
             welcomes: Vec::new(),
             max_devices: None,
             garble_welcomes: false,
+            pin_list: Vec::new(),
             garble_wraps_for: None,
             hide_epoch: false,
             files: Vec::new(),
@@ -2630,6 +2635,15 @@ impl World {
                 );
                 Some(ServerFrame::Done { reference })
             }
+            ClientFrame::Pins {
+                reference,
+                chat_list,
+            } => {
+                self.pin_list.retain(|(account, _)| *account != me);
+                self.pin_list.push((me, chat_list.clone()));
+                self.deliver(&[me], Some(device), &ServerFrame::Pins { chat_list });
+                Some(ServerFrame::Done { reference })
+            }
             // Profiles are driven against the real server, in the server's tests.
             ClientFrame::ProfileKeys { reference, .. } => Some(ServerFrame::Done { reference }),
             ClientFrame::Typing { chat, on } => {
@@ -2971,6 +2985,12 @@ impl World {
                     .find(|(account, _)| *account == me)
                     .map(|(_, draft)| draft.clone()),
                 profile_key_list: Vec::new(),
+                pin: self
+                    .pin_list
+                    .iter()
+                    .find(|(account, _)| *account == me)
+                    .and_then(|(_, list)| list.iter().position(|pinned| *pinned == chat.id))
+                    .map(|place| place as u32),
             });
         }
         chat_list
@@ -3234,6 +3254,107 @@ fn a_draft_is_sealed_sent_and_comes_back_in_the_list_but_is_not_kept_offline() {
     world.settle();
     world.online(mina);
     assert_eq!(world.sent_frames(mina, "draft"), 2);
+}
+
+/// The newest pinned order this phone was shown, from `Pins` or a `Chats` list's places.
+fn shown_pins(world: &World, p: usize) -> Option<Vec<Ulid>> {
+    world.phones[p]
+        .events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            Event::Pins { chat_list } => Some(chat_list.clone()),
+            Event::Chats { chat_list } => {
+                let mut pinned: Vec<(u32, Ulid)> = chat_list
+                    .iter()
+                    .filter_map(|item| item.pin.map(|pin| (pin, item.chat)))
+                    .collect();
+                pinned.sort();
+                Some(pinned.into_iter().map(|(_, chat)| chat).collect())
+            }
+            _ => None,
+        })
+}
+
+#[test]
+fn pins_go_to_the_other_devices_wait_offline_and_win_once_sent() {
+    let (mut world, _, mina, chat) = pair();
+    let own = world.self_chat(world.account(mina));
+    let second = world.log_in("mina");
+    world.restore(second, MINA_WORDS);
+    // Pinned on one device, shown there at once and pushed to the other.
+    world.command(
+        mina,
+        Command::Pins {
+            chat_list: vec![chat, own],
+        },
+    );
+    world.settle();
+    assert_eq!(shown_pins(&world, mina), Some(vec![chat, own]));
+    assert_eq!(shown_pins(&world, second), Some(vec![chat, own]));
+    world.command(second, Command::ChatList);
+    world.settle();
+    assert_eq!(shown_pins(&world, second), Some(vec![chat, own]));
+    // Offline, the order shows at once and survives a reload with no network.
+    world.offline(mina);
+    world.command(
+        mina,
+        Command::Pins {
+            chat_list: vec![own],
+        },
+    );
+    world.settle();
+    assert_eq!(shown_pins(&world, mina), Some(vec![own]));
+    world.command(
+        second,
+        Command::Pins {
+            chat_list: vec![chat],
+        },
+    );
+    world.settle();
+    let mina = world.reload(mina);
+    world.offline(mina);
+    world.settle();
+    assert_eq!(shown_pins(&world, mina), Some(vec![own]));
+    let pins = world.sent_frames(mina, "pins");
+    // Back online it goes before the list, and wins over the other device's.
+    world.online(mina);
+    world.settle();
+    assert_eq!(world.sent_frames(mina, "pins"), pins + 1);
+    assert_eq!(shown_pins(&world, mina), Some(vec![own]));
+    assert_eq!(shown_pins(&world, second), Some(vec![own]));
+    // While its own order has not reached the server, another device's does not replace it.
+    world.phones[mina].frame_faults.push(("pins", Fault::Drop));
+    world.command(mina, Command::Pins { chat_list: vec![] });
+    world.settle();
+    world.command(
+        second,
+        Command::Pins {
+            chat_list: vec![chat],
+        },
+    );
+    world.settle();
+    assert_eq!(shown_pins(&world, mina), Some(vec![]));
+    world.cut(mina);
+    world.advance(2 * SECOND);
+    assert_eq!(shown_pins(&world, second), Some(vec![]));
+    // A refused order is reported and dropped, and the next list says what the server holds.
+    world.phones[mina]
+        .frame_faults
+        .push(("pins", Fault::Refuse("not_member")));
+    world.command(
+        mina,
+        Command::Pins {
+            chat_list: vec![chat],
+        },
+    );
+    world.settle();
+    assert_eq!(world.errors(mina), vec!["not_member"]);
+    let pins = world.sent_frames(mina, "pins");
+    world.cut(mina);
+    world.advance(2 * SECOND);
+    assert_eq!(world.sent_frames(mina, "pins"), pins);
+    assert_eq!(shown_pins(&world, mina), Some(vec![]));
 }
 
 #[test]

@@ -233,6 +233,17 @@ the WASM build, because there is one `Cargo.lock`. Make targets stay inside
   client's own archive, and core's commit catch-up uses `sync`. The unread count is the content
   messages after this member's seen position in the archive. A reaction does not count, a call does not
   count, and neither does one of this account's own messages, which core marks `mine`. See [core/AGENTS.md](core/AGENTS.md).
+- **Pinned chats, chosen by the author.** Each person can pin any number of chats, kept on the server as
+  one `pin` place per member row, from 0 on top, so pins follow the person to every device: a change
+  reaches the account's other online devices at once as a `pins` frame, and offline ones get each chat's
+  `pin` in their next `chats` list. **A device sends the whole pinned order at once**, as a `pins` frame
+  `{ref, chat_list}` answered with `done`, or `PUT /api/v1/pins` with the same body, so a reorder never
+  lands half done; every chat it leaves out is unpinned. It needs membership of each chat, named once,
+  and no named permission, like a draft. **An order made offline shows at once and is kept in the
+  snapshot until the server takes it**, going first on the next connection, so it wins over what another
+  device did meanwhile; one the server refuses is dropped and reported. **A direct chat removed for
+  yourself loses its pin**, so it comes back as a normal chat. The server learns which chats a person
+  pinned, and in what order.
 - **Saved server times never go back, chosen by the author.** Every one is the larger of the clock and
   the last one written, server-wide, seeded at startup from the newest row. A clock that steps back,
   from NTP or a moved VM, could otherwise hide a row from "after time T" and from the page cursor.
@@ -770,8 +781,8 @@ holds it in memory only for that request and sends it back in its answer, so req
 match over one socket: a `send` gets its sequence id this way, and a `sync` its pages. **The
 server never stores a client's ULID, and it is not in the signed header.** What is saved goes by
 its sequence id, from 1. REST carries the same bodies. A client sends `send`,
-`seen`, `received`, `typing`, `sync`, `group_info`, `wraps`, `profile_keys`, `call_event`, `times`, `draft` and `ping`. The server sends `features`, `sent`, `done`,
-`refused`, `message`, `chats`, `welcome`, `typing`, `marks`, `revoked`, `call_event`, `times`, `draft`, `profile` and `profile_keys`. `group_info` and `wraps` are not
+`seen`, `received`, `typing`, `sync`, `group_info`, `wraps`, `profile_keys`, `call_event`, `times`, `draft`, `pins` and `ping`. The server sends `features`, `sent`, `done`,
+`refused`, `message`, `chats`, `welcome`, `typing`, `marks`, `revoked`, `call_event`, `times`, `draft`, `pins`, `profile` and `profile_keys`. `group_info` and `wraps` are not
 messages, so they take no sequence id and stay out of history, and what has no sequence id is
 answered with `done`. Binary fields are standard base64 with padding, through `base64ct`, which is
 already in the tree and constant-time. Kinds and modes are the schema's numbers. **A commit is a `send` with kind 3 plus its wraps, welcomes,
@@ -1122,6 +1133,7 @@ POST /api/v1/chats                  chat.create_direct: account -> chat, created
 GET  /api/v1/chats/{id}/group_info  member -> epoch, group_info
 GET  /api/v1/chats/{id}/devices     member -> device_list, with ended devices and their statements
 GET  /api/v1/chats/{id}/wraps       member -> wrap_list{epoch, account, wrapped}
+PUT  /api/v1/pins                   member of each: chat_list, the whole pinned order, first on top
 POST /api/v1/chats/{id}/files       member: kind, size, chunks -> file
 PUT  /api/v1/files/{id}/chunks/{n}  its uploader: the encrypted chunk's raw bytes
 GET  /api/v1/files/{id}             member -> size, chunks, received
@@ -1702,7 +1714,7 @@ first, as everywhere.
 - Files: quotas, by the author's choice none for now
 - A call chosen as recorded when neither device can encode H.264: the client should say so
   before it starts
-- Mute and pin
+- Mute
 - The client queue on disk, so unsent messages and unfinished uploads survive a restart: where it is
   kept on each platform and how it is locked
 - Whether a group or channel can be found and joined from outside, and how

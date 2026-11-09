@@ -488,6 +488,13 @@ pub trait Storage: Send + Sync + 'static {
         draft: Option<(u64, Vec<u8>)>,
         now: i64,
     ) -> impl Future<Output = Result<Option<DraftItem>>> + Send;
+    /// This account's pinned chats, the whole order at once, first on top: every chat it does not
+    /// name is unpinned, in one step.
+    fn put_pins(
+        &self,
+        account: Ulid,
+        chat_list: Vec<Ulid>,
+    ) -> impl Future<Output = Result<()>> + Send;
     /// When each member but the message's sender first received and first saw it, by the server's
     /// clock, or `None` if there is no such message. A member with receipts off has no `seen_at`.
     fn message_times(

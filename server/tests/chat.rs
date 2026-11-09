@@ -2133,6 +2133,75 @@ fn a_draft_belongs_to_its_chat_is_kept_sealed_and_comes_back_in_the_list() {
 }
 
 #[test]
+fn pins_are_kept_in_order_pushed_to_the_other_devices_and_listed() {
+    let mut pair = pair_on(open_server());
+    let chat = pair.chat;
+    let second_token = log_in(&pair.server, &pair.sara.username);
+    add_device(&pair.server, pair.sara.id, &pair.sara.keys, &second_token);
+    let mut second = connect(&pair.server, &second_token);
+    let pins = |socket: &mut Socket, chat_list: Vec<Ulid>| {
+        let wanted = reference();
+        socket.request(
+            &ClientFrame::Pins {
+                reference: wanted,
+                chat_list,
+            },
+            wanted,
+        )
+    };
+
+    // Kept, listed with its place, and pushed to the account's other device only.
+    let answer = pins(&mut pair.sara_socket, vec![chat]);
+    assert!(matches!(answer, ServerFrame::Done { .. }), "{answer:?}");
+    let pushed = second.next_where(|frame| matches!(frame, ServerFrame::Pins { .. }));
+    assert_eq!(
+        pushed,
+        ServerFrame::Pins {
+            chat_list: vec![chat]
+        }
+    );
+    assert_eq!(chat_item(&mut pair.sara_socket, chat).pin, Some(0));
+    assert_eq!(chat_item(&mut pair.babak_socket, chat).pin, None);
+
+    // A chat named twice, or one this account is not in, changes nothing.
+    let answer = pins(&mut pair.sara_socket, vec![chat, chat]);
+    assert!(
+        matches!(&answer, ServerFrame::Refused { code, .. } if code == "bad_body"),
+        "{answer:?}"
+    );
+    let answer = pins(&mut pair.sara_socket, vec![reference()]);
+    assert!(
+        matches!(&answer, ServerFrame::Refused { code, .. } if code == "not_member"),
+        "{answer:?}"
+    );
+    assert_eq!(chat_item(&mut pair.sara_socket, chat).pin, Some(0));
+
+    // Leaving a chat out unpins it.
+    let answer = pins(&mut pair.sara_socket, Vec::new());
+    assert!(matches!(answer, ServerFrame::Done { .. }), "{answer:?}");
+    assert_eq!(chat_item(&mut pair.sara_socket, chat).pin, None);
+
+    // REST does the same, and the other device hears of it.
+    let (status, reply) = pair.server.call(
+        "PUT",
+        "/api/v1/pins",
+        Some(&pair.sara.token),
+        Some(&json!({"chat_list": [chat]})),
+    );
+    assert_eq!(status, 200, "{reply}");
+    let pushed = second.next_where(
+        |frame| matches!(frame, ServerFrame::Pins { chat_list } if !chat_list.is_empty()),
+    );
+    assert_eq!(
+        pushed,
+        ServerFrame::Pins {
+            chat_list: vec![chat]
+        }
+    );
+    assert_eq!(chat_item(&mut second, chat).pin, Some(0));
+}
+
+#[test]
 fn a_chat_opens_on_its_newest_page_and_older_pages_load_upwards() {
     let server = open_server();
     let (mut sara, mut babak, chat) = apps_on(&server);

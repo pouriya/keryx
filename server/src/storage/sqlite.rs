@@ -1291,7 +1291,7 @@ impl Storage for Sqlite {
         self.read(move |connection| {
             let mut statement = connection.prepare(
                 "SELECT c.id, c.type, c.mode, c.last_seq, c.last_kind, c.last_at, c.last_content_seq,
-                 g.epoch, m.seen_seq, m.draft, m.draft_epoch, m.draft_at
+                 g.epoch, m.seen_seq, m.draft, m.draft_epoch, m.draft_at, m.pin
                  FROM member m JOIN conversation c ON c.id = m.conversation_id
                  LEFT JOIN mls_group g ON g.conversation_id = c.id
                  WHERE m.account_id = ?1
@@ -1329,6 +1329,9 @@ impl Storage for Sqlite {
                         }
                     },
                     profile_key_list: Vec::new(),
+                    pin: row
+                        .get::<_, Option<i64>>(12)?
+                        .and_then(|pin| u32::try_from(pin).ok()),
                 })
             })?;
             let mut chat_list = Vec::new();
@@ -1412,6 +1415,23 @@ impl Storage for Sqlite {
                 body: Bytes(body),
                 saved_at: now,
             }))
+        })
+        .await
+    }
+
+    async fn put_pins(&self, account: Ulid, chat_list: Vec<Ulid>) -> Result<()> {
+        self.write(move |connection| {
+            connection.execute(
+                "UPDATE member SET pin = NULL WHERE account_id = ?1 AND pin IS NOT NULL",
+                params![account.bytes()],
+            )?;
+            for (place, chat) in (0u64..).zip(&chat_list) {
+                connection.execute(
+                    "UPDATE member SET pin = ?3 WHERE conversation_id = ?1 AND account_id = ?2",
+                    params![chat.bytes(), account.bytes(), int(place)],
+                )?;
+            }
+            Ok(())
         })
         .await
     }

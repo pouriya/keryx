@@ -177,6 +177,13 @@ fn every_client_frame_has_the_agreed_shape() {
             json!({"type": "seen", "ref": REF, "chat": CHAT, "up_to_seq": 41, "client_seen_at": 1800}),
         ),
         (
+            ClientFrame::Pins {
+                reference: ulid(REF),
+                chat_list: vec![ulid(CHAT)],
+            },
+            json!({"type": "pins", "ref": REF, "chat_list": [CHAT]}),
+        ),
+        (
             ClientFrame::Ping {
                 reference: ulid(REF),
             },
@@ -294,6 +301,7 @@ fn every_server_frame_has_the_agreed_shape() {
         seen_seq: None,
         draft: None,
         profile_key_list: Vec::new(),
+        pin: None,
     };
     let marked = ChatItem {
         last_content_seq: Some(5),
@@ -304,6 +312,7 @@ fn every_server_frame_has_the_agreed_shape() {
             received_seq: 42,
             seen_seq: Some(41),
         }],
+        pin: Some(0),
         ..chat.clone()
     };
     let cases = [
@@ -349,8 +358,14 @@ fn every_server_frame_has_the_agreed_shape() {
                 "chat": CHAT, "type": 1, "mode": 0, "last_seq": 42, "last_kind": 0, "last_at": 1800,
                 "last_content_seq": 5, "epoch": 3, "last_content": {"chat": CHAT, "seq": 5,
                 "server_saved_at": 1900},
-                "mark_list": [{"account": ID, "received_seq": 42, "seen_seq": 41}],
+                "mark_list": [{"account": ID, "received_seq": 42, "seen_seq": 41}], "pin": 0,
             }]}),
+        ),
+        (
+            ServerFrame::Pins {
+                chat_list: vec![ulid(CHAT)],
+            },
+            json!({"type": "pins", "chat_list": [CHAT]}),
         ),
         (
             ServerFrame::Marks {

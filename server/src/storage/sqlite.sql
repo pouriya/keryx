@@ -392,6 +392,9 @@ CREATE TABLE member (
     draft_epoch      INTEGER,
     -- [Drafts] the server time it was saved, so a device keeps the newer one.
     draft_at         INTEGER,
+    -- [Pins] this chat's place among the account's pinned chats, from 0 on top. NULL means not
+    -- pinned. Set for all of them at once, and cleared when a direct chat is removed for yourself.
+    pin              INTEGER CHECK (pin >= 0),
     CHECK ((draft IS NULL) = (draft_epoch IS NULL) AND (draft IS NULL) = (draft_at IS NULL)),
     PRIMARY KEY (conversation_id, account_id)
 ) WITHOUT ROWID, STRICT;
