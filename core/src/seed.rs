@@ -23,6 +23,7 @@ use zeroize::Zeroizing;
 
 const MASTER_LABEL: &[u8] = b"keryx v1 master key";
 const ACCOUNT_LABEL: &[u8] = b"keryx v1 account key";
+const PROFILE_LABEL: &[u8] = b"keryx v1 profile key";
 
 #[derive(Debug, thiserror::Error)]
 pub enum SeedError {
@@ -59,6 +60,7 @@ pub struct AccountKeys {
     master_public: [u8; 32],
     account_private: Zeroizing<[u8; 32]>,
     account_public: [u8; 32],
+    profile: Zeroizing<[u8; 16]>,
 }
 
 impl AccountKeys {
@@ -76,6 +78,12 @@ impl AccountKeys {
 
     pub fn account_public(&self) -> &[u8; 32] {
         &self.account_public
+    }
+
+    /// The AES-128 key the account's photo, bio and links are sealed under. Unlike the others, a
+    /// running device keeps it, since it is shared with everyone in the account's chats anyway.
+    pub fn profile(&self) -> &[u8; 16] {
+        &self.profile
     }
 }
 
@@ -138,10 +146,16 @@ pub fn derive(words: &str) -> Result<AccountKeys, SeedError> {
     account_private.copy_from_slice(pair.private.as_ref());
     account_public.copy_from_slice(&pair.public);
 
+    let mut profile = Zeroizing::new([0u8; 16]);
+    if hkdf.expand(PROFILE_LABEL, profile.as_mut()).is_err() {
+        return Err(SeedError::Derive);
+    }
+
     Ok(AccountKeys {
         master_private,
         master_public,
         account_private,
         account_public,
+        profile,
     })
 }

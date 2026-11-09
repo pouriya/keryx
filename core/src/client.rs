@@ -37,9 +37,11 @@ use crate::protocol::{
     ClientFrame, ContentKind, CountReply, CreateChatBody, CreateFileBody, DeviceProof, DeviceReply,
     DevicesReply, DraftBody, DraftItem, EmptyReply, FeaturesReply, FileReply, GroupInfoReply,
     Header, KeyPackageItem, KeyPackageListReply, KeyPackagesBody, Kind, LoginBody, LoginReply,
-    MarkItem, MessageFrame, Question, RefusedReply, RegisterBody, RegisterDeviceBody, SendFrame,
-    ServerFrame, SetupBody, SetupReply, SignedBody, StickerListReply, StickerPack, SyncPosition,
-    TimesItem, WelcomeItem, WrapEntry, WrapItem, WrapListReply, call_text_header,
+    MarkItem, MessageFrame, NamesBody, PhotoReply, ProfileBody, ProfileKeyItem, ProfileKeyShare,
+    ProfileLink, ProfilePhoto, ProfileReply, PutProfileBody, Question, RefusedReply, RegisterBody,
+    RegisterDeviceBody, SendFrame, ServerFrame, SetupBody, SetupReply, SignedBody, SignedProfile,
+    StickerListReply, StickerPack, SyncPosition, TimesItem, VersionReply, WelcomeItem, WrapEntry,
+    WrapItem, WrapListReply, call_text_header,
 };
 use crate::queue::{Level, Queue, Target};
 use crate::seed::{self, AccountKeys};
@@ -52,6 +54,12 @@ const KEY_PACKAGES: u64 = 10;
 const RETRY_MS: [i64; 6] = [1_000, 2_000, 4_000, 8_000, 16_000, 30_000];
 /// How many messages one read of the archive asks for, when a chat opens or scrolls up.
 const PAGE: u32 = 50;
+/// A profile's bio, in characters, and its links, each name and address in characters. See the
+/// root AGENTS.md.
+const BIO_CHARS: usize = 140;
+const LINKS: usize = 3;
+const LINK_NAME_CHARS: usize = 32;
+const LINK_URL_CHARS: usize = 512;
 
 /// Text that must never be printed: a password, the words, a token or a message. Wiped when
 /// dropped, and its `Debug` shows nothing of it.
@@ -331,6 +339,40 @@ pub enum Command {
     StickerImage {
         sticker: Ulid,
     },
+    /// An account's profile, answered as [`Event::Profile`]: at once with what this device knows,
+    /// and again once the server's is opened.
+    Profile {
+        account: Ulid,
+    },
+    /// The photo a shown profile names, opened, answered as [`Event::Photo`].
+    Photo {
+        account: Ulid,
+    },
+    /// This account's bio and links, keeping its photo. Checked here before it goes.
+    SaveProfile {
+        #[serde(default)]
+        bio: Option<String>,
+        #[serde(default)]
+        link_list: Vec<ProfileLink>,
+    },
+    /// A new photo for this account: a square JPEG, and its small pixels for the BlurHash. It goes
+    /// up sealed, then the profile names it, and the old one is deleted.
+    SetPhoto {
+        #[serde(with = "serde_bytes")]
+        #[cfg_attr(feature = "wasm", tsify(type = "Uint8Array"))]
+        jpeg: Vec<u8>,
+        thumbnail: Thumbnail,
+    },
+    RemovePhoto,
+    /// This account's display name, username or both. A new username needs the password.
+    SetNames {
+        #[serde(default)]
+        display_name: Option<String>,
+        #[serde(default)]
+        username: Option<String>,
+        #[serde(default)]
+        password: Option<Secret>,
+    },
 }
 
 /// Everything that goes into [`Client::step`].
@@ -464,9 +506,11 @@ pub enum Output {
         offset: u64,
         length: u64,
     },
-    /// A PUT of these raw bytes. Its reply comes back as [`Input::Reply`] with the same id.
+    /// A PUT or POST, as `method` says, of these raw bytes. Its reply comes back as
+    /// [`Input::Reply`] with the same id.
     PutChunk {
         id: u64,
+        method: String,
         path: String,
         bearer: Option<Secret>,
         #[serde(with = "serde_bytes")]
@@ -771,6 +815,18 @@ pub enum Event {
     StickerMissing {
         sticker: Ulid,
     },
+    /// An account's profile as far as this device can open it, sent again whenever it changes.
+    Profile {
+        profile: ShownProfile,
+    },
+    /// The JPEG of the photo a profile names, opened.
+    Photo {
+        account: Ulid,
+        photo: Ulid,
+        bytes: Bytes,
+    },
+    /// This account's profile, photo or names were saved.
+    ProfileSaved,
     Typing {
         chat: Ulid,
         account: Ulid,
@@ -824,6 +880,45 @@ pub enum Event {
         code: String,
         message: String,
     },
+}
+
+/// An account's profile, for the platform to show.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify), tsify(missing_as_null))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShownProfile {
+    pub account: Ulid,
+    pub username: String,
+    pub display_name: Option<String>,
+    pub version: u64,
+    pub bio: Option<String>,
+    pub link_list: Vec<ProfileLink>,
+    /// What to draw while [`Command::Photo`] fetches it.
+    pub photo: Option<ShownPhoto>,
+}
+
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShownPhoto {
+    pub id: Ulid,
+    pub blurhash: String,
+}
+
+/// What this device knows of an account's profile, kept in the shelf.
+#[derive(Clone, Serialize, Deserialize)]
+struct ProfileState {
+    account: Ulid,
+    version: u64,
+    username: String,
+    #[serde(default)]
+    display_name: Option<String>,
+    /// The server's sealed profile, kept until it opens: its key may come later.
+    #[serde(default)]
+    signed: Option<SignedProfile>,
+    /// The photo the server holds. A sealed profile naming another one shows none.
+    #[serde(default)]
+    photo: Option<Ulid>,
+    #[serde(default)]
+    body: Option<ProfileBody>,
 }
 
 /// What a queued item does once it may go.
@@ -952,6 +1047,22 @@ enum Asked {
     StickerImage {
         sticker: Ulid,
     },
+    Profile {
+        account: Ulid,
+    },
+    PutProfile {
+        body: Box<ProfileBody>,
+    },
+    AddPhoto {
+        key: zeroize::Zeroizing<[u8; 16]>,
+        size: u64,
+        blurhash: String,
+    },
+    Photo {
+        account: Ulid,
+        photo: Ulid,
+    },
+    Names,
 }
 
 /// A REST request, kept until it is answered, to go again if nothing answered.
@@ -1115,6 +1226,8 @@ struct Shelf {
     account_list: Vec<AccountInfo>,
     #[serde(default)]
     device_list: Vec<ShelfDevice>,
+    #[serde(default)]
+    profile_list: Vec<ProfileState>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1284,6 +1397,16 @@ pub struct Client {
     reading: HashMap<u64, Ulid>,
     /// This account's devices, as handed to the platform.
     own_devices: Vec<Ulid>,
+    profiles: HashMap<Ulid, ProfileState>,
+    /// Profiles asked for and not yet answered.
+    profile_asked: HashSet<Ulid>,
+    /// Photos asked for and not yet answered.
+    photo_asked: HashSet<Ulid>,
+    /// This account's own profile key shared by a frame, by chat and epoch, so a list that has not
+    /// caught up yet does not send it again.
+    profile_shared: HashSet<(Ulid, u64)>,
+    /// Keys pushed for a chat this device has not joined yet, opened once it is ready.
+    profile_keys_waiting: HashMap<Ulid, Vec<ProfileKeyItem>>,
     dirty: bool,
     now: i64,
     out: Vec<Output>,
@@ -1313,6 +1436,37 @@ fn backoff(now: i64, attempt: usize) -> i64 {
     now + wait + jitter
 }
 
+/// Whether a bio and links are within the limits, and each link's address is a web one.
+fn check_profile(body: &ProfileBody) -> Result<(), &'static str> {
+    if body
+        .bio
+        .as_ref()
+        .is_some_and(|bio| bio.chars().count() > BIO_CHARS)
+    {
+        return Err("A bio is at most 140 characters");
+    }
+    if body.link_list.len() > LINKS {
+        return Err("A profile has at most 3 links");
+    }
+    for link in &body.link_list {
+        let name = link.name.chars().count();
+        if name == 0 || name > LINK_NAME_CHARS {
+            return Err("A link's name is 1 to 32 characters");
+        }
+        if link.url.chars().count() > LINK_URL_CHARS {
+            return Err("A link's address is at most 512 characters");
+        }
+        let lower = link.url.to_ascii_lowercase();
+        let rest = lower
+            .strip_prefix("https://")
+            .or_else(|| lower.strip_prefix("http://"));
+        if rest.is_none_or(str::is_empty) {
+            return Err("A link's address starts with https:// or http://");
+        }
+    }
+    Ok(())
+}
+
 /// Whether the client sent this by itself, so it retries rather than telling the person.
 fn background(asked: &Asked) -> bool {
     !matches!(
@@ -1328,6 +1482,9 @@ fn background(asked: &Asked) -> bool {
             | Asked::LogOut
             | Asked::Stickers
             | Asked::StickerImage { .. }
+            | Asked::PutProfile { .. }
+            | Asked::AddPhoto { .. }
+            | Asked::Names
     )
 }
 
@@ -1537,6 +1694,11 @@ impl Client {
             rows_saving: HashMap::new(),
             reading: HashMap::new(),
             own_devices: Vec::new(),
+            profiles: HashMap::new(),
+            profile_asked: HashSet::new(),
+            photo_asked: HashSet::new(),
+            profile_shared: HashSet::new(),
+            profile_keys_waiting: HashMap::new(),
             dirty: false,
             now: 0,
             out: Vec::new(),
@@ -1669,6 +1831,7 @@ impl Client {
         self.out.push(match (&request.bytes, request.raw) {
             (Some(bytes), _) => Output::PutChunk {
                 id,
+                method: request.method.clone(),
                 path,
                 bearer,
                 bytes: bytes.clone(),
@@ -1740,6 +1903,7 @@ impl Client {
                     master: Bytes(known.master.to_vec()),
                 })
                 .collect(),
+            profile_list: self.profiles.values().cloned().collect(),
         };
         let Some(device) = self.device.as_mut() else {
             return;
@@ -2095,6 +2259,62 @@ impl Client {
                     format!("/api/v1/devices/{id}/logout"),
                     Some(&body),
                     Asked::LogOut,
+                );
+            }
+            Command::Profile { account } => {
+                if self.profiles.contains_key(&account) {
+                    self.show_profile(account);
+                } else {
+                    self.ask_account(account);
+                    self.ask_profile(account);
+                }
+            }
+            Command::Photo { account } => self.ask_photo(account),
+            Command::SaveProfile { bio, link_list } => {
+                let Some(mut body) = self.own_body() else {
+                    return;
+                };
+                body.bio = bio
+                    .map(|bio| bio.trim().to_string())
+                    .filter(|bio| !bio.is_empty());
+                body.link_list = link_list
+                    .into_iter()
+                    .map(|link| ProfileLink {
+                        name: link.name.trim().to_string(),
+                        url: link.url.trim().to_string(),
+                    })
+                    .collect();
+                if let Err(message) = check_profile(&body) {
+                    return self.error("bad_profile", message);
+                }
+                self.put_profile(body);
+            }
+            Command::SetPhoto { jpeg, thumbnail } => self.set_photo(&jpeg, &thumbnail),
+            Command::RemovePhoto => {
+                let Some(mut body) = self.own_body() else {
+                    return;
+                };
+                body.photo = None;
+                self.put_profile(body);
+            }
+            Command::SetNames {
+                display_name,
+                username,
+                password,
+            } => {
+                let Some(account) = self.account else {
+                    return self.error("not_logged_in", "Log in first");
+                };
+                let body = NamesBody {
+                    display_name,
+                    username,
+                    password: password.map(|password| password.0.clone()),
+                };
+                self.request(
+                    "PUT",
+                    format!("/api/v1/accounts/{account}/names"),
+                    Some(&body),
+                    Asked::Names,
                 );
             }
             Command::NetworkBack => {
@@ -2694,7 +2914,447 @@ impl Client {
                 return self.event(Event::StickerMissing { sticker });
             }
         }
+        if let Asked::Photo { account, photo } = request.asked {
+            if (200..300).contains(&status) {
+                self.asked.remove(&id);
+                self.photo_asked.remove(&photo);
+                return self.photo_got(account, photo, bytes);
+            }
+            // Removed by admin or replaced since, so the profile keeps its BlurHash.
+            if status == 404 {
+                self.asked.remove(&id);
+                self.photo_asked.remove(&photo);
+                return;
+            }
+        }
         self.replied(id, status, &String::from_utf8_lossy(bytes));
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Profiles
+    // ---------------------------------------------------------------------------------------------
+
+    fn ask_profile(&mut self, account: Ulid) {
+        if self.profile_asked.insert(account) {
+            self.get(
+                format!("/api/v1/accounts/{account}/profile"),
+                Asked::Profile { account },
+            );
+        }
+    }
+
+    /// Whether the server's `version` of a profile is newer than what this device holds. An account
+    /// that never changed its profile has nothing beyond its names.
+    fn profile_moved(&self, account: Ulid, version: u64) -> bool {
+        match self.profiles.get(&account) {
+            Some(state) => state.version != version,
+            None => version > 0,
+        }
+    }
+
+    /// Opens the profile keys a chat's entry carries, shares this account's own where the chat
+    /// lacks it, and asks for every profile whose version moved.
+    fn profile_pass(&mut self, chat: Ulid) {
+        let Some(me) = self.account else {
+            return;
+        };
+        // Joined by a Welcome before any list named it: the person a chat was started with, whose
+        // own key nobody else could share.
+        let Some(item) = self.chat_cache.iter().find(|item| item.chat == chat) else {
+            return self.share_profile_key(chat, me);
+        };
+        let key_list = item.profile_key_list.clone();
+        self.take_profile_keys(chat, me, key_list);
+    }
+
+    /// A `profile_keys` frame: keys just shared in a chat, kept in its cached entry so a reload
+    /// has them, then opened.
+    fn profile_keys_pushed(&mut self, chat: Ulid, key_list: Vec<ProfileKeyItem>) {
+        let Some(me) = self.account else {
+            return;
+        };
+        if let Some(item) = self.chat_cache.iter_mut().find(|item| item.chat == chat) {
+            for entry in &key_list {
+                match item
+                    .profile_key_list
+                    .iter_mut()
+                    .find(|kept| kept.account == entry.account)
+                {
+                    Some(kept) => *kept = entry.clone(),
+                    None => item.profile_key_list.push(entry.clone()),
+                }
+            }
+            self.dirty = true;
+        }
+        // A commit's keys can come before the Welcome that lets this device open them.
+        if self
+            .device
+            .as_ref()
+            .is_none_or(|device| device.epoch(chat).is_err())
+        {
+            let waiting = self.profile_keys_waiting.entry(chat).or_default();
+            waiting.retain(|kept| key_list.iter().all(|entry| entry.account != kept.account));
+            waiting.extend(key_list);
+            return;
+        }
+        self.take_profile_keys(chat, me, key_list);
+    }
+
+    fn take_profile_keys(&mut self, chat: Ulid, me: Ulid, key_list: Vec<ProfileKeyItem>) {
+        for entry in key_list {
+            let account = entry.account;
+            if let (Some(epoch), Some(sealed)) = (entry.epoch, entry.sealed.as_ref())
+                && let Some(device) = self.device.as_mut()
+                && !device.has_profile_key(account)
+                && device
+                    .take_profile_key(chat, epoch, account, &sealed.0)
+                    .is_ok()
+            {
+                self.dirty = true;
+            }
+            if account == me && entry.sealed.is_none() {
+                self.share_profile_key(chat, me);
+            }
+            if self.profile_moved(account, entry.version) {
+                self.ask_profile(account);
+            } else if self
+                .profiles
+                .get(&account)
+                .is_some_and(|state| state.body.is_none() && state.signed.is_some())
+            {
+                self.open_stored(account);
+            }
+        }
+    }
+
+    /// This account's profile key, for a chat that lacks it: the one its own chat was started with,
+    /// and its self chat.
+    fn share_profile_key(&mut self, chat: Ulid, me: Ulid) {
+        let Some(device) = self.device.as_ref() else {
+            return;
+        };
+        let Ok((epoch, sealed)) = device.share_profile_key(chat, me) else {
+            return;
+        };
+        if !self.profile_shared.insert((chat, epoch)) {
+            return;
+        }
+        let reference = reference();
+        let frame = ClientFrame::ProfileKeys {
+            reference,
+            chat,
+            epoch,
+            profile_key_list: vec![ProfileKeyShare {
+                account: me,
+                sealed: Bytes(sealed),
+            }],
+        };
+        // Offline: the next list after reconnecting still lacks it, and it goes then.
+        if !self.ask(frame, reference, Waiting::Done) {
+            self.profile_shared.remove(&(chat, epoch));
+        }
+    }
+
+    fn profile_got(&mut self, reply: ProfileReply) {
+        let ProfileReply {
+            account,
+            username,
+            display_name,
+            version,
+            profile,
+            photo,
+        } = reply;
+        self.names_changed(account, username.clone(), display_name.clone());
+        self.profiles.insert(
+            account,
+            ProfileState {
+                account,
+                version,
+                username,
+                display_name,
+                signed: profile,
+                photo,
+                body: None,
+            },
+        );
+        self.dirty = true;
+        self.open_stored(account);
+    }
+
+    /// Opens a kept sealed profile, if its key and its account's master key are here, then shows
+    /// it. One that does not open shows names only.
+    fn open_stored(&mut self, account: Ulid) {
+        let Some(signed) = self
+            .profiles
+            .get(&account)
+            .and_then(|state| state.signed.clone())
+        else {
+            return self.show_profile(account);
+        };
+        let master = self
+            .accounts
+            .get(&account)
+            .and_then(|info| info.master_public.as_ref())
+            .and_then(|master| fixed::<32>(&master.0));
+        let Some(master_public) = master else {
+            self.ask_account(account);
+            return self.show_profile(account);
+        };
+        let (Some(device_public), Some(stamp), Some(signature)) = (
+            fixed::<32>(&signed.device_public.0),
+            fixed::<64>(&signed.stamp.0),
+            fixed::<64>(&signed.signature.0),
+        ) else {
+            return self.show_profile(account);
+        };
+        let record = DeviceRecord {
+            account,
+            device: signed.device,
+            device_public,
+            master_public,
+            stamp,
+        };
+        let opened = match self.device.as_ref() {
+            Some(device) => device.open_profile(&record, &signed.sealed.0, &signature),
+            None => return,
+        };
+        // Without its key, it opens once a `profile_keys` frame or a later list brings one.
+        if let Ok(plaintext) = opened
+            && let Ok(body) = serde_json::from_slice::<ProfileBody>(&plaintext)
+            && let Some(state) = self.profiles.get_mut(&account)
+        {
+            state.body = Some(body);
+            state.signed = None;
+            self.dirty = true;
+        }
+        self.show_profile(account);
+    }
+
+    fn show_profile(&mut self, account: Ulid) {
+        let profile = match self.profiles.get(&account) {
+            Some(state) => {
+                let body = state.body.clone().unwrap_or_default();
+                ShownProfile {
+                    account,
+                    username: state.username.clone(),
+                    display_name: state.display_name.clone(),
+                    version: state.version,
+                    bio: body.bio,
+                    link_list: body.link_list,
+                    photo: body
+                        .photo
+                        .filter(|photo| state.photo == Some(photo.id))
+                        .map(|photo| ShownPhoto {
+                            id: photo.id,
+                            blurhash: photo.blurhash,
+                        }),
+                }
+            }
+            None => match self.accounts.get(&account) {
+                Some(info) => ShownProfile {
+                    account,
+                    username: info.username.clone(),
+                    display_name: info.display_name.clone(),
+                    version: 0,
+                    bio: None,
+                    link_list: Vec::new(),
+                    photo: None,
+                },
+                None => return,
+            },
+        };
+        self.event(Event::Profile { profile });
+    }
+
+    /// An account's names from the server, wherever this device keeps them.
+    fn names_changed(&mut self, account: Ulid, username: String, display_name: Option<String>) {
+        if self.account == Some(account) {
+            self.username = Some(username.clone());
+        }
+        if let Some(state) = self.profiles.get_mut(&account) {
+            state.username = username.clone();
+            state.display_name = display_name.clone();
+        }
+        let Some(info) = self.accounts.get_mut(&account) else {
+            return;
+        };
+        if info.username == username && info.display_name == display_name {
+            return;
+        }
+        info.username = username.clone();
+        info.display_name = display_name.clone();
+        self.dirty = true;
+        self.event(Event::Account {
+            account: AccountBrief {
+                id: account,
+                username,
+                display_name,
+            },
+        });
+    }
+
+    /// What this account's profile holds now, to change one part of it. Its photo stays only if
+    /// the server still has it.
+    fn own_body(&mut self) -> Option<ProfileBody> {
+        let Some(me) = self.account else {
+            self.error("not_logged_in", "Log in first");
+            return None;
+        };
+        let Some(state) = self.profiles.get(&me) else {
+            self.ask_profile(me);
+            self.error("profile_loading", "Your profile has not loaded yet");
+            return None;
+        };
+        if state.signed.is_some() {
+            self.error("profile_loading", "Your profile could not be opened");
+            return None;
+        }
+        let mut body = state.body.clone().unwrap_or_default();
+        if body
+            .photo
+            .as_ref()
+            .is_some_and(|photo| state.photo != Some(photo.id))
+        {
+            body.photo = None;
+        }
+        Some(body)
+    }
+
+    fn put_profile(&mut self, body: ProfileBody) {
+        let Some(me) = self.account else {
+            return self.error("not_logged_in", "Log in first");
+        };
+        let Some(device) = self.device.as_ref() else {
+            return self.error("no_device", "This client has no device");
+        };
+        let plaintext = match serde_json::to_vec(&body) {
+            Ok(plaintext) => zeroize::Zeroizing::new(plaintext),
+            Err(_) => return self.error("internal", "Could not write the profile"),
+        };
+        let (sealed, signature) = match device.seal_profile(&plaintext) {
+            Ok(sealed) => sealed,
+            Err(error) => return self.error("seal_failed", &error.to_string()),
+        };
+        let put = PutProfileBody {
+            sealed: Some(Bytes(sealed)),
+            signature: Some(Bytes(signature.to_vec())),
+            photo: body.photo.as_ref().map(|photo| photo.id),
+        };
+        self.request(
+            "PUT",
+            format!("/api/v1/accounts/{me}/profile"),
+            Some(&put),
+            Asked::PutProfile {
+                body: Box::new(body),
+            },
+        );
+    }
+
+    fn profile_saved(&mut self, version: u64, body: ProfileBody) {
+        let Some(me) = self.account else {
+            return;
+        };
+        let (username, display_name) = match self.accounts.get(&me) {
+            Some(info) => (info.username.clone(), info.display_name.clone()),
+            None => (self.username.clone().unwrap_or_default(), None),
+        };
+        let state = self.profiles.entry(me).or_insert(ProfileState {
+            account: me,
+            version,
+            username,
+            display_name,
+            signed: None,
+            photo: None,
+            body: None,
+        });
+        state.version = version;
+        state.signed = None;
+        state.photo = body.photo.as_ref().map(|photo| photo.id);
+        state.body = Some(body);
+        self.dirty = true;
+        self.show_profile(me);
+        self.event(Event::ProfileSaved);
+    }
+
+    /// Seals the JPEG as one chunk under its own key and sends it up. The profile names it once
+    /// the server has it.
+    fn set_photo(&mut self, jpeg: &[u8], thumbnail: &Thumbnail) {
+        let Some(me) = self.account else {
+            return self.error("not_logged_in", "Log in first");
+        };
+        if jpeg.is_empty() || jpeg.len() as u64 > file::CHUNK {
+            return self.error("file_too_large", "That photo is too large");
+        }
+        let blurhash = match file::blurhash_of(thumbnail.width, thumbnail.height, &thumbnail.rgba) {
+            Ok(blurhash) => blurhash,
+            Err(error) => return self.error("bad_files", &error.to_string()),
+        };
+        let key = match file::new_key() {
+            Ok(key) => key,
+            Err(error) => return self.error("internal", &error.to_string()),
+        };
+        let sealed = match file::seal_chunk(key.as_ref(), 0, true, jpeg) {
+            Ok(sealed) => sealed,
+            Err(error) => return self.error("internal", &error.to_string()),
+        };
+        self.issue(Request {
+            method: "POST".to_string(),
+            path: format!("/api/v1/accounts/{me}/photos"),
+            body: None,
+            bytes: Some(sealed),
+            raw: false,
+            asked: Asked::AddPhoto {
+                key,
+                size: jpeg.len() as u64,
+                blurhash,
+            },
+            attempt: 0,
+        });
+    }
+
+    fn ask_photo(&mut self, account: Ulid) {
+        let Some(photo) = self.profiles.get(&account).and_then(|state| {
+            state
+                .body
+                .as_ref()
+                .and_then(|body| body.photo.as_ref())
+                .filter(|photo| state.photo == Some(photo.id))
+                .map(|photo| photo.id)
+        }) else {
+            return;
+        };
+        if !self.photo_asked.insert(photo) {
+            return;
+        }
+        self.issue(Request {
+            method: "GET".to_string(),
+            path: format!("/api/v1/photos/{photo}"),
+            body: None,
+            bytes: None,
+            raw: true,
+            asked: Asked::Photo { account, photo },
+            attempt: 0,
+        });
+    }
+
+    fn photo_got(&mut self, account: Ulid, photo: Ulid, sealed: &[u8]) {
+        let Some(named) = self
+            .profiles
+            .get(&account)
+            .and_then(|state| state.body.as_ref())
+            .and_then(|body| body.photo.clone())
+            .filter(|named| named.id == photo)
+        else {
+            return;
+        };
+        match file::open_chunk(&named.key.0, 0, true, sealed) {
+            Ok(jpeg) => self.event(Event::Photo {
+                account,
+                photo,
+                bytes: Bytes(jpeg.to_vec()),
+            }),
+            Err(error) => self.error("bad_photo", &error.to_string()),
+        }
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -2993,6 +3653,11 @@ impl Client {
                 username,
                 device: Some(own),
             });
+        }
+        for state in shelf.profile_list {
+            let account = state.account;
+            self.profiles.entry(account).or_insert(state);
+            self.show_profile(account);
         }
         self.chat_cache = shelf.chat_list.clone();
         let mut shown = Vec::with_capacity(shelf.chat_list.len());
@@ -3335,6 +4000,7 @@ impl Client {
             group_info: None,
             persist,
             remove,
+            profile_key_list: Vec::new(),
         };
         self.in_flight.insert(
             local,
@@ -3524,6 +4190,14 @@ impl Client {
             group_info: Some(Bytes(commit.group_info)),
             persist: Vec::new(),
             remove: Vec::new(),
+            profile_key_list: commit
+                .profile_key_list
+                .into_iter()
+                .map(|(account, sealed)| ProfileKeyShare {
+                    account,
+                    sealed: Bytes(sealed),
+                })
+                .collect(),
         };
         let snapshot = match device.export() {
             Ok(snapshot) => snapshot,
@@ -3635,6 +4309,11 @@ impl Client {
         state.join_attempt = 0;
         state.join_at = None;
         self.event(Event::ChatReady { chat });
+        if let (Some(me), Some(key_list)) = (self.account, self.profile_keys_waiting.remove(&chat))
+        {
+            self.take_profile_keys(chat, me, key_list);
+        }
+        self.profile_pass(chat);
     }
 
     /// Drops this chat's group, keeping its keys, and joins it again by external commit.
@@ -3911,6 +4590,21 @@ impl Client {
                 statement,
             } => self.revoked(account, device, &statement.0),
             ServerFrame::CallEvent(event) => self.call_row(*event, true),
+            ServerFrame::Profile {
+                account,
+                version,
+                username,
+                display_name,
+            } => {
+                self.names_changed(account, username, display_name);
+                if self.profile_moved(account, version) {
+                    self.ask_profile(account);
+                }
+            }
+            ServerFrame::ProfileKeys {
+                chat,
+                profile_key_list,
+            } => self.profile_keys_pushed(chat, profile_key_list),
         }
     }
 
@@ -4379,6 +5073,14 @@ impl Client {
         for message in preview_list {
             let chat = message.chat;
             self.open_list(chat, vec![message], true, true);
+        }
+        let chat_list: Vec<Ulid> = self.chat_cache.iter().map(|item| item.chat).collect();
+        for chat in chat_list {
+            self.profile_pass(chat);
+        }
+        // Saving a bio or links keeps the photo, so this account's own is always known.
+        if !self.profiles.contains_key(&me) {
+            self.ask_profile(me);
         }
     }
 
@@ -5377,6 +6079,42 @@ impl Client {
             }
             // An image's reply arrives as `Fetched`, so only a refusal's text reaches here.
             Asked::StickerImage { .. } => self.error("bad_reply", "The sticker could not be read"),
+            Asked::Photo { photo, .. } => {
+                self.photo_asked.remove(&photo);
+                self.error("bad_reply", "The photo could not be read");
+            }
+            Asked::Profile { account } => {
+                self.profile_asked.remove(&account);
+                if let Some(reply) = self.data::<ProfileReply>(body) {
+                    self.profile_got(reply);
+                }
+            }
+            Asked::PutProfile { body: profile } => {
+                if let Some(VersionReply { version }) = self.data(body) {
+                    self.profile_saved(version, *profile);
+                }
+            }
+            Asked::AddPhoto {
+                key,
+                size,
+                blurhash,
+            } => {
+                let Some(PhotoReply { photo }) = self.data(body) else {
+                    return;
+                };
+                let Some(mut profile) = self.own_body() else {
+                    return;
+                };
+                profile.photo = Some(ProfilePhoto {
+                    id: photo,
+                    key: Bytes(key.to_vec()),
+                    size,
+                    blurhash,
+                });
+                self.put_profile(profile);
+            }
+            // The server's `profile` frame brings the names, and a moved version the rest.
+            Asked::Names => self.event(Event::ProfileSaved),
             Asked::Search => {
                 if let Some(AccountListReply { account_list }) = self.data(body) {
                     self.event(Event::SearchResults { account_list });
@@ -5517,6 +6255,14 @@ impl Client {
         for (account, ended, statement) in pending {
             self.revoked(account, ended, &statement);
         }
+        // A sealed profile waits for its account's master key.
+        if self
+            .profiles
+            .get(&account)
+            .is_some_and(|state| state.signed.is_some())
+        {
+            self.open_stored(account);
+        }
     }
 
     fn rest_refused(&mut self, request: Request, status: u16, code: &str, message: &str) {
@@ -5535,6 +6281,8 @@ impl Client {
             | Asked::Setup { .. }
             | Asked::Challenge { .. }
             | Asked::Login { .. } => self.error(code, message),
+            // A wrong password is 401 here, and the session is still good.
+            Asked::Names if code == "bad_password" => self.error(code, message),
             // The socket opened and this count went out before the server closed it. A session
             // with no device is the login screen, and that refusal is not something they did.
             Asked::KeyPackageCount if code == "no_device" => {
@@ -5648,6 +6396,17 @@ impl Client {
             }
             Asked::Wraps { chat } => {
                 self.restored_without(chat);
+                self.error(code, message);
+            }
+            // Someone who no longer shares a chat: what was known stays.
+            Asked::Profile { account } => {
+                self.profile_asked.remove(&account);
+                if code != "not_shared" {
+                    self.error(code, message);
+                }
+            }
+            Asked::Photo { photo, .. } => {
+                self.photo_asked.remove(&photo);
                 self.error(code, message);
             }
             _ => self.error(code, message),

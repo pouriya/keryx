@@ -240,6 +240,9 @@ pub struct SendFrame {
     /// An edit's or delete's files, which the server removes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub remove: Vec<Ulid>,
+    /// A commit's: every member's profile key it knows, sealed at the epoch it moves to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profile_key_list: Vec<ProfileKeyShare>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -318,6 +321,15 @@ pub enum ClientFrame {
         chat: Ulid,
         epoch: u64,
         wrap_list: Vec<WrapItem>,
+    },
+    /// Profile keys missing from a chat, such as this account's own, sealed at `epoch`. Answered with
+    /// `done`. The server keeps the newest per chat and account.
+    ProfileKeys {
+        #[serde(rename = "ref")]
+        reference: Ulid,
+        chat: Ulid,
+        epoch: u64,
+        profile_key_list: Vec<ProfileKeyShare>,
     },
     /// Declining a call, from a device not in its MoQ. Saved inside the call and answered with
     /// `done`. Text in a call goes up on MoQ instead.
@@ -844,6 +856,118 @@ pub struct StickerReply {
     pub sticker: StickerItem,
 }
 
+/// One account's profile key, sealed under a chat's key at the epoch the commit or frame names. See
+/// the root AGENTS.md.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileKeyShare {
+    pub account: Ulid,
+    pub sealed: Bytes,
+}
+
+/// One member of a chat, in its `chats` entry: their profile's version, which moves on every change
+/// of their names, photo, bio or links, and their profile key sealed at `epoch` once someone shared it.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileKeyItem {
+    pub account: Ulid,
+    pub version: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sealed: Option<Bytes>,
+}
+
+/// An account's sealed photo, bio and links, signed by the device that saved them, with that device's
+/// key and the master key's stamp on it, so a client checks it against the pinned master key alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedProfile {
+    pub sealed: Bytes,
+    pub signature: Bytes,
+    pub device: Ulid,
+    pub device_public: Bytes,
+    pub stamp: Bytes,
+}
+
+/// `GET /api/v1/accounts/{id}/profile`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileReply {
+    pub account: Ulid,
+    pub username: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    pub version: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<SignedProfile>,
+    /// The photo the server holds, which the sealed profile names with its key. Gone when admin
+    /// removed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub photo: Option<Ulid>,
+}
+
+/// `PUT /api/v1/accounts/{id}/profile`: the sealed profile and its signature, or none to clear it,
+/// and the photo it names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PutProfileBody {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sealed: Option<Bytes>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<Bytes>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub photo: Option<Ulid>,
+}
+
+/// `PUT /api/v1/accounts/{id}/names`. Changing your own username needs your password; admin changing
+/// someone else's needs none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamesBody {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionReply {
+    pub version: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhotoReply {
+    pub photo: Ulid,
+}
+
+/// What an account's sealed profile holds. Only its own client writes it and only clients sharing a
+/// chat open it, so the server never reads it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileBody {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bio: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub link_list: Vec<ProfileLink>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub photo: Option<ProfilePhoto>,
+}
+
+/// One of a profile's links, opened in a browser.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileLink {
+    pub name: String,
+    pub url: String,
+}
+
+/// The photo a sealed profile names: its id on the server, the key its one chunk is sealed under,
+/// its JPEG's size and its BlurHash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfilePhoto {
+    pub id: Ulid,
+    pub key: Bytes,
+    pub size: u64,
+    pub blurhash: String,
+}
+
 /// A stored message. **A removed one has only `chat`, `seq` and `server_saved_at`**, the time it was
 /// removed, so `sync` hands it out and every device drops its copy, and a client knows something was
 /// there, not what. A call's message holds nothing about the call: that is in its `call` rows.
@@ -926,6 +1050,9 @@ pub struct ChatItem {
     /// This account's draft in the chat, still sealed, so a reload and a new device show it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft: Option<DraftItem>,
+    /// Every member's profile version and sealed profile key, this account's too.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profile_key_list: Vec<ProfileKeyItem>,
 }
 
 /// An account's unsent text in one chat, sealed under the chat's key at `epoch`. The server holds
@@ -1066,6 +1193,21 @@ pub enum ServerFrame {
         account: Ulid,
         device: Ulid,
         statement: Bytes,
+    },
+    /// Someone sharing a chat, or this account, changed their names, photo, bio or links. A client
+    /// fetches the profile when `version` moved.
+    Profile {
+        account: Ulid,
+        version: u64,
+        username: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_name: Option<String>,
+    },
+    /// Profile keys just shared in a chat, by a `profile_keys` frame or a commit, as its `chats`
+    /// entry carries them. A device that was offline gets them in its next `chats` list instead.
+    ProfileKeys {
+        chat: Ulid,
+        profile_key_list: Vec<ProfileKeyItem>,
     },
 }
 

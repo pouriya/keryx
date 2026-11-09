@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::Context;
 use clap::{CommandFactory, Parser, Subcommand};
 use keryx::api::{self, Settings};
-use keryx_core::protocol::CreateAccountBody;
+use keryx_core::protocol::{CreateAccountBody, NamesBody};
 use serde_json::{Value, json};
 use tanzim::validator::{ByteSize, Duration as DurationValue, StaticMap};
 use tracing_subscriber::filter::LevelFilter;
@@ -130,6 +130,31 @@ enum UserCommand {
         #[arg(long, value_name = "NAME")]
         display_name: Option<String>,
     },
+    /// Change an account's username or display name, such as an offensive or fake one.
+    Rename {
+        /// The account's username now.
+        username: String,
+        /// The new username. Lowercase a-z, 0-9 and _, not starting with a digit.
+        #[arg(long = "username", value_name = "NEW")]
+        new_username: Option<String>,
+        /// The new display name, 1 to 64 characters.
+        #[arg(long, value_name = "NAME")]
+        display_name: Option<String>,
+    },
+    /// An account's profile photo.
+    Photo {
+        #[command(subcommand)]
+        command: PhotoCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum PhotoCommand {
+    /// Remove an account's photo. Its bio and links stay, and nobody can see them here.
+    Remove {
+        /// The account's username.
+        username: String,
+    },
 }
 
 /// Reads `server.toml`. Flattening tanzim's error with `{:#}` is the point: that form carries the
@@ -157,7 +182,8 @@ fn read_configuration(path: &Path) -> anyhow::Result<Settings> {
         .optional("video", ByteSize::new())
         .optional("doc", ByteSize::new())
         .optional("file", ByteSize::new())
-        .optional("sticker", ByteSize::new());
+        .optional("sticker", ByteSize::new())
+        .optional("photo", ByteSize::new());
     let schema = StaticMap::new()
         .required_any("listen")
         .required_any("public_url")
@@ -356,6 +382,10 @@ fn request_server(
     let sent = match (method, payload) {
         ("GET", _) => agent.get(&url).header("Authorization", &bearer).call(),
         ("DELETE", _) => agent.delete(&url).header("Authorization", &bearer).call(),
+        ("PUT", Payload::Json(body)) => agent
+            .put(&url)
+            .header("Authorization", &bearer)
+            .send_json(&body),
         (_, Payload::Json(body)) => agent
             .post(&url)
             .header("Authorization", &bearer)
@@ -431,6 +461,81 @@ fn run_user_add(
         println!("{link}");
     }
     Ok(())
+}
+
+/// The id of the account with exactly this username, from the directory.
+fn account_id(
+    settings: &Settings,
+    remote: Option<String>,
+    insecure: bool,
+    username: &str,
+) -> anyhow::Result<String> {
+    let reply = request_server(
+        settings,
+        remote,
+        insecure,
+        "GET",
+        &format!("/api/v1/accounts?search={username}"),
+        Payload::None,
+    )?;
+    answered(&reply, false)?;
+    if let Some(account_list) = reply["data"]["account_list"].as_array() {
+        for account in account_list {
+            if account["username"].as_str() == Some(username)
+                && let Some(id) = account["id"].as_str()
+            {
+                return Ok(id.to_string());
+            }
+        }
+    }
+    anyhow::bail!("No account has that username")
+}
+
+fn run_user_rename(
+    settings: &Settings,
+    remote: Option<String>,
+    insecure: bool,
+    json_output: bool,
+    username: String,
+    new_username: Option<String>,
+    display_name: Option<String>,
+) -> anyhow::Result<()> {
+    if new_username.is_none() && display_name.is_none() {
+        anyhow::bail!("Give --username, --display-name, or both");
+    }
+    let id = account_id(settings, remote.clone(), insecure, &username)?;
+    let reply = request_server(
+        settings,
+        remote,
+        insecure,
+        "PUT",
+        &format!("/api/v1/accounts/{id}/names"),
+        Payload::Json(serde_json::to_value(NamesBody {
+            display_name,
+            username: new_username,
+            password: None,
+        })?),
+    )?;
+    answered(&reply, json_output)
+}
+
+fn run_photo_remove(
+    settings: &Settings,
+    remote: Option<String>,
+    insecure: bool,
+    json_output: bool,
+    username: String,
+) -> anyhow::Result<()> {
+    let id = account_id(settings, remote.clone(), insecure, &username)?;
+    let reply = request_server(
+        settings,
+        remote,
+        insecure,
+        "DELETE",
+        &format!("/api/v1/accounts/{id}/photo"),
+        Payload::None,
+    )?;
+    answered(&reply, json_output)
 }
 
 /// Prints the reply whole with `--json`, and stops with the server's reason when it refused.
@@ -640,6 +745,22 @@ fn main() -> anyhow::Result<()> {
                 admin,
                 display_name,
             ),
+            Some(UserCommand::Rename {
+                username,
+                new_username,
+                display_name,
+            }) => run_user_rename(
+                &configuration,
+                remote,
+                settings.insecure,
+                json,
+                username,
+                new_username,
+                display_name,
+            ),
+            Some(UserCommand::Photo {
+                command: PhotoCommand::Remove { username },
+            }) => run_photo_remove(&configuration, remote, settings.insecure, json, username),
             None => Ok(()),
         },
         Command::Sticker {

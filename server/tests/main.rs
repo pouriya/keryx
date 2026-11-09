@@ -288,6 +288,60 @@ fn user_add_tells_the_server_and_shows_its_reply() {
 }
 
 #[test]
+fn user_rename_and_photo_remove_tell_the_server() {
+    let server = Server::start("", "");
+    let config = config_of(&server);
+    let added = keryx(&["--config", &config, "user", "add", "sara_x"]);
+    assert!(added.status.success(), "{}", text(&added.stderr));
+
+    // Admin may break the length limit, as `user add` can.
+    let renamed = keryx(&[
+        "--config",
+        &config,
+        "user",
+        "rename",
+        "sara_x",
+        "--username",
+        "sa",
+        "--display-name",
+        "سارا",
+    ]);
+    assert!(renamed.status.success(), "{}", text(&renamed.stderr));
+    let (status, reply) = server.call(
+        "GET",
+        "/api/v1/accounts?search=sa",
+        Some(OPERATOR_TOKEN),
+        None,
+    );
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["data"]["account_list"][0]["username"], "sa");
+    assert_eq!(reply["data"]["account_list"][0]["display_name"], "سارا");
+
+    let nothing = keryx(&["--config", &config, "user", "rename", "sa"]);
+    assert!(!nothing.status.success());
+    assert!(text(&nothing.stderr).contains("Give --username"));
+    let nobody = keryx(&[
+        "--config",
+        &config,
+        "user",
+        "rename",
+        "nobody",
+        "--username",
+        "x_y",
+    ]);
+    assert!(!nobody.status.success());
+    assert!(text(&nobody.stderr).contains("No account has that username"));
+
+    // The photo's removal from a real profile is in the chat tests, which have devices.
+    let removed = keryx(&[
+        "--config", &config, "user", "photo", "remove", "sa", "--json",
+    ]);
+    assert!(!removed.status.success());
+    let reply: Value = serde_json::from_slice(&removed.stdout).unwrap();
+    assert_eq!(reply["code"], "no_such_photo");
+}
+
+#[test]
 fn remote_takes_a_host_a_port_or_a_scheme() {
     let server = Server::start("", "");
     let config = config_of(&server);

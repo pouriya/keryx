@@ -1116,6 +1116,7 @@ fn kind_of(frame: &ClientFrame) -> &'static str {
         ClientFrame::Ping { .. } => "ping",
         ClientFrame::Wraps { .. } => "wraps",
         ClientFrame::CallEvent { .. } => "call_event",
+        ClientFrame::ProfileKeys { .. } => "profile_keys",
     }
 }
 
@@ -1130,7 +1131,8 @@ fn reference_of(frame: &ClientFrame) -> Ulid {
         | ClientFrame::GroupInfo { reference, .. }
         | ClientFrame::Ping { reference }
         | ClientFrame::Wraps { reference, .. }
-        | ClientFrame::CallEvent { reference, .. } => *reference,
+        | ClientFrame::CallEvent { reference, .. }
+        | ClientFrame::ProfileKeys { reference, .. } => *reference,
         ClientFrame::Typing { .. } => Ulid::from_bytes([0; 16]),
     }
 }
@@ -2217,6 +2219,12 @@ impl World {
                 }
                 reply_ok(info)
             }
+            // No profile is ever saved here: profiles are driven against the real server.
+            ("GET", ["accounts", account, "profile"]) => {
+                let index = self.account_index(parse(account));
+                let account = &self.accounts[index];
+                reply_ok(json!({"account": account.id, "username": account.username, "version": 0}))
+            }
             ("PUT", ["account", "keys"]) => {
                 let me = me.unwrap();
                 let index = self.account_index(me);
@@ -2489,6 +2497,8 @@ impl World {
                 );
                 Some(ServerFrame::Done { reference })
             }
+            // Profiles are driven against the real server, in the server's tests.
+            ClientFrame::ProfileKeys { reference, .. } => Some(ServerFrame::Done { reference }),
             ClientFrame::Typing { chat, on } => {
                 let member_list = self.hub_chat(chat).member_list.clone();
                 self.deliver(
@@ -2827,6 +2837,7 @@ impl World {
                     .iter()
                     .find(|(account, _)| *account == me)
                     .map(|(_, draft)| draft.clone()),
+                profile_key_list: Vec::new(),
             });
         }
         chat_list

@@ -12,16 +12,17 @@ use std::time::Duration;
 use keryx_core::protocol::{
     AccountBrief, Bytes, CallEvent, CallEventKind, ChatDevice, ChatItem, ChatMode, ChatType,
     ContentKind, DeviceItem, DeviceLogItem, DraftItem, KeyPackageItem, Kind, MarkItem,
-    MessageFrame, SessionItem, StickerItem, StickerPack, SyncPosition, TimesItem, WrapEntry,
+    MessageFrame, ProfileKeyItem, ProfileReply, SessionItem, SignedProfile, StickerItem,
+    StickerPack, SyncPosition, TimesItem, WrapEntry,
 };
 use keryx_core::ulid::Ulid;
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
 use super::{
     Account, Appended, BuiltInRole, ChatAccess, DeviceKey, DeviceUsage, Error, GroupInfoPut,
-    MessageBrief, NewAccount, NewDevice, NewFile, NewMessage, NewSession, NewSticker, NewWrap,
-    Position, PositionReport, Registered, Result, Session, SetupLink, Storage, StoredFile,
-    SyncFrom, SyncPage,
+    MessageBrief, NamesSaved, NewAccount, NewDevice, NewFile, NewMessage, NewNames, NewPhoto,
+    NewProfile, NewSession, NewSticker, NewWrap, Position, PositionReport, ProfileSaved,
+    Registered, Result, Session, SetupLink, Storage, StoredFile, SyncFrom, SyncPage,
 };
 
 /// How long a connection waits for a lock another process holds, such as a backup.
@@ -315,7 +316,53 @@ fn account_row(row: &Row<'_>) -> rusqlite::Result<Account> {
         master_public: row.get(4)?,
         account_public: row.get(5)?,
         account_stamp: row.get(6)?,
+        profile_version: unsigned(row.get(7)?),
     })
+}
+
+fn put_profile_keys(
+    connection: &Connection,
+    chat: Ulid,
+    epoch: u64,
+    key_list: &[(Ulid, Vec<u8>)],
+) -> rusqlite::Result<()> {
+    for (account, sealed) in key_list {
+        connection.execute(
+            "INSERT INTO account_profile_key (account_id, conversation_id, epoch, sealed_key)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (account_id, conversation_id) DO UPDATE SET epoch = excluded.epoch,
+             sealed_key = excluded.sealed_key WHERE excluded.epoch >= account_profile_key.epoch",
+            params![account.bytes(), chat.bytes(), int(epoch), sealed],
+        )?;
+    }
+    Ok(())
+}
+
+/// Deletes the rows of the account's photos except `keep`, giving them so their bytes can go.
+fn take_photos(
+    connection: &Connection,
+    account: Ulid,
+    keep: Option<Ulid>,
+) -> rusqlite::Result<Vec<Ulid>> {
+    let keep = keep.map(|photo| photo.bytes().to_vec());
+    let mut statement = connection.prepare(
+        "DELETE FROM file WHERE account_id = ?1 AND (?2 IS NULL OR id != ?2) RETURNING id",
+    )?;
+    let mut removed = Vec::new();
+    for id in statement.query_map(params![account.bytes(), keep], |row| row.get(0))? {
+        removed.push(Ulid::from_bytes(id?));
+    }
+    Ok(removed)
+}
+
+fn next_profile_version(connection: &Connection, account: Ulid) -> rusqlite::Result<u64> {
+    let version: i64 = connection.query_row(
+        "UPDATE account SET profile_version = profile_version + 1 WHERE id = ?1
+         RETURNING profile_version",
+        params![account.bytes()],
+        |row| row.get(0),
+    )?;
+    Ok(unsigned(version))
 }
 
 fn usage(
@@ -431,7 +478,8 @@ impl Storage for Sqlite {
             connection
                 .query_row(
                     "SELECT id, username, display_name, password_hash, master_public_key,
-                     account_public_key, account_key_stamp FROM account WHERE username = ?1",
+                     account_public_key, account_key_stamp, profile_version
+                     FROM account WHERE username = ?1",
                     params![username],
                     account_row,
                 )
@@ -445,7 +493,8 @@ impl Storage for Sqlite {
             connection
                 .query_row(
                     "SELECT id, username, display_name, password_hash, master_public_key,
-                     account_public_key, account_key_stamp FROM account WHERE id = ?1",
+                     account_public_key, account_key_stamp, profile_version
+                     FROM account WHERE id = ?1",
                     params![id.bytes()],
                     account_row,
                 )
@@ -757,6 +806,20 @@ impl Storage for Sqlite {
                 params![id.bytes(), account.bytes()],
             )?;
             Ok(changed > 0)
+        })
+        .await
+    }
+
+    async fn is_admin(&self, account: Ulid) -> Result<bool> {
+        self.read(move |connection| {
+            connection.query_row(
+                "SELECT EXISTS (
+                     SELECT 1 FROM account_role a JOIN role r ON r.id = a.role_id
+                     WHERE a.account_id = ?1 AND r.scope = 0 AND r.built_in = 1 AND r.name = 'admin'
+                 )",
+                params![account.bytes()],
+                |row| row.get(0),
+            )
         })
         .await
     }
@@ -1194,6 +1257,36 @@ impl Storage for Sqlite {
         .await
     }
 
+    async fn chat_profile_keys(
+        &self,
+        chat: Ulid,
+        account_list: Vec<Ulid>,
+    ) -> Result<Vec<ProfileKeyItem>> {
+        self.read(move |connection| {
+            let mut statement = connection.prepare(
+                "SELECT a.profile_version, k.epoch, k.sealed_key FROM account_profile_key k
+                 JOIN account a ON a.id = k.account_id
+                 WHERE k.conversation_id = ?1 AND k.account_id = ?2",
+            )?;
+            let mut key_list = Vec::with_capacity(account_list.len());
+            for account in account_list {
+                let item = statement
+                    .query_row(params![chat.bytes(), account.bytes()], |row| {
+                        Ok(ProfileKeyItem {
+                            account,
+                            version: unsigned(row.get(0)?),
+                            epoch: Some(unsigned(row.get(1)?)),
+                            sealed: Some(Bytes(row.get(2)?)),
+                        })
+                    })
+                    .optional()?;
+                key_list.extend(item);
+            }
+            Ok(key_list)
+        })
+        .await
+    }
+
     async fn chat_list(&self, account: Ulid) -> Result<Vec<ChatItem>> {
         self.read(move |connection| {
             let mut statement = connection.prepare(
@@ -1235,6 +1328,7 @@ impl Storage for Sqlite {
                             _ => None,
                         }
                     },
+                    profile_key_list: Vec::new(),
                 })
             })?;
             let mut chat_list = Vec::new();
@@ -1247,6 +1341,13 @@ impl Storage for Sqlite {
             let mut marks = connection.prepare(
                 "SELECT account_id, received_seq, seen_seq FROM member
                  WHERE conversation_id = ?1 AND account_id != ?2 ORDER BY account_id",
+            )?;
+            let mut profiles = connection.prepare(
+                "SELECT m.account_id, a.profile_version, k.epoch, k.sealed_key FROM member m
+                 JOIN account a ON a.id = m.account_id
+                 LEFT JOIN account_profile_key k
+                     ON k.conversation_id = m.conversation_id AND k.account_id = m.account_id
+                 WHERE m.conversation_id = ?1 ORDER BY m.account_id",
             )?;
             for item in &mut chat_list {
                 if let Some(seq) = item.last_content_seq {
@@ -1271,6 +1372,17 @@ impl Storage for Sqlite {
                 })?;
                 for mark in rows {
                     item.mark_list.push(mark?);
+                }
+                let rows = profiles.query_map(params![item.chat.bytes()], |row| {
+                    Ok(ProfileKeyItem {
+                        account: Ulid::from_bytes(row.get(0)?),
+                        version: unsigned(row.get(1)?),
+                        epoch: opt_unsigned(row.get(2)?),
+                        sealed: row.get::<_, Option<Vec<u8>>>(3)?.map(Bytes),
+                    })
+                })?;
+                for profile in rows {
+                    item.profile_key_list.push(profile?);
                 }
             }
             Ok(chat_list)
@@ -1549,6 +1661,9 @@ impl Storage for Sqlite {
                             ],
                         )?;
                     }
+                    if let Some(epoch) = message.epoch {
+                        put_profile_keys(connection, chat, epoch, &message.profile_key_list)?;
+                    }
                     for welcome in &message.welcome_list {
                         connection.execute(
                             "INSERT INTO mls_welcome (id, device_id, conversation_id, body,
@@ -1814,6 +1929,16 @@ impl Storage for Sqlite {
         .await
     }
 
+    async fn put_profile_keys(
+        &self,
+        chat: Ulid,
+        epoch: u64,
+        key_list: Vec<(Ulid, Vec<u8>)>,
+    ) -> Result<()> {
+        self.write(move |connection| put_profile_keys(connection, chat, epoch, &key_list))
+            .await
+    }
+
     async fn take_welcomes(&self, device: Ulid) -> Result<Vec<(Ulid, Vec<u8>)>> {
         self.write(move |connection| {
             let mut statement = connection.prepare(
@@ -2011,6 +2136,195 @@ impl Storage for Sqlite {
                     },
                 )
                 .optional()
+        })
+        .await
+    }
+
+    async fn profile(&self, account: Ulid) -> Result<Option<ProfileReply>> {
+        self.read(move |connection| {
+            connection
+                .query_row(
+                    "SELECT a.id, a.username, a.display_name, a.profile_version, p.sealed,
+                     p.signature, p.updated_by, d.signing_public_key, d.master_stamp, p.photo_id
+                     FROM account a LEFT JOIN account_profile p ON p.account_id = a.id
+                     LEFT JOIN device d ON d.id = p.updated_by WHERE a.id = ?1",
+                    params![account.bytes()],
+                    |row| {
+                        let sealed: Option<Vec<u8>> = row.get(4)?;
+                        let signature: Option<Vec<u8>> = row.get(5)?;
+                        let device: Option<[u8; 16]> = row.get(6)?;
+                        let device_public: Option<Vec<u8>> = row.get(7)?;
+                        let stamp: Option<Vec<u8>> = row.get(8)?;
+                        let photo: Option<[u8; 16]> = row.get(9)?;
+                        let profile = match (sealed, signature, device, device_public, stamp) {
+                            (
+                                Some(sealed),
+                                Some(signature),
+                                Some(device),
+                                Some(device_public),
+                                Some(stamp),
+                            ) => Some(SignedProfile {
+                                sealed: Bytes(sealed),
+                                signature: Bytes(signature),
+                                device: Ulid::from_bytes(device),
+                                device_public: Bytes(device_public),
+                                stamp: Bytes(stamp),
+                            }),
+                            _ => None,
+                        };
+                        Ok(ProfileReply {
+                            account: Ulid::from_bytes(row.get(0)?),
+                            username: row.get(1)?,
+                            display_name: row.get(2)?,
+                            version: unsigned(row.get(3)?),
+                            profile,
+                            photo: photo.map(Ulid::from_bytes),
+                        })
+                    },
+                )
+                .optional()
+        })
+        .await
+    }
+
+    async fn put_profile(&self, profile: NewProfile) -> Result<ProfileSaved> {
+        self.write(move |connection| {
+            if let Some(photo) = profile.photo {
+                let owned: bool = connection.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM file WHERE id = ?1 AND account_id = ?2)",
+                    params![photo.bytes(), profile.account.bytes()],
+                    |row| row.get(0),
+                )?;
+                if !owned {
+                    return Ok(ProfileSaved::NoSuchPhoto);
+                }
+                connection.execute(
+                    "UPDATE file SET used_at = ?2 WHERE id = ?1 AND used_at IS NULL",
+                    params![photo.bytes(), profile.now],
+                )?;
+            }
+            let removed = take_photos(connection, profile.account, profile.photo)?;
+            match profile.sealed {
+                Some((sealed, signature)) => {
+                    connection.execute(
+                        "INSERT INTO account_profile (account_id, sealed, signature, updated_by,
+                         photo_id, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                         ON CONFLICT (account_id) DO UPDATE SET sealed = excluded.sealed,
+                         signature = excluded.signature, updated_by = excluded.updated_by,
+                         photo_id = excluded.photo_id, updated_at = excluded.updated_at",
+                        params![
+                            profile.account.bytes(),
+                            sealed,
+                            signature,
+                            profile.device.bytes(),
+                            profile.photo.map(|photo| photo.bytes().to_vec()),
+                            profile.now
+                        ],
+                    )?;
+                }
+                None => {
+                    connection.execute(
+                        "DELETE FROM account_profile WHERE account_id = ?1",
+                        params![profile.account.bytes()],
+                    )?;
+                }
+            }
+            let version = next_profile_version(connection, profile.account)?;
+            Ok(ProfileSaved::Saved { version, removed })
+        })
+        .await
+    }
+
+    async fn set_names(&self, names: NewNames) -> Result<NamesSaved> {
+        self.write(move |connection| {
+            if let Some(username) = &names.username {
+                let taken: bool = connection.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM account WHERE username = ?1 AND id != ?2)",
+                    params![username, names.account.bytes()],
+                    |row| row.get(0),
+                )?;
+                if taken {
+                    return Ok(NamesSaved::UsernameTaken);
+                }
+                connection.execute(
+                    "UPDATE account SET username = ?2 WHERE id = ?1",
+                    params![names.account.bytes(), username],
+                )?;
+            }
+            if let Some(display_name) = &names.display_name {
+                connection.execute(
+                    "UPDATE account SET display_name = ?2 WHERE id = ?1",
+                    params![names.account.bytes(), display_name],
+                )?;
+            }
+            let found = connection
+                .query_row(
+                    "SELECT username, display_name FROM account WHERE id = ?1",
+                    params![names.account.bytes()],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                )
+                .optional()?;
+            let Some((username, display_name)) = found else {
+                return Ok(NamesSaved::NoSuchAccount);
+            };
+            let version = next_profile_version(connection, names.account)?;
+            Ok(NamesSaved::Saved {
+                version,
+                username,
+                display_name,
+            })
+        })
+        .await
+    }
+
+    async fn add_photo(&self, photo: NewPhoto) -> Result<Vec<Ulid>> {
+        self.write(move |connection| {
+            let mut statement = connection.prepare(
+                "DELETE FROM file WHERE account_id = ?1 AND used_at IS NULL RETURNING id",
+            )?;
+            let mut removed = Vec::new();
+            for id in statement.query_map(params![photo.account.bytes()], |row| row.get(0))? {
+                removed.push(Ulid::from_bytes(id?));
+            }
+            connection.execute(
+                "INSERT INTO file (id, account_id, encrypted, kind, size, chunks, received,
+                 uploaded_by, created_at) VALUES (?1, ?2, 1, 3, ?3, 1, 1, ?4, ?5)",
+                params![
+                    photo.id.bytes(),
+                    photo.account.bytes(),
+                    int(photo.size),
+                    photo.device.bytes(),
+                    photo.now
+                ],
+            )?;
+            Ok(removed)
+        })
+        .await
+    }
+
+    async fn photo(&self, id: Ulid) -> Result<Option<Ulid>> {
+        self.read(move |connection| {
+            let account: Option<[u8; 16]> = connection
+                .query_row(
+                    "SELECT account_id FROM file WHERE id = ?1 AND account_id IS NOT NULL
+                     AND used_at IS NOT NULL",
+                    params![id.bytes()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(account.map(Ulid::from_bytes))
+        })
+        .await
+    }
+
+    async fn remove_photo(&self, account: Ulid) -> Result<Option<(Vec<Ulid>, u64)>> {
+        self.write(move |connection| {
+            let removed = take_photos(connection, account, None)?;
+            if removed.is_empty() {
+                return Ok(None);
+            }
+            let version = next_profile_version(connection, account)?;
+            Ok(Some((removed, version)))
         })
         .await
     }

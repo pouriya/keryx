@@ -48,38 +48,41 @@ CREATE TABLE account (
     words_set_at        INTEGER,
     -- [Seen times] a person may turn receipts off. Their times are still stored.
     receipts_enabled    INTEGER NOT NULL DEFAULT 1 CHECK (receipts_enabled IN (0, 1)),
+    -- [Account profile] moves on every change of the names, photo, bio or links, so a client that
+    -- was offline knows to fetch the profile again.
+    profile_version     INTEGER NOT NULL DEFAULT 0 CHECK (profile_version >= 0),
     -- [Admin] when the account was made.
     created_at          INTEGER NOT NULL
 ) WITHOUT ROWID, STRICT;
 
--- [Account profile] one encrypted blob per account: image info and its file key, bio, and
--- links as key and value. Readable only by people sharing a chat with this account.
+-- [Account profile] one encrypted blob per account: the photo's id and file key, the bio, and
+-- links as name and address, under the profile key the words give. Readable only by people sharing
+-- a chat with this account.
 CREATE TABLE account_profile (
     -- [Account profile] whose profile.
     account_id  BLOB PRIMARY KEY REFERENCES account (id) ON DELETE CASCADE,
-    -- [Account profile] says which profile key opens it, so a client can tell when it needs
-    -- a newer one.
-    key_version INTEGER NOT NULL,
     -- [Account profile] the blob, which the server cannot read.
     sealed      BLOB NOT NULL,
     -- [Signatures] by updated_by, so a server cannot forge someone's profile.
     signature   BLOB NOT NULL,
     -- [Signatures] which device changed it.
     updated_by  BLOB NOT NULL REFERENCES device (id),
-    -- [Account profile] lets a client skip fetching a blob it already has.
+    -- [Profile images] the photo the blob names, an account file. NULL with no photo, or once
+    -- admin removed it.
+    photo_id    BLOB REFERENCES file (id) ON DELETE SET NULL,
+    -- [Account profile] when it last changed.
     updated_at  INTEGER NOT NULL
 ) STRICT;
 
--- [Account profile] an account's profile key, shared with one chat under that chat's key.
--- This is one row per chat, not one profile per chat, so changing a profile rewrites one blob.
--- The key does not rotate when someone leaves, and channels get no rows here.
+-- [Account profile] an account's profile key, shared with one chat under that chat's key, the newest
+-- only. This is one row per chat, not one profile per chat, so changing a profile rewrites one blob.
+-- The key comes from the words and does not rotate when someone leaves, and channels get no rows
+-- here.
 CREATE TABLE account_profile_key (
     -- [Account profile] whose profile this opens.
     account_id       BLOB NOT NULL REFERENCES account (id) ON DELETE CASCADE,
     -- [Account profile] which chat's members can open it.
     conversation_id  BLOB NOT NULL REFERENCES conversation (id) ON DELETE CASCADE,
-    -- [Account profile] matched against account_profile.key_version.
-    key_version      INTEGER NOT NULL,
     -- [Account profile] the chat key this was encrypted under. Re-encrypted when a member is
     -- added, because a new member only has the current key.
     epoch            INTEGER NOT NULL,
@@ -590,7 +593,8 @@ CREATE TABLE file (
     id               BLOB PRIMARY KEY,
     -- [Files, Retention] the chat it belongs to. NULL for an account's profile image.
     conversation_id  BLOB REFERENCES conversation (id) ON DELETE CASCADE,
-    -- [Profile images] the account it belongs to. NULL for a chat's file.
+    -- [Profile images] the account it belongs to, its bytes under `accounts/<account id>`. NULL for a
+    -- chat's file. A photo is one chunk, of kind 3, and used_at is set once the profile names it.
     account_id       BLOB REFERENCES account (id) ON DELETE CASCADE,
     -- [Unencrypted messages] 0 only for files in an unencrypted chat.
     encrypted        INTEGER NOT NULL CHECK (encrypted IN (0, 1)),

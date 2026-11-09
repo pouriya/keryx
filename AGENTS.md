@@ -312,6 +312,86 @@ Direct and self chats have no profile of their own.
 - **Channel subscribers do not share profile keys**, so they see only each other's display
   names. Sharing would cost about 6 MB per new subscriber in a 100,000-member channel.
 
+**An account's profile, chosen by the author.** This part builds it for accounts, with a page to edit your
+own and others' shown wherever a person is. Groups and channels come with them.
+
+- **Both the display name and the username can be changed, chosen by the author.** **A display name is 1 to
+  64 characters after trimming spaces, chosen by the author**, long enough for a full Persian name. **A
+  freed username can be taken by anyone at once, chosen by the author**, since keryx has no mentions or
+  profile links yet that could point at the wrong person. **Changing the username asks for the password,
+  chosen by the author**, as it is what the person logs in with, so a stolen session cannot rename the
+  account and leave its owner not knowing what to type. Removing the password, under First phase, has to
+  replace this check.
+- **The account changes its own names, and admin can change anyone's, chosen by the author**, from the
+  command line, to fix an offensive or fake name. The photo, bio and links are encrypted, so admin can
+  remove the photo and never see it.
+- **Two new permissions, chosen by the author:** `profile.edit` for the photo, bio, links and display name,
+  and `account.rename` for the username, so a server can let people set a photo but not change their
+  username. Member, moderator and admin hold both.
+- **The photo is one square JPEG of 640x640, chosen by the author**, about 50 to 150 KB, which every phone
+  and browser can make and show, with a BlurHash. It is limited to 1 MiB, encrypted under its own random
+  key like any file, with that key, its size and BlurHash inside the sealed profile. **The phone picks the
+  square on a crop screen, chosen by the author**, dragging and pinching to zoom. **There is one photo,
+  chosen by the author:** a new one replaces the old, whose file is deleted.
+- **A bio is at most 140 characters, with at most 3 links, chosen by the author**, short like Telegram's.
+- **Its bytes live under `[files] directory`, in `accounts/<account id>/`, chosen by the author**, beside
+  the per-chat folders and `stickers`, with no new config key.
+- **The profile key comes from the words, chosen by the author:** one more HKDF label, `keryx v1 profile
+  key`, giving 16 bytes, like the master and account keys. Every device of the account has it at once, with
+  no sharing and no race between two devices making different keys, and running devices keep it in their
+  snapshot after dropping the words' other keys. It changes only if the words do.
+- **Whoever adds a member shares every member's profile key with them, inside the commit, chosen by the
+  author:** a `profile_key_list` of `{account, sealed}` beside its wraps, saved in the same step, so a new
+  member sees everyone's photo at once and the keys can never be lost between two requests. Each is sealed
+  under the chat's key at the commit's epoch, with the label `keryx v1 profile key`, the chat, the account
+  and the epoch as associated data. **A member whose own key is missing from a chat shares it with a
+  `profile_keys` frame** `{ref, chat, epoch, profile_key_list}`, answered with `done`, like `wraps`: the
+  person a chat was started with, and the self chat. The server keeps the newest per chat and account.
+- **The sealed profile is `{"bio"?, "link_list"?: [{"name", "url"}], "photo"?: {"id", "key", "size",
+  "blurhash"}}`**, AES-GCM under the profile key with `keryx v1 profile` and the account as associated
+  data. The photo is sealed as one chunk in the file format, under its own key.
+- **The routes, chosen by the author.** Usernames follow the sign-up rules, and admin may break the length
+  limit, as `keryx user add` can.
+
+  ```
+  GET  /api/v1/accounts/{id}/profile   yourself, or sharing a chat -> username, display_name, version,
+                                       profile?, photo?
+  PUT  /api/v1/accounts/{id}/profile   profile.edit, yourself: profile?, photo? -> version. An old photo
+                                       no longer named is deleted
+  PUT  /api/v1/accounts/{id}/names     display_name? (profile.edit), username? and password
+                                       (account.rename); admin: anyone's, with no password
+  POST /api/v1/accounts/{id}/photos    profile.edit, yourself: the sealed JPEG's raw bytes -> photo
+  GET  /api/v1/photos/{id}             yourself, or sharing a chat with its account -> the bytes, immutable
+  DEL  /api/v1/accounts/{id}/photo     admin
+  ```
+
+  The photo's limit is `[limits.upload] photo`, 1 MiB. **The operator's commands, chosen by the author,** are
+  `keryx user rename <username> [--username <new>] [--display-name <name>]` and `keryx user photo remove
+  <username>`, over REST like `user add`.
+- **Changes go out live, chosen by the author:** the server sends a `profile` frame `{account, version,
+  username, display_name}` to the online devices of everyone sharing a chat with the account, and its own.
+  Each `chats` entry carries `profile_key_list: [{account, epoch, sealed, version}]` for its members, so a
+  phone that was offline fetches a profile whose version moved when it reconnects.
+- **Shared profile keys are pushed too, chosen by the author: what changes reaches online devices live, and
+  offline ones get it when they come back, which is the rule for everything.** Once a `profile_keys` frame
+  or a commit carrying keys is saved, the chat's other online devices get a `profile_keys` server frame
+  `{chat, profile_key_list}`, with the same items as a `chats` entry, sent after the commit itself so a
+  device has reached its epoch. Core opens them and shows any profile that was waiting for its key, and
+  holds keys for a chat it has not joined yet until that chat is ready, since a commit's keys reach a new
+  member just before its Welcome. A device that joins a chat by Welcome before any list names it shares
+  its own key at once: it is the person the chat was started with, whose key nobody else holds. A device
+  that was offline gets them in its next `chats` list.
+- **Android's profile page, chosen by the author:** the photo, display name, bio and links, the username
+  shown with tap to copy, and Devices and Log out, which move there from the chat list's menu. Others'
+  photos show in the chat list and the chat's header, and tapping the header opens their profile. **Tapping
+  a photo in the chat list opens that person's profile, not the chat, chosen by the author.** **It is
+  drawn in `tmp/design/profile.html` and approved as drawn, chosen by the author:** the menu button opens
+  the profile; each line opens its own editor, saved with a check in the bar; the name and @username show
+  under the photo and as lines; a taken username shows on save as "That username is taken."; a link's
+  address starts with `https://` or `http://`, its name is at most 32 characters and its address 512, and
+  tapping one opens the browser; someone with no photo keeps the letter, and one still loading shows its
+  BlurHash; Remove photo asks nothing; the photo uploads when Done is tapped, under a turning ring.
+
 ### Files
 
 **Files are encrypted, each with its own random AES-GCM key, in chunks** because a browser's
@@ -683,8 +763,8 @@ holds it in memory only for that request and sends it back in its answer, so req
 match over one socket: a `send` gets its sequence id this way, and a `sync` its pages. **The
 server never stores a client's ULID, and it is not in the signed header.** What is saved goes by
 its sequence id, from 1. REST carries the same bodies. A client sends `send`,
-`seen`, `received`, `typing`, `sync`, `group_info`, `wraps`, `call_event`, `times`, `draft` and `ping`. The server sends `features`, `sent`, `done`,
-`refused`, `message`, `chats`, `welcome`, `typing`, `marks`, `revoked`, `call_event`, `times` and `draft`. `group_info` and `wraps` are not
+`seen`, `received`, `typing`, `sync`, `group_info`, `wraps`, `profile_keys`, `call_event`, `times`, `draft` and `ping`. The server sends `features`, `sent`, `done`,
+`refused`, `message`, `chats`, `welcome`, `typing`, `marks`, `revoked`, `call_event`, `times`, `draft`, `profile` and `profile_keys`. `group_info` and `wraps` are not
 messages, so they take no sequence id and stay out of history, and what has no sequence id is
 answered with `done`. Binary fields are standard base64 with padding, through `base64ct`, which is
 already in the tree and constant-time. Kinds and modes are the schema's numbers. **A commit is a `send` with kind 3 plus its wraps, welcomes,
@@ -1202,6 +1282,7 @@ accepts the first for each step. The loser gets a rejection, catches up and retr
   doc = "100MiB"
   file = "2GiB"
   sticker = "256KiB"        # one sticker's WebP. Not encrypted: everyone on the server sees it
+  photo = "1MiB"            # one profile photo, sealed. An account's file, not a chat's
 
   [tcp]
   send_timeout = "15s"      # no byte taken for this long: the connection closes. WebSocket and REST
@@ -1506,8 +1587,9 @@ another device still holding the key.
 
 ## To fix
 
-Found in a review of the calls, sync and Android commits after `82cc9a6`. Each comes off this list in the
-change that fixes it. Fixes that need a decision are asked first, as everywhere.
+Found in a review of the calls, sync and Android commits after `82cc9a6`, and in the phone test of stickers
+and questions. Each comes off this list in the change that fixes it. Fixes that need a decision are asked
+first, as everywhere.
 
 **Bugs**
 
@@ -1526,6 +1608,18 @@ change that fixes it. Fixes that need a decision are asked first, as everywhere.
 - **A rekey can be lost while a call connects.** `android/ffi/`'s `callConnect` takes the pending join and
   blocks up to 10 seconds. A `CallKey` arriving meanwhile finds no call and no join, and is dropped, so the
   phone seals under the old epoch and a device that joined with only the new key cannot hear or see it.
+- **Android's down button can count a message that is already on screen.** In the stickers and questions
+  phone test, it showed 1 after 15 messages had arrived. Not chased yet.
+- **Android's chat list can show an unread count for the chat that is open.** In the same test, it showed 1
+  while that chat was open and at its end. Not chased yet.
+- **`a_frame_over_call_frame_closes_its_socket_as_a_leave` is flaky.** Once under `make coverage` it saw
+  `(1, "")` where it wanted `(4403, "frame_too_large")`, and passed on the next run. Not chased yet.
+
+**Not yet tested on the phone**
+
+- **Receiving a sticker from another account**, and **a deleted question's answer showing "Message
+  unavailable"**. `server/examples/drive.rs` cannot send a sticker or delete a message yet, so two commands
+  for those come with the test.
 
 **Access**
 
@@ -1556,7 +1650,8 @@ change that fixes it. Fixes that need a decision are asked first, as everywhere.
 - `moq/src/lib.rs`'s `closed` says the server sends `qmux`'s application close, which it never does.
 - Calls above: "`keryx-moq` uses its `ws::Client`" contradicts the later decision that `keryx-moq` opens the
   WebSocket itself, and "any other track name is refused" is not what the relay does: it ignores them.
-- Status says Android's call screen is next, but it is built.
+- Status says Android's call screen is next, but it is built, and it does not mention stickers and questions,
+  which are built and tested on the phone.
 - A question for the author, not a bug: the words screen's Copy could mark the clip sensitive on Android
   13 and later, so the clipboard preview hides it, and the words screen could set `FLAG_SECURE`, so
   screenshots and the recent-apps thumbnail never hold the words.
@@ -1592,8 +1687,7 @@ change that fixes it. Fixes that need a decision are asked first, as everywhere.
 **Chat**
 
 - What the REST fallback looks like: how a client receives without a socket
-- Profiles: who may see and change them, image size and format limits, limits on bios and
-  links, and where an account's folder lives
+- Profiles of groups and channels: who may change them, and their limits. Accounts' are decided above
 - Files: quotas, by the author's choice none for now
 - A call chosen as recorded when neither device can encode H.264: the client should say so
   before it starts

@@ -7,13 +7,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{OPERATOR_TOKEN, Server};
-use keryx_core::client::{Command, Draft, Event, FileSpec, Pointer, Secret, Thumbnail};
+use keryx_core::client::{
+    Command, Draft, Event, FileSpec, Pointer, Secret, ShownProfile, Thumbnail,
+};
 use keryx_core::file;
 use keryx_core::mls::{AccountWrap, Commit, Device};
 use keryx_core::protocol::{
     Answer, Bytes, CallEvent, CallEventKind, CallOutcome, ChatType, ClientFrame, ContentKind,
-    Header, Kind, MessageFrame, Question, SendFrame, ServerFrame, SyncPosition, WelcomeItem,
-    WrapItem,
+    Header, Kind, MessageFrame, ProfileKeyShare, ProfileLink, Question, SendFrame, ServerFrame,
+    SyncPosition, WelcomeItem, WrapItem,
 };
 use keryx_core::ulid::Ulid;
 use person::{
@@ -225,6 +227,7 @@ fn sealed_as(
         group_info: None,
         persist: Vec::new(),
         remove: Vec::new(),
+        profile_key_list: Vec::new(),
     }
 }
 
@@ -268,6 +271,14 @@ fn commit_frame(
         group_info: Some(Bytes(commit.group_info.clone())),
         persist: Vec::new(),
         remove: Vec::new(),
+        profile_key_list: commit
+            .profile_key_list
+            .iter()
+            .map(|(account, sealed)| ProfileKeyShare {
+                account: *account,
+                sealed: Bytes(sealed.clone()),
+            })
+            .collect(),
     }
 }
 
@@ -715,6 +726,7 @@ fn a_new_device_cannot_remove_its_notice_but_an_older_one_can() {
             group_info: None,
             persist: Vec::new(),
             remove: Vec::new(),
+            profile_key_list: Vec::new(),
         }
     };
 
@@ -3921,4 +3933,254 @@ fn a_question_and_its_answer_are_sealed_checked_by_core_and_the_answer_can_chang
     };
     assert_eq!(target_seq, answered);
     assert_eq!(message.answer.as_ref(), Some(&skipped));
+}
+
+/// A third person's words, for someone who shares no chat.
+const NIMA_WORDS: &str =
+    "letter advice cage absurd amount doctor acoustic avoid letter advice cage above";
+
+fn is_profile(event: &Event, account: Ulid, wanted: impl Fn(&ShownProfile) -> bool) -> bool {
+    matches!(event, Event::Profile { profile } if profile.account == account && wanted(profile))
+}
+
+fn profile_of(event: Event) -> ShownProfile {
+    match event {
+        Event::Profile { profile } => profile,
+        other => panic!("Wanted a profile, and got {other:?}"),
+    }
+}
+
+fn refusal(app: &mut App, server: &Server, command: Command) -> String {
+    app.command(server, command);
+    match app.wait(server, |event| matches!(event, Event::Error { .. })) {
+        Event::Error { code, .. } => code,
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn a_profile_is_sealed_to_those_sharing_a_chat_and_changes_reach_them_live() {
+    let server = open_server();
+    let (mut sara, mut babak, _chat) = apps_on(&server);
+    let (sara_id, babak_id) = (sara.id(), babak.id());
+    sara.wait(&server, |event| is_profile(event, sara_id, |_| true));
+
+    let link = ProfileLink {
+        name: "Site".to_string(),
+        url: "https://example.com".to_string(),
+    };
+    sara.command(
+        &server,
+        Command::SaveProfile {
+            bio: Some(" Hello ".to_string()),
+            link_list: vec![link.clone()],
+        },
+    );
+    sara.wait(&server, |event| matches!(event, Event::ProfileSaved));
+    let jpeg: Vec<u8> = (0..3000).map(|n| (n % 251) as u8).collect();
+    sara.command(
+        &server,
+        Command::SetPhoto {
+            jpeg: jpeg.clone(),
+            thumbnail: Thumbnail {
+                width: 2,
+                height: 2,
+                rgba: vec![200; 16],
+            },
+        },
+    );
+    sara.wait(&server, |event| matches!(event, Event::ProfileSaved));
+
+    // Babak hears of it live, and opens it with the key Sara's commit shared in their chat.
+    let profile = profile_of(babak.wait(&server, |event| {
+        is_profile(event, sara_id, |profile| profile.photo.is_some())
+    }));
+    assert_eq!(profile.bio.as_deref(), Some("Hello"));
+    assert_eq!(profile.link_list, vec![link]);
+    let photo = profile.photo.unwrap();
+    assert!(!photo.blurhash.is_empty());
+    babak.command(&server, Command::Photo { account: sara_id });
+    let Event::Photo {
+        photo: got, bytes, ..
+    } = babak.wait(&server, |event| matches!(event, Event::Photo { .. }))
+    else {
+        unreachable!();
+    };
+    assert_eq!(got, photo.id);
+    assert_eq!(bytes.0, jpeg);
+
+    // Babak's own key reached the chat by a frame, so Sara opens his profile too.
+    babak.wait(&server, |event| is_profile(event, babak_id, |_| true));
+    babak.command(
+        &server,
+        Command::SaveProfile {
+            bio: Some("Hi".to_string()),
+            link_list: Vec::new(),
+        },
+    );
+    babak.wait(&server, |event| matches!(event, Event::ProfileSaved));
+    sara.wait(&server, |event| {
+        is_profile(event, babak_id, |profile| {
+            profile.bio.as_deref() == Some("Hi")
+        })
+    });
+
+    // Names are readable, and reach the other person live.
+    babak.command(
+        &server,
+        Command::SetNames {
+            display_name: Some("  Babak J ".to_string()),
+            username: None,
+            password: None,
+        },
+    );
+    babak.wait(&server, |event| matches!(event, Event::ProfileSaved));
+    sara.wait(&server, |event| {
+        matches!(event, Event::Account { account }
+            if account.id == babak_id && account.display_name.as_deref() == Some("Babak J"))
+    });
+    babak.command(
+        &server,
+        Command::SetNames {
+            display_name: None,
+            username: Some("babak_new".to_string()),
+            password: Some(Secret(PASSWORD.to_string())),
+        },
+    );
+    babak.wait(&server, |event| matches!(event, Event::ProfileSaved));
+    sara.wait(&server, |event| {
+        matches!(event, Event::Account { account }
+            if account.id == babak_id && account.username == "babak_new")
+    });
+    let rename = |username: &str, password: &str| Command::SetNames {
+        display_name: None,
+        username: Some(username.to_string()),
+        password: Some(Secret(password.to_string())),
+    };
+    assert_eq!(
+        refusal(&mut babak, &server, rename("sara_x", PASSWORD)),
+        "username_taken"
+    );
+    assert_eq!(
+        refusal(
+            &mut babak,
+            &server,
+            rename("babak_other", "not the password")
+        ),
+        "bad_password"
+    );
+    assert_eq!(
+        refusal(
+            &mut babak,
+            &server,
+            Command::SetNames {
+                display_name: Some("   ".to_string()),
+                username: None,
+                password: None,
+            }
+        ),
+        "bad_display_name"
+    );
+
+    // Core refuses what breaks the limits before anything goes.
+    let save = |bio: &str, link_list: Vec<ProfileLink>| Command::SaveProfile {
+        bio: Some(bio.to_string()),
+        link_list,
+    };
+    let link_to = |url: &str| ProfileLink {
+        name: "x".to_string(),
+        url: url.to_string(),
+    };
+    for command in [
+        save(&"a".repeat(141), Vec::new()),
+        save("", vec![link_to("ftp://example.com")]),
+        save("", vec![link_to("https://")]),
+        save("", vec![link_to("https://example.com"); 4]),
+    ] {
+        assert_eq!(refusal(&mut sara, &server, command), "bad_profile");
+    }
+
+    // Someone sharing no chat gets neither the profile nor the photo.
+    let stranger = App::sign_up(&server, "nima_x", NIMA_WORDS);
+    let token = stranger.token.clone().unwrap();
+    let (status, body) = raw(
+        &server,
+        "GET",
+        &format!("/api/v1/accounts/{sara_id}/profile"),
+        &token,
+        None,
+    );
+    assert_eq!(status, 403, "{}", String::from_utf8_lossy(&body));
+    let (status, _) = raw(
+        &server,
+        "GET",
+        &format!("/api/v1/photos/{}", photo.id),
+        &token,
+        None,
+    );
+    assert_eq!(status, 404);
+
+    // Only admin changes someone else's names or removes their photo, and never sees it.
+    let babak_token = babak.token.clone().unwrap();
+    let names = json!({"display_name": "Not Sara"});
+    let route = format!("/api/v1/accounts/{sara_id}/names");
+    let (status, _) = server.call("PUT", &route, Some(&babak_token), Some(&names));
+    assert_eq!(status, 403);
+    let route = format!("/api/v1/accounts/{sara_id}/photo");
+    let (status, _) = server.call("DELETE", &route, Some(&babak_token), None);
+    assert_eq!(status, 403);
+    let (status, reply) = server.call("DELETE", &route, Some(OPERATOR_TOKEN), None);
+    assert_eq!(status, 200, "{reply}");
+    babak.wait(&server, |event| {
+        is_profile(event, sara_id, |profile| {
+            profile.photo.is_none() && profile.bio.as_deref() == Some("Hello")
+        })
+    });
+    let (status, reply) = server.call("DELETE", &route, Some(OPERATOR_TOKEN), None);
+    assert_eq!(status, 404);
+    assert_eq!(reply["code"], "no_such_photo");
+    let names = json!({"username": "b"});
+    let route = format!("/api/v1/accounts/{babak_id}/names");
+    let (status, reply) = server.call("PUT", &route, Some(OPERATOR_TOKEN), Some(&names));
+    assert_eq!(status, 200, "{reply}");
+    sara.wait(&server, |event| {
+        matches!(event, Event::Account { account } if account.id == babak_id && account.username == "b")
+    });
+
+    // A new photo, then removing it: the old bytes go each time.
+    sara.command(
+        &server,
+        Command::SetPhoto {
+            jpeg: jpeg.clone(),
+            thumbnail: Thumbnail {
+                width: 1,
+                height: 1,
+                rgba: vec![9; 4],
+            },
+        },
+    );
+    sara.wait(&server, |event| matches!(event, Event::ProfileSaved));
+    babak.wait(&server, |event| {
+        is_profile(event, sara_id, |profile| profile.photo.is_some())
+    });
+    sara.command(&server, Command::RemovePhoto);
+    sara.wait(&server, |event| matches!(event, Event::ProfileSaved));
+    babak.wait(&server, |event| {
+        is_profile(event, sara_id, |profile| {
+            profile.photo.is_none() && profile.bio.as_deref() == Some("Hello")
+        })
+    });
+    let (status, _) = raw(
+        &server,
+        "GET",
+        &format!("/api/v1/photos/{}", photo.id),
+        babak.token.as_deref().unwrap(),
+        None,
+    );
+    assert_eq!(status, 404);
+    let folder = server
+        .path("files")
+        .join("accounts")
+        .join(sara_id.to_string());
+    assert_eq!(std::fs::read_dir(folder).unwrap().count(), 0);
 }

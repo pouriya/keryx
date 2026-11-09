@@ -15,7 +15,8 @@ use std::time::Duration;
 use axum::extract::ws::Utf8Bytes;
 use keryx_core::protocol::{
     Bytes, CallEvent, CallEventKind, CallOutcome, CallText, ChatMode, ChatType, ClientFrame,
-    ContentKind, Kind, MessageFrame, SendFrame, ServerFrame, WelcomeItem, WrapItem,
+    ContentKind, Kind, MessageFrame, ProfileKeyShare, SendFrame, ServerFrame, WelcomeItem,
+    WrapItem,
 };
 use keryx_core::ulid::Ulid;
 use tokio::sync::{Notify, mpsc, oneshot};
@@ -587,6 +588,19 @@ async fn handle(app: &Arc<App>, state: &mut ChatState, job: Job) {
                     );
                     Some(answer_of(reference, result))
                 }
+                ClientFrame::ProfileKeys {
+                    reference,
+                    chat,
+                    epoch,
+                    profile_key_list,
+                } => {
+                    let result = operation!(
+                        "ProfileKeys",
+                        "profile_keys",
+                        run_profile_keys(app, session, reference, chat, epoch, profile_key_list)
+                    );
+                    Some(answer_of(reference, result))
+                }
                 ClientFrame::CallEvent {
                     reference,
                     chat,
@@ -679,9 +693,12 @@ async fn run_send(
     if frame.kind != Kind::Commit
         && !(frame.wrap_list.is_empty()
             && frame.welcome_list.is_empty()
-            && frame.group_info.is_none())
+            && frame.group_info.is_none()
+            && frame.profile_key_list.is_empty())
     {
-        return Err(bad("Only a commit carries wraps, welcomes and group info"));
+        return Err(bad(
+            "Only a commit carries wraps, welcomes, group info and profile keys",
+        ));
     }
 
     check_files(app, session, &frame).await?;
@@ -815,6 +832,11 @@ async fn run_send(
 
     let member_list = app.storage.member_accounts(chat).await?;
     let wrap_list = check_wraps(&member_list, frame.wrap_list)?;
+    let profile_key_list = check_profile_keys(&member_list, frame.profile_key_list)?;
+    let shared_list: Vec<Ulid> = profile_key_list
+        .iter()
+        .map(|(account, _)| *account)
+        .collect();
     let mut welcome_list = Vec::with_capacity(frame.welcome_list.len());
     let mut welcome_devices = Vec::with_capacity(frame.welcome_list.len());
     if !frame.welcome_list.is_empty() {
@@ -867,6 +889,7 @@ async fn run_send(
             body: frame.body.0.clone(),
             wrap_list,
             welcome_list,
+            profile_key_list,
             group_info: frame.group_info.map(|group_info| group_info.0),
             persist: frame.persist,
             remove: frame.remove.clone(),
@@ -941,6 +964,8 @@ async fn run_send(
             signature: Some(frame.signature),
         })),
     );
+    // After the commit itself, so a device has reached its epoch before opening them.
+    push_profile_keys(app, chat, &member_list, device, shared_list).await?;
     for file in frame.remove {
         file::remove(app, chat, file).await;
     }
@@ -1317,6 +1342,25 @@ fn check_wraps(member_list: &[Ulid], wrap_list: Vec<WrapItem>) -> Result<Vec<New
     Ok(checked)
 }
 
+/// A profile key can only be one of the chat's accounts'.
+fn check_profile_keys(
+    member_list: &[Ulid],
+    key_list: Vec<ProfileKeyShare>,
+) -> Result<Vec<(Ulid, Vec<u8>)>, Refused> {
+    let mut checked = Vec::with_capacity(key_list.len());
+    for ProfileKeyShare { account, sealed } in key_list {
+        if !member_list.contains(&account) {
+            return Err(refused(
+                404,
+                "not_member",
+                "A profile key is for an account not in this chat",
+            ));
+        }
+        checked.push((account, sealed.0));
+    }
+    Ok(checked)
+}
+
 /// Gives an online device its waiting Welcomes. Each is deleted as it is handed to the connection,
 /// and if that connection then dies, the device joins by external commit instead.
 pub async fn hand_welcomes(app: &App, account: Ulid, device: Ulid) -> Result<(), Refused> {
@@ -1441,4 +1485,47 @@ async fn run_wraps(
         .put_wraps(chat, epoch, wrap_list, device)
         .await?;
     Ok(ServerFrame::Done { reference })
+}
+
+async fn run_profile_keys(
+    app: &Arc<App>,
+    session: Session,
+    reference: Ulid,
+    chat: Ulid,
+    epoch: u64,
+    profile_key_list: Vec<ProfileKeyShare>,
+) -> Result<ServerFrame, Refused> {
+    check(app, &Caller::Session(session), Need::Member(chat)).await?;
+    let device = session.device()?;
+    let member_list = app.storage.member_accounts(chat).await?;
+    let key_list = check_profile_keys(&member_list, profile_key_list)?;
+    let account_list = key_list.iter().map(|(account, _)| *account).collect();
+    app.storage.put_profile_keys(chat, epoch, key_list).await?;
+    push_profile_keys(app, chat, &member_list, device, account_list).await?;
+    Ok(ServerFrame::Done { reference })
+}
+
+/// Sends the chat's other online devices the profile keys it now keeps for these accounts.
+async fn push_profile_keys(
+    app: &App,
+    chat: Ulid,
+    member_list: &[Ulid],
+    device: Ulid,
+    account_list: Vec<Ulid>,
+) -> Result<(), Refused> {
+    if account_list.is_empty() {
+        return Ok(());
+    }
+    let profile_key_list = app.storage.chat_profile_keys(chat, account_list).await?;
+    if !profile_key_list.is_empty() {
+        app.hub.deliver(
+            member_list,
+            Some(device),
+            &ServerFrame::ProfileKeys {
+                chat,
+                profile_key_list,
+            },
+        );
+    }
+    Ok(())
 }

@@ -32,6 +32,7 @@ fn send_frame() -> SendFrame {
         group_info: None,
         persist: Vec::new(),
         remove: Vec::new(),
+        profile_key_list: Vec::new(),
     }
 }
 
@@ -292,6 +293,7 @@ fn every_server_frame_has_the_agreed_shape() {
         mark_list: Vec::new(),
         seen_seq: None,
         draft: None,
+        profile_key_list: Vec::new(),
     };
     let marked = ChatItem {
         last_content_seq: Some(5),

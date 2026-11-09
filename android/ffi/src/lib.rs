@@ -352,6 +352,7 @@ fn run<'caller>(
             }
             Output::PutChunk {
                 id,
+                method,
                 path,
                 bearer,
                 bytes,
@@ -360,6 +361,7 @@ fn run<'caller>(
                 Ok(serde_json::json!({
                     "type": "put_chunk",
                     "id": id,
+                    "method": method,
                     "path": path,
                     "bearer": bearer,
                     "chunk": chunk,

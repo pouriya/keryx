@@ -5,8 +5,8 @@ use std::future::Future;
 
 use keryx_core::protocol::{
     AccountBrief, CallEvent, ChatDevice, ChatItem, ChatMode, ChatType, ContentKind, DeviceItem,
-    DraftItem, KeyPackageItem, Kind, MarkItem, MessageFrame, SessionItem, StickerItem, StickerPack,
-    SyncPosition, TimesItem, WrapEntry,
+    DraftItem, KeyPackageItem, Kind, MarkItem, MessageFrame, ProfileKeyItem, ProfileReply,
+    SessionItem, StickerItem, StickerPack, SyncPosition, TimesItem, WrapEntry,
 };
 use keryx_core::ulid::Ulid;
 
@@ -59,6 +59,8 @@ pub struct Account {
     pub master_public: Option<Vec<u8>>,
     pub account_public: Option<Vec<u8>>,
     pub account_stamp: Option<Vec<u8>>,
+    /// Moves on every change of the names, photo, bio or links.
+    pub profile_version: u64,
 }
 
 pub struct NewAccount {
@@ -177,6 +179,48 @@ pub struct NewSticker {
     pub now: i64,
 }
 
+/// A photo whose bytes are already on disk, for its account's profile to name.
+pub struct NewPhoto {
+    pub id: Ulid,
+    pub account: Ulid,
+    pub device: Ulid,
+    pub size: u64,
+    pub now: i64,
+}
+
+/// A profile as a device saved it: sealed, signed, and naming its photo.
+pub struct NewProfile {
+    pub account: Ulid,
+    pub device: Ulid,
+    pub sealed: Option<(Vec<u8>, Vec<u8>)>,
+    pub photo: Option<Ulid>,
+    pub now: i64,
+}
+
+pub enum ProfileSaved {
+    /// The new version, with the photos no longer named, whose bytes can go.
+    Saved { version: u64, removed: Vec<Ulid> },
+    /// The photo named is not one of this account's uploads.
+    NoSuchPhoto,
+}
+
+/// New names for an account. `None` keeps what it has.
+pub struct NewNames {
+    pub account: Ulid,
+    pub display_name: Option<String>,
+    pub username: Option<String>,
+}
+
+pub enum NamesSaved {
+    Saved {
+        version: u64,
+        username: String,
+        display_name: Option<String>,
+    },
+    UsernameTaken,
+    NoSuchAccount,
+}
+
 /// A chat's stored file. `account` is its uploader's.
 pub struct StoredFile {
     pub chat: Ulid,
@@ -214,6 +258,8 @@ pub struct NewMessage {
     /// A commit's. Empty otherwise.
     pub wrap_list: Vec<NewWrap>,
     pub welcome_list: Vec<NewWelcome>,
+    /// A commit's profile keys, sealed at its epoch. Each replaces an older one.
+    pub profile_key_list: Vec<(Ulid, Vec<u8>)>,
     /// A commit's group info at its epoch, saved in the same step so it is never left behind.
     /// `None` otherwise.
     pub group_info: Option<Vec<u8>>,
@@ -347,6 +393,8 @@ pub trait Storage: Send + Sync + 'static {
         account: Ulid,
         permission: &'static str,
     ) -> impl Future<Output = Result<bool>> + Send;
+    /// Whether an account holds the built-in server admin role.
+    fn is_admin(&self, account: Ulid) -> impl Future<Output = Result<bool>> + Send;
     /// Whether a chat's member holds a permission there. The server admin role holds them all, and
     /// in a direct or self chat both people hold the built-in member role.
     fn chat_permitted(
@@ -422,6 +470,13 @@ pub trait Storage: Send + Sync + 'static {
         account: Ulid,
     ) -> impl Future<Output = Result<Option<ChatAccess>>> + Send;
     fn member_accounts(&self, chat: Ulid) -> impl Future<Output = Result<Vec<Ulid>>> + Send;
+    /// The sealed profile keys a chat keeps for these accounts, with each account's profile version,
+    /// as a `chats` entry carries them.
+    fn chat_profile_keys(
+        &self,
+        chat: Ulid,
+        account_list: Vec<Ulid>,
+    ) -> impl Future<Output = Result<Vec<ProfileKeyItem>>> + Send;
     fn chat_list(&self, account: Ulid) -> impl Future<Output = Result<Vec<ChatItem>>> + Send;
     fn chat_devices(&self, chat: Ulid) -> impl Future<Output = Result<Vec<ChatDevice>>> + Send;
     /// Keeps this account's sealed draft in the chat as it is, or clears it with `None`, and gives
@@ -487,6 +542,13 @@ pub trait Storage: Send + Sync + 'static {
         wrap_list: Vec<NewWrap>,
         device: Ulid,
     ) -> impl Future<Output = Result<()>> + Send;
+    /// Keeps profile keys sealed at `epoch` in a chat, each replacing one sealed at an older epoch.
+    fn put_profile_keys(
+        &self,
+        chat: Ulid,
+        epoch: u64,
+        key_list: Vec<(Ulid, Vec<u8>)>,
+    ) -> impl Future<Output = Result<()>> + Send;
     /// Deletes this device's waiting Welcomes and returns each with its chat.
     fn take_welcomes(
         &self,
@@ -516,6 +578,23 @@ pub trait Storage: Send + Sync + 'static {
     /// Every pack with its stickers, each oldest first.
     fn sticker_list(&self) -> impl Future<Output = Result<Vec<StickerPack>>> + Send;
     fn sticker(&self, id: Ulid) -> impl Future<Output = Result<Option<StickerItem>>> + Send;
+
+    /// An account's names, version, sealed profile with its device's key and stamp, and photo.
+    fn profile(&self, account: Ulid) -> impl Future<Output = Result<Option<ProfileReply>>> + Send;
+    /// Saves the profile, marks its photo used and removes the account's other photos' rows.
+    fn put_profile(&self, profile: NewProfile)
+    -> impl Future<Output = Result<ProfileSaved>> + Send;
+    fn set_names(&self, names: NewNames) -> impl Future<Output = Result<NamesSaved>> + Send;
+    /// A new photo, removing the rows of the account's photos no profile names yet, which it gives
+    /// so their bytes can go.
+    fn add_photo(&self, photo: NewPhoto) -> impl Future<Output = Result<Vec<Ulid>>> + Send;
+    /// A photo's account, once a profile named it.
+    fn photo(&self, id: Ulid) -> impl Future<Output = Result<Option<Ulid>>> + Send;
+    /// Removes the account's photos, giving them and the new version, or `None` without one.
+    fn remove_photo(
+        &self,
+        account: Ulid,
+    ) -> impl Future<Output = Result<Option<(Vec<Ulid>, u64)>>> + Send;
 
     fn create_file(&self, file: NewFile) -> impl Future<Output = Result<()>> + Send;
     /// A chat's file, removed or not. `None` for an account's file or none at all.

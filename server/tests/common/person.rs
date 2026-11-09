@@ -241,12 +241,13 @@ impl App {
                 }
                 Output::PutChunk {
                     id,
+                    method,
                     path,
                     bearer,
                     bytes,
                 } => {
                     let token = bearer.map(|bearer| bearer.0.clone()).unwrap_or_default();
-                    let (status, reply) = raw(server, "PUT", &path, &token, Some(&bytes));
+                    let (status, reply) = raw(server, &method, &path, &token, Some(&bytes));
                     Some(Input::Reply {
                         id,
                         status,

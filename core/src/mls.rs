@@ -41,6 +41,8 @@ const LOGOUT_LABEL: &[u8] = b"keryx v1 logout";
 const PASSWORD_RESET_LABEL: &[u8] = b"keryx v1 password reset";
 const DEVICE_LOGIN_LABEL: &[u8] = b"keryx v1 device login";
 const DRAFT_LABEL: &[u8] = b"keryx v1 draft";
+const PROFILE_KEY_LABEL: &[u8] = b"keryx v1 profile key";
+const PROFILE_LABEL: &[u8] = b"keryx v1 profile";
 const BODY_VERSION: u8 = 1;
 /// The account id, device id, master public key and stamp.
 const CREDENTIAL_SIZE: usize = 128;
@@ -121,6 +123,9 @@ pub enum MlsError {
     /// Signed correctly but does not open: the wrong key, or a sender's bug.
     #[error("A message does not open with its epoch's key")]
     Decrypt,
+
+    #[error("This device has no profile key for account {account}")]
+    NoProfileKey { account: Ulid },
 
     #[error("Could not wrap or unwrap a key")]
     Wrap(#[from] WrapError),
@@ -206,6 +211,9 @@ pub struct Commit {
     /// The chat's group info at the new epoch, which the server keeps with the commit, so the
     /// copy new devices join from is never left behind.
     pub group_info: Vec<u8>,
+    /// Every member's profile key this device holds, sealed at the new epoch, so a member it adds
+    /// sees everyone's photo at once.
+    pub profile_key_list: Vec<(Ulid, Vec<u8>)>,
 }
 
 /// Someone else's commit, applied.
@@ -248,6 +256,8 @@ pub struct Device {
     generation: u64,
     pins: HashMap<Ulid, [u8; 32]>,
     epoch_keys: HashMap<(Ulid, u64), Zeroizing<[u8; 16]>>,
+    /// Profile keys by account, this account's own from the words and others' opened from chats.
+    profile_keys: HashMap<Ulid, Zeroizing<[u8; 16]>>,
     chats: HashMap<Ulid, Chat>,
     /// The server time of the last row the platform saved, where the next `sync` starts. Kept here
     /// so it never runs ahead of the commits this state has applied.
@@ -409,6 +419,73 @@ fn draft_data(chat: Ulid, epoch: u64) -> Vec<u8> {
     data
 }
 
+/// **Permanent:** a profile key shared in a chat, as associated data.
+fn profile_key_data(chat: Ulid, account: Ulid, epoch: u64) -> Vec<u8> {
+    let mut data = Vec::with_capacity(PROFILE_KEY_LABEL.len() + 40);
+    data.extend_from_slice(PROFILE_KEY_LABEL);
+    data.extend_from_slice(chat.bytes());
+    data.extend_from_slice(account.bytes());
+    data.extend_from_slice(&epoch.to_be_bytes());
+    data
+}
+
+/// **Permanent:** a sealed profile's associated data, and with its body what the device signs.
+fn profile_data(account: Ulid) -> Vec<u8> {
+    let mut data = Vec::with_capacity(PROFILE_LABEL.len() + 16);
+    data.extend_from_slice(PROFILE_LABEL);
+    data.extend_from_slice(account.bytes());
+    data
+}
+
+/// A version byte, a random 12-byte nonce, then AES-128-GCM, as message bodies are.
+fn seal_under(key: &[u8; 16], data: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, MlsError> {
+    let cipher = match Aes128Gcm::new_from_slice(key) {
+        Ok(cipher) => cipher,
+        Err(_) => return Err(MlsError::Encrypt),
+    };
+    let mut nonce = [0u8; 12];
+    if let Err(source) = getrandom::fill(&mut nonce) {
+        return Err(MlsError::Random { source });
+    }
+    let payload = Payload {
+        msg: plaintext,
+        aad: data,
+    };
+    let sealed = match cipher.encrypt(Nonce::from_slice(&nonce), payload) {
+        Ok(sealed) => sealed,
+        Err(_) => return Err(MlsError::Encrypt),
+    };
+    let mut body = Vec::with_capacity(13 + sealed.len());
+    body.push(BODY_VERSION);
+    body.extend_from_slice(&nonce);
+    body.extend_from_slice(&sealed);
+    Ok(body)
+}
+
+fn open_under(key: &[u8; 16], data: &[u8], body: &[u8]) -> Result<Zeroizing<Vec<u8>>, MlsError> {
+    if body.is_empty() {
+        return Err(MlsError::BodyShort);
+    }
+    if body[0] != BODY_VERSION {
+        return Err(MlsError::BodyVersion { version: body[0] });
+    }
+    if body.len() < 29 {
+        return Err(MlsError::BodyShort);
+    }
+    let cipher = match Aes128Gcm::new_from_slice(key) {
+        Ok(cipher) => cipher,
+        Err(_) => return Err(MlsError::Decrypt),
+    };
+    let payload = Payload {
+        msg: &body[13..],
+        aad: data,
+    };
+    match cipher.decrypt(Nonce::from_slice(&body[1..13]), payload) {
+        Ok(plaintext) => Ok(Zeroizing::new(plaintext)),
+        Err(_) => Err(MlsError::Decrypt),
+    }
+}
+
 fn device_statement_bytes(label: &[u8], account: &Ulid, device: &Ulid) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(label.len() + 64);
     bytes.extend_from_slice(label);
@@ -564,6 +641,8 @@ impl Device {
         };
         let mut pins = HashMap::new();
         pins.insert(account, *keys.master_public());
+        let mut profile_keys = HashMap::new();
+        profile_keys.insert(account, Zeroizing::new(*keys.profile()));
         Ok(Self {
             provider,
             signer,
@@ -571,6 +650,7 @@ impl Device {
             generation: 0,
             pins,
             epoch_keys: HashMap::new(),
+            profile_keys,
             chats: HashMap::new(),
             since: None,
             shelf: Vec::new(),
@@ -1230,6 +1310,95 @@ impl Device {
         }
     }
 
+    /// Whether this device holds an account's profile key.
+    pub fn has_profile_key(&self, account: Ulid) -> bool {
+        self.profile_keys.contains_key(&account)
+    }
+
+    /// An account's profile key, sealed under the chat's current key, for a member whose key the
+    /// chat is missing. Returns the epoch it is sealed at.
+    pub fn share_profile_key(&self, chat: Ulid, account: Ulid) -> Result<(u64, Vec<u8>), MlsError> {
+        let Some(profile_key) = self.profile_keys.get(&account) else {
+            return Err(MlsError::NoProfileKey { account });
+        };
+        let epoch = self.epoch(chat)?;
+        let key = self.current_key(chat, epoch)?;
+        let data = profile_key_data(chat, account, epoch);
+        Ok((epoch, seal_under(&key, &data, profile_key.as_ref())?))
+    }
+
+    /// Opens a profile key shared in a chat at `epoch`, and keeps it. One that does not open
+    /// changes nothing.
+    pub fn take_profile_key(
+        &mut self,
+        chat: Ulid,
+        epoch: u64,
+        account: Ulid,
+        sealed: &[u8],
+    ) -> Result<(), MlsError> {
+        let key = self.current_key(chat, epoch)?;
+        let data = profile_key_data(chat, account, epoch);
+        let opened = open_under(&key, &data, sealed)?;
+        if opened.len() != 16 {
+            return Err(MlsError::Decrypt);
+        }
+        let mut profile_key = Zeroizing::new([0u8; 16]);
+        profile_key.copy_from_slice(&opened);
+        self.profile_keys.insert(account, profile_key);
+        Ok(())
+    }
+
+    /// This account's profile, sealed under its profile key and signed by this device over the
+    /// label, the account and the sealed bytes.
+    pub fn seal_profile(&self, plaintext: &[u8]) -> Result<(Vec<u8>, [u8; 64]), MlsError> {
+        let account = self.record.account;
+        let Some(profile_key) = self.profile_keys.get(&account) else {
+            return Err(MlsError::NoProfileKey { account });
+        };
+        let data = profile_data(account);
+        let sealed = seal_under(profile_key, &data, plaintext)?;
+        let mut signed = data;
+        signed.extend_from_slice(&sealed);
+        let signature = self.sign_bytes(&signed)?;
+        Ok((sealed, signature))
+    }
+
+    /// Checks a profile's device against the account's pinned master key, its signature against
+    /// that device, then opens it with the account's profile key.
+    pub fn open_profile(
+        &self,
+        record: &DeviceRecord,
+        sealed: &[u8],
+        signature: &[u8; 64],
+    ) -> Result<Zeroizing<Vec<u8>>, MlsError> {
+        let account = record.account;
+        match self.pins.get(&account) {
+            Some(pinned) if *pinned == record.master_public => {}
+            Some(_) => return Err(MlsError::MasterKeyChanged { account }),
+            None => return Err(MlsError::BadStamp { account }),
+        }
+        let bytes = device_stamp_bytes(&record.account, &record.device, &record.device_public);
+        verify(
+            &record.master_public,
+            &bytes,
+            &record.stamp,
+            MlsError::BadStamp { account },
+        )?;
+        let data = profile_data(account);
+        let mut signed = data.clone();
+        signed.extend_from_slice(sealed);
+        verify(
+            &record.device_public,
+            &signed,
+            signature,
+            MlsError::Signature,
+        )?;
+        let Some(profile_key) = self.profile_keys.get(&account) else {
+            return Err(MlsError::NoProfileKey { account });
+        };
+        open_under(profile_key, &data, sealed)
+    }
+
     /// Sign an unencrypted message, whose body is its content.
     pub fn sign(&self, header: &Header, body: &[u8]) -> Result<[u8; 64], MlsError> {
         let mut signed = header.bytes();
@@ -1342,6 +1511,11 @@ impl Device {
             out.extend_from_slice(chat.bytes());
             out.extend_from_slice(&state.epoch_started_at.to_be_bytes());
             out.push(u8::from(state.joining));
+        }
+        out.extend_from_slice(&(self.profile_keys.len() as u32).to_be_bytes());
+        for (account, key) in &self.profile_keys {
+            out.extend_from_slice(account.bytes());
+            out.extend_from_slice(key.as_ref());
         }
         let values = match self.provider.storage().values.read() {
             Ok(values) => values,
@@ -1457,6 +1631,13 @@ impl Device {
             let [joining]: [u8; 1] = read_array(&mut reader)?;
             chat_list.push((chat, epoch_started_at, joining == 1));
         }
+        let mut profile_keys = HashMap::new();
+        let count = u32::from_be_bytes(read_array(&mut reader)?);
+        for _ in 0..count {
+            let account = Ulid::from_bytes(read_array(&mut reader)?);
+            let key: [u8; 16] = read_array(&mut reader)?;
+            profile_keys.insert(account, Zeroizing::new(key));
+        }
 
         let provider = OpenMlsRustCrypto::default();
         let count = u32::from_be_bytes(read_array(&mut reader)?);
@@ -1519,6 +1700,7 @@ impl Device {
             generation,
             pins,
             epoch_keys,
+            profile_keys,
             chats,
             since,
             shelf,
@@ -1641,12 +1823,21 @@ impl Device {
         let mut key_bytes = Zeroizing::new([0u8; 16]);
         key_bytes.copy_from_slice(&key);
         let wrap_list = self.wrap_list(&secret, &key_bytes, chat, epoch, account_list)?;
+        let mut profile_key_list = Vec::new();
+        for account in account_list {
+            if let Some(profile_key) = self.profile_keys.get(&account.account) {
+                let data = profile_key_data(chat, account.account, epoch);
+                let sealed = seal_under(&key_bytes, &data, profile_key.as_ref())?;
+                profile_key_list.push((account.account, sealed));
+            }
+        }
         Ok(Commit {
             epoch,
             commit,
             welcome,
             wrap_list,
             group_info,
+            profile_key_list,
         })
     }
 

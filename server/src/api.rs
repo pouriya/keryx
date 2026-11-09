@@ -41,9 +41,10 @@ use keryx_core::protocol::{
     CreateAccountBody, CreateChatBody, CreateFileBody, CreatePackBody, CreatedAccountReply,
     DeviceListReply, DeviceReply, DevicesReply, DraftBody, DraftRequest, EmptyReply, FeaturesReply,
     FileReply, FileStatusReply, GroupInfoReply, KeyPackageListReply, KeyPackagesBody, LoginBody,
-    LoginReply, PackReply, ReducedDeviceItem, ReducedDeviceListReply, RegisterBody,
-    RegisterDeviceBody, ResetBody, SelfChatReply, ServerFrame, SessionListReply, SetupBody,
-    SetupReply, SignedBody, StickerItem, StickerListReply, StickerReply, TimesReply, WrapListReply,
+    LoginReply, NamesBody, PackReply, PhotoReply, ProfileReply, PutProfileBody, ReducedDeviceItem,
+    ReducedDeviceListReply, RegisterBody, RegisterDeviceBody, ResetBody, SelfChatReply,
+    ServerFrame, SessionListReply, SetupBody, SetupReply, SignedBody, StickerItem,
+    StickerListReply, StickerReply, TimesReply, VersionReply, WrapListReply,
 };
 use keryx_core::ulid::Ulid;
 use serde::de::DeserializeOwned;
@@ -63,8 +64,8 @@ use crate::file;
 use crate::moq;
 use crate::storage::sqlite::Sqlite;
 use crate::storage::{
-    self, BuiltInRole, NewAccount, NewDevice, NewFile, NewSession, NewSticker, Registered, Session,
-    Storage, StoredFile, SyncFrom,
+    self, BuiltInRole, NamesSaved, NewAccount, NewDevice, NewFile, NewNames, NewPhoto, NewProfile,
+    NewSession, NewSticker, ProfileSaved, Registered, Session, Storage, StoredFile, SyncFrom,
 };
 
 pub const CHAT_CREATE_DIRECT: &str = "chat.create_direct";
@@ -75,6 +76,8 @@ pub const MESSAGE_COMMIT: &str = "message.commit";
 pub const EDIT_OWN: &str = "message.edit.own";
 pub const DELETE_OWN: &str = "message.delete.own";
 pub const STICKER_MANAGE: &str = "sticker.manage";
+pub const PROFILE_EDIT: &str = "profile.edit";
+pub const ACCOUNT_RENAME: &str = "account.rename";
 
 /// The closed list of permission names. A stored role holding any other name stops startup, so a
 /// typo in a role cannot silently grant nothing.
@@ -100,6 +103,8 @@ pub const PERMISSION_LIST: &[&str] = &[
     EDIT_OWN,
     DELETE_OWN,
     STICKER_MANAGE,
+    PROFILE_EDIT,
+    ACCOUNT_RENAME,
 ];
 
 /// Everyone's built-in roles hold the whole list, except these, which are the admin's alone.
@@ -367,6 +372,8 @@ pub struct UploadLimits {
     pub file: u64,
     /// One sticker's WebP, which is not a chat's file.
     pub sticker: u64,
+    /// One profile photo, sealed: an account's file, not a chat's.
+    pub photo: u64,
 }
 
 impl Default for UploadLimits {
@@ -380,6 +387,7 @@ impl Default for UploadLimits {
             doc: 100 * MIB,
             file: 2048 * MIB,
             sticker: 256 * 1024,
+            photo: MIB,
         }
     }
 }
@@ -596,6 +604,8 @@ pub enum Need {
     Member(Ulid),
     /// Membership is not a permission, so the admin needs it too. Then a permission in that chat.
     MemberWith(Ulid, &'static str),
+    /// The built-in server admin role, or the operator, for acting on someone else's account.
+    Admin,
 }
 
 /// The one check every operation passes through.
@@ -603,7 +613,10 @@ pub async fn check(app: &App, caller: &Caller, need: Need) -> Result<(), Refused
     if matches!(need, Need::Anyone) {
         return Ok(());
     }
-    if matches!((caller, &need), (Caller::Operator, Need::Server(_))) {
+    if matches!(
+        (caller, &need),
+        (Caller::Operator, Need::Server(_) | Need::Admin)
+    ) {
         return Ok(());
     }
     let session = caller.session()?;
@@ -633,6 +646,13 @@ pub async fn check(app: &App, caller: &Caller, need: Need) -> Result<(), Refused
                 .server_permitted(session.account, permission)
                 .await?
             {
+                Ok(())
+            } else {
+                Err(refused(403, "no_permission", "You may not do this"))
+            }
+        }
+        Need::Admin => {
+            if app.storage.is_admin(session.account).await? {
                 Ok(())
             } else {
                 Err(refused(403, "no_permission", "You may not do this"))
@@ -1848,6 +1868,316 @@ pub async fn run_remove_sticker(
     Ok(EmptyReply {})
 }
 
+// -------------------------------------------------------------------------------------------------
+// Profiles
+// -------------------------------------------------------------------------------------------------
+
+/// A display name's longest, in characters after trimming, fixed by the author.
+const DISPLAY_NAME_CHARS: usize = 64;
+
+/// Whether `other` is this account or shares a chat with it, as profiles and photos need.
+async fn shares_or_self(app: &App, account: Ulid, other: Ulid) -> Result<bool, Refused> {
+    if account == other {
+        return Ok(true);
+    }
+    Ok(app
+        .storage
+        .accounts_sharing(account)
+        .await?
+        .contains(&other))
+}
+
+/// Tells the online devices of everyone sharing a chat with the account, and its own, that its
+/// profile moved.
+async fn profile_changed(
+    app: &App,
+    account: Ulid,
+    version: u64,
+    username: String,
+    display_name: Option<String>,
+) -> Result<(), Refused> {
+    let mut account_list = app.storage.accounts_sharing(account).await?;
+    if !account_list.contains(&account) {
+        account_list.push(account);
+    }
+    app.hub.deliver(
+        &account_list,
+        None,
+        &ServerFrame::Profile {
+            account,
+            version,
+            username,
+            display_name,
+        },
+    );
+    Ok(())
+}
+
+/// Tells everyone after a change that did not touch the names, which are read back for the frame.
+async fn profile_moved(app: &App, account: Ulid, version: u64) -> Result<(), Refused> {
+    let Some(found) = app.storage.account_by_id(account).await? else {
+        return Ok(());
+    };
+    profile_changed(app, account, version, found.username, found.display_name).await
+}
+
+/// An account's names, version and sealed profile, for itself or someone sharing a chat with it.
+pub async fn run_profile(app: &App, caller: &Caller, id: Ulid) -> Result<ProfileReply, Refused> {
+    check(app, caller, Need::Device).await?;
+    let session = caller.session()?;
+    if !shares_or_self(app, session.account, id).await? {
+        return Err(refused(
+            403,
+            "not_shared",
+            "You share no chat with that account",
+        ));
+    }
+    match app.storage.profile(id).await? {
+        Some(profile) => Ok(profile),
+        None => Err(refused(
+            404,
+            "no_such_account",
+            "That account does not exist",
+        )),
+    }
+}
+
+/// Saves your own sealed profile and the photo it names. A photo no longer named is deleted.
+pub async fn run_put_profile(
+    app: &App,
+    caller: &Caller,
+    id: Ulid,
+    input: PutProfileBody,
+) -> Result<VersionReply, Refused> {
+    check(app, caller, Need::Device).await?;
+    check(app, caller, Need::Server(PROFILE_EDIT)).await?;
+    let session = caller.session()?;
+    let device = session.device()?;
+    if id != session.account {
+        return Err(refused(
+            403,
+            "no_permission",
+            "You may change only your own profile",
+        ));
+    }
+    let sealed = match (input.sealed, input.signature) {
+        (Some(sealed), Some(signature)) => {
+            let signature: [u8; 64] = fixed(&signature, "signature")?;
+            Some((sealed.0, signature.to_vec()))
+        }
+        (None, None) => None,
+        _ => {
+            return Err(refused(
+                400,
+                "bad_body",
+                "A sealed profile needs its signature",
+            ));
+        }
+    };
+    if sealed.is_none() && input.photo.is_some() {
+        return Err(refused(
+            400,
+            "bad_body",
+            "A photo is named by a sealed profile",
+        ));
+    }
+    let saved = app
+        .storage
+        .put_profile(NewProfile {
+            account: id,
+            device,
+            sealed,
+            photo: input.photo,
+            now: Ulid::now(),
+        })
+        .await?;
+    let ProfileSaved::Saved { version, removed } = saved else {
+        return Err(refused(404, "no_such_photo", "That photo does not exist"));
+    };
+    for photo in removed {
+        file::remove_photo(app, id, photo).await;
+    }
+    tracing::info!(msg = "Saved a profile", account = %id);
+    profile_moved(app, id, version).await?;
+    Ok(VersionReply { version })
+}
+
+/// Your own display name and username, or admin's change to anyone's. Changing your own username
+/// needs your password.
+pub async fn run_names(
+    app: &App,
+    caller: &Caller,
+    id: Ulid,
+    input: NamesBody,
+) -> Result<VersionReply, Refused> {
+    if input.display_name.is_none() && input.username.is_none() {
+        return Err(refused(400, "bad_body", "Nothing to change"));
+    }
+    let own = matches!(caller, Caller::Session(session) if session.account == id);
+    if own {
+        check(app, caller, Need::Device).await?;
+        if input.display_name.is_some() {
+            check(app, caller, Need::Server(PROFILE_EDIT)).await?;
+        }
+        if input.username.is_some() {
+            check(app, caller, Need::Server(ACCOUNT_RENAME)).await?;
+        }
+    } else {
+        check(app, caller, Need::Admin).await?;
+    }
+    let display_name = match input.display_name {
+        Some(name) => {
+            let name = name.trim().to_string();
+            let length = name.chars().count();
+            if length == 0 || length > DISPLAY_NAME_CHARS {
+                return Err(refused(
+                    400,
+                    "bad_display_name",
+                    "A display name is 1 to 64 characters",
+                ));
+            }
+            Some(name)
+        }
+        None => None,
+    };
+    if let Some(username) = &input.username {
+        let min_length = if own {
+            Some(app.settings.registration.username_min_length)
+        } else {
+            None
+        };
+        check_username(username, min_length)?;
+        if own {
+            let wrong = refused(401, "bad_password", "That password is wrong");
+            let Some(password) = input.password else {
+                return Err(wrong);
+            };
+            if password.chars().count() > MAX_PASSWORD_CHARS {
+                return Err(wrong);
+            }
+            let Some(account) = app.storage.account_by_id(id).await? else {
+                return Err(wrong);
+            };
+            let Some(stored) = account.password_hash else {
+                return Err(wrong);
+            };
+            let verified = tokio::task::spawn_blocking(move || {
+                Argon2::default()
+                    .verify_password(password.as_bytes(), stored.as_str())
+                    .is_ok()
+            })
+            .await;
+            if !matches!(verified, Ok(true)) {
+                return Err(wrong);
+            }
+        }
+    }
+    let saved = app
+        .storage
+        .set_names(NewNames {
+            account: id,
+            display_name,
+            username: input.username,
+        })
+        .await?;
+    match saved {
+        NamesSaved::Saved {
+            version,
+            username,
+            display_name,
+        } => {
+            tracing::info!(msg = "Changed an account's names", account = %id);
+            profile_changed(app, id, version, username, display_name).await?;
+            Ok(VersionReply { version })
+        }
+        NamesSaved::UsernameTaken => Err(refused(409, "username_taken", "That username is taken")),
+        NamesSaved::NoSuchAccount => Err(refused(
+            404,
+            "no_such_account",
+            "That account does not exist",
+        )),
+    }
+}
+
+/// A new photo's sealed bytes, one chunk, for your own profile to name next.
+pub async fn run_add_photo(
+    app: &App,
+    caller: &Caller,
+    id: Ulid,
+    bytes: Vec<u8>,
+) -> Result<PhotoReply, Refused> {
+    check(app, caller, Need::Device).await?;
+    check(app, caller, Need::Server(PROFILE_EDIT)).await?;
+    let session = caller.session()?;
+    let device = session.device()?;
+    if id != session.account {
+        return Err(refused(
+            403,
+            "no_permission",
+            "You may change only your own profile",
+        ));
+    }
+    let size = bytes.len() as u64;
+    if size > app.settings.limits.upload.photo {
+        return Err(refused(413, "file_too_large", "That photo is too large"));
+    }
+    if !file::fits(size, 1) {
+        return Err(refused(400, "bad_body", "A photo is one sealed chunk"));
+    }
+    let photo = new_id()?;
+    file::write_photo(app, id, photo, &bytes).await?;
+    let removed = match app
+        .storage
+        .add_photo(NewPhoto {
+            id: photo,
+            account: id,
+            device,
+            size,
+            now: Ulid::now(),
+        })
+        .await
+    {
+        Ok(removed) => removed,
+        Err(error) => {
+            file::remove_photo(app, id, photo).await;
+            return Err(error.into());
+        }
+    };
+    for old in removed {
+        file::remove_photo(app, id, old).await;
+    }
+    Ok(PhotoReply { photo })
+}
+
+/// A photo's sealed bytes, for its account or someone sharing a chat with it. They never change, as
+/// an id is never reused.
+pub async fn run_photo(app: &App, caller: &Caller, id: Ulid) -> Result<Vec<u8>, Refused> {
+    check(app, caller, Need::Device).await?;
+    let session = caller.session()?;
+    let missing = refused(404, "no_such_photo", "That photo does not exist");
+    let Some(account) = app.storage.photo(id).await? else {
+        return Err(missing);
+    };
+    if !shares_or_self(app, session.account, account).await? {
+        return Err(missing);
+    }
+    file::read_photo(app, account, id).await
+}
+
+/// Admin removes someone's photo, whose sealed profile still names it.
+pub async fn run_remove_photo(app: &App, caller: &Caller, id: Ulid) -> Result<EmptyReply, Refused> {
+    check(app, caller, Need::Admin).await?;
+    let Some((removed, version)) = app.storage.remove_photo(id).await? else {
+        return Err(refused(404, "no_such_photo", "That account has no photo"));
+    };
+    for photo in removed {
+        file::remove_photo(app, id, photo).await;
+    }
+    tracing::info!(msg = "Removed an account's photo", account = %id);
+    profile_moved(app, id, version).await?;
+    Ok(EmptyReply {})
+}
+
 /// What a device's frames do: reads answer here, and everything else goes through the chat's task.
 pub async fn run_frame(
     app: &Arc<App>,
@@ -1939,6 +2269,9 @@ pub async fn run_frame(
             reference, chat, ..
         }
         | ClientFrame::Wraps {
+            reference, chat, ..
+        }
+        | ClientFrame::ProfileKeys {
             reference, chat, ..
         }
         | ClientFrame::CallEvent {
@@ -2519,6 +2852,82 @@ async fn remove_sticker(
     }))
 }
 
+async fn profile(State(app): Shared, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    respond(operation!("Profile", "profile", async {
+        let caller = caller_of(&app, &headers).await?;
+        run_profile(&app, &caller, path_id(&id)?).await
+    }))
+}
+
+async fn put_profile(
+    State(app): Shared,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Body,
+) -> Response {
+    respond(operation!("PutProfile", "put_profile", async {
+        let caller = caller_of(&app, &headers).await?;
+        run_put_profile(&app, &caller, path_id(&id)?, parse(body)?).await
+    }))
+}
+
+async fn put_names(
+    State(app): Shared,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Body,
+) -> Response {
+    respond(operation!("Names", "names", async {
+        let caller = caller_of(&app, &headers).await?;
+        run_names(&app, &caller, path_id(&id)?, parse(body)?).await
+    }))
+}
+
+async fn add_photo(
+    State(app): Shared,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Body,
+) -> Response {
+    respond(operation!("AddPhoto", "add_photo", async {
+        let caller = caller_of(&app, &headers).await?;
+        let bytes = match body {
+            Ok(bytes) => bytes.to_vec(),
+            Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+                return Err(refused(413, "file_too_large", "That photo is too large"));
+            }
+            Err(_) => return Err(refused(400, "bad_body", "That body could not be read")),
+        };
+        run_add_photo(&app, &caller, path_id(&id)?, bytes).await
+    }))
+}
+
+async fn photo(State(app): Shared, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    let result = operation!("Photo", "photo", async {
+        let caller = caller_of(&app, &headers).await?;
+        run_photo(&app, &caller, path_id(&id)?).await
+    });
+    match result {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [
+                (CONTENT_TYPE, "application/octet-stream"),
+                (CACHE_CONTROL, "private, max-age=31536000, immutable"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(refusal) => refusal.into_response(),
+    }
+}
+
+async fn remove_photo(State(app): Shared, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    respond(operation!("RemovePhoto", "remove_photo", async {
+        let caller = caller_of(&app, &headers).await?;
+        run_remove_photo(&app, &caller, path_id(&id)?).await
+    }))
+}
+
 async fn nothing_here() -> Response {
     refused(404, "not_found", "There is nothing there").into_response()
 }
@@ -2882,6 +3291,7 @@ fn router(app: Arc<App>, www: &FilePath) -> Router {
     let rest_body = app.settings.limits.rest_body;
     let chunk_body = usize::try_from(file::CHUNK + file::TAG).unwrap_or(usize::MAX);
     let sticker_body = usize::try_from(app.settings.limits.upload.sticker).unwrap_or(usize::MAX);
+    let photo_body = usize::try_from(app.settings.limits.upload.photo).unwrap_or(usize::MAX);
     let files = ServeDir::new(www).fallback(ServeFile::new(www.join("index.html")));
     Router::new()
         .route("/api/v1", get(guide))
@@ -2900,6 +3310,17 @@ fn router(app: Arc<App>, www: &FilePath) -> Router {
         .route("/api/v1/account/keys", put(account_keys))
         .route("/api/v1/accounts", get(directory).post(create_account))
         .route("/api/v1/accounts/{id}", get(account))
+        .route(
+            "/api/v1/accounts/{id}/profile",
+            get(profile).put(put_profile),
+        )
+        .route("/api/v1/accounts/{id}/names", put(put_names))
+        .route(
+            "/api/v1/accounts/{id}/photos",
+            post(add_photo).layer(DefaultBodyLimit::max(photo_body)),
+        )
+        .route("/api/v1/accounts/{id}/photo", delete(remove_photo))
+        .route("/api/v1/photos/{id}", get(photo))
         .route("/api/v1/devices", get(devices).post(register_device))
         .route("/api/v1/devices/id", post(device_id))
         .route("/api/v1/devices/{id}/terminate", post(terminate))

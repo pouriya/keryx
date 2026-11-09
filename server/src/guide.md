@@ -66,6 +66,10 @@ good.
     DEL  /sticker_packs/{id}     sticker.manage: the pack and its stickers
     POST /sticker_packs/{id}/stickers?emoji=   sticker.manage: the raw WebP -> sticker
     DEL  /stickers/{id}          sticker.manage
+    PUT  /accounts/{id}/names    display_name? (profile.edit), username? and password
+                                 (account.rename), for yourself -> version. Admin: anyone's, with no
+                                 password
+    DEL  /accounts/{id}/photo    admin: removes the account's photo
 
 ## With a registered device, under the account's device limit
 
@@ -78,6 +82,14 @@ good.
     GET  /chats/{id}/wraps                -> wrap_list{epoch, account, wrapped}
     GET  /chats/{id}/messages/{seq}/times -> member_list{account, received_at?, seen_at?}
     PUT  /chats/{id}/draft                {draft?: {epoch, body}}: keeps your sealed draft, or clears it
+    GET  /accounts/{id}/profile           yourself, or sharing a chat -> account, username,
+                                          display_name?, version, profile?{sealed, signature,
+                                          device, device_public, stamp}, photo?
+    PUT  /accounts/{id}/profile           profile.edit, yourself: sealed?, signature?, photo?
+                                          -> version
+    POST /accounts/{id}/photos            profile.edit, yourself: the sealed photo's raw bytes,
+                                          one chunk -> photo
+    GET  /photos/{id}                     yourself, or sharing a chat -> the sealed bytes
     POST /chats/{id}/files                kind, size, chunks -> file
     PUT  /files/{id}/chunks/{n}           the encrypted chunk's raw bytes -> size, chunks, received
     GET  /files/{id}                      -> size, chunks, received
@@ -118,10 +130,19 @@ itself. To check the server yourself, send a WebSocket ping, or a `ping` frame, 
 
 Every frame is JSON with a `type`. A request's `ref` is a ULID you make, which comes back in its answer.
 
-You send: `send`, `seen`, `received`, `typing`, `sync`, `group_info`, `wraps`, `call_event`, `times`, `draft`, `ping`.
+You send: `send`, `seen`, `received`, `typing`, `sync`, `group_info`, `wraps`, `profile_keys`,
+`call_event`, `times`, `draft`, `ping`.
 
 The server sends: `features`, `sent`, `done`, `refused`, `message`, `chats`, `welcome`, `typing`,
-`marks`, `revoked`, `call_event`, `times`, `draft`.
+`marks`, `revoked`, `call_event`, `times`, `draft`, `profile`, `profile_keys`.
+
+`profile` carries an `account` sharing a chat with you, or your own, with its `version`, `username` and
+`display_name`, whenever its names, photo, bio or links change. Each `chats` entry carries every
+member's `version` in `profile_key_list`, with their profile key sealed under the chat's key at `epoch`
+once someone shared it. A commit carries `profile_key_list`, `{account, sealed}` at its epoch, and
+`profile_keys` carries `chat`, `epoch` and the same list for keys a chat is missing, answered with
+`done`. The server keeps the newest per chat and account. Once either is saved, the chat's other online
+devices get `profile_keys` with `chat` and those accounts' items as a `chats` entry carries them.
 
 `received` and `seen` each carry `chat` and `up_to_seq`, and the server keeps the highest of each. When
 one rises, the other members' online devices get `marks` with the `account`, its `received_seq` and its

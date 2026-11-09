@@ -1,8 +1,9 @@
 //! Files' bytes on disk under `[files] directory`: a folder per chat named by its id, and one file per
 //! upload named by its id, holding its encrypted chunks back to back. Chunk writes and reads, and
 //! removing uploads no sent message named. Stickers live there too, in a `stickers` folder, a file
-//! per sticker named by its id, each a WebP checked by its header. The rows are in storage. See the
-//! root AGENTS.md.
+//! per sticker named by its id, each a WebP checked by its header, and profile photos in
+//! `accounts/<account id>`, a file per photo named by its id, each one sealed chunk. The rows are in
+//! storage. See the root AGENTS.md.
 
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
@@ -196,5 +197,43 @@ pub async fn remove_sticker(app: &App, sticker: Ulid) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => tracing::error!(msg = "Could not delete a sticker's bytes", error = %error),
+    }
+}
+
+fn photo_path(directory: &Path, account: Ulid, photo: Ulid) -> PathBuf {
+    directory
+        .join("accounts")
+        .join(account.to_string())
+        .join(photo.to_string())
+}
+
+/// Writes a profile photo's sealed bytes, and waits until they are on disk.
+pub async fn write_photo(
+    app: &App,
+    account: Ulid,
+    photo: Ulid,
+    bytes: &[u8],
+) -> Result<(), Refused> {
+    let path = photo_path(&app.settings.files.directory, account, photo);
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await.map_err(failed)?;
+    }
+    let mut handle = tokio::fs::File::create(&path).await.map_err(failed)?;
+    handle.write_all(bytes).await.map_err(failed)?;
+    handle.sync_data().await.map_err(failed)
+}
+
+pub async fn read_photo(app: &App, account: Ulid, photo: Ulid) -> Result<Vec<u8>, Refused> {
+    let path = photo_path(&app.settings.files.directory, account, photo);
+    tokio::fs::read(&path).await.map_err(failed)
+}
+
+/// Deletes a profile photo's bytes. One already gone is fine.
+pub async fn remove_photo(app: &App, account: Ulid, photo: Ulid) {
+    let path = photo_path(&app.settings.files.directory, account, photo);
+    match tokio::fs::remove_file(&path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => tracing::error!(msg = "Could not delete a photo's bytes", error = %error),
     }
 }

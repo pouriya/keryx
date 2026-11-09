@@ -85,6 +85,7 @@ video = "2GiB"
 doc = "100MiB"
 file = "2GiB"
 sticker = "256KiB"        # one sticker's WebP. Not encrypted: everyone on the server sees it
+photo = "1MiB"            # one profile photo, sealed. An account's file, not a chat's
 
 # Without this section the server speaks plain HTTP, for local use or behind a reverse proxy.
 [tcp]
