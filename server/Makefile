@@ -3,6 +3,11 @@ VERSION=$(shell awk 'BEGIN{FS="[ \"]"}$$1 == "version"{print $$4;exit}' Cargo.to
 BUILD_DIR=build
 CARGO_TARGET_DIR ?= ../target
 COVERAGE_TABLE=tests/AGENTS.md
+# `make docker`. DOCKER_REGISTRY is a prefix for the base images, with its trailing slash
+# (`registry.example.com/`); empty means Docker Hub.
+DOCKER_REGISTRY ?=
+DOCKER_ALPINE_VERSION ?= 3.23
+DOCKER_IMAGE_VERSION ?= ${VERSION}
 
 
 all: dev clippy moq coverage check-style
@@ -72,6 +77,15 @@ coverage:
 	@ sed -n '/coverage:start/,/coverage:end/p' ${COVERAGE_TABLE}
 
 
+# The image, tagged with the version and `latest`, built from the repository's root Dockerfile, so
+# the host needs no Rust.
+docker:
+	docker build --build-arg DOCKER_REGISTRY=${DOCKER_REGISTRY} \
+		--build-arg DOCKER_ALPINE_VERSION=${DOCKER_ALPINE_VERSION} \
+		--build-arg KERYX_VERSION=${VERSION} \
+		--force-rm -t keryx:${DOCKER_IMAGE_VERSION} -t keryx:latest ..
+
+
 clean:
 	cargo clean -p keryx
 
@@ -80,4 +94,4 @@ dist-clean: clean
 	rm -rf ${BUILD_DIR}
 
 
-.PHONY: all version dev release start-dev clippy moq check-style fmt lint test coverage clean dist-clean
+.PHONY: all version dev release start-dev clippy moq check-style fmt lint test coverage docker clean dist-clean

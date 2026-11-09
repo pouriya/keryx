@@ -58,6 +58,8 @@ Delete this section when it stops being true.
 ```
 AGENTS.md       This file: what applies to the whole repository
 Cargo.toml      The workspace: server and core, with one Cargo.lock and one target/
+Dockerfile      The server's image, built by `make docker` in server/
+.dockerignore   Keeps everything the Dockerfile does not copy out of its context
 server/         The `keryx` binary: `keryx serve`, the CLI and TUI, local MCP
   AGENTS.md     Binding rules for server/: layout, style, logging, make
   tests/        Integration tests
@@ -117,7 +119,8 @@ the WASM build, because there is one `Cargo.lock`. Make targets stay inside
 | Passwords | Argon2id through `argon2` 0.6.0, at 19 MiB, 2 passes and 1 lane: the crate's defaults and OWASP's minimum. The settings are stored with each hash, so they can be raised later |
 | Retention | How long the server keeps ciphertext is configured in `server.toml`. **Unset means unlimited.** It can also be set per chat, where the client offers that. **The shortest limit wins:** a chat can shorten the server's limit but never exceed it, and setting it is a permission. Deleting removes the server's copy only |
 | Authorization | **A complete RBAC, with many features built on it.** See below |
-| Web delivery | Built on its own, copied into the server's Docker image, and served from `[www] directory = "..."` in `server.toml` through `tower-http`'s ServeDir, so keryx does not own a path check. A path with no file gets `index.html`, so `/setup#token` works. Not embedded in the binary |
+| Docker | **One root `Dockerfile`, built by `make docker` in `server/`, chosen by the author after activeplano's.** A static musl binary from `rust:alpine` on `alpine` 3.23, the dependencies built first against empty sources so a source change reuses their layer, with a `DOCKER_REGISTRY` prefix for the base images, empty for Docker Hub. **The server only for now:** the web client is on hold. **Everything lives in one volume, `/var/lib/keryx`:** `server.toml`, which the image does not carry, the database, `files/` and an empty `www/`. `ENTRYPOINT` is `keryx --config /var/lib/keryx/server.toml` and `CMD` is `serve`. Tagged `keryx:<version>` and `keryx:latest`, with no `HEALTHCHECK` and no compose file yet |
+| Web delivery | Built on its own, copied into the server's Docker image once the web client is off hold, and served from `[www] directory = "..."` in `server.toml` through `tower-http`'s ServeDir, so keryx does not own a path check. A path with no file gets `index.html`, so `/setup#token` works. Not embedded in the binary |
 | No production yet | **No migrations, no backward compatibility and no `ALTER`s until there is a production server, chosen by the author.** The schema, the wire and stored formats change in place, and a change means deleting the database and the clients' stored state |
 | Database | SQLite in **one `.db` file, with no `.wal`**, using its classic `DELETE` journal: a `-journal` file exists only during a write, so a crash mid-write rolls back. One writer and one reader connection, each behind a lock, which take turns. If that becomes too slow, the answer is Postgres |
 | v1 scope | Direct and group chats, channels, calls in all three, encrypted attachments, local message search, all four MCP roles |
@@ -1663,7 +1666,8 @@ first, as everywhere.
 - The web client's open questions are in [web/AGENTS.md](web/AGENTS.md), and Android's in
   [android/AGENTS.md](android/AGENTS.md)
 - CI, release targets and installers
-- Docker: Dockerfile location, base images, and how the web build reaches the image
+- Docker: how the web build reaches the image, once the web client is off hold; a health check and a
+  compose file
 
 **Crypto and identity**
 

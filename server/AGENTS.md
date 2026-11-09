@@ -54,6 +54,7 @@ not claim it passed without running it.
 | `make lint` | `clippy` + `check-style`, no build |
 | `make test` | `cargo test --target …` |
 | `make coverage` | Runs the tests under `cargo-llvm-cov` and **rewrites the table** in [tests/AGENTS.md](tests/AGENTS.md) |
+| `make docker` | The image `keryx:<version>` and `keryx:latest` from the root `Dockerfile`. `DOCKER_REGISTRY` prefixes the base images |
 | `make clean` / `dist-clean` | Drop `target/` / also `build/` |
 
 **`make start-dev` needs `CONFIG=/absolute/server.toml`,** since the configuration has no default here

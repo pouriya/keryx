@@ -1,0 +1,13 @@
+# Only what the Dockerfile copies; everything else (target/, tmp/, android/, web/, node_modules,
+# the git history, local notes) stays out of the context.
+*
+!Cargo.toml
+!Cargo.lock
+!server/Makefile
+!server/Cargo.toml
+!server/src
+!core/Cargo.toml
+!core/src
+!moq/Cargo.toml
+!web/wasm/Cargo.toml
+!android/ffi/Cargo.toml
