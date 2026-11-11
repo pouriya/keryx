@@ -4,7 +4,7 @@
 //! check reads the role tables each time, so a role change applies at once. Secrets travel only in
 //! headers and bodies, because the access log records the path and the query.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
@@ -37,14 +37,15 @@ use keryx_core::mls::{
 };
 use keryx_core::protocol::{
     AccountInfo, AccountKeysBody, AccountListReply, AccountReply, Bytes, ChallengeBody,
-    ChallengeReply, ChatDeviceListReply, ChatMode, ChatReply, ClientFrame, ContentKind, CountReply,
-    CreateAccountBody, CreateChatBody, CreateFileBody, CreatePackBody, CreatedAccountReply,
-    DeviceListReply, DeviceReply, DevicesReply, DraftBody, DraftRequest, EmptyReply, FeaturesReply,
-    FileReply, FileStatusReply, GroupInfoReply, KeyPackageListReply, KeyPackagesBody, LoginBody,
-    LoginReply, NamesBody, PackReply, PhotoReply, PinsRequest, ProfileReply, PutProfileBody,
-    ReducedDeviceItem, ReducedDeviceListReply, RegisterBody, RegisterDeviceBody, ResetBody,
-    SelfChatReply, ServerFrame, SessionListReply, SetupBody, SetupReply, SignedBody, StickerItem,
-    StickerListReply, StickerReply, TimesReply, VersionReply, WrapListReply,
+    ChallengeReply, ChatDeviceListReply, ChatFolders, ChatMode, ChatReply, ClientFrame,
+    ContentKind, CountReply, CreateAccountBody, CreateChatBody, CreateFileBody, CreatePackBody,
+    CreatedAccountReply, DeviceListReply, DeviceReply, DevicesReply, DraftBody, DraftRequest,
+    EmptyReply, FeaturesReply, FileReply, FileStatusReply, FolderReply, GroupInfoReply,
+    KeyPackageListReply, KeyPackagesBody, LoginBody, LoginReply, NamesBody, PackReply, PhotoReply,
+    ProfileReply, PutProfileBody, ReducedDeviceItem, ReducedDeviceListReply, RegisterBody,
+    RegisterDeviceBody, ResetBody, SelfChatReply, ServerFrame, SessionListReply, SetupBody,
+    SetupReply, SignedBody, StickerItem, StickerListReply, StickerReply, TimesReply, VersionReply,
+    WrapListReply,
 };
 use keryx_core::ulid::Ulid;
 use serde::de::DeserializeOwned;
@@ -78,6 +79,13 @@ pub const DELETE_OWN: &str = "message.delete.own";
 pub const STICKER_MANAGE: &str = "sticker.manage";
 pub const PROFILE_EDIT: &str = "profile.edit";
 pub const ACCOUNT_RENAME: &str = "account.rename";
+pub const FOLDER_CREATE: &str = "folder.create";
+pub const FOLDER_RENAME: &str = "folder.rename";
+pub const FOLDER_REMOVE: &str = "folder.remove";
+pub const FOLDER_REORDER: &str = "folder.reorder";
+pub const FOLDER_DEFAULT: &str = "folder.default";
+pub const FOLDER_CHATS: &str = "folder.chats";
+pub const CHAT_PIN: &str = "chat.pin";
 
 /// The closed list of permission names. A stored role holding any other name stops startup, so a
 /// typo in a role cannot silently grant nothing.
@@ -105,6 +113,13 @@ pub const PERMISSION_LIST: &[&str] = &[
     STICKER_MANAGE,
     PROFILE_EDIT,
     ACCOUNT_RENAME,
+    FOLDER_CREATE,
+    FOLDER_RENAME,
+    FOLDER_REMOVE,
+    FOLDER_REORDER,
+    FOLDER_DEFAULT,
+    FOLDER_CHATS,
+    CHAT_PIN,
 ];
 
 /// Everyone's built-in roles hold the whole list, except these, which are the admin's alone.
@@ -141,6 +156,7 @@ const CHALLENGE_MS: i64 = 5 * 60 * 1000;
 const PURPOSE_RESET: i64 = 0;
 const PURPOSE_DEVICE_LOGIN: i64 = 1;
 const PURPOSE_DEVICE_ID: i64 = 2;
+const PURPOSE_FOLDER_ID: i64 = 3;
 
 /// A setup link works for 7 days.
 const SETUP_LINK_MS: i64 = 7 * 24 * 60 * 60 * 1000;
@@ -276,6 +292,8 @@ pub struct Limits {
     pub key_packages: u64,
     pub call_frame: usize,
     pub call_cache: usize,
+    /// An account's folders, not counting `all`.
+    pub folders: usize,
     pub body: BodyLimits,
     pub upload: UploadLimits,
 }
@@ -293,6 +311,7 @@ impl Default for Limits {
             key_packages: 100,
             call_frame: 256 * 1024,
             call_cache: 16 * 1024 * 1024,
+            folders: 20,
             body: BodyLimits::default(),
             upload: UploadLimits::default(),
         }
@@ -317,6 +336,8 @@ pub struct BodyLimits {
     pub sticker: u64,
     /// An account's sealed draft in one chat, which is not a message.
     pub draft: u64,
+    /// One sealed folder name.
+    pub folder_name: u64,
 }
 
 impl Default for BodyLimits {
@@ -336,6 +357,7 @@ impl Default for BodyLimits {
             answer: 16 * 1024,
             sticker: 1024,
             draft: 64 * 1024,
+            folder_name: 256,
         }
     }
 }
@@ -821,6 +843,7 @@ pub async fn run_register(
             display_name: input.display_name,
             password_hash: Some(password_hash),
             admin: false,
+            all_folder: new_id()?,
             setup: None,
             now: Ulid::now(),
         })
@@ -850,6 +873,7 @@ pub async fn run_create_account(
             display_name: input.display_name,
             password_hash: None,
             admin: input.admin,
+            all_folder: new_id()?,
             setup: Some((token_hash, now + SETUP_LINK_MS)),
             now,
         })
@@ -1584,30 +1608,208 @@ pub async fn run_put_draft(
     Ok(EmptyReply {})
 }
 
-/// Keeps this account's pinned chats, the whole order at once, and tells its other online devices.
-/// Each must be a chat this account is in, named once. Like a draft it takes no chat task and no
-/// named permission, only membership.
-pub async fn run_put_pins(
+/// A new folder's id, which its sealed name's associated data holds, so a client never chooses its
+/// own. Kept for this account for 5 minutes, like a device's.
+pub async fn run_folder_id(app: &App, caller: &Caller) -> Result<FolderReply, Refused> {
+    check(app, caller, Need::Device).await?;
+    check(app, caller, Need::Server(FOLDER_CREATE)).await?;
+    let session = caller.session()?;
+    let id = new_id()?;
+    let now = Ulid::now();
+    app.storage
+        .create_challenge(
+            id.bytes().to_vec(),
+            session.account,
+            PURPOSE_FOLDER_ID,
+            now + CHALLENGE_MS,
+            now,
+        )
+        .await?;
+    Ok(FolderReply { folder: id })
+}
+
+/// Keeps this account's whole arrangement of folders, and tells its other online devices. Chats it
+/// is not in are dropped. Each kind of change needs its own permission, found by comparing with what
+/// is kept, and refused in any part is refused whole. Like a draft it takes no chat task.
+pub async fn run_put_chat_folders(
     app: &App,
     caller: &Caller,
-    chat_list: Vec<Ulid>,
+    folders: ChatFolders,
 ) -> Result<EmptyReply, Refused> {
     check(app, caller, Need::Device).await?;
     let session = caller.session()?;
-    let mut named = HashSet::new();
-    for chat in &chat_list {
-        if !named.insert(*chat) {
-            return Err(refused(400, "bad_body", "A chat is pinned twice"));
-        }
-        check(app, caller, Need::Member(*chat)).await?;
+    let (held, chat_list) = app.storage.chat_folders(session.account).await?;
+    let mut member = HashSet::new();
+    for chat in chat_list {
+        member.insert(chat);
     }
-    app.storage
-        .put_pins(session.account, chat_list.clone())
-        .await?;
+    let mut held_all = None;
+    let mut before = HashMap::new();
+    for folder in &held.folder_list {
+        if folder.name.is_none() {
+            held_all = Some(folder.id);
+        }
+        before.insert(folder.id, folder);
+    }
+
+    // The shape first: one `all`, this account's own, and every id, chat and pin once.
+    let mut folders = folders;
+    let mut id_list = HashSet::new();
+    let mut all = None;
+    let mut named = 0;
+    for folder in &folders.folder_list {
+        if !id_list.insert(folder.id) {
+            return Err(refused(400, "bad_body", "A folder is named twice"));
+        }
+        match (&folder.name, &folder.chat_list) {
+            (None, None) => {
+                if all.replace(folder.id).is_some() {
+                    return Err(refused(400, "bad_body", "There is more than one all"));
+                }
+            }
+            (Some(name), Some(chat_list)) => {
+                named += 1;
+                if name.0.len() as u64 > app.settings.limits.body.folder_name {
+                    return Err(refused(
+                        413,
+                        "body_too_large",
+                        "That folder name is larger than this server keeps",
+                    ));
+                }
+                let mut seen = HashSet::new();
+                for chat in chat_list {
+                    if !seen.insert(*chat) {
+                        return Err(refused(400, "bad_body", "A chat is in a folder twice"));
+                    }
+                }
+            }
+            _ => {
+                return Err(refused(
+                    400,
+                    "bad_body",
+                    "Every folder but all has a name and chats, and all has neither",
+                ));
+            }
+        }
+        let mut seen = HashSet::new();
+        for chat in &folder.pin_list {
+            if !seen.insert(*chat) {
+                return Err(refused(400, "bad_body", "A chat is pinned twice"));
+            }
+            if let Some(chat_list) = &folder.chat_list
+                && !chat_list.contains(chat)
+            {
+                return Err(refused(
+                    400,
+                    "bad_body",
+                    "A pinned chat is not in its folder",
+                ));
+            }
+        }
+    }
+    if all.is_none() || all != held_all {
+        return Err(refused(400, "bad_body", "This account's all is missing"));
+    }
+    if !id_list.contains(&folders.default) {
+        return Err(refused(
+            400,
+            "bad_body",
+            "The default is not one of the folders",
+        ));
+    }
+    if named > app.settings.limits.folders {
+        return Err(Refused {
+            status: 403,
+            code: "too_many_folders",
+            message: format!(
+                "This account may have {} folders",
+                app.settings.limits.folders
+            ),
+            call_seq: None,
+        });
+    }
+    for folder in &mut folders.folder_list {
+        if let Some(chat_list) = &mut folder.chat_list {
+            chat_list.retain(|chat| member.contains(chat));
+        }
+        folder.pin_list.retain(|chat| member.contains(chat));
+    }
+
+    // Then what changed, each kind needing its own permission.
+    let mut need_list = Vec::new();
+    let mut kept_order = Vec::new();
+    for folder in &folders.folder_list {
+        let Some(old) = before.get(&folder.id) else {
+            need_list.push(FOLDER_CREATE);
+            if matches!(&folder.chat_list, Some(chat_list) if !chat_list.is_empty()) {
+                need_list.push(FOLDER_CHATS);
+            }
+            if !folder.pin_list.is_empty() {
+                need_list.push(CHAT_PIN);
+            }
+            continue;
+        };
+        kept_order.push(folder.id);
+        if folder.name != old.name {
+            need_list.push(FOLDER_RENAME);
+        }
+        if let (Some(chat_list), Some(old_list)) = (&folder.chat_list, &old.chat_list) {
+            let mut moved = chat_list.len() != old_list.len();
+            for chat in chat_list {
+                if !old_list.contains(chat) {
+                    moved = true;
+                }
+            }
+            if moved {
+                need_list.push(FOLDER_CHATS);
+            }
+        }
+        if folder.pin_list != old.pin_list {
+            need_list.push(CHAT_PIN);
+        }
+    }
+    let mut old_order = Vec::new();
+    for folder in &held.folder_list {
+        if id_list.contains(&folder.id) {
+            old_order.push(folder.id);
+        } else {
+            need_list.push(FOLDER_REMOVE);
+        }
+    }
+    if old_order != kept_order {
+        need_list.push(FOLDER_REORDER);
+    }
+    // Removing the default makes `all` the default, which is part of removing it.
+    let default_removed = !id_list.contains(&held.default);
+    if folders.default != held.default && !(default_removed && Some(folders.default) == held_all) {
+        need_list.push(FOLDER_DEFAULT);
+    }
+    need_list.sort_unstable();
+    need_list.dedup();
+    for permission in need_list {
+        check(app, caller, Need::Server(permission)).await?;
+    }
+
+    if !app
+        .storage
+        .put_chat_folders(
+            session.account,
+            folders.clone(),
+            PURPOSE_FOLDER_ID,
+            Ulid::now(),
+        )
+        .await?
+    {
+        return Err(refused(
+            404,
+            "unknown_folder",
+            "That folder is not one of yours",
+        ));
+    }
     app.hub.deliver(
         &[session.account],
         session.device,
-        &ServerFrame::Pins { chat_list },
+        &ServerFrame::ChatFolders(Box::new(folders)),
     );
     Ok(EmptyReply {})
 }
@@ -2244,13 +2446,21 @@ pub async fn run_frame(
             });
             return Some(answer_of(reference, result));
         }
-        ClientFrame::Pins {
-            reference,
-            chat_list,
-        } => {
-            let (reference, chat_list) = (*reference, chat_list.clone());
-            let result = operation!("Pins", "pins", async {
-                run_put_pins(app, &caller, chat_list).await?;
+        ClientFrame::FolderId { reference } => {
+            let reference = *reference;
+            let result = operation!("FolderId", "folder_id", async {
+                let reply = run_folder_id(app, &caller).await?;
+                Ok(ServerFrame::FolderId {
+                    reference,
+                    folder: reply.folder,
+                })
+            });
+            return Some(answer_of(reference, result));
+        }
+        ClientFrame::ChatFolders { reference, folders } => {
+            let (reference, folders) = (*reference, folders.clone());
+            let result = operation!("ChatFolders", "chat_folders", async {
+                run_put_chat_folders(app, &caller, folders).await?;
                 Ok(ServerFrame::Done { reference })
             });
             return Some(answer_of(reference, result));
@@ -2275,9 +2485,12 @@ pub async fn run_frame(
                         SyncFrom::Since(since.map_or(0, |since| since.saturating_sub(SYNC_BACK_MS)))
                     }
                 };
-                let chat_list = match after {
-                    Some(_) => Vec::new(),
-                    None => app.storage.chat_list(session.account).await?,
+                let (chat_list, chat_folders) = match after {
+                    Some(_) => (Vec::new(), None),
+                    None => (
+                        app.storage.chat_list(session.account).await?,
+                        Some(app.storage.chat_folders(session.account).await?.0),
+                    ),
                 };
                 let page = app
                     .storage
@@ -2294,6 +2507,7 @@ pub async fn run_frame(
                     message_list: page.message_list,
                     call_list: page.call_list,
                     more: page.more,
+                    chat_folders,
                 })
             });
             return Some(answer_of(reference, result));
@@ -2730,11 +2944,17 @@ async fn message_times(
     }))
 }
 
-async fn put_pins(State(app): Shared, headers: HeaderMap, body: Body) -> Response {
-    respond(operation!("PutPins", "put_pins", async {
+async fn folder_id(State(app): Shared, headers: HeaderMap) -> Response {
+    respond(operation!("FolderId", "folder_id", async {
         let caller = caller_of(&app, &headers).await?;
-        let request: PinsRequest = parse(body)?;
-        run_put_pins(&app, &caller, request.chat_list).await
+        run_folder_id(&app, &caller).await
+    }))
+}
+
+async fn put_chat_folders(State(app): Shared, headers: HeaderMap, body: Body) -> Response {
+    respond(operation!("PutChatFolders", "put_chat_folders", async {
+        let caller = caller_of(&app, &headers).await?;
+        run_put_chat_folders(&app, &caller, parse(body)?).await
     }))
 }
 
@@ -3387,7 +3607,8 @@ fn router(app: Arc<App>, www: &FilePath) -> Router {
         )
         .route("/api/v1/chats/{id}/wraps", get(chat_wraps))
         .route("/api/v1/chats/{id}/draft", put(put_draft))
-        .route("/api/v1/pins", put(put_pins))
+        .route("/api/v1/chat_folders", put(put_chat_folders))
+        .route("/api/v1/chat_folders/id", post(folder_id))
         .route("/api/v1/chats/{id}/files", post(create_file))
         .route("/api/v1/files/{id}", get(file_status))
         .route(

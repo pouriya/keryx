@@ -174,7 +174,8 @@ fn read_configuration(path: &Path) -> anyhow::Result<Settings> {
         .optional("question", ByteSize::new())
         .optional("answer", ByteSize::new())
         .optional("sticker", ByteSize::new())
-        .optional("draft", ByteSize::new());
+        .optional("draft", ByteSize::new())
+        .optional("folder_name", ByteSize::new());
     let upload = StaticMap::new()
         .optional("voice", ByteSize::new())
         .optional("image", ByteSize::new())
@@ -230,6 +231,7 @@ fn read_configuration(path: &Path) -> anyhow::Result<Settings> {
                 .optional_any("key_packages")
                 .optional("call_frame", ByteSize::new())
                 .optional("call_cache", ByteSize::new())
+                .optional_any("folders")
                 .optional("body", body)
                 .optional("upload", upload),
         )

@@ -44,6 +44,8 @@ pub struct App {
     /// The archive an app keeps on disk: every message and call row as the server sent it.
     pub archive: BTreeMap<(Ulid, u64), MessageFrame>,
     pub archive_calls: BTreeMap<(Ulid, u64, u64), CallEvent>,
+    /// No network: nothing answers a request and no socket connects.
+    pub offline: bool,
 }
 
 /// One request with raw bytes each way, as file chunks go: the status and the reply's bytes.
@@ -108,6 +110,7 @@ impl App {
             call_outputs: VecDeque::new(),
             archive: BTreeMap::new(),
             archive_calls: BTreeMap::new(),
+            offline: false,
         }
     }
 
@@ -160,6 +163,11 @@ impl App {
                     }
                     None
                 }
+                Output::Request { id, .. } if self.offline => Some(Input::Reply {
+                    id,
+                    status: 0,
+                    body: String::new(),
+                }),
                 Output::Request {
                     id,
                     method,
@@ -184,6 +192,10 @@ impl App {
                         body: reply.to_string(),
                     })
                 }
+                Output::Connect { .. } if self.offline => Some(Input::Closed {
+                    code: 1006,
+                    reason: String::new(),
+                }),
                 Output::Connect { bearer } => {
                     let url = format!("{}/api/v1/ws", server.origin.replace("http://", "ws://"));
                     let mut request = ClientRequestBuilder::new(url.parse().unwrap())

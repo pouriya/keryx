@@ -48,6 +48,10 @@ error paths, are still to do:** see [core/tests/AGENTS.md](core/tests/AGENTS.md)
 - **Calls are done in core, the server and `keryx-moq`** for direct chats: ringing, decline, joins,
   leaves, the drop grace, media, state and text through the relay, tested end to end in the server's
   tests with `keryx-moq` as the client. Android's call screen is next.
+- **Folders are done in core, the server and Android**, each with its own pins, replacing the pinned
+  chats. On the author's phone: up to 20 folders and the 21st refused, the sheet's create, rename,
+  remove, default and drag, move, copy and remove from a folder, pins per folder, unread counts per tab,
+  and an arrangement saved offline reaching the server on reconnect.
 - **Next, chosen by the author: calls, then Android for files and calls.** Both clients stay as they
   are and grow only what testing needs; standard screens and a full redesign come after.
 
@@ -233,17 +237,82 @@ the WASM build, because there is one `Cargo.lock`. Make targets stay inside
   client's own archive, and core's commit catch-up uses `sync`. The unread count is the content
   messages after this member's seen position in the archive. A reaction does not count, a call does not
   count, and neither does one of this account's own messages, which core marks `mine`. See [core/AGENTS.md](core/AGENTS.md).
-- **Pinned chats, chosen by the author.** Each person can pin any number of chats, kept on the server as
-  one `pin` place per member row, from 0 on top, so pins follow the person to every device: a change
-  reaches the account's other online devices at once as a `pins` frame, and offline ones get each chat's
-  `pin` in their next `chats` list. **A device sends the whole pinned order at once**, as a `pins` frame
-  `{ref, chat_list}` answered with `done`, or `PUT /api/v1/pins` with the same body, so a reorder never
-  lands half done; every chat it leaves out is unpinned. It needs membership of each chat, named once,
-  and no named permission, like a draft. **An order made offline shows at once and is kept in the
-  snapshot until the server takes it**, going first on the next connection, so it wins over what another
-  device did meanwhile; one the server refuses is dropped and reported. **A direct chat removed for
-  yourself loses its pin**, so it comes back as a normal chat. The server learns which chats a person
-  pinned, and in what order.
+- **Pinned chats, chosen by the author, are kept per folder, below**, which replaced the first build's
+  `pin` place on each member row, its `pins` frame and `PUT /api/v1/pins`. What carried over: a device
+  sends the whole order at once, so a reorder never lands half done, and **an order made offline shows at
+  once and is kept in the snapshot until the server takes it**, going first on the next connection, so it
+  wins over what another device did meanwhile; one the server refuses is dropped and reported. The server
+  learns which chats a person pinned, and in what order.
+- **Folders, all chosen by the author, built in the server, core and Android; designs in
+  `tmp/design/folders.html`.** Each account
+  arranges its chats into folders, kept on the server and following it to every device.
+  - **`all`** holds every chat. It can be moved and made default, never renamed or removed. Its row is
+    written when the account is made, and clients show it as any folder from the server, minus rename and
+    remove. A new chat goes into `all` only.
+  - **A chat can be in several folders**, moved or copied between them. **Each folder has its own pins**,
+    under `all`'s rules: new pins go under the pinned, an unpinned chat goes back by its time, handles
+    show at two or more pinned.
+  - **One folder is the default**, the tab a device opens on. A new account's is `all`, and removing the
+    default makes `all` the default.
+  - **Names are sealed** like a draft: AES-GCM under the profile key, associated data `keryx v1 folder
+    name`, account id and folder id, plaintext the bare UTF-8 name. The server sees only that folders
+    exist, their order and their chats.
+  - **Ids are asked for first**, as a device's is, so the name can be sealed with it:
+    `POST /api/v1/chat_folders/id` -> `{folder}`, or a `folder_id` frame `{ref}` answered with
+    `folder_id` `{ref, folder}`. Both need `folder.create`, and the server keeps the id for that account
+    for 5 minutes.
+  - **The whole arrangement travels at once**, replacing `pins`: a `chat_folders` frame
+    `{ref, folder_list: [{id, name?, chat_list?, pin_list}], default}`, folders in tab order, `all` the
+    one with no name or `chat_list`, `default` a folder id, answered with `done`. `PUT
+    /api/v1/chat_folders` takes the same body, and the first page of `chats` carries it as
+    `chat_folders` `{folder_list, default}`. An unchanged name is sent back as the same sealed bytes, so
+    the server can tell a rename.
+  - **Pushed live**: saved, then sent to the account's other online devices as a `chat_folders` frame
+    `{folder_list, default}`; offline ones get it on connecting. **One made offline wins**, as pins did:
+    it goes first on the next connection and drops chats the account has left. **One naming a folder
+    another device removed is refused whole, chosen by the author**, so a removed folder never comes back.
+  - **One permission per kind of change**: `folder.create`, `folder.rename`, `folder.remove`,
+    `folder.reorder`, `folder.default`, `folder.chats` (move, copy, remove from a folder) and `chat.pin`
+    (pins in any folder, so pinning stops being permission-free). **All are server permissions, `chat.pin`
+    too, chosen by the author.** Member, moderator and admin hold all. The server compares with what it
+    keeps and checks each change. **Refused in any part is refused whole**: the device goes back to the
+    server's arrangement and says why.
+  - **Refusals, chosen by the author**: a change not permitted is `no_permission`; more than 20 folders
+    `too_many_folders`; an id that is neither a folder of this account nor one issued to it
+    `unknown_folder`; a sealed name over its limit `body_too_large`; a broken shape (`all` missing or
+    twice, an id or a chat twice, a pin outside its folder, a default that is not a folder) `bad_body`.
+  - **Core, chosen by the author**: `FolderId` asks for a new folder's id and hands it back as
+    `Event::FolderId {folder}`, so it needs a connection, and saves nothing; `Folders {folder_list,
+    default}` takes plain names, seals a new folder's name and reseals only changed ones;
+    `Event::Folders` hands the arrangement back with names opened. **A new folder is saved only with
+    the arrangement it is part of, chosen by the author**, so a client's edit session that is thrown
+    away leaves only an unused id, which the server drops after 5 minutes. A session saved more than 5
+    minutes after its id was issued is refused whole with `unknown_folder`.
+  - **Limits**: `[limits] folders = 20`, not counting `all`; a name of 1 to 32 characters, checked by
+    clients; the sealed name capped by `[limits.body] folder_name = "256B"`.
+  - **Storage**: one `folder` table, `all` included: `id`, `account_id`, `place` (tab order from 0),
+    `name` (sealed, NULL only for `all`), `chats` (chat ids in order, 16 bytes each, NULL for `all`),
+    `pins` (top first) and `is_default`, with one default and one `all` per account. **`member.pin`
+    goes**, with each `chats` entry's `pin`, the `pins` frame and `PUT /api/v1/pins`.
+  - **When an account stops being in a chat**, by leaving, removal, the chat's deletion or a direct chat
+    removed for yourself, the server takes it out of that account's folders and pins in the same step and
+    pushes the result. The client sends nothing more. None of these is built yet, so this comes with the
+    first of them.
+  - **Tabs** sit at the bottom of the chat list, by the thumb. Each counts its unread chats up to 99, then
+    shows +99.
+  - **Building**: existing files only: the server's `api.rs`, `storage.rs`, `storage/sqlite.rs`,
+    `sqlite.sql` and `guide.md`, and core's `protocol.rs`, `mls.rs` and `client.rs`, replacing pins
+    there. Server and core first, tested by the server's integration tests driving core, then Android,
+    tested on the author's phone. **Pins went at once with no compatibility, chosen by the author.**
+- **Search, all chosen by the author, not built yet; designs in `tmp/design/search.html`.**
+  - **Tabs All, Accounts and Messages**, All the default, at the bottom like the folders'. Accounts: chats
+    in the list matched by name, plus the server's directory. Messages: text in this device's archive.
+    All: both, people first.
+  - **Messages are opened and scanned per search**, newest first, stopping at a page of hits, so no
+    plaintext index is written. An index may come later, as an open question.
+  - **A hit shows two lines around the match**, under its chat's name. While scanning, the search field's
+    circle is a ring filling 0 to 100 with the percent and % inside.
+  - **No recent searches for now.**
 - **Saved server times never go back, chosen by the author.** Every one is the larger of the clock and
   the last one written, server-wide, seeded at startup from the newest row. A clock that steps back,
   from NTP or a moved VM, could otherwise hide a row from "after time T" and from the page cursor.
@@ -785,8 +854,8 @@ holds it in memory only for that request and sends it back in its answer, so req
 match over one socket: a `send` gets its sequence id this way, and a `sync` its pages. **The
 server never stores a client's ULID, and it is not in the signed header.** What is saved goes by
 its sequence id, from 1. REST carries the same bodies. A client sends `send`,
-`seen`, `received`, `typing`, `sync`, `group_info`, `wraps`, `profile_keys`, `call_event`, `times`, `draft`, `pins` and `ping`. The server sends `features`, `sent`, `done`,
-`refused`, `message`, `chats`, `welcome`, `typing`, `marks`, `revoked`, `call_event`, `times`, `draft`, `pins`, `profile` and `profile_keys`. `group_info` and `wraps` are not
+`seen`, `received`, `typing`, `sync`, `group_info`, `wraps`, `profile_keys`, `call_event`, `times`, `draft`, `folder_id`, `chat_folders` and `ping`. The server sends `features`, `sent`, `done`,
+`refused`, `message`, `chats`, `welcome`, `typing`, `marks`, `revoked`, `call_event`, `times`, `draft`, `folder_id`, `chat_folders`, `profile` and `profile_keys`. `group_info` and `wraps` are not
 messages, so they take no sequence id and stay out of history, and what has no sequence id is
 answered with `done`. Binary fields are standard base64 with padding, through `base64ct`, which is
 already in the tree and constant-time. Kinds and modes are the schema's numbers. **A commit is a `send` with kind 3 plus its wraps, welcomes,
@@ -1137,7 +1206,8 @@ POST /api/v1/chats                  chat.create_direct: account -> chat, created
 GET  /api/v1/chats/{id}/group_info  member -> epoch, group_info
 GET  /api/v1/chats/{id}/devices     member -> device_list, with ended devices and their statements
 GET  /api/v1/chats/{id}/wraps       member -> wrap_list{epoch, account, wrapped}
-PUT  /api/v1/pins                   member of each: chat_list, the whole pinned order, first on top
+POST /api/v1/chat_folders/id       folder.create -> folder, kept for this account for 5 minutes
+PUT  /api/v1/chat_folders          a permission per change: folder_list, default, the whole arrangement
 POST /api/v1/chats/{id}/files       member: kind, size, chunks -> file
 PUT  /api/v1/files/{id}/chunks/{n}  its uploader: the encrypted chunk's raw bytes
 GET  /api/v1/files/{id}             member -> size, chunks, received
@@ -1280,6 +1350,7 @@ accepts the first for each step. The loser gets a rejection, catches up and retr
   key_packages = 100        # the most one device may keep on the server
   call_frame = "256KiB"     # one frame on a call's state, audio or video track. Larger: that device leaves
   call_cache = "16MiB"      # the relay's room for older groups. Newest groups are always kept
+  folders = 20              # an account's folders, not counting all
 
   [limits.body]             # one message's body. A file's bytes upload separately
   text = "64KiB"
@@ -1296,6 +1367,7 @@ accepts the first for each step. The loser gets a rejection, catches up and retr
   answer = "16KiB"
   sticker = "1KiB"
   draft = "64KiB" # an account's sealed draft in one chat. Not a message
+  folder_name = "256B"      # one sealed folder name
 
   [limits.upload]           # one file's encrypted bytes, by the type its uploader declares
   voice = "50MiB"
@@ -1734,8 +1806,8 @@ first, as everywhere.
 **Attachments and search**
 
 - Quotas and retention for attachments
-- Local search: engine, whether borhan's normalizer is reused, and where it lives.
-  **No module in the closed lists holds it yet**, and tantivy on WASM is unproven
+- Local search: an index, once scanning per search is too slow; whether borhan's normalizer is reused,
+  and where it lives. **No module in the closed lists holds it yet**, and tantivy on WASM is unproven
 
 **MCP**
 

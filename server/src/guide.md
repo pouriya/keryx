@@ -82,7 +82,8 @@ good.
     GET  /chats/{id}/wraps                -> wrap_list{epoch, account, wrapped}
     GET  /chats/{id}/messages/{seq}/times -> member_list{account, received_at?, seen_at?}
     PUT  /chats/{id}/draft                {draft?: {epoch, body}}: keeps your sealed draft, or clears it
-    PUT  /pins                            {chat_list}: your pinned chats, the whole order, first on top
+    POST /chat_folders/id                 -> folder: a new folder's id, yours for 5 minutes
+    PUT  /chat_folders                    {folder_list, default}: your whole arrangement of folders
     GET  /accounts/{id}/profile           yourself, or sharing a chat -> account, username,
                                           display_name?, version, profile?{sealed, signature,
                                           device, device_public, stamp}, photo?
@@ -132,10 +133,11 @@ itself. To check the server yourself, send a WebSocket ping, or a `ping` frame, 
 Every frame is JSON with a `type`. A request's `ref` is a ULID you make, which comes back in its answer.
 
 You send: `send`, `seen`, `received`, `typing`, `sync`, `group_info`, `wraps`, `profile_keys`,
-`call_event`, `times`, `draft`, `pins`, `ping`.
+`call_event`, `times`, `draft`, `folder_id`, `chat_folders`, `ping`.
 
 The server sends: `features`, `sent`, `done`, `refused`, `message`, `chats`, `welcome`, `typing`,
-`marks`, `revoked`, `call_event`, `times`, `draft`, `pins`, `profile`, `profile_keys`.
+`marks`, `revoked`, `call_event`, `times`, `draft`, `folder_id`, `chat_folders`, `profile`,
+`profile_keys`.
 
 `profile` carries an `account` sharing a chat with you, or your own, with its `version`, `username` and
 `display_name`, whenever its names, photo, bio or links change. Each `chats` entry carries every
@@ -153,9 +155,16 @@ message in `last_content`. Neither goes out in a channel.
 `draft` carries `chat` and `draft`, `{epoch, body}` sealed by your client, or none to clear it, and is
 answered with `done`. The server keeps one per account and chat, never reads it, and sends it as `draft`
 to your other online devices. Each `chats` entry carries yours in `draft`, with `saved_at`.
-`pins` carries `chat_list`, your pinned chats in order, first on top, each a chat you are in and named
-once, and every chat it leaves out is unpinned. It is answered with `done`, and your other online
-devices get it as `pins`. Each `chats` entry carries its place in `pin`, from 0, when it is pinned.
+`folder_id` asks for a new folder's id and is answered with `folder_id` and `folder`, kept for you for
+5 minutes, so your client can seal the folder's name with it. `chat_folders` carries your whole
+arrangement at once: `folder_list` in tab order, each `{id, name?, chat_list?, pin_list}`, and
+`default`, the folder a device opens on. `all` is the one folder with no `name` or `chat_list`, and
+holds every chat. A name is sealed by your client and never read; send an unchanged one back as the
+same bytes. It is answered with `done`, and your other online devices get it as `chat_folders`. The
+first page of `chats` carries yours in `chat_folders`. A change you may not make is `no_permission`,
+more than `folders` folders `too_many_folders`, an id neither yours nor issued to you
+`unknown_folder`, a sealed name over its limit `body_too_large`, and a broken shape `bad_body`; any
+of them refuses the whole arrangement.
 `times` carries `chat` and `seq` and is answered with `times`: `member_list` of each member but the
 sender, with the server's time for `received_at` and `seen_at`.
 

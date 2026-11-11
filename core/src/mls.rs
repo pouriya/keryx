@@ -43,6 +43,7 @@ const DEVICE_LOGIN_LABEL: &[u8] = b"keryx v1 device login";
 const DRAFT_LABEL: &[u8] = b"keryx v1 draft";
 const PROFILE_KEY_LABEL: &[u8] = b"keryx v1 profile key";
 const PROFILE_LABEL: &[u8] = b"keryx v1 profile";
+const FOLDER_NAME_LABEL: &[u8] = b"keryx v1 folder name";
 const BODY_VERSION: u8 = 1;
 /// The account id, device id, master public key and stamp.
 const CREDENTIAL_SIZE: usize = 128;
@@ -434,6 +435,15 @@ fn profile_data(account: Ulid) -> Vec<u8> {
     let mut data = Vec::with_capacity(PROFILE_LABEL.len() + 16);
     data.extend_from_slice(PROFILE_LABEL);
     data.extend_from_slice(account.bytes());
+    data
+}
+
+/// **Permanent:** a folder name's associated data.
+fn folder_name_data(account: Ulid, folder: Ulid) -> Vec<u8> {
+    let mut data = Vec::with_capacity(FOLDER_NAME_LABEL.len() + 32);
+    data.extend_from_slice(FOLDER_NAME_LABEL);
+    data.extend_from_slice(account.bytes());
+    data.extend_from_slice(folder.bytes());
     data
 }
 
@@ -1397,6 +1407,32 @@ impl Device {
             return Err(MlsError::NoProfileKey { account });
         };
         open_under(profile_key, &data, sealed)
+    }
+
+    /// One of this account's folder names, sealed under its profile key like a draft: unsigned, as
+    /// only this account's own devices ever read it.
+    pub fn seal_folder_name(&self, folder: Ulid, name: &str) -> Result<Vec<u8>, MlsError> {
+        let account = self.record.account;
+        let Some(profile_key) = self.profile_keys.get(&account) else {
+            return Err(MlsError::NoProfileKey { account });
+        };
+        seal_under(
+            profile_key,
+            &folder_name_data(account, folder),
+            name.as_bytes(),
+        )
+    }
+
+    pub fn open_folder_name(
+        &self,
+        folder: Ulid,
+        sealed: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>, MlsError> {
+        let account = self.record.account;
+        let Some(profile_key) = self.profile_keys.get(&account) else {
+            return Err(MlsError::NoProfileKey { account });
+        };
+        open_under(profile_key, &folder_name_data(account, folder), sealed)
     }
 
     /// Sign an unencrypted message, whose body is its content.

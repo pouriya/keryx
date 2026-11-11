@@ -274,13 +274,18 @@ pub enum ClientFrame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         draft: Option<DraftBody>,
     },
-    /// This account's pinned chats, the whole order at once, first on top. Every chat it does not
-    /// name is unpinned. Answered with `done`, and the account's other online devices get it as
-    /// `pins`.
-    Pins {
+    /// Asks for a new folder's id, so its name can be sealed with it. Answered with `folder_id`.
+    FolderId {
         #[serde(rename = "ref")]
         reference: Ulid,
-        chat_list: Vec<Ulid>,
+    },
+    /// This account's whole arrangement of folders at once. Answered with `done`, and the account's
+    /// other online devices get it as `chat_folders`.
+    ChatFolders {
+        #[serde(rename = "ref")]
+        reference: Ulid,
+        #[serde(flatten)]
+        folders: ChatFolders,
     },
     /// When each other member's device received and saw one message, answered with `times`.
     Times {
@@ -1061,9 +1066,34 @@ pub struct ChatItem {
     /// Every member's profile version and sealed profile key, this account's too.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub profile_key_list: Vec<ProfileKeyItem>,
-    /// This chat's place among this account's pinned chats, from 0 on top. None: not pinned.
+}
+
+/// One folder of an account. `all` is the one with no name and no `chat_list`, and holds every chat.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FolderItem {
+    pub id: Ulid,
+    /// Sealed under the account's profile key, with the folder's id in its associated data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pin: Option<u32>,
+    pub name: Option<Bytes>,
+    /// Its chats, in no order a client has to keep.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_list: Option<Vec<Ulid>>,
+    /// Its pinned chats, first on top.
+    pub pin_list: Vec<Ulid>,
+}
+
+/// An account's whole arrangement: its folders in tab order, and the one a device opens on. Also the
+/// body of `PUT /api/v1/chat_folders`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatFolders {
+    pub folder_list: Vec<FolderItem>,
+    pub default: Ulid,
+}
+
+/// `POST /api/v1/chat_folders/id`: a new folder's id, kept for this account for 5 minutes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FolderReply {
+    pub folder: Ulid,
 }
 
 /// An account's unsent text in one chat, sealed under the chat's key at `epoch`. The server holds
@@ -1089,12 +1119,6 @@ pub struct DraftBody {
 pub struct DraftRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft: Option<DraftBody>,
-}
-
-/// `PUT /api/v1/pins`: this account's pinned chats, the whole order at once, first on top.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PinsRequest {
-    pub chat_list: Vec<Ulid>,
 }
 
 /// When one member's devices first received and first saw a message, by the server's clock. Each is
@@ -1180,6 +1204,9 @@ pub enum ServerFrame {
         message_list: Vec<MessageFrame>,
         call_list: Vec<CallEvent>,
         more: bool,
+        /// This account's folders, on the first page only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chat_folders: Option<ChatFolders>,
     },
     Welcome {
         chat: Ulid,
@@ -1196,10 +1223,14 @@ pub enum ServerFrame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         draft: Option<DraftItem>,
     },
-    /// This account's pinned chats changed on another of its devices: the whole order, first on top.
-    Pins {
-        chat_list: Vec<Ulid>,
+    /// A new folder's id, answering `folder_id`.
+    FolderId {
+        #[serde(rename = "ref")]
+        reference: Ulid,
+        folder: Ulid,
     },
+    /// This account's folders changed on another of its devices: the whole arrangement.
+    ChatFolders(Box<ChatFolders>),
     /// A member's received or seen position rose, sent to the other members' online devices.
     Marks {
         chat: Ulid,

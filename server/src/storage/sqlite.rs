@@ -4,15 +4,16 @@
 //! during a write. One writer and one reader connection, each behind a lock, taking turns on the
 //! blocking pool. If that becomes too slow, the answer is Postgres.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use keryx_core::protocol::{
-    AccountBrief, Bytes, CallEvent, CallEventKind, ChatDevice, ChatItem, ChatMode, ChatType,
-    ContentKind, DeviceItem, DeviceLogItem, DraftItem, KeyPackageItem, Kind, MarkItem,
-    MessageFrame, ProfileKeyItem, ProfileReply, SessionItem, SignedProfile, StickerItem,
+    AccountBrief, Bytes, CallEvent, CallEventKind, ChatDevice, ChatFolders, ChatItem, ChatMode,
+    ChatType, ContentKind, DeviceItem, DeviceLogItem, DraftItem, FolderItem, KeyPackageItem, Kind,
+    MarkItem, MessageFrame, ProfileKeyItem, ProfileReply, SessionItem, SignedProfile, StickerItem,
     StickerPack, SyncPosition, TimesItem, WrapEntry,
 };
 use keryx_core::ulid::Ulid;
@@ -132,6 +133,25 @@ impl Sqlite {
 /// A sequence id or epoch as SQLite holds it. A larger number than any stored can match nothing.
 fn int(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+/// Ids stored side by side, 16 bytes each, as a folder's chats and pins are.
+fn id_bytes(id_list: &[Ulid]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(id_list.len() * 16);
+    for id in id_list {
+        bytes.extend_from_slice(id.bytes());
+    }
+    bytes
+}
+
+fn id_list(bytes: &[u8]) -> Vec<Ulid> {
+    let mut id_list = Vec::with_capacity(bytes.len() / 16);
+    for chunk in bytes.chunks_exact(16) {
+        let mut id = [0u8; 16];
+        id.copy_from_slice(chunk);
+        id_list.push(Ulid::from_bytes(id));
+    }
+    id_list
 }
 
 fn opt_int(value: Option<u64>) -> Option<i64> {
@@ -460,6 +480,11 @@ impl Storage for Sqlite {
                     account.id.bytes(),
                     if account.admin { "admin" } else { "member" }
                 ],
+            )?;
+            connection.execute(
+                "INSERT INTO folder (id, account_id, place, name, chats, pins, is_default)
+                 VALUES (?1, ?2, 0, NULL, NULL, x'', 1)",
+                params![account.all_folder.bytes(), account.id.bytes()],
             )?;
             if let Some((token_hash, expires_at)) = account.setup {
                 connection.execute(
@@ -1291,7 +1316,7 @@ impl Storage for Sqlite {
         self.read(move |connection| {
             let mut statement = connection.prepare(
                 "SELECT c.id, c.type, c.mode, c.last_seq, c.last_kind, c.last_at, c.last_content_seq,
-                 g.epoch, m.seen_seq, m.draft, m.draft_epoch, m.draft_at, m.pin
+                 g.epoch, m.seen_seq, m.draft, m.draft_epoch, m.draft_at
                  FROM member m JOIN conversation c ON c.id = m.conversation_id
                  LEFT JOIN mls_group g ON g.conversation_id = c.id
                  WHERE m.account_id = ?1
@@ -1329,9 +1354,6 @@ impl Storage for Sqlite {
                         }
                     },
                     profile_key_list: Vec::new(),
-                    pin: row
-                        .get::<_, Option<i64>>(12)?
-                        .and_then(|pin| u32::try_from(pin).ok()),
                 })
             })?;
             let mut chat_list = Vec::new();
@@ -1419,19 +1441,122 @@ impl Storage for Sqlite {
         .await
     }
 
-    async fn put_pins(&self, account: Ulid, chat_list: Vec<Ulid>) -> Result<()> {
-        self.write(move |connection| {
-            connection.execute(
-                "UPDATE member SET pin = NULL WHERE account_id = ?1 AND pin IS NOT NULL",
-                params![account.bytes()],
+    async fn chat_folders(&self, account: Ulid) -> Result<(ChatFolders, Vec<Ulid>)> {
+        self.read(move |connection| {
+            let mut statement = connection.prepare(
+                "SELECT id, name, chats, pins, is_default FROM folder WHERE account_id = ?1
+                 ORDER BY place",
             )?;
-            for (place, chat) in (0u64..).zip(&chat_list) {
+            let rows = statement.query_map(params![account.bytes()], |row| {
+                let chats: Option<Vec<u8>> = row.get(2)?;
+                let pins: Vec<u8> = row.get(3)?;
+                let is_default: bool = row.get(4)?;
+                Ok((
+                    FolderItem {
+                        id: Ulid::from_bytes(row.get(0)?),
+                        name: row.get::<_, Option<Vec<u8>>>(1)?.map(Bytes),
+                        chat_list: chats.map(|chats| id_list(&chats)),
+                        pin_list: id_list(&pins),
+                    },
+                    is_default,
+                ))
+            })?;
+            let mut folder_list = Vec::new();
+            let mut default = None;
+            for row in rows {
+                let (folder, is_default) = row?;
+                if is_default {
+                    default = Some(folder.id);
+                }
+                folder_list.push(folder);
+            }
+            // Every account has its `all`, which starts as the default.
+            let Some(default) = default else {
+                return Err(rusqlite::Error::QueryReturnedNoRows);
+            };
+            let mut statement =
+                connection.prepare("SELECT conversation_id FROM member WHERE account_id = ?1")?;
+            let rows = statement.query_map(params![account.bytes()], |row| {
+                Ok(Ulid::from_bytes(row.get(0)?))
+            })?;
+            let mut chat_list = Vec::new();
+            for chat in rows {
+                chat_list.push(chat?);
+            }
+            Ok((
+                ChatFolders {
+                    folder_list,
+                    default,
+                },
+                chat_list,
+            ))
+        })
+        .await
+    }
+
+    async fn put_chat_folders(
+        &self,
+        account: Ulid,
+        folders: ChatFolders,
+        purpose: i64,
+        now: i64,
+    ) -> Result<bool> {
+        self.write(move |connection| {
+            let mut held = HashSet::new();
+            let mut statement =
+                connection.prepare("SELECT id FROM folder WHERE account_id = ?1")?;
+            let rows = statement.query_map(params![account.bytes()], |row| {
+                Ok(Ulid::from_bytes(row.get(0)?))
+            })?;
+            for id in rows {
+                held.insert(id?);
+            }
+            // Every new id is checked before any is used up, so a refusal changes nothing.
+            let mut issued = Vec::new();
+            for folder in &folders.folder_list {
+                if held.contains(&folder.id) {
+                    continue;
+                }
+                let expires_at: Option<i64> = connection
+                    .query_row(
+                        "SELECT expires_at FROM challenge
+                         WHERE value = ?1 AND account_id = ?2 AND purpose = ?3",
+                        params![folder.id.bytes(), account.bytes(), purpose],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                match expires_at {
+                    Some(expires_at) if expires_at >= now => issued.push(folder.id),
+                    _ => return Ok(false),
+                }
+            }
+            for id in issued {
                 connection.execute(
-                    "UPDATE member SET pin = ?3 WHERE conversation_id = ?1 AND account_id = ?2",
-                    params![chat.bytes(), account.bytes(), int(place)],
+                    "DELETE FROM challenge WHERE value = ?1",
+                    params![id.bytes()],
                 )?;
             }
-            Ok(())
+            connection.execute(
+                "DELETE FROM folder WHERE account_id = ?1",
+                params![account.bytes()],
+            )?;
+            for (place, folder) in (0u64..).zip(&folders.folder_list) {
+                let chats = folder.chat_list.as_deref().map(id_bytes);
+                connection.execute(
+                    "INSERT INTO folder (id, account_id, place, name, chats, pins, is_default)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        folder.id.bytes(),
+                        account.bytes(),
+                        int(place),
+                        folder.name.as_ref().map(|name| name.0.as_slice()),
+                        chats,
+                        id_bytes(&folder.pin_list),
+                        folder.id == folders.default
+                    ],
+                )?;
+            }
+            Ok(true)
         })
         .await
     }

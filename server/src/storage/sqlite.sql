@@ -132,14 +132,15 @@ CREATE INDEX login_session_expiry ON login_session (expires_at);
 -- [Password reset, Returning device, Device ids] what the server handed out to be used once: a
 -- challenge to sign, or a new device's id, so a client can never choose its own.
 CREATE TABLE challenge (
-    -- [Password reset, Returning device, Device ids] 32 random bytes, or a device's ULID.
+    -- [Password reset, Returning device, Device ids, Folders] 32 random bytes, or a device's or
+    -- folder's ULID.
     value       BLOB PRIMARY KEY,
-    -- [Password reset, Returning device, Device ids] which account it is for.
+    -- [Password reset, Returning device, Device ids, Folders] which account it is for.
     account_id  BLOB NOT NULL REFERENCES account (id) ON DELETE CASCADE,
-    -- [Password reset, Returning device, Device ids] 0 password reset, 1 returning device,
-    -- 2 device id: so one cannot be used as another.
-    purpose     INTEGER NOT NULL CHECK (purpose IN (0, 1, 2)),
-    -- [Password reset, Returning device, Device ids] five minutes after it was made.
+    -- [Password reset, Returning device, Device ids, Folders] 0 password reset, 1 returning
+    -- device, 2 device id, 3 folder id: so one cannot be used as another.
+    purpose     INTEGER NOT NULL CHECK (purpose IN (0, 1, 2, 3)),
+    -- [Password reset, Returning device, Device ids, Folders] five minutes after it was made.
     expires_at  INTEGER NOT NULL
 ) WITHOUT ROWID, STRICT;
 
@@ -392,9 +393,6 @@ CREATE TABLE member (
     draft_epoch      INTEGER,
     -- [Drafts] the server time it was saved, so a device keeps the newer one.
     draft_at         INTEGER,
-    -- [Pins] this chat's place among the account's pinned chats, from 0 on top. NULL means not
-    -- pinned. Set for all of them at once, and cleared when a direct chat is removed for yourself.
-    pin              INTEGER CHECK (pin >= 0),
     CHECK ((draft IS NULL) = (draft_epoch IS NULL) AND (draft IS NULL) = (draft_at IS NULL)),
     PRIMARY KEY (conversation_id, account_id)
 ) WITHOUT ROWID, STRICT;
@@ -405,6 +403,33 @@ CREATE INDEX member_account ON member (account_id, conversation_id);
 CREATE INDEX member_owner ON member (conversation_id) WHERE is_owner = 1;
 -- [Read state, Seen counts] who has or has not seen message N, and how many.
 CREATE INDEX member_seen ON member (conversation_id, seen_seq);
+
+-- [Folders] an account's arrangement of its chats, kept here so it follows the account to every
+-- device. Saved whole each time. `all` is a row too, written with the account, and holds every chat.
+-- Not WITHOUT ROWID: `chats` grows with the account's chats.
+CREATE TABLE folder (
+    -- [Folders] issued by the server first, since the sealed name's associated data holds it.
+    id          BLOB PRIMARY KEY,
+    -- [Folders] whose.
+    account_id  BLOB NOT NULL REFERENCES account (id) ON DELETE CASCADE,
+    -- [Folders] tab order, from 0.
+    place       INTEGER NOT NULL CHECK (place >= 0),
+    -- [Folders] sealed by the account's client under its profile key. The server never reads it.
+    -- NULL only for `all`.
+    name        BLOB,
+    -- [Folders] its chat ids, 16 bytes each. NULL only for `all`, which holds every chat.
+    chats       BLOB CHECK (length(chats) % 16 = 0),
+    -- [Pins] its pinned chat ids, 16 bytes each, top first.
+    pins        BLOB NOT NULL CHECK (length(pins) % 16 = 0),
+    -- [Folders] the tab a device opens on.
+    is_default  INTEGER NOT NULL CHECK (is_default IN (0, 1)),
+    CHECK ((name IS NULL) = (chats IS NULL))
+) STRICT;
+
+-- [Folders] one place, one default and one `all` per account.
+CREATE UNIQUE INDEX folder_place ON folder (account_id, place);
+CREATE UNIQUE INDEX folder_default ON folder (account_id) WHERE is_default = 1;
+CREATE UNIQUE INDEX folder_all ON folder (account_id) WHERE name IS NULL;
 
 -- [RBAC] chat-scope roles held by a member.
 CREATE TABLE member_role (

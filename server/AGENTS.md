@@ -52,7 +52,7 @@ not claim it passed without running it.
 | `make check-style` | `cargo fmt --check` |
 | `make fmt` | Rewrites formatting in place |
 | `make lint` | `clippy` + `check-style`, no build |
-| `make test` | `cargo test --target …` |
+| `make test` | `cargo test --target …`. `TEST=name` runs only the tests whose names hold it; empty runs them all |
 | `make coverage` | Runs the tests under `cargo-llvm-cov` and **rewrites the table** in [tests/AGENTS.md](tests/AGENTS.md) |
 | `make docker` | The image `keryx:<version>` and `keryx:latest` from the root `Dockerfile`. `DOCKER_REGISTRY` prefixes the base images |
 | `make clean` / `dist-clean` | Drop `target/` / also `build/` |

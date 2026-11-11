@@ -4,9 +4,9 @@
 use std::future::Future;
 
 use keryx_core::protocol::{
-    AccountBrief, CallEvent, ChatDevice, ChatItem, ChatMode, ChatType, ContentKind, DeviceItem,
-    DraftItem, KeyPackageItem, Kind, MarkItem, MessageFrame, ProfileKeyItem, ProfileReply,
-    SessionItem, StickerItem, StickerPack, SyncPosition, TimesItem, WrapEntry,
+    AccountBrief, CallEvent, ChatDevice, ChatFolders, ChatItem, ChatMode, ChatType, ContentKind,
+    DeviceItem, DraftItem, KeyPackageItem, Kind, MarkItem, MessageFrame, ProfileKeyItem,
+    ProfileReply, SessionItem, StickerItem, StickerPack, SyncPosition, TimesItem, WrapEntry,
 };
 use keryx_core::ulid::Ulid;
 
@@ -69,6 +69,8 @@ pub struct NewAccount {
     pub display_name: Option<String>,
     pub password_hash: Option<String>,
     pub admin: bool,
+    /// The id of its `all` folder, written with it.
+    pub all_folder: Ulid,
     /// The one-time link's token hash and when it stops working.
     pub setup: Option<([u8; 32], i64)>,
     pub now: i64,
@@ -488,13 +490,21 @@ pub trait Storage: Send + Sync + 'static {
         draft: Option<(u64, Vec<u8>)>,
         now: i64,
     ) -> impl Future<Output = Result<Option<DraftItem>>> + Send;
-    /// This account's pinned chats, the whole order at once, first on top: every chat it does not
-    /// name is unpinned, in one step.
-    fn put_pins(
+    /// This account's folders in tab order, `all` included, and the chats it is in.
+    fn chat_folders(
         &self,
         account: Ulid,
-        chat_list: Vec<Ulid>,
-    ) -> impl Future<Output = Result<()>> + Send;
+    ) -> impl Future<Output = Result<(ChatFolders, Vec<Ulid>)>> + Send;
+    /// Replaces this account's whole arrangement in one step. Each id not already one of its folders
+    /// must have been issued to it under `purpose` and not have expired, and is used up. `false`, with
+    /// nothing changed, when one was not.
+    fn put_chat_folders(
+        &self,
+        account: Ulid,
+        folders: ChatFolders,
+        purpose: i64,
+        now: i64,
+    ) -> impl Future<Output = Result<bool>> + Send;
     /// When each member but the message's sender first received and first saw it, by the server's
     /// clock, or `None` if there is no such message. A member with receipts off has no `seen_at`.
     fn message_times(

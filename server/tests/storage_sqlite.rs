@@ -333,9 +333,9 @@ fn foreign_keys_hold_and_a_chat_takes_its_rows_with_it() {
 }
 
 #[test]
-fn a_challenge_has_only_the_three_purposes() {
+fn a_challenge_has_only_the_four_purposes() {
     let connection = world();
-    for purpose in [0, 1, 2] {
+    for purpose in [0, 1, 2, 3] {
         connection
             .execute(
                 "INSERT INTO challenge (value, account_id, purpose, expires_at) VALUES (?1, ?2, ?3, 1)",
@@ -346,7 +346,7 @@ fn a_challenge_has_only_the_three_purposes() {
     assert!(
         connection
             .execute(
-                "INSERT INTO challenge (value, account_id, purpose, expires_at) VALUES (x'09', ?1, 3, 1)",
+                "INSERT INTO challenge (value, account_id, purpose, expires_at) VALUES (x'09', ?1, 4, 1)",
                 params![id(1)],
             )
             .is_err()
@@ -379,6 +379,7 @@ async fn one_file_with_the_classic_journal_and_opening_twice_keeps_everything() 
         display_name: None,
         password_hash: None,
         admin: false,
+        all_folder: Ulid::new().unwrap(),
         setup: None,
         now: 1,
     };
@@ -428,6 +429,7 @@ async fn a_setup_link_says_whether_it_is_unknown_used_or_expired() {
             display_name: None,
             password_hash: None,
             admin: false,
+            all_folder: Ulid::new().unwrap(),
             setup: Some((hash, 100)),
             now: 1,
         })
@@ -460,6 +462,7 @@ async fn a_setup_link_says_whether_it_is_unknown_used_or_expired() {
             display_name: None,
             password_hash: None,
             admin: false,
+            all_folder: Ulid::new().unwrap(),
             setup: Some(([8u8; 32], 100)),
             now: 1,
         })

@@ -56,8 +56,11 @@ moq:
 lint: clippy check-style
 
 
+# TEST picks tests by name, as cargo's filter does. Empty runs them all.
+TEST ?=
+
 test:
-	cargo test --target ${TARGET}
+	cargo test --target ${TARGET} ${TEST}
 
 
 # Runs the tests, then rewrites the table between the markers from llvm-cov's summary. Its columns

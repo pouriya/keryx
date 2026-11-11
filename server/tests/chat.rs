@@ -8,14 +8,14 @@ use std::time::Duration;
 
 use common::{OPERATOR_TOKEN, Server};
 use keryx_core::client::{
-    Command, Draft, Event, FileSpec, Pointer, Secret, ShownProfile, Thumbnail,
+    Command, Draft, Event, FileSpec, Folder, Pointer, Secret, ShownProfile, Thumbnail,
 };
 use keryx_core::file;
 use keryx_core::mls::{AccountWrap, Commit, Device};
 use keryx_core::protocol::{
-    Answer, Bytes, CallEvent, CallEventKind, CallOutcome, ChatType, ClientFrame, ContentKind,
-    Header, Kind, MessageFrame, ProfileKeyShare, ProfileLink, Question, SendFrame, ServerFrame,
-    SyncPosition, WelcomeItem, WrapItem,
+    Answer, Bytes, CallEvent, CallEventKind, CallOutcome, ChatFolders, ChatType, ClientFrame,
+    ContentKind, FolderItem, Header, Kind, MessageFrame, ProfileKeyShare, ProfileLink, Question,
+    SendFrame, ServerFrame, SyncPosition, WelcomeItem, WrapItem,
 };
 use keryx_core::ulid::Ulid;
 use person::{
@@ -69,7 +69,8 @@ fn reference_of(frame: &ServerFrame) -> Option<Ulid> {
         ServerFrame::Sent { reference, .. }
         | ServerFrame::Done { reference }
         | ServerFrame::Refused { reference, .. }
-        | ServerFrame::Chats { reference, .. } => Some(*reference),
+        | ServerFrame::Chats { reference, .. }
+        | ServerFrame::FolderId { reference, .. } => Some(*reference),
         _ => None,
     }
 }
@@ -81,7 +82,9 @@ impl Socket {
     }
 
     fn read(&mut self) -> ServerFrame {
+        let started = std::time::Instant::now();
         loop {
+            assert!(started.elapsed() < Duration::from_secs(20), "No frame came");
             match self.inner.read().unwrap() {
                 Message::Text(text) => return serde_json::from_str(text.as_str()).unwrap(),
                 Message::Close(frame) => panic!("The socket closed: {frame:?}"),
@@ -97,7 +100,14 @@ impl Socket {
                 return self.waiting.remove(index);
             }
         }
+        // Pings keep a socket's reads from timing out, so a frame that never comes ends here.
+        let started = std::time::Instant::now();
         loop {
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "Waited too long, holding {:?}",
+                self.waiting
+            );
             let frame = self.read();
             if wanted(&frame) {
                 return frame;
@@ -2133,72 +2143,436 @@ fn a_draft_belongs_to_its_chat_is_kept_sealed_and_comes_back_in_the_list() {
 }
 
 #[test]
-fn pins_are_kept_in_order_pushed_to_the_other_devices_and_listed() {
+fn folders_are_saved_whole_checked_against_what_is_kept_and_pushed_to_the_other_devices() {
     let mut pair = pair_on(open_server());
     let chat = pair.chat;
+    let own = pair.sara.self_chat;
     let second_token = log_in(&pair.server, &pair.sara.username);
     add_device(&pair.server, pair.sara.id, &pair.sara.keys, &second_token);
     let mut second = connect(&pair.server, &second_token);
-    let pins = |socket: &mut Socket, chat_list: Vec<Ulid>| {
+    let listed = |socket: &mut Socket| {
+        let wanted = reference();
+        let answer = socket.request(&sync_frame(wanted), wanted);
+        let ServerFrame::Chats {
+            chat_folders: Some(folders),
+            ..
+        } = answer
+        else {
+            panic!("Wanted the folders, got {answer:?}");
+        };
+        folders
+    };
+    let issue = |socket: &mut Socket| {
+        let wanted = reference();
+        let answer = socket.request(&ClientFrame::FolderId { reference: wanted }, wanted);
+        let ServerFrame::FolderId { folder, .. } = answer else {
+            panic!("Wanted an id, got {answer:?}");
+        };
+        folder
+    };
+    let save = |socket: &mut Socket, folders: &ChatFolders| {
         let wanted = reference();
         socket.request(
-            &ClientFrame::Pins {
+            &ClientFrame::ChatFolders {
                 reference: wanted,
-                chat_list,
+                folders: folders.clone(),
             },
             wanted,
         )
     };
+    let named = |id: Ulid, chat_list: Vec<Ulid>, pin_list: Vec<Ulid>| FolderItem {
+        id,
+        name: Some(Bytes(b"sealed".to_vec())),
+        chat_list: Some(chat_list),
+        pin_list,
+    };
 
-    // Kept, listed with its place, and pushed to the account's other device only.
-    let answer = pins(&mut pair.sara_socket, vec![chat]);
-    assert!(matches!(answer, ServerFrame::Done { .. }), "{answer:?}");
-    let pushed = second.next_where(|frame| matches!(frame, ServerFrame::Pins { .. }));
+    // A new account has only `all`, its own and its default.
+    let held = listed(&mut pair.sara_socket);
+    let all = held.default;
     assert_eq!(
-        pushed,
-        ServerFrame::Pins {
-            chat_list: vec![chat]
-        }
+        held.folder_list,
+        vec![FolderItem {
+            id: all,
+            name: None,
+            chat_list: None,
+            pin_list: Vec::new(),
+        }]
     );
-    assert_eq!(chat_item(&mut pair.sara_socket, chat).pin, Some(0));
-    assert_eq!(chat_item(&mut pair.babak_socket, chat).pin, None);
+    let babak_all = listed(&mut pair.babak_socket).default;
+    assert_ne!(babak_all, all);
+    let all_with = |pin_list: Vec<Ulid>| FolderItem {
+        id: all,
+        name: None,
+        chat_list: None,
+        pin_list,
+    };
 
-    // A chat named twice, or one this account is not in, changes nothing.
-    let answer = pins(&mut pair.sara_socket, vec![chat, chat]);
-    assert!(
-        matches!(&answer, ServerFrame::Refused { code, .. } if code == "bad_body"),
-        "{answer:?}"
+    // A folder under an issued id, with chats and pins in it and in `all`: kept, listed, and pushed
+    // to the account's other device.
+    let work = issue(&mut pair.sara_socket);
+    let arranged = ChatFolders {
+        folder_list: vec![
+            all_with(vec![own, chat]),
+            named(work, vec![chat, own], vec![chat]),
+        ],
+        default: work,
+    };
+    done(save(&mut pair.sara_socket, &arranged));
+    let pushed = second.next_where(|frame| matches!(frame, ServerFrame::ChatFolders(_)));
+    assert_eq!(pushed, ServerFrame::ChatFolders(Box::new(arranged.clone())));
+    assert_eq!(listed(&mut pair.sara_socket), arranged);
+    assert_eq!(listed(&mut second), arranged);
+
+    // Broken in any part, refused whole, and nothing changes.
+    let stranger = reference();
+    let mut case_list = Vec::new();
+    let mut broken = arranged.clone();
+    broken.folder_list.remove(0);
+    case_list.push((broken, "bad_body"));
+    let mut broken = arranged.clone();
+    broken.folder_list[0].id = stranger;
+    case_list.push((broken, "bad_body"));
+    let mut broken = arranged.clone();
+    broken.folder_list.push(FolderItem {
+        id: stranger,
+        name: None,
+        chat_list: None,
+        pin_list: Vec::new(),
+    });
+    case_list.push((broken, "bad_body"));
+    let mut broken = arranged.clone();
+    broken.folder_list.push(named(work, Vec::new(), Vec::new()));
+    case_list.push((broken, "bad_body"));
+    let mut broken = arranged.clone();
+    broken.folder_list[1] = named(work, vec![chat, chat], Vec::new());
+    case_list.push((broken, "bad_body"));
+    let mut broken = arranged.clone();
+    broken.folder_list[1] = named(work, vec![chat], vec![own]);
+    case_list.push((broken, "bad_body"));
+    let mut broken = arranged.clone();
+    broken.folder_list[0] = all_with(vec![chat, chat]);
+    case_list.push((broken, "bad_body"));
+    let mut broken = arranged.clone();
+    broken.folder_list[1].chat_list = None;
+    case_list.push((broken, "bad_body"));
+    let mut broken = arranged.clone();
+    broken.default = stranger;
+    case_list.push((broken, "bad_body"));
+    let mut broken = arranged.clone();
+    broken.folder_list[1].name = Some(Bytes(vec![7; 300]));
+    case_list.push((broken, "body_too_large"));
+    let mut broken = arranged.clone();
+    broken
+        .folder_list
+        .push(named(stranger, Vec::new(), Vec::new()));
+    case_list.push((broken, "unknown_folder"));
+    let mut broken = arranged.clone();
+    broken
+        .folder_list
+        .push(named(babak_all, Vec::new(), Vec::new()));
+    case_list.push((broken, "unknown_folder"));
+    for (broken, code) in case_list {
+        assert_refused(save(&mut pair.sara_socket, &broken), code);
+    }
+    assert_eq!(listed(&mut pair.sara_socket), arranged);
+
+    // Chats this account is not in are dropped, not refused.
+    let mut with_strangers = arranged.clone();
+    with_strangers.folder_list[0] = all_with(vec![own, pair.babak.self_chat, chat]);
+    with_strangers.folder_list[1] = named(work, vec![chat, stranger, own], vec![chat, stranger]);
+    done(save(&mut pair.sara_socket, &with_strangers));
+    assert_eq!(listed(&mut pair.sara_socket), arranged);
+
+    // At most 20 folders besides `all`.
+    let mut many = ChatFolders {
+        folder_list: vec![all_with(Vec::new()), named(work, Vec::new(), Vec::new())],
+        default: all,
+    };
+    for _ in 0..20 {
+        many.folder_list
+            .push(named(issue(&mut pair.sara_socket), Vec::new(), Vec::new()));
+    }
+    assert_refused(save(&mut pair.sara_socket, &many), "too_many_folders");
+    many.folder_list.pop();
+    done(save(&mut pair.sara_socket, &many));
+    assert_eq!(listed(&mut pair.sara_socket), many);
+
+    // Removing a folder, the default too, which makes `all` the default. It never comes back.
+    done(save(&mut pair.sara_socket, &arranged));
+    let only_all = ChatFolders {
+        folder_list: vec![all_with(Vec::new())],
+        default: all,
+    };
+    done(save(&mut pair.sara_socket, &only_all));
+    second.next_where(|frame| {
+        matches!(frame, ServerFrame::ChatFolders(folders) if folders.folder_list.len() == 1)
+    });
+    assert_refused(save(&mut pair.sara_socket, &arranged), "unknown_folder");
+    assert_eq!(listed(&mut pair.sara_socket), only_all);
+
+    // REST issues ids and saves the same body, and the other device hears of it.
+    let (status, reply) = pair.server.call(
+        "POST",
+        "/api/v1/chat_folders/id",
+        Some(&pair.sara.token),
+        None,
     );
-    let answer = pins(&mut pair.sara_socket, vec![reference()]);
-    assert!(
-        matches!(&answer, ServerFrame::Refused { code, .. } if code == "not_member"),
-        "{answer:?}"
-    );
-    assert_eq!(chat_item(&mut pair.sara_socket, chat).pin, Some(0));
-
-    // Leaving a chat out unpins it.
-    let answer = pins(&mut pair.sara_socket, Vec::new());
-    assert!(matches!(answer, ServerFrame::Done { .. }), "{answer:?}");
-    assert_eq!(chat_item(&mut pair.sara_socket, chat).pin, None);
-
-    // REST does the same, and the other device hears of it.
+    assert_eq!(status, 200, "{reply}");
+    let home = ulid_of(&reply["data"]["folder"]);
+    let by_rest = ChatFolders {
+        folder_list: vec![named(home, vec![own], Vec::new()), all_with(vec![chat])],
+        default: home,
+    };
     let (status, reply) = pair.server.call(
         "PUT",
-        "/api/v1/pins",
+        "/api/v1/chat_folders",
         Some(&pair.sara.token),
-        Some(&json!({"chat_list": [chat]})),
+        Some(&serde_json::to_value(&by_rest).unwrap()),
     );
     assert_eq!(status, 200, "{reply}");
     let pushed = second.next_where(
-        |frame| matches!(frame, ServerFrame::Pins { chat_list } if !chat_list.is_empty()),
+        |frame| matches!(frame, ServerFrame::ChatFolders(folders) if folders.default == home),
     );
-    assert_eq!(
-        pushed,
-        ServerFrame::Pins {
-            chat_list: vec![chat]
+    assert_eq!(pushed, ServerFrame::ChatFolders(Box::new(by_rest.clone())));
+    let (status, reply) = pair.server.call(
+        "PUT",
+        "/api/v1/chat_folders",
+        Some(&pair.sara.token),
+        Some(&json!({"folder_list": [], "default": all})),
+    );
+    assert_eq!((status, &reply["code"]), (400, &json!("bad_body")));
+    assert_eq!(listed(&mut pair.sara_socket), by_rest);
+}
+
+/// The newest folders this app was shown, as (id, name, chats, pins), and the default.
+type ShownFolders = (
+    Vec<(Ulid, Option<String>, Option<Vec<Ulid>>, Vec<Ulid>)>,
+    Ulid,
+);
+
+/// Waits for the folders an app shows to match, dropping older ones on the way.
+fn folders_shown(
+    app: &mut App,
+    server: &Server,
+    wanted: impl Fn(&ShownFolders) -> bool,
+) -> ShownFolders {
+    loop {
+        let Event::Folders {
+            folder_list,
+            default,
+        } = app.wait(server, |event| matches!(event, Event::Folders { .. }))
+        else {
+            unreachable!();
+        };
+        let mut shown = Vec::new();
+        for folder in folder_list {
+            let name = folder.name.as_ref().map(|name| name.0.clone());
+            shown.push((folder.id, name, folder.chat_list, folder.pin_list));
         }
+        let shown = (shown, default);
+        if wanted(&shown) {
+            return shown;
+        }
+    }
+}
+
+/// A new folder's id from the server, which saves nothing.
+fn new_folder_id(app: &mut App, server: &Server) -> Ulid {
+    app.command(server, Command::FolderId);
+    let Event::FolderId { folder } =
+        app.wait(server, |event| matches!(event, Event::FolderId { .. }))
+    else {
+        unreachable!();
+    };
+    folder
+}
+
+/// Opens an app's saved state again with no network: it shows what it kept and never connects.
+fn reopen_offline(server: &Server, app: App) -> App {
+    let [first, second] = app.slots.clone();
+    let token = app.token.clone().map(Secret);
+    drop(app);
+    let mut back = App::new();
+    back.slots = [first.clone(), second.clone()];
+    back.offline = true;
+    back.feed(
+        server,
+        keryx_core::client::Input::Loaded {
+            first,
+            second,
+            resume: false,
+            token,
+        },
     );
-    assert_eq!(chat_item(&mut second, chat).pin, Some(0));
+    back
+}
+
+#[test]
+fn folders_follow_the_account_with_sealed_names_and_an_offline_change_wins() {
+    let server = open_server();
+    let (mut sara, _babak, chat) = apps_on(&server);
+    let own = sara.self_chat.unwrap();
+    let (start, all) = folders_shown(&mut sara, &server, |_| true);
+    assert_eq!(start, vec![(all, None, None, Vec::new())]);
+
+    // A second device, from the words alone.
+    let mut second = App::new();
+    second.command(
+        &server,
+        Command::LogIn {
+            username: "sara_x".to_string(),
+            password: Secret(PASSWORD.to_string()),
+            captcha: None,
+        },
+    );
+    second.wait(&server, |event| {
+        matches!(event, Event::NeedWords { restore: true })
+    });
+    second.command(
+        &server,
+        Command::Restore {
+            words: Secret(SARA_WORDS.to_string()),
+        },
+    );
+    folders_shown(&mut second, &server, |_| true);
+
+    // A new folder's id saves nothing until an arrangement names it, which shows here at once, and
+    // its name opens on the other device.
+    let work = new_folder_id(&mut sara, &server);
+    let unused = new_folder_id(&mut sara, &server);
+    assert_ne!(work, unused);
+    sara.command(
+        &server,
+        Command::Folders {
+            folder_list: vec![
+                Folder {
+                    id: all,
+                    name: None,
+                    chat_list: None,
+                    pin_list: Vec::new(),
+                },
+                Folder {
+                    id: work,
+                    name: Some(Secret("Work".to_string())),
+                    chat_list: Some(Vec::new()),
+                    pin_list: Vec::new(),
+                },
+            ],
+            default: all,
+        },
+    );
+    let (shown, _) = folders_shown(&mut sara, &server, |(list, _)| list.len() == 2);
+    assert_eq!(
+        shown[1],
+        (work, Some("Work".to_string()), Some(Vec::new()), Vec::new())
+    );
+    let (seen, _) = folders_shown(&mut second, &server, |(list, _)| list.len() == 2);
+    assert_eq!(seen, shown);
+
+    // Moving a chat in and pinning it, the other device follows, and the server holds no name.
+    let arranged = vec![
+        Folder {
+            id: all,
+            name: None,
+            chat_list: None,
+            pin_list: vec![own],
+        },
+        Folder {
+            id: work,
+            name: Some(Secret("Work".to_string())),
+            chat_list: Some(vec![chat]),
+            pin_list: vec![chat],
+        },
+    ];
+    sara.command(
+        &server,
+        Command::Folders {
+            folder_list: arranged.clone(),
+            default: work,
+        },
+    );
+    let (seen, default) = folders_shown(&mut second, &server, |(_, default)| *default == work);
+    assert_eq!(default, work);
+    assert_eq!(seen[0], (all, None, None, vec![own]));
+    assert_eq!(
+        seen[1],
+        (work, Some("Work".to_string()), Some(vec![chat]), vec![chat])
+    );
+    folders_shown(&mut sara, &server, |(_, default)| *default == work);
+
+    // Offline, a change shows at once, and a new folder needs a connection.
+    let mut sara = reopen_offline(&server, sara);
+    let mut renamed = arranged.clone();
+    renamed[1].name = Some(Secret("Home".to_string()));
+    sara.command(
+        &server,
+        Command::Folders {
+            folder_list: renamed.clone(),
+            default: all,
+        },
+    );
+    folders_shown(&mut sara, &server, |(list, default)| {
+        *default == all && list[1].1.as_deref() == Some("Home")
+    });
+    sara.command(&server, Command::FolderId);
+    sara.wait(
+        &server,
+        |event| matches!(event, Event::Error { code, .. } if code == "offline"),
+    );
+    // Meanwhile the other device moves the chat out.
+    let mut moved = arranged.clone();
+    moved[1].chat_list = Some(Vec::new());
+    moved[1].pin_list = Vec::new();
+    second.command(
+        &server,
+        Command::Folders {
+            folder_list: moved,
+            default: work,
+        },
+    );
+    folders_shown(&mut second, &server, |(list, _)| {
+        list[1].2 == Some(Vec::new())
+    });
+
+    // Back online, the offline change goes first and wins everywhere.
+    sara.offline = false;
+    sara.command(&server, Command::NetworkBack);
+    let wins = |(list, default): &ShownFolders| {
+        *default == all && list[1].1.as_deref() == Some("Home") && list[1].2 == Some(vec![chat])
+    };
+    sara.wait(&server, |event| matches!(event, Event::Online));
+    folders_shown(&mut second, &server, wins);
+
+    // An offline change naming a folder another device removed is refused whole, and the server's
+    // arrangement shows instead.
+    let mut sara = reopen_offline(&server, sara);
+    sara.command(
+        &server,
+        Command::Folders {
+            folder_list: renamed.clone(),
+            default: work,
+        },
+    );
+    second.command(
+        &server,
+        Command::Folders {
+            folder_list: vec![arranged[0].clone()],
+            default: all,
+        },
+    );
+    folders_shown(&mut second, &server, |(list, _)| list.len() == 1);
+    sara.offline = false;
+    sara.command(&server, Command::NetworkBack);
+    sara.wait(
+        &server,
+        |event| matches!(event, Event::Error { code, .. } if code == "unknown_folder"),
+    );
+    // It may first show the last arrangement it kept, until the server's list comes.
+    let (shown, default) = folders_shown(&mut sara, &server, |(list, _)| {
+        list.len() == 1 && !list[0].3.is_empty()
+    });
+    assert_eq!((shown, default), (vec![(all, None, None, vec![own])], all));
 }
 
 #[test]

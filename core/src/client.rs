@@ -33,15 +33,16 @@ use crate::mls::{
 use crate::protocol::{
     AccountBrief, AccountInfo, AccountKeysBody, AccountListReply, AccountReply, Answer, Bytes,
     CallBody, CallEvent, CallEventKind, CallOutcome, CallText, CaptchaAnswer, CaptchaReply,
-    ChallengeBody, ChallengeReply, ChatDevice, ChatDeviceListReply, ChatItem, ChatReply, ChatType,
-    ClientFrame, ContentKind, CountReply, CreateChatBody, CreateFileBody, DeviceProof, DeviceReply,
-    DevicesReply, DraftBody, DraftItem, EmptyReply, FeaturesReply, FileReply, GroupInfoReply,
-    Header, KeyPackageItem, KeyPackageListReply, KeyPackagesBody, Kind, LoginBody, LoginReply,
-    MarkItem, MessageFrame, NamesBody, PhotoReply, ProfileBody, ProfileKeyItem, ProfileKeyShare,
-    ProfileLink, ProfilePhoto, ProfileReply, PutProfileBody, Question, RefusedReply, RegisterBody,
-    RegisterDeviceBody, SendFrame, ServerFrame, SetupBody, SetupReply, SignedBody, SignedProfile,
-    StickerListReply, StickerPack, SyncPosition, TimesItem, VersionReply, WelcomeItem, WrapEntry,
-    WrapItem, WrapListReply, call_text_header,
+    ChallengeBody, ChallengeReply, ChatDevice, ChatDeviceListReply, ChatFolders, ChatItem,
+    ChatReply, ChatType, ClientFrame, ContentKind, CountReply, CreateChatBody, CreateFileBody,
+    DeviceProof, DeviceReply, DevicesReply, DraftBody, DraftItem, EmptyReply, FeaturesReply,
+    FileReply, FolderItem, GroupInfoReply, Header, KeyPackageItem, KeyPackageListReply,
+    KeyPackagesBody, Kind, LoginBody, LoginReply, MarkItem, MessageFrame, NamesBody, PhotoReply,
+    ProfileBody, ProfileKeyItem, ProfileKeyShare, ProfileLink, ProfilePhoto, ProfileReply,
+    PutProfileBody, Question, RefusedReply, RegisterBody, RegisterDeviceBody, SendFrame,
+    ServerFrame, SetupBody, SetupReply, SignedBody, SignedProfile, StickerListReply, StickerPack,
+    SyncPosition, TimesItem, VersionReply, WelcomeItem, WrapEntry, WrapItem, WrapListReply,
+    call_text_header,
 };
 use crate::queue::{Level, Queue, Target};
 use crate::seed::{self, AccountKeys};
@@ -264,11 +265,16 @@ pub enum Command {
         chat: Ulid,
         draft: Option<Draft>,
     },
-    /// This account's pinned chats, the whole order at once, first on top: every chat it leaves out
-    /// is unpinned. Shown at once as [`Event::Pins`], and kept until the server takes it, so one
-    /// made offline goes on the next connection and wins over what other devices did meanwhile.
-    Pins {
-        chat_list: Vec<Ulid>,
+    /// A new folder's id, from the server, answered as [`Event::FolderId`]. It saves nothing: the
+    /// folder is saved with the [`Command::Folders`] that names it, within 5 minutes.
+    FolderId,
+    /// This account's whole arrangement of folders, with plain names: only a changed name is sealed
+    /// again. Shown at once as [`Event::Folders`], and kept until the server takes it, so one made
+    /// offline goes on the next connection and wins over what other devices did meanwhile. One the
+    /// server refuses goes back to the server's, with an [`Event::Error`] saying why.
+    Folders {
+        folder_list: Vec<Folder>,
+        default: Ulid,
     },
     /// When each other member received and saw one message, answered as [`Event::Times`].
     Times {
@@ -612,6 +618,21 @@ pub enum Problem {
     Malformed,
 }
 
+/// One of this account's folders. `all` is the one with no name and no `chat_list`, and holds every
+/// chat. A name this device cannot open shows empty.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify), tsify(missing_as_null))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Folder {
+    pub id: Ulid,
+    #[serde(default)]
+    pub name: Option<Secret>,
+    #[serde(default)]
+    pub chat_list: Option<Vec<Ulid>>,
+    /// Pinned chats, first on top.
+    #[serde(default)]
+    pub pin_list: Vec<Ulid>,
+}
+
 /// Unsent text in a chat, with the message it replies to or edits, if any.
 #[cfg_attr(feature = "wasm", derive(tsify::Tsify), tsify(missing_as_null))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -817,10 +838,15 @@ pub enum Event {
         draft: Option<Draft>,
         saved_at: i64,
     },
-    /// This account's pinned chats changed, here or on another of its devices: the whole order,
-    /// first on top. The list's own `pin` places say the same after a `Chats`.
-    Pins {
-        chat_list: Vec<Ulid>,
+    /// The answer to [`Command::FolderId`]: a new folder's id, kept for this account for 5 minutes.
+    FolderId {
+        folder: Ulid,
+    },
+    /// This account's folders, here or from the server: the whole arrangement in tab order, names
+    /// opened, and the one to open on.
+    Folders {
+        folder_list: Vec<Folder>,
+        default: Ulid,
     },
     /// The answer to `Times`: each member but the sender, by the server's clock.
     Times {
@@ -1196,9 +1222,11 @@ enum Waiting {
         which: Which,
         up_to: u64,
     },
-    /// A `pins` frame: kept until the server takes this order.
-    Pins {
-        chat_list: Vec<Ulid>,
+    /// A new folder's id.
+    FolderId,
+    /// A `chat_folders` frame: kept until the server takes this arrangement.
+    Folders {
+        folders: ChatFolders,
     },
     Done,
 }
@@ -1267,9 +1295,12 @@ struct Shelf {
     device_list: Vec<ShelfDevice>,
     #[serde(default)]
     profile_list: Vec<ProfileState>,
-    /// A pinned order the server has not taken yet.
+    /// The server's last arrangement of folders, so a start with no network shows it.
     #[serde(default)]
-    pins_out: Option<Vec<Ulid>>,
+    folders: Option<ChatFolders>,
+    /// An arrangement the server has not taken yet.
+    #[serde(default)]
+    folders_out: Option<ChatFolders>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1415,8 +1446,10 @@ pub struct Client {
     devices: HashMap<Ulid, KnownDevice>,
     /// The last chat list the server sent, previews included, kept in the snapshot's shelf.
     chat_cache: Vec<ChatItem>,
-    /// A pinned order the server has not taken yet, sent on every connection until it is.
-    pins_out: Option<Vec<Ulid>>,
+    /// The server's last arrangement of folders, still sealed.
+    folders: Option<ChatFolders>,
+    /// An arrangement the server has not taken yet, sent on every connection until it is.
+    folders_out: Option<ChatFolders>,
     /// Ending statements waiting for their account's master key.
     revocations: Vec<(Ulid, Ulid, Vec<u8>)>,
     uploads: HashMap<u64, Upload>,
@@ -1469,14 +1502,6 @@ fn reference() -> Ulid {
         Ok(id) => id,
         Err(_) => Ulid::from_bytes([0; 16]),
     }
-}
-
-/// A chat's place in a pinned order, from 0 on top.
-fn place_of(chat_list: &[Ulid], chat: Ulid) -> Option<u32> {
-    chat_list
-        .iter()
-        .position(|pinned| *pinned == chat)
-        .and_then(|place| u32::try_from(place).ok())
 }
 
 /// When to try again after `attempt` earlier tries, with a little randomness so clients spread out.
@@ -1733,7 +1758,8 @@ impl Client {
             asked_accounts: HashSet::new(),
             devices: HashMap::new(),
             chat_cache: Vec::new(),
-            pins_out: None,
+            folders: None,
+            folders_out: None,
             revocations: Vec::new(),
             uploads: HashMap::new(),
             next_upload: 0,
@@ -1961,7 +1987,8 @@ impl Client {
                 })
                 .collect(),
             profile_list: self.profiles.values().cloned().collect(),
-            pins_out: self.pins_out.clone(),
+            folders: self.folders.clone(),
+            folders_out: self.folders_out.clone(),
         };
         let Some(device) = self.device.as_mut() else {
             return;
@@ -2172,14 +2199,75 @@ impl Client {
                 }
             }
             Command::Draft { chat, draft } => self.keep_draft(chat, draft),
-            Command::Pins { chat_list } => {
-                self.place_pins(&chat_list);
-                self.pins_out = Some(chat_list.clone());
-                self.dirty = true;
-                self.event(Event::Pins {
-                    chat_list: chat_list.clone(),
+            Command::FolderId => {
+                let reference = reference();
+                let frame = ClientFrame::FolderId { reference };
+                if !self.ask(frame, reference, Waiting::FolderId) {
+                    self.error("offline", "A new folder needs a connection");
+                }
+            }
+            Command::Folders {
+                folder_list,
+                default,
+            } => {
+                let Some(device) = self.device.as_ref() else {
+                    return;
+                };
+                // A name the same as the one shown keeps its sealed bytes, so the server sees no
+                // rename.
+                let mut shown = HashMap::new();
+                let current = match &self.folders_out {
+                    Some(folders) => Some(folders),
+                    None => self.folders.as_ref(),
+                };
+                if let Some(current) = current {
+                    for folder in &current.folder_list {
+                        if let Some(name) = &folder.name {
+                            shown.insert(folder.id, name.clone());
+                        }
+                    }
+                }
+                let mut sealed_list = Vec::with_capacity(folder_list.len());
+                for folder in folder_list {
+                    let name = match &folder.name {
+                        None => None,
+                        Some(name) => {
+                            let kept = match shown.get(&folder.id) {
+                                Some(sealed) => match device.open_folder_name(folder.id, &sealed.0)
+                                {
+                                    Ok(opened) if opened.as_slice() == name.0.as_bytes() => {
+                                        Some(sealed.clone())
+                                    }
+                                    _ => None,
+                                },
+                                None => None,
+                            };
+                            match kept {
+                                Some(sealed) => Some(sealed),
+                                None => match device.seal_folder_name(folder.id, &name.0) {
+                                    Ok(sealed) => Some(Bytes(sealed)),
+                                    Err(_) => {
+                                        return self
+                                            .error("seal", "A folder name could not be sealed");
+                                    }
+                                },
+                            }
+                        }
+                    };
+                    sealed_list.push(FolderItem {
+                        id: folder.id,
+                        name,
+                        chat_list: folder.chat_list.clone(),
+                        pin_list: folder.pin_list.clone(),
+                    });
+                }
+                self.folders_out = Some(ChatFolders {
+                    folder_list: sealed_list,
+                    default,
                 });
-                self.send_pins();
+                self.dirty = true;
+                self.show_folders();
+                self.send_folders();
             }
             Command::Times { chat, seq } => {
                 let reference = reference();
@@ -3527,8 +3615,8 @@ impl Client {
             self.verifying += 1;
         }
         self.sync_next.clear();
-        // Before the `sync`, so the list it brings already holds this order.
-        self.send_pins();
+        // Before the `sync`, so the list it brings already holds this arrangement.
+        self.send_folders();
         self.start_sync(None, since);
         let mut chat_list: Vec<Ulid> = self.chats.keys().copied().collect();
         chat_list.sort();
@@ -3787,10 +3875,9 @@ impl Client {
             self.show_profile(account);
         }
         self.chat_cache = shelf.chat_list.clone();
-        self.pins_out = shelf.pins_out.clone();
-        if let Some(chat_list) = self.pins_out.clone() {
-            self.place_pins(&chat_list);
-        }
+        self.folders = shelf.folders.clone();
+        self.folders_out = shelf.folders_out.clone();
+        self.show_folders();
         let mut shown = Vec::with_capacity(shelf.chat_list.len());
         let mut preview_list = Vec::new();
         for mut item in shelf.chat_list {
@@ -4695,20 +4782,25 @@ impl Client {
                 message_list,
                 call_list,
                 more,
-            } => self.synced(reference, chat_list, message_list, call_list, more),
+                chat_folders,
+            } => {
+                if let Some(folders) = chat_folders {
+                    self.folders_listed(folders);
+                }
+                self.synced(reference, chat_list, message_list, call_list, more)
+            }
             ServerFrame::Welcome { chat, body } => self.welcome(chat, &body.0),
             ServerFrame::Typing { chat, account, on } => {
                 self.event(Event::Typing { chat, account, on })
             }
             ServerFrame::Marks { chat, mark } => self.event(Event::Marks { chat, mark }),
             ServerFrame::Draft { chat, draft } => self.show_draft(chat, draft),
-            // An order of this device's own still waiting wins, and goes when it can.
-            ServerFrame::Pins { chat_list } if self.pins_out.is_none() => {
-                self.place_pins(&chat_list);
-                self.dirty = true;
-                self.event(Event::Pins { chat_list });
+            ServerFrame::ChatFolders(folders) => self.folders_listed(*folders),
+            ServerFrame::FolderId { reference, folder } => {
+                if let Some(Waiting::FolderId) = self.waiting.remove(&reference) {
+                    self.event(Event::FolderId { folder });
+                }
             }
-            ServerFrame::Pins { .. } => {}
             ServerFrame::Times {
                 reference,
                 chat,
@@ -4894,8 +4986,9 @@ impl Client {
                 self.send_outs(chat);
             }
             Waiting::Position { chat, which, up_to } => self.position_done(chat, which, up_to),
-            Waiting::Pins { chat_list } if self.pins_out.as_ref() == Some(&chat_list) => {
-                self.pins_out = None;
+            Waiting::Folders { folders } if self.folders_out.as_ref() == Some(&folders) => {
+                self.folders = Some(folders);
+                self.folders_out = None;
                 self.dirty = true;
             }
             _ => {}
@@ -5027,14 +5120,15 @@ impl Client {
                 self.error(code, message);
                 self.position_done(chat, which, up_to);
             }
-            // Refused, such as for a chat left meanwhile, it would be refused again, so it goes, and
-            // the next list puts back what the server holds.
-            Waiting::Pins { chat_list } => {
-                if self.pins_out.as_ref() == Some(&chat_list) {
-                    self.pins_out = None;
-                    self.dirty = true;
-                }
+            Waiting::FolderId => self.error(code, message),
+            // Refused, it would be refused again, so it goes, and the server's shows instead.
+            Waiting::Folders { folders } => {
                 self.error(code, message);
+                if self.folders_out.as_ref() == Some(&folders) {
+                    self.folders_out = None;
+                    self.dirty = true;
+                    self.show_folders();
+                }
             }
             Waiting::Done => self.error(code, message),
         }
@@ -5154,36 +5248,71 @@ impl Client {
         });
     }
 
-    /// Sends the pinned order still waiting, if connected. Offline, the next connection sends it.
-    fn send_pins(&mut self) {
-        let Some(chat_list) = self.pins_out.clone() else {
+    /// Sends the arrangement still waiting, if connected. Offline, the next connection sends it.
+    fn send_folders(&mut self) {
+        let Some(folders) = self.folders_out.clone() else {
             return;
         };
         let reference = reference();
-        let frame = ClientFrame::Pins {
+        let frame = ClientFrame::ChatFolders {
             reference,
-            chat_list: chat_list.clone(),
+            folders: folders.clone(),
         };
-        self.ask(frame, reference, Waiting::Pins { chat_list });
+        self.ask(frame, reference, Waiting::Folders { folders });
     }
 
-    /// Puts this pinned order into the kept list, so a start with no network shows it.
-    fn place_pins(&mut self, chat_list: &[Ulid]) {
-        for item in &mut self.chat_cache {
-            item.pin = place_of(chat_list, item.chat);
+    /// The server's arrangement, from a list or another device. One of this device's own still
+    /// waiting stays shown, and goes when it can.
+    fn folders_listed(&mut self, folders: ChatFolders) {
+        self.folders = Some(folders);
+        self.dirty = true;
+        if self.folders_out.is_none() {
+            self.show_folders();
         }
+    }
+
+    /// Shows this account's folders, its own unsent arrangement over the server's, names opened.
+    fn show_folders(&mut self) {
+        let shown = match &self.folders_out {
+            Some(folders) => folders,
+            None => match &self.folders {
+                Some(folders) => folders,
+                None => return,
+            },
+        };
+        let mut folder_list = Vec::with_capacity(shown.folder_list.len());
+        for folder in &shown.folder_list {
+            let name = match &folder.name {
+                None => None,
+                Some(sealed) => {
+                    let opened = match self.device.as_ref() {
+                        Some(device) => device.open_folder_name(folder.id, &sealed.0).ok(),
+                        None => None,
+                    };
+                    match opened {
+                        Some(opened) => Some(Secret(String::from_utf8_lossy(&opened).into_owned())),
+                        None => Some(Secret(String::new())),
+                    }
+                }
+            };
+            folder_list.push(Folder {
+                id: folder.id,
+                name,
+                chat_list: folder.chat_list.clone(),
+                pin_list: folder.pin_list.clone(),
+            });
+        }
+        let default = shown.default;
+        self.event(Event::Folders {
+            folder_list,
+            default,
+        });
     }
 
     fn chats_listed(&mut self, chat_list: Vec<ChatItem>) {
         let Some(me) = self.account else {
             return;
         };
-        let mut chat_list = chat_list;
-        if let Some(pins) = &self.pins_out {
-            for item in &mut chat_list {
-                item.pin = place_of(pins, item.chat);
-            }
-        }
         self.chat_cache = chat_list.clone();
         self.dirty = true;
         let mut shown = Vec::with_capacity(chat_list.len());
