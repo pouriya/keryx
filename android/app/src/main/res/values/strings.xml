@@ -165,4 +165,44 @@
     <string name="profile_done">Done</string>
     <string name="profile_save">Save</string>
     <string name="profile_remove_link">Remove link</string>
+    <string name="folders_all">All</string>
+    <string name="folders_title">Folders</string>
+    <string name="folders_save">Save</string>
+    <string name="folders_copy">Copy</string>
+    <string name="folders_new">New</string>
+    <string name="folders_remove">Remove</string>
+    <string name="folders_new_folder">New folder</string>
+    <string name="folders_new_with_these">New folder with these</string>
+    <string name="folders_new_with_it">New folder with it</string>
+    <string name="folders_in">In %1$s</string>
+    <string name="folders_already_in">Already in</string>
+    <string name="folders_remove_from">Remove from %1$s</string>
+    <plurals name="folders_chats">
+        <item quantity="one">%d chat</item>
+        <item quantity="other">%d chats</item>
+    </plurals>
+    <string name="folders_create">Create</string>
+    <string name="folders_rename_title">Rename folder</string>
+    <string name="folders_rename">Rename</string>
+    <string name="folders_default">Default</string>
+    <plurals name="folders_go_in">
+        <item quantity="one">goes in it.</item>
+        <item quantity="other">go in it.</item>
+    </plurals>
+    <string name="folders_who_and">" and "</string>
+    <string name="folders_who_comma">", "</string>
+    <plurals name="folders_who_others">
+        <item quantity="one">" and %d other"</item>
+        <item quantity="other">" and %d others"</item>
+    </plurals>
+    <string name="folders_remove_title">Remove “%1$s”?</string>
+    <string name="folders_remove_body">Its chats stay in All and in any other folder.</string>
+    <string name="folders_remove_default">This was your default, so All becomes the default.</string>
+    <string name="folders_offline">A new folder needs a connection.</string>
+    <string name="folders_at_most">You can have at most 20 folders.</string>
+    <string name="folders_changed">Your folders changed on another device.</string>
+    <string name="folders_refused_many">Couldn’t save: you can have at most 20 folders. Nothing was changed.</string>
+    <string name="folders_refused_permission">Couldn’t save: this server doesn’t let you change that. Nothing was changed.</string>
+    <string name="folders_refused_unknown">Couldn’t save: a folder was removed on another device. Nothing was changed.</string>
+    <string name="folders_refused">Couldn’t save the folders. Nothing was changed.</string>
 </resources>

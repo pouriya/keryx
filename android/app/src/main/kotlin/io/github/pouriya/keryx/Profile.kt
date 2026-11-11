@@ -1383,6 +1383,14 @@ internal object Glyphs {
     val pin = listOf("M9 4h6l-1 6 3 3H7l3-3z", "M12 13v7")
     val unpin = listOf("M9 4h6l-1 6 3 3H7l3-3z", "M12 13v7", "M4 4l16 16")
     val handle = listOf("M5 9h14M5 12h14M5 15h14")
+    private const val FOLDER = "M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"
+    val folder = listOf(FOLDER)
+    val folderPlus = listOf(FOLDER, "M12 10.5v5M9.5 13h5")
+    val move = listOf(FOLDER, "M9 13h6M13 11l2 2-2 2")
+    val folderOut = listOf(FOLDER, "M9.5 13h5")
+    val copy = listOf(box(8f, 8f, 12f, 12f, 2f), "M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2")
+    val star = listOf("M12 4l2.4 5 5.6.8-4 3.9.9 5.5L12 16.6 7.1 19.2 8 13.7 4 9.8l5.6-.8z")
+    val edit = listOf("M4 20h4L19 9l-4-4L4 16z")
 }
 
 @Composable
@@ -1391,11 +1399,13 @@ internal fun Glyph(
     color: Color,
     size: Dp = 22.dp,
     width: Float = 2f,
+    filled: Boolean = false,
 ) {
     val parsed = remember(paths) { paths.map { PathParser().parsePathString(it).toPath() } }
     Canvas(Modifier.size(size)) {
         scale(this.size.width / 24f, pivot = Offset.Zero) {
             for (path in parsed) {
+                if (filled) drawPath(path, color)
                 drawPath(path, color, style = Stroke(width, cap = StrokeCap.Round, join = StrokeJoin.Round))
             }
         }

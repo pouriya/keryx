@@ -165,4 +165,44 @@
     <string name="profile_done">تمام</string>
     <string name="profile_save">ذخیره</string>
     <string name="profile_remove_link">حذف پیوند</string>
+    <string name="folders_all">همه</string>
+    <string name="folders_title">پوشه‌ها</string>
+    <string name="folders_save">ذخیره</string>
+    <string name="folders_copy">رونوشت</string>
+    <string name="folders_new">تازه</string>
+    <string name="folders_remove">برداشتن</string>
+    <string name="folders_new_folder">پوشهٔ تازه</string>
+    <string name="folders_new_with_these">پوشهٔ تازه با این‌ها</string>
+    <string name="folders_new_with_it">پوشهٔ تازه با این</string>
+    <string name="folders_in">در %1$s</string>
+    <string name="folders_already_in">از پیش در آن</string>
+    <string name="folders_remove_from">برداشتن از %1$s</string>
+    <plurals name="folders_chats">
+        <item quantity="one">%d گفتگو</item>
+        <item quantity="other">%d گفتگو</item>
+    </plurals>
+    <string name="folders_create">ساختن</string>
+    <string name="folders_rename_title">تغییر نام پوشه</string>
+    <string name="folders_rename">تغییر نام</string>
+    <string name="folders_default">پیش‌فرض</string>
+    <plurals name="folders_go_in">
+        <item quantity="one">در آن می‌رود.</item>
+        <item quantity="other">در آن می‌روند.</item>
+    </plurals>
+    <string name="folders_who_and">" و "</string>
+    <string name="folders_who_comma">"، "</string>
+    <plurals name="folders_who_others">
+        <item quantity="one">" و %d گفتگوی دیگر"</item>
+        <item quantity="other">" و %d گفتگوی دیگر"</item>
+    </plurals>
+    <string name="folders_remove_title">«%1$s» برداشته شود؟</string>
+    <string name="folders_remove_body">گفتگوهایش در «همه» و در هر پوشهٔ دیگری می‌مانند.</string>
+    <string name="folders_remove_default">این پیش‌فرض شما بود، پس «همه» پیش‌فرض می‌شود.</string>
+    <string name="folders_offline">پوشهٔ تازه به اتصال نیاز دارد.</string>
+    <string name="folders_at_most">بیش از ۲۰ پوشه نمی‌توانید داشته باشید.</string>
+    <string name="folders_changed">پوشه‌هایتان در دستگاه دیگری تغییر کرد.</string>
+    <string name="folders_refused_many">ذخیره نشد: بیش از ۲۰ پوشه نمی‌توانید داشته باشید. چیزی تغییر نکرد.</string>
+    <string name="folders_refused_permission">ذخیره نشد: این سرور اجازهٔ این تغییر را نمی‌دهد. چیزی تغییر نکرد.</string>
+    <string name="folders_refused_unknown">ذخیره نشد: پوشه‌ای در دستگاه دیگری برداشته شد. چیزی تغییر نکرد.</string>
+    <string name="folders_refused">پوشه‌ها ذخیره نشدند. چیزی تغییر نکرد.</string>
 </resources>

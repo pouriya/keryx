@@ -183,11 +183,17 @@ sealed interface Command {
         val draft: DraftText? = null,
     ) : Command
 
-    /** The whole pinned order, first on top. Every chat it leaves out is unpinned. */
+    /** A new folder's id from the server, answered as `Event.FolderId`. It saves nothing. */
     @Serializable
-    @SerialName("pins")
-    data class Pins(
-        val chat_list: List<String>,
+    @SerialName("folder_id")
+    data object FolderId : Command
+
+    /** The whole arrangement of folders, with plain names, in tab order, saved as one change. */
+    @Serializable
+    @SerialName("folders")
+    data class Folders(
+        val folder_list: List<Folder>,
+        val default: String,
     ) : Command
 
     /** When each other member received and saw one message, answered as `Event.Times`. */
@@ -826,8 +832,15 @@ data class ChatItem(
     val last_content: MessageFrame? = null,
     val mark_list: List<MarkItem> = emptyList(),
     val seen_seq: Long? = null,
-    /** Its place among this account's pinned chats, from 0 on top, or none. */
-    val pin: Int? = null,
+)
+
+/** One folder: `all` is the one with no name and no `chat_list`. Pins are first on top. */
+@Serializable
+data class Folder(
+    val id: String,
+    val name: String? = null,
+    val chat_list: List<String>? = null,
+    val pin_list: List<String> = emptyList(),
 )
 
 @Serializable
@@ -1084,11 +1097,19 @@ sealed interface Event {
         val saved_at: Long = 0,
     ) : Event
 
-    /** This account's pinned chats changed, here or on another device: the whole order, first on top. */
+    /** The answer to `Command.FolderId`: a new folder's id, kept for this account for 5 minutes. */
     @Serializable
-    @SerialName("pins")
-    data class Pins(
-        val chat_list: List<String>,
+    @SerialName("folder_id")
+    data class FolderId(
+        val folder: String,
+    ) : Event
+
+    /** This account's folders, here or from another device: the whole arrangement in tab order. */
+    @Serializable
+    @SerialName("folders")
+    data class Folders(
+        val folder_list: List<Folder>,
+        val default: String,
     ) : Event
 
     @Serializable

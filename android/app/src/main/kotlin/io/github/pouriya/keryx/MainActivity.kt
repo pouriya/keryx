@@ -102,6 +102,7 @@ class MainActivity : ComponentActivity() {
     private var wordsBack: () -> Boolean = { false }
     private val chats = mutableStateListOf<ChatItem>()
     private val list = ChatRows()
+    private val folders = FolderState { engine.send(it) }
     private val people = mutableStateMapOf<String, AccountBrief>()
     private val me = mutableStateOf<String?>(null)
 
@@ -358,6 +359,7 @@ class MainActivity : ComponentActivity() {
                                 ringing = ringing.value,
                                 found = found,
                                 foundFor = foundFor.value,
+                                folders = folders,
                                 onSearch = ::searchPeople,
                                 onPerson = { account -> engine.send(Command.StartChat(account.id)) },
                                 onOpen = { row -> openChat(row.id) },
@@ -366,11 +368,6 @@ class MainActivity : ComponentActivity() {
                                 onDecline = { call ->
                                     engine.send(Command.DeclineCall(call.chat, call.seq))
                                     ringing.value = null
-                                },
-                                // Shown at once here, as core's own Pins event will say again.
-                                onPins = { order ->
-                                    list.pins(order)
-                                    engine.send(Command.Pins(order))
                                 },
                             )
                         }
@@ -943,6 +940,7 @@ class MainActivity : ComponentActivity() {
             return
         }
         profiles.apply(event)
+        folders.apply(event)
         happened.add(0, event::class.simpleName ?: "?")
         if (happened.size > 40) {
             happened.removeAt(happened.lastIndex)
@@ -1071,7 +1069,6 @@ class MainActivity : ComponentActivity() {
                 loadingOlder = false
             }
             is Event.Draft -> talk.drafted(event)
-            is Event.Pins -> list.pins(event.chat_list)
             is Event.Times -> timesAnswer.value = TimesAnswer(event.seq, event.member_list)
             is Event.Failed -> {
                 talk.failed(event)
@@ -1116,6 +1113,7 @@ class MainActivity : ComponentActivity() {
                 profileOf.value = null
                 chats.clear()
                 list.clear()
+                folders.clear()
                 people.clear()
                 messages.clear()
                 talk.close()
