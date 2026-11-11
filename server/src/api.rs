@@ -199,6 +199,23 @@ pub struct Settings {
     pub tcp: TcpSettings,
     pub tls: Option<TlsSettings>,
     pub captcha: Option<captcha::Settings>,
+    #[serde(default)]
+    pub stickers: StickerSettings,
+}
+
+/// `[stickers]`.
+#[derive(Deserialize)]
+#[serde(default)]
+pub struct StickerSettings {
+    /// Whether the bundled `Default` pack is listed. Off, its bytes are still served, so old messages
+    /// keep showing their stickers.
+    pub default_pack: bool,
+}
+
+impl Default for StickerSettings {
+    fn default() -> Self {
+        Self { default_pack: true }
+    }
 }
 
 #[derive(Deserialize)]
@@ -474,6 +491,8 @@ pub struct App {
     pub stopping: watch::Sender<bool>,
     /// The relay's one byte budget for cached groups, `[limits] call_cache`, shared by every call.
     pub call_pool: moq_net::cache::Pool,
+    /// The bundled sticker pack, checked at startup.
+    pub default_pack: file::DefaultPack,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -492,6 +511,8 @@ pub enum ServeError {
     Id(#[source] keryx_core::ulid::Error),
     #[error("Could not read the TLS certificate or key")]
     Tls(#[source] std::io::Error),
+    #[error("A bundled sticker is broken: {0}")]
+    DefaultPack(String),
     #[error("Could not listen on {address}")]
     Listen {
         address: SocketAddr,
@@ -1967,13 +1988,20 @@ pub async fn run_sticker_list(app: &App, caller: &Caller) -> Result<StickerListR
     {
         check(app, caller, Need::Device).await?;
     }
-    let pack_list = app.storage.sticker_list().await?;
+    let mut pack_list = app.storage.sticker_list().await?;
+    if app.settings.stickers.default_pack {
+        pack_list.push(app.default_pack.listed());
+    }
     Ok(StickerListReply { pack_list })
 }
 
-/// A sticker's WebP. Its bytes never change, as an id is never reused.
+/// A sticker's WebP. Its bytes never change, as an id is never reused. A bundled one is served even
+/// while its pack is not listed.
 pub async fn run_sticker_image(app: &App, caller: &Caller, id: Ulid) -> Result<Vec<u8>, Refused> {
     check(app, caller, Need::Device).await?;
+    if let Some(bytes) = app.default_pack.image(id) {
+        return Ok(bytes.to_vec());
+    }
     if app.storage.sticker(id).await?.is_none() {
         return Err(refused(
             404,
@@ -2000,7 +2028,7 @@ pub async fn run_create_pack(
         ));
     }
     let id = new_id()?;
-    if !app.storage.create_pack(id, name, Ulid::now()).await? {
+    if name == file::DEFAULT_PACK_NAME || !app.storage.create_pack(id, name, Ulid::now()).await? {
         return Err(refused(409, "name_taken", "A pack already has that name"));
     }
     tracing::info!(msg = "Added a sticker pack", pack = %id);
@@ -3887,6 +3915,8 @@ pub async fn serve(settings: Settings) -> Result<(), ServeError> {
         }
         None => None,
     };
+    let default_pack =
+        file::default_pack(settings.limits.upload.sticker).map_err(ServeError::DefaultPack)?;
     let www = settings.www.directory.clone();
     let (stopping, _) = watch::channel(false);
     let call_pool = moq_net::cache::Pool::new(settings.limits.call_cache as u64);
@@ -3896,6 +3926,7 @@ pub async fn serve(settings: Settings) -> Result<(), ServeError> {
         hub: Hub::default(),
         stopping,
         call_pool,
+        default_pack,
     });
     captcha::start_sweep(Arc::clone(&app));
     if let Err(refusal) = file::sweep(&app, None).await {

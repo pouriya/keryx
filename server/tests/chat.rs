@@ -4173,8 +4173,9 @@ fn a_sticker_names_a_server_sticker_inside_its_encryption_and_cannot_be_edited()
     else {
         unreachable!();
     };
-    assert_eq!(pack_list.len(), 1);
+    assert_eq!(pack_list.len(), 2);
     assert_eq!(pack_list[0].sticker_list[0].id, sticker);
+    assert_eq!(pack_list[1].name, "Default");
     sara.command(&server, Command::StickerImage { sticker });
     let Event::StickerImage { bytes, .. } =
         sara.wait(&server, |event| matches!(event, Event::StickerImage { .. }))

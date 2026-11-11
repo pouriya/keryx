@@ -114,7 +114,9 @@ lists the files it drops in `remove`. An upload no sent message keeps is removed
 
 A sticker is a static or animated WebP of at most 512x512 and `[limits.upload] sticker`, kept in a pack
 whose name is unique. It is not encrypted, since everyone here can see it. A sticker message, content
-kind 12, names it inside its encryption as `{"sticker": "<id>"}`, and cannot be edited. A question
+kind 12, names it inside its encryption as `{"sticker": "<id>"}`, and cannot be edited. The pack named
+`Default` is built into the server and listed after the others unless `[stickers] default_pack` is false;
+its stickers are always served, and it cannot be changed, removed or named again. A question
 message, kind 10, holds a tree of questions, and an answer, kind 11, one account's answer to it, both
 sealed like text, so the server reads neither.
 

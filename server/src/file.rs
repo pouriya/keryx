@@ -3,11 +3,13 @@
 //! removing uploads no sent message named. Stickers live there too, in a `stickers` folder, a file
 //! per sticker named by its id, each a WebP checked by its header, and profile photos in
 //! `accounts/<account id>`, a file per photo named by its id, each one sealed chunk. The rows are in
-//! storage. See the root AGENTS.md.
+//! storage. The bundled `default` sticker pack is compiled in from `stickers/` and held in memory. See
+//! the root AGENTS.md.
 
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 
+use keryx_core::protocol::{StickerItem, StickerPack};
 use keryx_core::ulid::Ulid;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
@@ -168,6 +170,167 @@ pub fn webp_size(bytes: &[u8]) -> Option<(u32, u32)> {
         }
         _ => None,
     }
+}
+
+/// The bundled `default` pack's id. It and its stickers' ids are fixed forever, since a sticker message
+/// names its sticker by id.
+pub const DEFAULT_PACK: &str = "01M75K3ET0RVS2RWCK815GA1N8";
+/// The bundled pack's name, which no operator's pack may take, on or off, chosen by the author.
+pub const DEFAULT_PACK_NAME: &str = "Default";
+
+/// The bundled pack's stickers, in order: id, emoji, file name and bytes. Bit, a pixel robot by Godspeed
+/// Mission Control, from github.com/MichaelZelbel/hermes-telegram-stickers under CC0, converted once to
+/// lossless WebP. Each emoji is the first of the two its source names.
+const DEFAULT_STICKER_LIST: [(&str, &str, &str, &[u8]); 15] = [
+    (
+        "01M75K3ET0J4MTEQ0J3G56RJVF",
+        "🎧",
+        "bit-today.webp",
+        include_bytes!("stickers/bit-today.webp"),
+    ),
+    (
+        "01M75K3ET0HJTQ3AQGM8D8ESGT",
+        "💻",
+        "bit-onit.webp",
+        include_bytes!("stickers/bit-onit.webp"),
+    ),
+    (
+        "01M75K3ET0ACPQXC056RSE4K61",
+        "📝",
+        "bit-note.webp",
+        include_bytes!("stickers/bit-note.webp"),
+    ),
+    (
+        "01M75K3ET0GMDRB84WRQBB6CEE",
+        "📡",
+        "bit-copy.webp",
+        include_bytes!("stickers/bit-copy.webp"),
+    ),
+    (
+        "01M75K3ET0GXK4E2AK9GA7SXCW",
+        "🔧",
+        "bit-fix.webp",
+        include_bytes!("stickers/bit-fix.webp"),
+    ),
+    (
+        "01M75K3ET0Y2RZK5P8V1B0CAES",
+        "🫡",
+        "bit-done.webp",
+        include_bytes!("stickers/bit-done.webp"),
+    ),
+    (
+        "01M75K3ET0G1341CS6F2X40D3A",
+        "😴",
+        "bit-quiet.webp",
+        include_bytes!("stickers/bit-quiet.webp"),
+    ),
+    (
+        "01M75K3ET018RHXBR62ED3YV75",
+        "👍",
+        "bit-ok.webp",
+        include_bytes!("stickers/bit-ok.webp"),
+    ),
+    (
+        "01M75K3ET095VQG0BZAJHQ9CX6",
+        "🤔",
+        "bit-think.webp",
+        include_bytes!("stickers/bit-think.webp"),
+    ),
+    (
+        "01M75K3ET06SM5ZPV02CBRWT2C",
+        "🔍",
+        "bit-found.webp",
+        include_bytes!("stickers/bit-found.webp"),
+    ),
+    (
+        "01M75K3ET0YY75648XYK8ACPF6",
+        "😅",
+        "bit-oops.webp",
+        include_bytes!("stickers/bit-oops.webp"),
+    ),
+    (
+        "01M75K3ET0MY6Y4ZZDG50W8Z5X",
+        "🎉",
+        "bit-party.webp",
+        include_bytes!("stickers/bit-party.webp"),
+    ),
+    (
+        "01M75K3ET0H2E2PWSSSQ69ZBT2",
+        "🙏",
+        "bit-thanks.webp",
+        include_bytes!("stickers/bit-thanks.webp"),
+    ),
+    (
+        "01M75K3ET0NRA36BCKP8T027B7",
+        "☕",
+        "bit-morning.webp",
+        include_bytes!("stickers/bit-morning.webp"),
+    ),
+    (
+        "01M75K3ET0S637G16NRFP5SR6K",
+        "🌙",
+        "bit-night.webp",
+        include_bytes!("stickers/bit-night.webp"),
+    ),
+];
+
+/// The bundled pack, held in memory and never in the database.
+pub struct DefaultPack {
+    pub id: Ulid,
+    pub sticker_list: Vec<StickerItem>,
+    bytes: Vec<&'static [u8]>,
+}
+
+impl DefaultPack {
+    /// The pack as a client lists it.
+    pub fn listed(&self) -> StickerPack {
+        StickerPack {
+            id: self.id,
+            name: DEFAULT_PACK_NAME.to_string(),
+            sticker_list: self.sticker_list.clone(),
+        }
+    }
+
+    /// A bundled sticker's bytes, or `None` for any other id.
+    pub fn image(&self, id: Ulid) -> Option<&'static [u8]> {
+        self.sticker_list
+            .iter()
+            .position(|sticker| sticker.id == id)
+            .and_then(|index| self.bytes.get(index).copied())
+    }
+}
+
+/// The bundled pack, each sticker put through the same check an upload gets: a WebP of at most 512x512
+/// and `limit` bytes. An `Err` names the file that failed, so startup stops.
+pub fn default_pack(limit: u64) -> Result<DefaultPack, String> {
+    let id = Ulid::parse(DEFAULT_PACK).map_err(|_| "the pack's id".to_string())?;
+    let mut sticker_list = Vec::with_capacity(DEFAULT_STICKER_LIST.len());
+    let mut bytes = Vec::with_capacity(DEFAULT_STICKER_LIST.len());
+    for (sticker, emoji, name, image) in DEFAULT_STICKER_LIST {
+        let sticker = Ulid::parse(sticker).map_err(|_| format!("{name}'s id"))?;
+        let Some((width, height)) = webp_size(image) else {
+            return Err(format!("{name}, which is not a WebP"));
+        };
+        if width == 0 || height == 0 || width > STICKER_SIDE || height > STICKER_SIDE {
+            return Err(format!("{name}, which is larger than 512x512"));
+        }
+        if image.len() as u64 > limit {
+            return Err(format!("{name}, which is over [limits.upload] sticker"));
+        }
+        sticker_list.push(StickerItem {
+            id: sticker,
+            emoji: Some(emoji.to_string()),
+            width,
+            height,
+            size: image.len() as u64,
+        });
+        bytes.push(image);
+    }
+    Ok(DefaultPack {
+        id,
+        sticker_list,
+        bytes,
+    })
 }
 
 fn sticker_path(directory: &Path, sticker: Ulid) -> PathBuf {

@@ -1119,7 +1119,7 @@ fn upload(server: &Server, pack: &str, emoji: &str, bytes: &[u8]) -> (u16, Value
 fn stickers_are_kept_in_packs_that_admins_manage_and_devices_use() {
     let server = Server::start(
         "",
-        "[registration]\nallow = true\n[limits.upload]\nsticker = \"1KiB\"\n",
+        "[registration]\nallow = true\n[limits.upload]\nsticker = \"2KiB\"\n[stickers]\ndefault_pack = false\n",
     );
     let sara = sign_up(&server, "sara_x", SARA_WORDS);
     let (status, reply) = server.call("GET", "/api/v1/stickers", Some(&sara.token), None);
@@ -1204,7 +1204,7 @@ fn stickers_are_kept_in_packs_that_admins_manage_and_devices_use() {
     truncated.pop();
     let (status, reply) = upload(&server, &cats, "", &truncated);
     assert_eq!((status, reply["code"].clone()), (400, json!("bad_sticker")));
-    let (status, reply) = upload(&server, &cats, "", &webp(b"VP8L", &[0x2f; 2000]));
+    let (status, reply) = upload(&server, &cats, "", &webp(b"VP8L", &[0x2f; 3000]));
     assert_eq!(
         (status, reply["code"].clone()),
         (413, json!("file_too_large"))
@@ -1331,4 +1331,120 @@ fn stickers_are_kept_in_packs_that_admins_manage_and_devices_use() {
     );
     let (_, reply) = server.call("GET", "/api/v1/stickers", Some(&sara.token), None);
     assert_eq!(reply["data"]["pack_list"], json!([]));
+}
+
+#[test]
+fn the_default_pack_is_bundled_listed_last_and_served_even_when_off() {
+    let server = Server::start("", "[registration]\nallow = true\n");
+    let sara = sign_up(&server, "sara_x", SARA_WORDS);
+    let (status, reply) = server.call(
+        "POST",
+        "/api/v1/sticker_packs",
+        Some(OPERATOR_TOKEN),
+        Some(&json!({"name": "Cats"})),
+    );
+    assert_eq!(status, 200, "{reply}");
+
+    // It comes after the operator's packs, with its fixed ids, sizes and emoji.
+    let (status, reply) = server.call("GET", "/api/v1/stickers", Some(&sara.token), None);
+    assert_eq!(status, 200, "{reply}");
+    let pack_list = reply["data"]["pack_list"].as_array().unwrap();
+    assert_eq!(pack_list.len(), 2);
+    assert_eq!(pack_list[0]["name"], "Cats");
+    let default = &pack_list[1];
+    assert_eq!(default["id"], json!(keryx::file::DEFAULT_PACK));
+    assert_eq!(default["name"], "Default");
+    let sticker_list = default["sticker_list"].as_array().unwrap();
+    assert_eq!(sticker_list.len(), 15);
+    let ok = &sticker_list[7];
+    assert_eq!(ok["id"], "01M75K3ET018RHXBR62ED3YV75");
+    assert_eq!(ok["emoji"], "👍");
+    assert_eq!(
+        (ok["width"].clone(), ok["height"].clone()),
+        (json!(512), json!(512))
+    );
+    let bundled = include_bytes!("../src/stickers/bit-ok.webp");
+    assert_eq!(ok["size"], json!(bundled.len()));
+    let (status, bytes) = person::raw(
+        &server,
+        "GET",
+        "/api/v1/stickers/01M75K3ET018RHXBR62ED3YV75",
+        &sara.token,
+        None,
+    );
+    assert_eq!((status, bytes.as_slice()), (200, bundled.as_slice()));
+
+    // Nobody can take its name, add to it, or remove it or its stickers.
+    for name in ["Default", " Default "] {
+        refused(
+            server.call(
+                "POST",
+                "/api/v1/sticker_packs",
+                Some(OPERATOR_TOKEN),
+                Some(&json!({"name": name})),
+            ),
+            409,
+            "name_taken",
+        );
+    }
+    let (status, reply) = upload(&server, keryx::file::DEFAULT_PACK, "", &lossy(1, 1));
+    assert_eq!(
+        (status, reply["code"].clone()),
+        (404, json!("no_such_pack"))
+    );
+    refused(
+        server.call(
+            "DELETE",
+            "/api/v1/stickers/01M75K3ET018RHXBR62ED3YV75",
+            Some(OPERATOR_TOKEN),
+            None,
+        ),
+        404,
+        "no_such_sticker",
+    );
+    refused(
+        server.call(
+            "DELETE",
+            &format!("/api/v1/sticker_packs/{}", keryx::file::DEFAULT_PACK),
+            Some(OPERATOR_TOKEN),
+            None,
+        ),
+        404,
+        "no_such_pack",
+    );
+    let (_, reply) = server.call("GET", "/api/v1/stickers", Some(&sara.token), None);
+    assert_eq!(
+        reply["data"]["pack_list"][1]["sticker_list"]
+            .as_array()
+            .unwrap()
+            .len(),
+        15
+    );
+
+    // Turned off, it is not listed, its stickers still show, and its name stays taken.
+    let off = Server::start(
+        "",
+        "[registration]\nallow = true\n[stickers]\ndefault_pack = false\n",
+    );
+    let babak = sign_up(&off, "babak_x", BABAK_WORDS);
+    let (_, reply) = off.call("GET", "/api/v1/stickers", Some(&babak.token), None);
+    assert_eq!(reply["data"]["pack_list"], json!([]));
+    let (status, bytes) = person::raw(
+        &off,
+        "GET",
+        "/api/v1/stickers/01M75K3ET018RHXBR62ED3YV75",
+        &babak.token,
+        None,
+    );
+    assert_eq!((status, bytes.as_slice()), (200, bundled.as_slice()));
+    refused(
+        off.call(
+            "POST",
+            "/api/v1/sticker_packs",
+            Some(OPERATOR_TOKEN),
+            Some(&json!({"name": "Default"})),
+        ),
+        409,
+        "name_taken",
+    );
 }

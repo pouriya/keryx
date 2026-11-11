@@ -980,6 +980,26 @@ Whatever is saved to show later gets the next number. Whatever is not saved gets
   picker, and a taken one is refused with `name_taken`.
   **Android sends and shows them, and has no management screens:** a sticker button by the text box opens the
   packs, a sticker shows in the chat at 160 dp, and one removed from the server shows "Sticker unavailable".
+- **A `Default` pack is bundled inside the server's source and served to every client, chosen by the
+  author.** It is **Bit**, a pixel robot in 15 poses by Godspeed Mission Control, from
+  `github.com/MichaelZelbel/hermes-telegram-stickers` under CC0, so no credit is owed, picked by the author
+  from free sets after getstickerpack.com's `stickthing-2` could not be downloaded. They are 512x512 PNGs
+  **converted once to lossless WebP, about 1.3 KB each, and committed in `server/src/stickers/`, chosen by
+  the author**, compiled in with `include_bytes!`. **Each has a fixed ULID written in `server/src/file.rs`,
+  and so does the pack, chosen by the author**, never to change, since a sticker message names its sticker
+  by id. **Each carries the first of the two emoji its source gives, chosen by the author.**
+  - **It lives in memory only, never in the database, chosen by the author:** `GET /api/v1/stickers` adds
+    it **after the operator's packs, named `Default`, chosen by the author**, and `GET /api/v1/stickers/{id}`
+    answers its ids from memory. `sticker.manage` cannot add to it or remove it or its stickers, which are
+    answered `no_such_pack` and `no_such_sticker` as an unknown id is. **No operator's pack may be named
+    `Default`, whether the bundled one is on or off, chosen by the author:** `name_taken`.
+  - **`[stickers] default_pack = false` stops listing it, chosen by the author**; unset means listed.
+    **Turned off, its bytes are still served, chosen by the author**, so old messages keep showing their
+    stickers while nobody can send new ones.
+  - **The server checks each one at startup with the same check an upload gets, chosen by the author**,
+    `[limits.upload] sticker` included, and a failure stops startup, naming the file.
+  - **`keryx sticker list` marks it `(built in)`, chosen by the author**, so the operator knows its ids
+    cannot be removed.
 
 ### Read state
 
@@ -1338,6 +1358,9 @@ accepts the first for each step. The loser gets a rejection, catches up and retr
 
   [files]
   directory = "/var/lib/keryx/files"   # a folder per chat, a file per upload
+
+  [stickers]
+  default_pack = true       # the bundled pack, Default. false: not listed, old messages still show theirs
 
   [limits]
   websocket_frame = "1MiB"

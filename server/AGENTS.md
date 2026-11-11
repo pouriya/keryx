@@ -78,6 +78,7 @@ src/storage/sqlite.sql The schema, compiled in with include_str!, since SQLite t
                   field's comment names the feature that needs it, and a new field must do
                   the same
 src/guide.md      The REST guide. Not code: prose, include_str!'d
+src/stickers/     The bundled Default sticker pack's 15 WebP files, include_bytes!'d by file.rs. Not code
 server.toml       The commented example configuration
 tests/            Integration tests. See tests/AGENTS.md
 examples/drive.rs Drives core as a real client against a running server, to send what a phone cannot,

@@ -119,6 +119,11 @@ fn a_bad_configuration_stops_startup_and_says_where() {
             format!("{good}\n[limits]\nrest_body = \"lots\"\n"),
             "rest_body",
         ),
+        (
+            format!("{good}\n[limits.upload]\nsticker = \"1KiB\"\n"),
+            "bit-today.webp, which is over [limits.upload] sticker",
+        ),
+        (format!("{good}\n[stickers]\nnot_a_key = 1\n"), "not_a_key"),
     ];
     for (bad, naming) in bad_list {
         fs::write(&path, bad).unwrap();
@@ -654,6 +659,13 @@ fn sticker_commands_add_list_and_remove_packs_and_stickers() {
     let listed = text(&listed.stdout);
     assert!(listed.contains(&format!("{pack}  Cats")), "{listed}");
     assert!(
+        listed.contains(&format!(
+            "{}  Default  (built in)",
+            keryx::file::DEFAULT_PACK
+        )),
+        "{listed}"
+    );
+    assert!(
         listed.contains(&format!("  {sticker}  64x32  😺")),
         "{listed}"
     );
@@ -670,6 +682,10 @@ fn sticker_commands_add_list_and_remove_packs_and_stickers() {
     assert!(!removed.status.success());
     let removed = keryx(&["--config", &config, "sticker", "pack", "remove", &pack]);
     assert!(removed.status.success(), "{}", text(&removed.stderr));
-    let listed = keryx(&["--config", &config, "sticker", "list"]);
-    assert_eq!(text(&listed.stdout), "");
+    let listed = text(&keryx(&["--config", &config, "sticker", "list"]).stdout);
+    assert!(listed.starts_with(&format!(
+        "{}  Default  (built in)\n",
+        keryx::file::DEFAULT_PACK
+    )));
+    assert!(!listed.contains("Cats"), "{listed}");
 }

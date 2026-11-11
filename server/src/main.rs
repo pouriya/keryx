@@ -267,7 +267,8 @@ fn read_configuration(path: &Path) -> anyhow::Result<Settings> {
                 .optional("keep_for", DurationValue::new().to_int())
                 .optional_any("test_answer")
                 .optional_any("pass_code"),
-        );
+        )
+        .optional("stickers", StaticMap::new().optional_any("default_pack"));
     let settings: Settings = match tanzim::Config::default()
         .with_source(tanzim::source::file(path.to_string_lossy()))
         .with_schema(schema)
@@ -579,11 +580,13 @@ fn run_sticker(
                 anyhow::bail!("The server's reply has no packs");
             };
             for pack in pack_list {
-                println!(
-                    "{}  {}",
-                    pack["id"].as_str().unwrap_or(""),
-                    pack["name"].as_str().unwrap_or("")
-                );
+                let id = pack["id"].as_str().unwrap_or("");
+                let built_in = if id == keryx::file::DEFAULT_PACK {
+                    "  (built in)"
+                } else {
+                    ""
+                };
+                println!("{}  {}{built_in}", id, pack["name"].as_str().unwrap_or(""));
                 if let Some(sticker_list) = pack["sticker_list"].as_array() {
                     for sticker in sticker_list {
                         println!(

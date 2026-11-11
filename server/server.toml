@@ -49,6 +49,11 @@ directory = "/var/lib/keryx/www"
 # Uploads' encrypted bytes: a folder per chat, a file per upload.
 directory = "/var/lib/keryx/files"
 
+[stickers]
+# The bundled pack, Default, listed after the operator's own. false: not listed, though old messages
+# still show its stickers.
+default_pack = true
+
 [limits]
 websocket_frame = "1MiB"
 rest_body = "1MiB"        # not file uploads
