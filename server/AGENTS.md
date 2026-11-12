@@ -47,6 +47,7 @@ not claim it passed without running it.
 | `make release` | Release build → `build/keryx-<version>-<target>` |
 | `make version` | Prints the `Cargo.toml` version |
 | `make start-dev` | `make dev`, then runs `serve` with `--debug` |
+| `make drive` | Builds `examples/drive.rs`, the phone test's other person, into `../target/<target>/debug/examples/drive`, chosen by the author |
 | `make clippy` | `cargo clippy --all-targets --no-deps -- -D warnings` |
 | `make moq` | `make lint` in `../moq`, since the tests use keryx-moq as their call client |
 | `make check-style` | `cargo fmt --check` |
@@ -82,7 +83,7 @@ src/stickers/     The bundled Default sticker pack's 15 WebP files, include_byte
 server.toml       The commented example configuration
 tests/            Integration tests. See tests/AGENTS.md
 examples/drive.rs Drives core as a real client against a running server, to send what a phone cannot,
-                  such as a question. Not a test
+                  such as a question. Not a test. Built by `make drive`, chosen by the author
 Makefile          Every build and check entry point
 ```
 

@@ -30,6 +30,11 @@ release:
 	@ cp ${CARGO_TARGET_DIR}/${TARGET}/release/keryx ${BUILD_DIR}/keryx-${VERSION}-${TARGET}
 
 
+# The phone test's other person, examples/drive.rs, read from stdin. Not part of the server.
+drive:
+	cargo build --target ${TARGET} --example drive
+
+
 # The configuration has no default, here as everywhere: make start-dev CONFIG=/absolute/server.toml
 start-dev: dev
 	@ test -n "${CONFIG}" || { echo "give the configuration: make start-dev CONFIG=/absolute/server.toml" >&2; exit 1; }
@@ -97,4 +102,4 @@ dist-clean: clean
 	rm -rf ${BUILD_DIR}
 
 
-.PHONY: all version dev release start-dev clippy moq check-style fmt lint test coverage docker clean dist-clean
+.PHONY: all version dev release start-dev drive clippy moq check-style fmt lint test coverage docker clean dist-clean

@@ -2,7 +2,7 @@
 //! cannot, such as a question. Not part of the server, and not a test. Reads one command per line on
 //! stdin: `signup` or `login` with a username, password and words, `find <username>`, `say <text>`,
 //! `many <n>`, `seen`, `call`, `question`, `bio <text>`, `link <name> <url>`, `photo <file.jpg>`,
-//! `pump <ms>` and `quit`.
+//! `app <on|off>`, `kv <key> <json>`, `pump <ms>` and `quit`.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
@@ -10,7 +10,7 @@ use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
 use keryx_core::client::{
-    Auth, Client, Command, Event, Input, Output, Platform, Secret, Thumbnail,
+    Auth, Client, Command, Event, Input, Output, Platform, Secret, Setting, Thumbnail,
 };
 use keryx_core::protocol::{ChatType, MessageFrame, ProfileLink};
 use keryx_core::ulid::Ulid;
@@ -523,6 +523,30 @@ fn main() {
                 });
                 app.wait(|event| matches!(event, Event::ProfileSaved));
                 println!("saved");
+            }
+            // Whether this account's app is open, so others see it online, then away.
+            "app" => {
+                app.command(Command::InApp {
+                    in_app: rest == "on",
+                });
+                app.pump(500);
+                println!("app {rest}");
+            }
+            // Sets one setting, so logged in as the phone's own account it acts as a second device.
+            "kv" => {
+                let (key, value) = rest.split_once(' ').expect("kv <key> <json>");
+                app.events
+                    .retain(|event| !matches!(event, Event::Kv { .. }));
+                app.command(Command::Kv {
+                    set: vec![Setting {
+                        key: key.to_string(),
+                        value: serde_json::from_str(value).unwrap(),
+                    }],
+                    remove: Vec::new(),
+                });
+                app.wait(|event| matches!(event, Event::Kv { .. }));
+                app.pump(800);
+                println!("set {key}");
             }
             "pump" => {
                 let ms: u64 = rest.parse().unwrap_or(1000);
