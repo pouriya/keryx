@@ -1,21 +1,20 @@
-// The words screen. A new account is shown a phrase in boxes, then three of those words.
+// The words screen. A new account is shown a phrase as pills, then asked for three of those words.
 // A later phone types the phrase it already has, or is told that new words cannot replace the old keys.
 package io.github.pouriya.keryx
 
 import android.content.Context
-import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.WindowInsets
-import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -24,19 +23,16 @@ import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.windowInsetsPadding
-import androidx.compose.foundation.relocation.BringIntoViewRequester
-import androidx.compose.foundation.relocation.bringIntoViewRequester
-import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -102,7 +98,6 @@ private class WordList(
     }
 }
 
-@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun Words(
     server: String,
@@ -127,11 +122,7 @@ fun Words(
     var answers by remember { mutableStateOf(listOf("", "", "")) }
     val parts = phrase?.split(' ')?.filter { it.isNotEmpty() } ?: emptyList()
     val places = remember(phrase) { if (parts.size >= 3) pickThree(parts.size) else emptyList() }
-    val intoView = remember { BringIntoViewRequester() }
     val keyboard = WindowInsets.ime.getBottom(LocalDensity.current) > 0
-    LaunchedEffect(step, error) {
-        if (step == WordsStep.Check) intoView.bringIntoView()
-    }
     SideEffect {
         onBindBack {
             when {
@@ -182,7 +173,7 @@ fun Words(
                     )
                 WordsStep.Check ->
                     Check(
-                        ink, list, parts, places, answers, error, busy, intoView,
+                        ink, list, parts, places, answers, error, busy,
                         onAnswer = { at, value ->
                             answers = answers.toMutableList().also { it[at] = value }
                             onClearError()
@@ -248,25 +239,12 @@ private fun ColumnScope.Phrase(
         textAlign = TextAlign.Center,
     )
     Length(ink, count, onCount)
-    CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
-        Box(Modifier.weight(1f).fillMaxWidth()) {
-            Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                parts.chunked(3).forEachIndexed { rowIndex, row ->
-                    Row(Modifier.weight(1f).fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                        row.forEachIndexed { at, word ->
-                            WordBox(ink, rowIndex * 3 + at + 1, word, Modifier.weight(1f).fillMaxHeight())
-                        }
-                    }
-                }
-            }
-        }
-    }
+    PillGrid(parts.size) { at, modifier -> Pill(ink, at + 1, parts[at], modifier) }
     if (error != null) Text(error, Modifier.padding(top = 8.dp), color = ink.danger, fontSize = 14.sp)
     Go(stringResource(R.string.wrote_them), parts.isNotEmpty(), onWrote)
     LineButton(stringResource(R.string.copy), parts.isNotEmpty(), onCopy)
 }
 
-@OptIn(ExperimentalFoundationApi::class, androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 @Composable
 private fun ColumnScope.Check(
     ink: Ink,
@@ -276,14 +254,27 @@ private fun ColumnScope.Check(
     answers: List<String>,
     error: String?,
     busy: Boolean,
-    intoView: BringIntoViewRequester,
     onAnswer: (Int, String) -> Unit,
     onContinue: () -> Unit,
     onBack: () -> Unit,
 ) {
+    var focus by remember { mutableIntStateOf(0) }
+    val requester = remember { FocusRequester() }
+    val current = answers.getOrElse(focus) { "" }
+    val bad = current.isNotEmpty() && !list.prefix(current)
     val ready = places.indices.all { answers.getOrElse(it) { "" } == parts.getOrNull(places[it]) }
     val filled = places.indices.all { answers.getOrElse(it) { "" }.isNotEmpty() }
-    val shown = if (filled && !ready) stringResource(R.string.words_mismatch) else error
+    val shown =
+        when {
+            bad -> stringResource(R.string.wrong_word)
+            filled && !ready -> stringResource(R.string.words_mismatch)
+            else -> error
+        }
+
+    fun move(at: Int) {
+        focus = at.coerceIn(0, places.lastIndex.coerceAtLeast(0))
+        runCatching { requester.requestFocus() }
+    }
     Text(
         stringResource(R.string.words_title),
         Modifier.fillMaxWidth(),
@@ -301,37 +292,48 @@ private fun ColumnScope.Check(
             textAlign = TextAlign.Center,
         )
     }
-    Column(Modifier.weight(1f).fillMaxWidth().bringIntoViewRequester(intoView).verticalScroll(rememberScrollState())) {
-        places.forEachIndexed { at, place ->
-            val value = answers.getOrElse(at) { "" }
-            WordEntry(ink, stringResource(R.string.word_n, place + 1), value, value.isNotEmpty() && !list.prefix(value)) {
-                onAnswer(at, it)
-            }
-            val found = list.matches(value)
-            if (found.isNotEmpty() && !list.word(value)) {
-                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    found.forEach { word ->
-                        Text(
-                            word,
-                            Modifier.padding(
-                                bottom = 8.dp,
-                            ).clip(RoundedCornerShape(999.dp)).border(1.dp, ink.line, RoundedCornerShape(999.dp)).clickable {
-                                onAnswer(at, word)
-                            }.padding(horizontal = 10.dp, vertical = 4.dp),
-                            color = accent,
-                            fontSize = 14.sp,
-                        )
-                    }
-                }
-            }
-        }
-        if (shown != null) Text(shown, Modifier.padding(bottom = 8.dp), color = ink.danger, fontSize = 14.sp)
+    PillGrid(places.size) { at, modifier ->
+        val wrong = at == focus && bad
+        Pill(
+            ink,
+            places[at] + 1,
+            answers.getOrElse(at) { "" },
+            modifier,
+            edge =
+                if (wrong) {
+                    ink.danger
+                } else if (at == focus) {
+                    accent
+                } else {
+                    ink.line
+                },
+            color = if (wrong) ink.danger else ink.text,
+            onClick = { move(at) },
+        )
     }
+    if (places.isNotEmpty()) {
+        WordLine(
+            ink,
+            stringResource(R.string.word_n, places[focus] + 1),
+            current,
+            bad,
+            requester,
+            last = focus == places.lastIndex,
+            onValue = { raw -> onAnswer(focus, raw.lowercase().filter { it.isLetter() }) },
+            onNext = { move(focus + 1) },
+            onDone = { if (ready && !busy) onContinue() },
+        )
+        Matches(ink, list, current) { word ->
+            onAnswer(focus, word)
+            val next = (focus + 1 until places.size).firstOrNull { answers.getOrElse(it) { "" }.isEmpty() }
+            if (next != null) move(next)
+        }
+    }
+    if (shown != null) Text(shown, Modifier.padding(top = 8.dp), color = ink.danger, fontSize = 14.sp)
     Go(stringResource(R.string.continue_word), ready && !busy, onContinue)
     Quiet(stringResource(R.string.back), onBack)
 }
 
-@OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 @Composable
 private fun ColumnScope.Enter(
     ink: Ink,
@@ -351,7 +353,6 @@ private fun ColumnScope.Enter(
     val bad = current.isNotEmpty() && !list.prefix(current)
     val ready = boxes.isNotEmpty() && boxes.all { list.word(it) }
     val shown = if (bad) stringResource(R.string.wrong_word) else error
-    val dense = count > 12
 
     fun put(
         next: List<String>,
@@ -384,50 +385,33 @@ private fun ColumnScope.Enter(
             put(List(value) { boxes.getOrElse(it) { "" } }, focus.coerceAtMost(value - 1), false)
         }
     }
-    CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
-        Column(Modifier.weight(1f).fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(if (dense) 4.dp else 8.dp)) {
-            boxes.chunked(3).forEachIndexed { row, words ->
-                Row(Modifier.weight(1f).fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(if (dense) 4.dp else 8.dp)) {
-                    words.forEachIndexed { column, word ->
-                        val at = row * 3 + column
-                        val edge =
-                            when {
-                                at == focus && bad -> ink.danger
-                                at == focus -> accent
-                                else -> ink.line
-                            }
-                        Box(
-                            Modifier
-                                .weight(1f)
-                                .fillMaxHeight()
-                                .border(1.dp, edge, RoundedCornerShape(if (dense) 8.dp else 12.dp))
-                                .clickable(role = Role.Button) { put(boxes, at, true) },
-                        ) {
-                            Text(
-                                "${at + 1}",
-                                Modifier.align(Alignment.TopStart).padding(start = 6.dp, top = 4.dp),
-                                color = ink.muted,
-                                fontSize = if (dense) 10.sp else 11.sp,
-                            )
-                            Text(
-                                word,
-                                Modifier.align(Alignment.Center).padding(horizontal = 4.dp),
-                                color = if (at == focus && bad) ink.danger else ink.text,
-                                fontSize = if (dense) 12.sp else 15.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                maxLines = 1,
-                                textAlign = TextAlign.Center,
-                            )
-                        }
-                    }
-                }
-            }
-        }
+    PillGrid(boxes.size) { at, modifier ->
+        val wrong = at == focus && bad
+        Pill(
+            ink,
+            at + 1,
+            boxes[at],
+            modifier,
+            edge =
+                if (wrong) {
+                    ink.danger
+                } else if (at == focus) {
+                    accent
+                } else {
+                    ink.line
+                },
+            color = if (wrong) ink.danger else ink.text,
+            onClick = { put(boxes, at, true) },
+        )
     }
-    Text(stringResource(R.string.word_n, focus + 1), color = ink.muted, fontSize = 13.sp)
-    BasicTextField(
-        value = current,
-        onValueChange = { raw ->
+    WordLine(
+        ink,
+        stringResource(R.string.word_n, focus + 1),
+        current,
+        bad,
+        requester,
+        last = focus == boxes.lastIndex,
+        onValue = { raw ->
             val tokens = raw.lowercase().split(Regex("\\s+")).filter { it.isNotEmpty() && it.all { letter -> letter.isLetter() } }
             if (raw.any { it.isWhitespace() } && tokens.size > 1) {
                 val next = boxes.toMutableList()
@@ -441,51 +425,14 @@ private fun ColumnScope.Enter(
                 put(boxes.toMutableList().also { it[focus] = tokens.firstOrNull() ?: "" }, focus, false)
             }
         },
-        modifier =
-            Modifier
-                .fillMaxWidth()
-                .padding(top = 6.dp)
-                .focusRequester(requester)
-                .border(1.dp, if (bad) ink.danger else accent, RoundedCornerShape(12.dp))
-                .padding(horizontal = 14.dp, vertical = 12.dp),
-        textStyle = TextStyle(color = ink.text, fontSize = 16.sp),
-        singleLine = true,
-        keyboardOptions =
-            KeyboardOptions(
-                capitalization = KeyboardCapitalization.None,
-                autoCorrectEnabled = false,
-                keyboardType = KeyboardType.Ascii,
-                imeAction = if (focus == boxes.lastIndex) ImeAction.Done else ImeAction.Next,
-            ),
-        keyboardActions =
-            KeyboardActions(
-                onNext = { if (focus < boxes.lastIndex) put(boxes, focus + 1, true) },
-                onDone = { if (ready && !busy) onRestore(boxes.joinToString(" ")) },
-            ),
-        cursorBrush = SolidColor(accent),
+        onNext = { if (focus < boxes.lastIndex) put(boxes, focus + 1, true) },
+        onDone = { if (ready && !busy) onRestore(boxes.joinToString(" ")) },
     )
-    val found = list.matches(current)
-    if (found.isNotEmpty() && !list.word(current)) {
-        FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            found.forEach { word ->
-                Text(
-                    word,
-                    Modifier
-                        .padding(top = 8.dp)
-                        .clip(RoundedCornerShape(999.dp))
-                        .border(1.dp, ink.line, RoundedCornerShape(999.dp))
-                        .clickable {
-                            val next = boxes.toMutableList()
-                            next[focus] = word
-                            val land = (focus + 1 until next.size).firstOrNull { next[it].isEmpty() } ?: focus
-                            put(next, land, true)
-                        }
-                        .padding(horizontal = 10.dp, vertical = 4.dp),
-                    color = accent,
-                    fontSize = 14.sp,
-                )
-            }
-        }
+    Matches(ink, list, current) { word ->
+        val next = boxes.toMutableList()
+        next[focus] = word
+        val land = (focus + 1 until next.size).firstOrNull { next[it].isEmpty() } ?: focus
+        put(next, land, true)
     }
     if (shown != null) Text(shown, Modifier.padding(top = 8.dp), color = ink.danger, fontSize = 14.sp)
     if (!keyboard) {
@@ -569,49 +516,91 @@ private fun Length(
     }
 }
 
+/**
+ * Pills in rows of three, left to right in Persian too, in the middle of the space they are given.
+ * Twelve are the size of twenty-four; only when the space is too short do they shrink, to fit.
+ */
 @Composable
-private fun WordBox(
+private fun ColumnScope.PillGrid(
+    count: Int,
+    pill: @Composable (Int, Modifier) -> Unit,
+) {
+    CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
+        BoxWithConstraints(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+            val rows = (count + 2) / 3
+            val gap = 8.dp
+            val height = if (rows == 0) 38.dp else ((maxHeight - gap * (rows - 1)) / rows).coerceIn(24.dp, 38.dp)
+            Column(verticalArrangement = Arrangement.spacedBy(gap)) {
+                (0 until count).chunked(3).forEach { row ->
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(gap)) {
+                        row.forEach { at -> pill(at, Modifier.weight(1f).height(height)) }
+                        repeat(3 - row.size) { Box(Modifier.weight(1f)) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** An outlined pill with its number in a small accent circle before the word, which may be empty. */
+@Composable
+private fun Pill(
     ink: Ink,
     number: Int,
     word: String,
     modifier: Modifier,
+    edge: Color = ink.line,
+    color: Color = ink.text,
+    onClick: (() -> Unit)? = null,
 ) {
-    Box(modifier.border(1.dp, ink.line, RoundedCornerShape(10.dp))) {
-        Text(
-            "$number",
-            Modifier.align(Alignment.TopStart).padding(start = 6.dp, top = 4.dp),
-            color = ink.muted,
-            fontSize = 11.sp,
-        )
+    val shape = RoundedCornerShape(50)
+    Row(
+        modifier
+            .clip(shape)
+            .border(1.dp, edge, shape)
+            .then(if (onClick != null) Modifier.clickable(role = Role.Button, onClick = onClick) else Modifier)
+            .padding(start = 4.dp, end = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(5.dp),
+    ) {
+        Box(Modifier.size(22.dp).background(accent, CircleShape), contentAlignment = Alignment.Center) {
+            Text("$number", color = onAccent, fontSize = 10.5.sp, lineHeight = 12.sp, fontWeight = FontWeight.Bold)
+        }
         Text(
             word,
-            Modifier.align(Alignment.Center).padding(horizontal = 4.dp),
-            color = ink.text,
-            fontSize = if (word.length > 8) 12.sp else 14.sp,
+            color = color,
+            fontSize = if (word.length > 7) 13.sp else 14.sp,
             fontWeight = FontWeight.SemiBold,
             maxLines = 1,
-            textAlign = TextAlign.Center,
+            softWrap = false,
         )
     }
 }
 
+/** The one line a word is typed into, under the pills, naming which word it is. */
 @Composable
-private fun WordEntry(
+private fun WordLine(
     ink: Ink,
     label: String,
     value: String,
     bad: Boolean,
+    requester: FocusRequester,
+    last: Boolean,
     onValue: (String) -> Unit,
+    onNext: () -> Unit,
+    onDone: () -> Unit,
 ) {
     Text(label, color = ink.muted, fontSize = 13.sp)
     BasicTextField(
         value = value,
-        onValueChange = { onValue(it.lowercase()) },
+        onValueChange = onValue,
         modifier =
-            Modifier.fillMaxWidth().padding(
-                top = 6.dp,
-                bottom = 8.dp,
-            ).border(1.dp, if (bad) ink.danger else ink.line, RoundedCornerShape(12.dp)).padding(horizontal = 14.dp, vertical = 12.dp),
+            Modifier
+                .fillMaxWidth()
+                .padding(top = 6.dp)
+                .focusRequester(requester)
+                .border(1.dp, if (bad) ink.danger else accent, RoundedCornerShape(12.dp))
+                .padding(horizontal = 14.dp, vertical = 12.dp),
         textStyle = TextStyle(color = ink.text, fontSize = 16.sp),
         singleLine = true,
         keyboardOptions =
@@ -619,9 +608,39 @@ private fun WordEntry(
                 capitalization = KeyboardCapitalization.None,
                 autoCorrectEnabled = false,
                 keyboardType = KeyboardType.Ascii,
+                imeAction = if (last) ImeAction.Done else ImeAction.Next,
             ),
+        keyboardActions = KeyboardActions(onNext = { onNext() }, onDone = { onDone() }),
         cursorBrush = SolidColor(accent),
     )
+}
+
+/** At most five words starting with what is typed, once two letters are in. */
+@OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
+@Composable
+private fun Matches(
+    ink: Ink,
+    list: WordList,
+    value: String,
+    onPick: (String) -> Unit,
+) {
+    val found = list.matches(value)
+    if (found.isEmpty() || list.word(value)) return
+    FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        found.forEach { word ->
+            Text(
+                word,
+                Modifier
+                    .padding(top = 8.dp)
+                    .clip(RoundedCornerShape(999.dp))
+                    .border(1.dp, ink.line, RoundedCornerShape(999.dp))
+                    .clickable { onPick(word) }
+                    .padding(horizontal = 10.dp, vertical = 4.dp),
+                color = accent,
+                fontSize = 14.sp,
+            )
+        }
+    }
 }
 
 @Composable
