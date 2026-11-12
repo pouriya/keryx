@@ -40,6 +40,23 @@ internal data class Bubble(
             sticker == null && question == null && answer == null
 }
 
+/** One reaction in the open chat: confirmed (a sequence id) or still waiting (a local id), on a message by either. */
+internal data class Reaction(
+    val seq: Long?,
+    val local: Long?,
+    val on: Long?,
+    val onLocal: Long?,
+    val emoji: String,
+    val mine: Boolean,
+)
+
+/** One chip under a message: an exact emoji, how many reactions carry it, and this account's newest of them. */
+internal data class Chip(
+    val emoji: String,
+    val count: Int,
+    val mine: Reaction?,
+)
+
 internal const val CONTENT_TEXT = 0
 internal const val CONTENT_REACTION = 2
 internal const val CONTENT_CALL = 8
@@ -51,6 +68,12 @@ internal const val CONTENT_STICKER = 12
 internal class Talk {
     val bubbles = mutableStateListOf<Bubble>()
     val selected = mutableStateListOf<String>()
+
+    /** The open chat's reactions, added up into each message's chips. */
+    val reactions = mutableStateListOf<Reaction>()
+
+    /** This account's reactions with a delete waiting, by key, hidden until the delete lands or fails. */
+    private val unreacting = mutableStateMapOf<String, Long>()
 
     /** Messages removed for everyone, so a reply to one can say so. */
     val gone = mutableStateMapOf<Long, Boolean>()
@@ -70,6 +93,8 @@ internal class Talk {
         this.chat = chat
         actions.clear()
         bubbles.clear()
+        reactions.clear()
+        unreacting.clear()
         selected.clear()
         gone.clear()
         hasOlder = false
@@ -81,6 +106,8 @@ internal class Talk {
         chat = null
         restored = null
         bubbles.clear()
+        reactions.clear()
+        unreacting.clear()
         selected.clear()
         gone.clear()
         seeking = null
@@ -113,10 +140,33 @@ internal class Talk {
         mine: Boolean = false,
     ): Bubble? = bubbles.lastOrNull { it.answer?.question == seq && (!mine || it.mine) }
 
+    /**
+     * A message's chips, one per exact emoji in the order they first came, leaving out reactions with a
+     * delete waiting. A chip counts reactions, not people, since one person may repeat an emoji.
+     */
+    fun chips(bubble: Bubble): List<Chip> {
+        val on =
+            reactions.filter {
+                (bubble.seq != null && it.on == bubble.seq || bubble.local != null && it.onLocal == bubble.local) &&
+                    reactionKey(it) !in unreacting
+            }
+        if (on.isEmpty()) return emptyList()
+        return on.groupBy { it.emoji }.map { (emoji, list) -> Chip(emoji, list.size, list.lastOrNull { it.mine }) }
+    }
+
+    private fun reactionKey(reaction: Reaction): String = if (reaction.seq != null) "s${reaction.seq}" else "l${reaction.local}"
+
+    private fun reacted(shown: Shown) {
+        val emoji = shown.emoji ?: return
+        val on = shown.on ?: return
+        if (gone[shown.seq] == true || reactions.any { it.seq == shown.seq }) return
+        reactions.add(Reaction(shown.seq, null, on, null, emoji, shown.mine))
+    }
+
     fun message(shown: Shown) {
         if (shown.chat != chat) return
         val kind = shown.content_kind ?: return
-        if (kind == CONTENT_REACTION) return
+        if (kind == CONTENT_REACTION) return reacted(shown)
         val bubble =
             Bubble(
                 seq = shown.seq,
@@ -156,9 +206,20 @@ internal class Talk {
         if (event.chat != chat) return
         if (event.kind == KIND_EDIT || event.kind == KIND_DELETE) {
             actions[event.local] = event
+            val target = event.target
+            val reaction =
+                reactions.firstOrNull {
+                    target != null && (it.seq != null && it.seq == target.seq || it.local != null && it.local == target.local)
+                }
+            if (event.kind == KIND_DELETE && reaction != null) unreacting[reactionKey(reaction)] = event.local
             return
         }
         if (event.kind != KIND_CONTENT) return
+        val emoji = event.emoji
+        if (emoji != null) {
+            reactions.add(Reaction(null, event.local, event.target?.seq, event.target?.local, emoji, true))
+            return
+        }
         if (event.text == null && event.sticker == null && event.answer == null) return
         bubbles.add(
             Bubble(
@@ -202,6 +263,19 @@ internal class Talk {
                 }
             }
         }
+        val waiting = reactions.indexOfFirst { it.local == event.local }
+        if (waiting >= 0) {
+            val reaction = reactions.removeAt(waiting)
+            val key = "l${event.local}"
+            unreacting.remove(key)?.let { unreacting["s${event.seq}"] = it }
+            if (reactions.none { it.seq == event.seq } && gone[event.seq] != true) {
+                reactions.add(waiting, reaction.copy(seq = event.seq, local = null))
+            }
+        }
+        for (i in reactions.indices) {
+            val one = reactions[i]
+            if (one.onLocal == event.local) reactions[i] = one.copy(on = event.seq, onLocal = null)
+        }
         val at = bubbles.indexOfFirst { it.local == event.local }
         if (bubbles.any { it.seq == event.seq }) {
             if (at >= 0) bubbles.removeAt(at)
@@ -219,6 +293,8 @@ internal class Talk {
 
     fun failed(event: Event.Failed) {
         actions.remove(event.local)
+        unreacting.entries.removeAll { it.value == event.local }
+        reactions.removeAll { it.local == event.local }
         val at = bubbles.indexOfFirst { it.local == event.local }
         if (at >= 0) bubbles[at] = bubbles[at].copy(failed = true)
     }
@@ -235,6 +311,8 @@ internal class Talk {
 
     fun removed(seq: Long) {
         gone[seq] = true
+        reactions.removeAll { it.seq == seq }
+        unreacting.remove("s$seq")
         bubbles.removeAll { it.seq == seq }
         selected.remove("s$seq")
     }

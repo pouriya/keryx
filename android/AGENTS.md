@@ -111,14 +111,38 @@ code is looked at again when calls are built.
   the root AGENTS.md says 112 dp; under a minute counts as 1m ago; opening a profile of someone with no
   presence yet asks `presence_of` once; Saved messages and your own page have no dot. The Persian texts
   for presence, Language and Theme are drafts
-- **Reactions, not built yet, chosen by the author from `tmp/design/reactions.html`:** a row of emoji
+- **Reactions, built so and not decided:** chips stand in the order of their oldest reaction still there,
+  so removing one can move a chip; this phone's own reaction shows at once, and one being removed hides at
+  once, coming back if the server refuses; a message that failed to send has no emoji row; a tap in the
+  picker reacts and closes it; the picker is 60% of the screen, less while the keyboard leaves less room;
+  search ignores colons around a shortcode; the strip's jump is animated, as the sticker panel's. The Persian
+  texts for the picker are drafts
+- **Reactions, built and tested on the author's phone, chosen by the author from `tmp/design/reactions.html`:** a row of emoji
   under the options modal, with no double tap; the row shows the newest of `recent.reactions` first,
   then 👍 ❤️ 😂 😮 😢 🙏 not already there, six in all, then +; a reaction shows as a chip inside the
   bubble under its text, one per emoji with its count, yours tinted; tapping your chip removes it and
   tapping another adds the same. **A person may put several reactions on one message, chosen by the
   author**, each its own reaction message, so tapping one of yours removes only that one. **+ opens a
   picker whose emoji list comes from core, through the `emojis` crate, chosen by the author**, so web
-  and desktop show the same set later; each client draws its own grid. How core hands it over, and the
-  picker's look, are still to ask
+  and desktop show the same set later; each client draws its own grid. **The picker has its groups,
+  search and skin tones, chosen by the author:** a strip of group icons that jumps and follows the
+  scroll, as the sticker panel's does, a search field, and a long press on an emoji with tones to choose
+  one. **Search matches the crate's English names and shortcodes only for now, in Persian too, chosen by
+  the author**, its hint saying so. The phone asks core for the list the first time the picker opens.
+  A message's chips come from the archive, one per exact emoji, as the root AGENTS.md says. **An emoji
+  tapped in the row or the picker always adds a reaction, even one this person already put on the
+  message, chosen by the author**, so a chip counts reactions, not people, and tapping your own chip
+  removes only your newest with that emoji. **The strip's icons are fixed, one per core group, chosen by
+  the author:** 🕘 for Recent, then 😀 👋 🐻 🍔 ✈️ ⚽ 💡 ❤️ 🏳️ in core's group order, as drawn plus one
+  for people. **A long press on an emoji with tones opens a small row above it with the emoji and its 5
+  tones, and the choice is not remembered, chosen by the author:** the grid keeps the plain emoji, and
+  Recent holds the toned one once used. **The app bundles Noto Color Emoji through
+  `androidx.emoji2:emoji2-bundled` 1.7.0, about 11 MB, chosen by the author** over hiding what a phone's
+  font cannot draw, so the picker is the same everywhere. It draws only what the phone's own font lacks,
+  started in `MainActivity` with emoji2's own start, which would fetch Google's downloadable font, removed
+  from the manifest. An emoji newer than the bundled font still shows as a box. **A chip shows its whole
+  count with no cap, accepted by the author for direct chats**, where two digits only widen the chip a
+  little; how a chip shows large counts is asked again with groups
+- How a reaction chip shows a large count, such as 1,200, once groups have reactions
 - The folder layout and code style, once the first slice works
 - Release signing, the store, and how the app reaches people

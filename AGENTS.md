@@ -57,8 +57,12 @@ error paths, are still to do:** see [core/tests/AGENTS.md](core/tests/AGENTS.md)
   Recent row passed the author's phone test**, with `server/examples/drive.rs` as the other person and as a
   second device of the phone's own account: away, online and offline, `theme` and `lang` from another device
   live and after the app was stopped, and Recent kept across a restart. The red dot of a call is not tested
-  yet, as `drive.rs` cannot join a call. Reactions, and their Recent row, wait for Android's reactions: see
-  [android/AGENTS.md](android/AGENTS.md).
+  yet, as `drive.rs` cannot join a call.
+- **Reactions are done in core, the server and Android, and passed the author's phone test**, with
+  `drive.rs` as the other person: the row under a message's options with Recent first, chips added up from
+  the archive, tapping a chip to add or remove, twenty different emoji on one message wrapping in its bubble,
+  the + picker's strip, search and skin tones, the chat list's "Reacted" preview with no unread count, and
+  the other person's reaction and its removal arriving live. See [android/AGENTS.md](android/AGENTS.md).
 - **Next, chosen by the author: calls, then Android for files and calls.** Both clients stay as they
   are and grow only what testing needs; standard screens and a full redesign come after.
 

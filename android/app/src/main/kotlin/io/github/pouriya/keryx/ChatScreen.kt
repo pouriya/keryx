@@ -10,6 +10,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
@@ -18,6 +19,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
@@ -71,6 +73,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
@@ -109,10 +112,15 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntRect
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.window.Popup
+import androidx.compose.ui.window.PopupPositionProvider
+import androidx.compose.ui.window.PopupProperties
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -141,6 +149,11 @@ private sealed interface Modal {
     ) : Modal
 
     data object NoKey : Modal
+
+    /** Every emoji, in a sheet over the chat, to react to `bubble` with. */
+    data class Picker(
+        val bubble: Bubble,
+    ) : Modal
 
     data class Confirm(
         val list: List<Bubble>,
@@ -191,6 +204,10 @@ internal fun ChatScreen(
     stickers: Stickers,
     onStickers: () -> Unit,
     onSticker: (id: String, reply: Bubble?) -> Unit,
+    reactions: Reactions,
+    onEmoji: () -> Unit,
+    onReact: (Bubble, String) -> Unit,
+    onUnreact: (Reaction) -> Unit,
     onAnswer: (question: Bubble, answer: Answer, editing: Bubble?) -> Unit,
     onProfile: (String) -> Unit,
 ) {
@@ -443,6 +460,11 @@ internal fun ChatScreen(
                                 onJump = ::jump,
                                 onFile = onFile,
                                 stickers = stickers,
+                                chips = talk.chips(row.bubble),
+                                onChip = { chip ->
+                                    val yours = chip.mine
+                                    if (yours != null) onUnreact(yours) else onReact(row.bubble, chip.emoji)
+                                },
                                 onAnswer = {
                                     val tree = row.bubble.question
                                     if (tree != null) openForm(Form(row.bubble, tree, null, null))
@@ -553,7 +575,37 @@ internal fun ChatScreen(
             )
         }
         modal?.let { shown ->
-            Overlay(ink, dark, onDismiss = { modal = null }) {
+            if (shown is Modal.Picker) {
+                EmojiSheet(reactions, ink, dark, onClose = { modal = null }) { emoji ->
+                    modal = null
+                    onReact(shown.bubble, emoji)
+                }
+                return@let
+            }
+            // The emoji row sits under a message's options, for any message that can still be sent.
+            val reactable = (shown as? Modal.Options)?.bubble?.takeIf { !it.failed }
+            Overlay(
+                ink,
+                dark,
+                onDismiss = { modal = null },
+                below =
+                    reactable?.let { bubble ->
+                        {
+                            ReactRow(
+                                recent = reactions.recent,
+                                ink = ink,
+                                onPick = { emoji ->
+                                    modal = null
+                                    onReact(bubble, emoji)
+                                },
+                                onMore = {
+                                    onEmoji()
+                                    modal = Modal.Picker(bubble)
+                                },
+                            )
+                        }
+                    },
+            ) {
                 when (shown) {
                     is Modal.Options ->
                         OptionsModal(
@@ -601,6 +653,7 @@ internal fun ChatScreen(
                                     },
                         )
                     Modal.NoKey -> NoKeyModal(ink) { modal = null }
+                    is Modal.Picker -> {}
                     is Modal.Confirm ->
                         ConfirmModal(
                             count = shown.list.size,
@@ -788,6 +841,8 @@ private fun MessageRow(
     onJump: (Long) -> Unit,
     onFile: (FileInfo) -> Unit,
     stickers: Stickers,
+    chips: List<Chip>,
+    onChip: (Chip) -> Unit,
     onAnswer: () -> Unit,
 ) {
     val rtl = LocalLayoutDirection.current == LayoutDirection.Rtl
@@ -867,7 +922,9 @@ private fun MessageRow(
             }
             val sticker = bubble.sticker
             if (sticker != null && !bubble.locked) {
-                StickerBubble(bubble, sticker, type, me, people, marks, talk, selecting, stickers, ink, onOpen, onSelect, onJump)
+                StickerBubble(bubble, sticker, type, me, people, marks, talk, selecting, stickers, ink, onOpen, onSelect, onJump) {
+                    Chips(chips, onBubble = false, mine = false, dark = dark, ink = ink, enabled = !selecting, onChip = onChip)
+                }
                 return@Row
             }
             Column(
@@ -915,6 +972,7 @@ private fun MessageRow(
                         if (bubble.mine) Ticks(bubble, type, me, marks, quiet)
                     }
                 }
+                Chips(chips, onBubble = true, mine = bubble.mine, dark = dark, ink = ink, enabled = !selecting, onChip = onChip)
             }
         }
     }
@@ -1256,6 +1314,7 @@ private fun Overlay(
     ink: Ink,
     dark: Boolean,
     onDismiss: () -> Unit,
+    below: (@Composable () -> Unit)? = null,
     content: @Composable () -> Unit,
 ) {
     val scrim = remember { MutableInteractionSource() }
@@ -1268,13 +1327,24 @@ private fun Overlay(
         contentAlignment = Alignment.Center,
     ) {
         val block = remember { MutableInteractionSource() }
-        Column(
-            Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(22.dp))
-                .background(if (dark) Color(0xFF1E2833) else Color.White)
-                .clickable(block, null) {},
-        ) { content() }
+        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Column(
+                Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(22.dp))
+                    .background(if (dark) Color(0xFF1E2833) else Color.White)
+                    .clickable(block, null) {},
+            ) { content() }
+            if (below != null) {
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(22.dp))
+                        .background(if (dark) Color(0xFF1E2833) else Color.White)
+                        .clickable(block, null) {},
+                ) { below() }
+            }
+        }
     }
 }
 
@@ -1721,6 +1791,7 @@ private fun StickerBubble(
     onOpen: () -> Unit,
     onSelect: () -> Unit,
     onJump: (Long) -> Unit,
+    chips: @Composable () -> Unit,
 ) {
     Column(
         Modifier
@@ -1783,6 +1854,7 @@ private fun StickerBubble(
                 }
             }
         }
+        chips()
     }
 }
 
@@ -1872,6 +1944,373 @@ private fun StickerPanel(
                                 .padding(2.dp),
                             contentAlignment = Alignment.Center,
                         ) { StickerArt(stickers.file(sticker.id), CELL_SIDE.dp) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** The emoji a reaction can be, once core has listed them, and `recent.reactions`, newest first. */
+internal class Reactions(
+    val groups: List<EmojiGroup>?,
+    val recent: List<String>,
+)
+
+/** What fills the emoji row after the recent ones, chosen by the author. */
+private val DEFAULT_REACTIONS = listOf("👍", "❤️", "😂", "😮", "😢", "🙏")
+
+/** The emoji row's length before +, chosen by the author. */
+private const val ROW_REACTIONS = 6
+
+/** The picker strip's icon for each of core's groups, chosen by the author. */
+private val GROUP_ICONS =
+    mapOf(
+        "smileys_and_emotion" to "😀",
+        "people_and_body" to "👋",
+        "animals_and_nature" to "🐻",
+        "food_and_drink" to "🍔",
+        "travel_and_places" to "✈️",
+        "activities" to "⚽",
+        "objects" to "💡",
+        "symbols" to "❤️",
+        "flags" to "🏳️",
+    )
+
+@Composable
+private fun groupName(group: String): String =
+    when (group) {
+        "smileys_and_emotion" -> stringResource(R.string.emoji_smileys)
+        "people_and_body" -> stringResource(R.string.emoji_people)
+        "animals_and_nature" -> stringResource(R.string.emoji_animals)
+        "food_and_drink" -> stringResource(R.string.emoji_food)
+        "travel_and_places" -> stringResource(R.string.emoji_travel)
+        "activities" -> stringResource(R.string.emoji_activities)
+        "objects" -> stringResource(R.string.emoji_objects)
+        "symbols" -> stringResource(R.string.emoji_symbols)
+        "flags" -> stringResource(R.string.emoji_flags)
+        else -> group
+    }
+
+/** The row under a message's options: the newest recent emoji, then the defaults not already there, then +. */
+@Composable
+private fun ReactRow(
+    recent: List<String>,
+    ink: Ink,
+    onPick: (String) -> Unit,
+    onMore: () -> Unit,
+) {
+    val shown = (recent + DEFAULT_REACTIONS).distinct().take(ROW_REACTIONS)
+    val more = stringResource(R.string.emoji_more)
+    Row(
+        Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 6.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        for (emoji in shown) {
+            Box(
+                Modifier.size(40.dp).clip(CircleShape).clickable(role = Role.Button) { onPick(emoji) },
+                contentAlignment = Alignment.Center,
+            ) { Text(emoji, fontSize = 24.sp) }
+        }
+        Box(
+            Modifier
+                .size(40.dp)
+                .clip(CircleShape)
+                .semantics { contentDescription = more }
+                .clickable(role = Role.Button, onClick = onMore),
+            contentAlignment = Alignment.Center,
+        ) { Text("+", color = ink.muted, fontSize = 22.sp, fontWeight = FontWeight.Bold) }
+    }
+}
+
+/**
+ * A message's reactions, one chip per exact emoji with its count, yours tinted. Tapping yours removes your
+ * newest with that emoji; tapping another adds the same.
+ */
+@OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
+@Composable
+private fun Chips(
+    list: List<Chip>,
+    onBubble: Boolean,
+    mine: Boolean,
+    dark: Boolean,
+    ink: Ink,
+    enabled: Boolean,
+    onChip: (Chip) -> Unit,
+) {
+    if (list.isEmpty()) return
+    FlowRow(
+        Modifier.padding(top = 6.dp, bottom = 2.dp),
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        for (chip in list) {
+            val yours = chip.mine != null
+            val back =
+                when {
+                    onBubble && mine ->
+                        Color.White.copy(
+                            alpha =
+                                when {
+                                    yours && dark -> 0.32f
+                                    yours -> 0.38f
+                                    dark -> 0.14f
+                                    else -> 0.18f
+                                },
+                        )
+                    dark -> if (yours) Color(0xFF34507A) else Color(0xFF2A333F)
+                    else -> if (yours) Color(0xFFC9D7EE) else Color(0xFFE1E6EE)
+                }
+            Row(
+                Modifier
+                    .height(26.dp)
+                    .clip(RoundedCornerShape(13.dp))
+                    .background(back)
+                    .clickable(enabled = enabled, role = Role.Button) { onChip(chip) }
+                    .padding(horizontal = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                Text(chip.emoji, fontSize = 14.sp)
+                if (chip.count > 1) {
+                    Text(
+                        chip.count.toString(),
+                        color = if (onBubble && mine) Color.White else ink.text,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                    )
+                }
+            }
+        }
+    }
+}
+
+/** One emoji in the picker, with its skin tones, the emoji itself left out. */
+private data class EmojiCell(
+    val emoji: String,
+    val tones: List<String>,
+)
+
+/** A section of the picker: its key, its strip icon, its name and its emoji. */
+private data class EmojiSection(
+    val key: String,
+    val icon: String,
+    val name: String,
+    val cells: List<EmojiCell>,
+)
+
+/** Puts a popup just above what it belongs to, kept inside the window. */
+private object Above : PopupPositionProvider {
+    override fun calculatePosition(
+        anchorBounds: IntRect,
+        windowSize: IntSize,
+        layoutDirection: LayoutDirection,
+        popupContentSize: IntSize,
+    ): IntOffset {
+        val x = anchorBounds.left + (anchorBounds.width - popupContentSize.width) / 2
+        val y = anchorBounds.top - popupContentSize.height
+        return IntOffset(x.coerceIn(0, maxOf(0, windowSize.width - popupContentSize.width)), maxOf(0, y))
+    }
+}
+
+/**
+ * Every emoji, in a sheet over the chat: a search field, a strip of group icons that jumps and follows the
+ * scroll, and the groups in one grid, Recent first while it has any. Search matches the English names and
+ * shortcodes. A long press on an emoji with tones shows them above it, and nothing is remembered.
+ */
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
+@Composable
+private fun EmojiSheet(
+    reactions: Reactions,
+    ink: Ink,
+    dark: Boolean,
+    onClose: () -> Unit,
+    onPick: (String) -> Unit,
+) {
+    val scrim = remember { MutableInteractionSource() }
+    val block = remember { MutableInteractionSource() }
+    val height = (LocalConfiguration.current.screenHeightDp * 0.6f).dp
+    val sheet = if (dark) Color(0xFF1E2833) else Color.White
+    var query by remember { mutableStateOf("") }
+    var toned by remember { mutableStateOf<String?>(null) }
+    val groups = reactions.groups.orEmpty()
+    val tones = remember(groups) { groups.flatMap { it.emoji_list }.associate { it.emoji to it.tone_list } }
+    val names = groups.map { groupName(it.group) }
+    val recentName = stringResource(R.string.stickers_recent)
+    val sections =
+        buildList {
+            if (reactions.recent.isNotEmpty()) {
+                add(EmojiSection("recent", "🕘", recentName, reactions.recent.map { EmojiCell(it, tones[it].orEmpty()) }))
+            }
+            groups.forEachIndexed { index, group ->
+                val icon = GROUP_ICONS[group.group] ?: group.emoji_list.firstOrNull()?.emoji.orEmpty()
+                add(EmojiSection(group.group, icon, names[index], group.emoji_list.map { EmojiCell(it.emoji, it.tone_list) }))
+            }
+        }
+    val needle = query.trim().trim(':').lowercase()
+    val found =
+        if (needle.isEmpty()) {
+            null
+        } else {
+            groups
+                .flatMap { it.emoji_list }
+                .filter { item -> item.name.lowercase().contains(needle) || item.shortcode_list.any { it.contains(needle) } }
+                .map { EmojiCell(it.emoji, it.tone_list) }
+        }
+    val heads = ArrayList<Int>()
+    var at = 0
+    for (section in sections) {
+        heads.add(at)
+        at += 1 + section.cells.size
+    }
+    val grid = rememberLazyGridState()
+    val scope = rememberCoroutineScope()
+    val current = heads.indexOfLast { it <= grid.firstVisibleItemIndex }.coerceAtLeast(0)
+
+    @Composable
+    fun Cell(
+        cell: EmojiCell,
+        key: String,
+    ) {
+        Box(
+            Modifier
+                .aspectRatio(1f)
+                .clip(RoundedCornerShape(10.dp))
+                .combinedClickable(
+                    role = Role.Button,
+                    onLongClick = if (cell.tones.isEmpty()) null else ({ toned = key }),
+                ) { onPick(cell.emoji) },
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(cell.emoji, fontSize = 24.sp)
+            if (toned == key) {
+                Popup(
+                    popupPositionProvider = Above,
+                    onDismissRequest = { toned = null },
+                    properties = PopupProperties(focusable = true),
+                ) {
+                    Row(
+                        Modifier
+                            .shadow(8.dp, RoundedCornerShape(22.dp))
+                            .clip(RoundedCornerShape(22.dp))
+                            .background(sheet)
+                            .padding(horizontal = 6.dp, vertical = 4.dp),
+                    ) {
+                        for (emoji in listOf(cell.emoji) + cell.tones) {
+                            Box(
+                                Modifier.size(42.dp).clip(CircleShape).clickable(role = Role.Button) {
+                                    toned = null
+                                    onPick(emoji)
+                                },
+                                contentAlignment = Alignment.Center,
+                            ) { Text(emoji, fontSize = 26.sp) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Box(
+        Modifier
+            .fillMaxSize()
+            .background(Color.Black.copy(alpha = 0.42f))
+            .clickable(scrim, null, onClick = onClose),
+        contentAlignment = Alignment.BottomCenter,
+    ) {
+        Column(
+            Modifier
+                .fillMaxWidth()
+                // 60% of the screen, or less while the keyboard leaves less room.
+                .heightIn(max = height)
+                .fillMaxHeight()
+                .clip(RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp))
+                .background(sheet)
+                .clickable(block, null) {},
+        ) {
+            Box(
+                Modifier
+                    .padding(top = 8.dp, bottom = 8.dp)
+                    .align(Alignment.CenterHorizontally)
+                    .size(width = 36.dp, height = 4.dp)
+                    .clip(RoundedCornerShape(2.dp))
+                    .background(ink.muted.copy(alpha = 0.4f)),
+            )
+            BasicTextField(
+                value = query,
+                onValueChange = { query = it },
+                modifier =
+                    Modifier
+                        .padding(horizontal = 14.dp)
+                        .fillMaxWidth()
+                        .background(ink.field, RoundedCornerShape(20.dp))
+                        .border(1.dp, ink.line, RoundedCornerShape(20.dp))
+                        .padding(horizontal = 16.dp, vertical = 10.dp),
+                textStyle = TextStyle(color = ink.text, fontSize = 15.sp),
+                cursorBrush = SolidColor(accent),
+                singleLine = true,
+                decorationBox = { inner ->
+                    if (query.isEmpty()) Text(stringResource(R.string.emoji_search), color = ink.muted, fontSize = 15.sp)
+                    inner()
+                },
+            )
+            if (found == null) {
+                Row(
+                    Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 8.dp, vertical = 6.dp),
+                    horizontalArrangement = Arrangement.spacedBy(2.dp),
+                ) {
+                    sections.forEachIndexed { index, section ->
+                        Box(
+                            Modifier
+                                .size(38.dp)
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(if (index == current) accent.copy(alpha = 0.22f) else Color.Transparent)
+                                .semantics { contentDescription = section.name }
+                                .clickable(role = Role.Button) { scope.launch { grid.animateScrollToItem(heads[index]) } },
+                            contentAlignment = Alignment.Center,
+                        ) { Text(section.icon, fontSize = 20.sp) }
+                    }
+                }
+            } else {
+                Spacer(Modifier.height(8.dp))
+            }
+            Box(Modifier.fillMaxWidth().height(1.dp).background(ink.line))
+            LazyVerticalGrid(
+                columns = GridCells.Fixed(8),
+                modifier = Modifier.weight(1f).fillMaxWidth().padding(horizontal = 8.dp),
+                state = grid,
+            ) {
+                if (found != null) {
+                    if (found.isEmpty()) {
+                        item(key = "none", span = { GridItemSpan(maxLineSpan) }) {
+                            Text(
+                                stringResource(R.string.emoji_none),
+                                Modifier.padding(top = 24.dp),
+                                color = ink.muted,
+                                fontSize = 14.sp,
+                                textAlign = TextAlign.Center,
+                            )
+                        }
+                    }
+                    for (cell in found) {
+                        item(key = "found-${cell.emoji}") { Cell(cell, "found-${cell.emoji}") }
+                    }
+                } else {
+                    for (section in sections) {
+                        item(key = section.key, span = { GridItemSpan(maxLineSpan) }) {
+                            Text(
+                                section.name,
+                                Modifier.padding(start = 4.dp, top = 10.dp, bottom = 4.dp),
+                                color = ink.muted,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                        }
+                        for (cell in section.cells) {
+                            val key = "${section.key}-${cell.emoji}"
+                            item(key = key) { Cell(cell, key) }
+                        }
                     }
                 }
             }

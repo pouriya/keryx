@@ -52,4 +52,8 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.9.3")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
+
+    // Noto Color Emoji inside the app, chosen by the author, so a phone whose own font is older still
+    // draws the reaction picker's and chips' emoji. About 11 MB. Compose already brings emoji2 itself.
+    implementation("androidx.emoji2:emoji2-bundled:1.7.0")
 }

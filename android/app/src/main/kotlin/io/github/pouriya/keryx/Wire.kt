@@ -316,6 +316,20 @@ sealed interface Command {
         val reply: Pointer? = null,
     ) : Command
 
+    /** One emoji on the message at `on`, refused by core as `bad_emoji` unless the `emojis` crate knows it. */
+    @Serializable
+    @SerialName("send_reaction")
+    data class SendReaction(
+        val chat: String,
+        val emoji: String,
+        val on: Pointer,
+    ) : Command
+
+    /** Every emoji a reaction can be, by group, answered as `Event.Emoji`. */
+    @Serializable
+    @SerialName("emoji")
+    data object Emoji : Command
+
     /** This account's answer, checked by core against the question as shown. */
     @Serializable
     @SerialName("send_answer")
@@ -508,6 +522,22 @@ data class StickerPack(
     val id: String,
     val name: String,
     val sticker_list: List<StickerItem>,
+)
+
+/** One of core's emoji groups, `smileys_and_emotion` through `flags`, in its order. */
+@Serializable
+data class EmojiGroup(
+    val group: String,
+    val emoji_list: List<EmojiItem>,
+)
+
+/** One emoji with its English name, its shortcodes and its skin tones, the emoji itself left out. */
+@Serializable
+data class EmojiItem(
+    val emoji: String,
+    val name: String,
+    val shortcode_list: List<String> = emptyList(),
+    val tone_list: List<String> = emptyList(),
 )
 
 /** One of this account's settings, opened: its name and its JSON value. */
@@ -905,6 +935,9 @@ data class Shown(
     val sticker: String? = null,
     val question: Question? = null,
     val answer: Answer? = null,
+    /** A reaction's emoji, with the sequence id of the message it is on in `on`. */
+    val emoji: String? = null,
+    val on: Long? = null,
     val problem: String? = null,
 )
 
@@ -1096,6 +1129,8 @@ sealed interface Event {
         val handles: List<Long> = emptyList(),
         val sticker: String? = null,
         val answer: Answer? = null,
+        /** A reaction's emoji, its message in `target`. */
+        val emoji: String? = null,
     ) : Event
 
     @Serializable
@@ -1221,6 +1256,13 @@ sealed interface Event {
     @SerialName("stickers")
     data class Stickers(
         val pack_list: List<StickerPack>,
+    ) : Event
+
+    /** Every emoji a reaction can be, by group, the answer to `Command.Emoji`. */
+    @Serializable
+    @SerialName("emoji")
+    data class Emoji(
+        val group_list: List<EmojiGroup>,
     ) : Event
 
     /** Where someone sharing a chat is, on every change, or the answer to `Command.PresenceOf`. */

@@ -56,6 +56,8 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.core.content.FileProvider
+import androidx.emoji2.bundled.BundledEmojiCompatConfig
+import androidx.emoji2.text.EmojiCompat
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -137,6 +139,9 @@ class MainActivity : ComponentActivity() {
 
     /** The server's sticker packs, once asked for; stickers kept on disk; stickers the server no longer has. */
     private val stickerPacks = mutableStateOf<List<StickerPack>?>(null)
+
+    /** Every emoji a reaction can be, by group, asked of core the first time the picker opens. */
+    private val emojiGroups = mutableStateOf<List<EmojiGroup>?>(null)
     private val stickersKept = mutableStateMapOf<String, Boolean>()
     private val stickersGone = mutableStateMapOf<String, Boolean>()
     private var loadingOlder = false
@@ -220,6 +225,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(saved: Bundle?) {
         super.onCreate(saved)
+        // The bundled emoji font draws whatever the phone's own font lacks. Started once per process.
+        EmojiCompat.init(BundledEmojiCompatConfig(applicationContext))
         vault = Vault(applicationContext)
         language.value = vault.note("lang")?.takeIf { it == "en" || it == "fa" } ?: "en"
         vault.note("server")?.let {
@@ -519,6 +526,16 @@ class MainActivity : ComponentActivity() {
     private fun recentStickers(): List<String> =
         (settings["recent.stickers"] as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }.orEmpty()
 
+    /** An emoji just reacted with goes first, at most 8, as `recent.reactions` in `kv`. */
+    private fun recentReaction(emoji: String) {
+        val now = recentReactions()
+        val next = (listOf(emoji) + now.filter { it != emoji }).take(RECENT_REACTIONS)
+        if (next != now) setSetting("recent.reactions", JsonArray(next.map(::JsonPrimitive)))
+    }
+
+    private fun recentReactions(): List<String> =
+        (settings["recent.reactions"] as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }.orEmpty()
+
     override fun onStart() {
         super.onStart()
         engine.inApp(true)
@@ -607,7 +624,7 @@ class MainActivity : ComponentActivity() {
         val text = message.text?.takeIf { it.isNotBlank() }
         return when (message.content_kind) {
             1 -> getString(R.string.kind_voice)
-            2 -> text?.let { getString(R.string.kind_reacted, it) } ?: getString(R.string.kind_reacted, "").trim()
+            2 -> getString(R.string.kind_reacted, message.emoji.orEmpty()).trim()
             3 -> text ?: getString(R.string.kind_photo)
             4 -> text ?: getString(R.string.kind_music)
             5 -> text ?: getString(R.string.kind_video)
@@ -1119,9 +1136,12 @@ class MainActivity : ComponentActivity() {
                     list.pending(event.chat, getString(R.string.kind_sticker))
                 } else if (event.kind == 0 && event.answer != null) {
                     list.pending(event.chat, getString(R.string.kind_answered))
+                } else if (event.kind == 0 && event.emoji != null) {
+                    list.pending(event.chat, getString(R.string.kind_reacted, event.emoji))
                 }
             }
             is Event.Stickers -> stickerPacks.value = event.pack_list
+            is Event.Emoji -> emojiGroups.value = event.group_list
             is Event.StickerImage -> stickersKept[event.sticker] = true
             is Event.StickerMissing -> stickersGone[event.sticker] = true
             is Event.Sent -> {
@@ -1475,6 +1495,15 @@ class MainActivity : ComponentActivity() {
                     recent = recentStickers(),
                 ),
             onStickers = { engine.send(Command.Stickers) },
+            reactions = Reactions(groups = emojiGroups.value, recent = recentReactions()),
+            onEmoji = { if (emojiGroups.value == null) engine.send(Command.Emoji) },
+            onReact = { bubble, emoji ->
+                engine.send(Command.SendReaction(chat, emoji, pointer(bubble)))
+                recentReaction(emoji)
+            },
+            onUnreact = { reaction ->
+                engine.send(Command.Delete(chat, Pointer(seq = reaction.seq, local = reaction.local)))
+            },
             onSticker = { id, reply ->
                 engine.send(Command.SendSticker(chat, id, reply?.let(::pointer)))
                 recentSticker(id)
@@ -1623,3 +1652,6 @@ class MainActivity : ComponentActivity() {
 
 /** The most stickers `recent.stickers` keeps, as core's `RECENT_STICKERS`. */
 private const val RECENT_STICKERS = 20
+
+/** The most emoji `recent.reactions` keeps, as core's `RECENT_REACTIONS`. */
+private const val RECENT_REACTIONS = 8
