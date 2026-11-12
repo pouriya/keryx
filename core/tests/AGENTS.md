@@ -7,6 +7,9 @@ MATCHING THE CODE. A CHANGE WITH A STALE TABLE IS NOT FINISHED.**
 
 - **Run `make coverage`.** It runs the tests and rewrites the table between the
   markers. `make all` runs it too, so passing the gate leaves the table current.
+- **`make coverage` first removes every workspace crate's old coverage build and profiles,
+  chosen by the author.** Core and the server share `target/llvm-cov-target`, and the other's
+  test binaries, built from older source, would count a changed file twice.
 - **Never edit the numbers by hand.** If the numbers look wrong, fix the measurement.
 - **Commit the table with the change that moved it.** A diff in this file is how a
   reviewer sees what the change did to coverage.

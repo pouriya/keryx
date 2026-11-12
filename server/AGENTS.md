@@ -42,7 +42,7 @@ not claim it passed without running it.
 
 | Target | What it does |
 |--------|--------------|
-| `make all` | **The gate**: `dev` + `clippy` + `moq` + `coverage` + `check-style` |
+| `make all` | **The gate**: `clippy` + `moq` + `coverage` + `check-style`. **No `dev`, chosen by the author:** the tests run the coverage build's binary, and `make start-dev` builds the dev one |
 | `make dev` | Debug build → `build/keryx-<version>-<target>-dev` |
 | `make release` | Release build → `build/keryx-<version>-<target>` |
 | `make version` | Prints the `Cargo.toml` version |

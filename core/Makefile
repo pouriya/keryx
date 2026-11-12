@@ -39,9 +39,13 @@ wasm:
 
 # Runs the tests, then rewrites the table between the markers from llvm-cov's summary. Its columns
 # are: file, regions, missed, cover, functions, missed, executed, lines, missed lines, cover, ...
+# It first removes every workspace crate's old build and profiles from llvm-cov's target, chosen by
+# the author: core and the server share it, and the other's test binaries, built from older source,
+# would count a changed file twice.
 # A file missing from the summary has no line of code to measure, which is not the same as not
 # measured, so the table lists what the tool reports and nothing else.
 coverage:
+	@ cargo llvm-cov clean --workspace
 	@ cargo llvm-cov --summary-only --target ${TARGET} > target-coverage.txt || { cat target-coverage.txt; rm -f target-coverage.txt; exit 1; }
 	@ awk 'BEGIN { print "<!-- coverage:start -->"; print "| File | Lines | Covered | Coverage |"; print "|------|------:|--------:|---------:|" } \
 		/^[a-z_\/]+\.rs / { lines=$$8; covered=$$8-$$9; name=$$1; sub(/^src\//, "", name); percent=(lines ? covered*100/lines : 100); printf "| `src/%s` | %d | %d | %.2f%% |\n", name, lines, covered, percent } \

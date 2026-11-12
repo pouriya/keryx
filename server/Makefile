@@ -10,7 +10,9 @@ DOCKER_ALPINE_VERSION ?= 3.23
 DOCKER_IMAGE_VERSION ?= ${VERSION}
 
 
-all: dev clippy moq coverage check-style
+# No `dev`, chosen by the author: the tests build and run the coverage build's binary, and
+# `make start-dev` builds the dev one, so building it here too was one more full build each run.
+all: clippy moq coverage check-style
 
 
 version:
@@ -70,7 +72,11 @@ test:
 
 # Runs the tests, then rewrites the table between the markers from llvm-cov's summary. Its columns
 # are: file, regions, missed, cover, functions, missed, executed, lines, missed lines, cover, ...
+# It first removes every workspace crate's old build and profiles from llvm-cov's target, chosen by
+# the author: core and the server share it, and the other's test binaries, built from older source,
+# would count a changed file twice.
 coverage:
+	@ cargo llvm-cov clean --workspace
 	@ cargo llvm-cov --summary-only --target ${TARGET} > target-coverage.txt || { cat target-coverage.txt; rm -f target-coverage.txt; exit 1; }
 	@ awk 'BEGIN { print "<!-- coverage:start -->"; print "| File | Lines | Covered | Coverage |"; print "|------|------:|--------:|---------:|" } \
 		/^[a-z_\/]+\.rs / { lines=$$8; covered=$$8-$$9; name=$$1; sub(/^src\//, "", name); percent=(lines ? covered*100/lines : 100); printf "| `src/%s` | %d | %d | %.2f%% |\n", name, lines, covered, percent } \
