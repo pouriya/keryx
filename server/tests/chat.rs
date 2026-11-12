@@ -4255,6 +4255,77 @@ fn a_sticker_names_a_server_sticker_inside_its_encryption_and_cannot_be_edited()
 }
 
 #[test]
+fn reactions_go_through_core_with_their_target_inside_the_encryption_and_several_can_stand() {
+    let server = open_server();
+    let (mut sara, mut babak, chat) = apps_on(&server);
+    sara.command(
+        &server,
+        Command::SendText {
+            chat,
+            text: Secret("lunch?".to_string()),
+            reply: None,
+        },
+    );
+    let Event::Sent { seq: on, .. } =
+        sara.wait(&server, |event| matches!(event, Event::Sent { .. }))
+    else {
+        unreachable!();
+    };
+    shown(babak.wait(&server, |event| is_message(event, chat, on)));
+    // Two from one person on one message, each its own message.
+    let mut sent = Vec::new();
+    for emoji in ["👍", "👍🏽"] {
+        babak.command(
+            &server,
+            Command::SendReaction {
+                chat,
+                emoji: emoji.to_string(),
+                on: Pointer::Seq(on),
+            },
+        );
+        let Event::Sent { seq, .. } =
+            babak.wait(&server, |event| matches!(event, Event::Sent { .. }))
+        else {
+            unreachable!();
+        };
+        sent.push(seq);
+    }
+    for (seq, emoji) in sent.iter().zip(["👍", "👍🏽"]) {
+        let message = shown(sara.wait(&server, |event| is_message(event, chat, *seq)));
+        assert_eq!(message.content_kind, Some(ContentKind::Reaction));
+        assert_eq!(message.emoji.as_deref(), Some(emoji));
+        assert_eq!(message.on, Some(on));
+        assert_eq!(message.text, None);
+    }
+
+    // The server holds no pointer: what it is on is only in the ciphertext.
+    let mut socket = connect(&server, babak.token.as_deref().unwrap());
+    let (rows, _) = sync_chat(&mut socket, chat);
+    for row in rows {
+        if sent.contains(&row.seq) {
+            assert_eq!(row.pointer_seq, None);
+        }
+    }
+
+    // Removing one is a delete pointing at it, and the other stays.
+    babak.command(
+        &server,
+        Command::Delete {
+            chat,
+            target: Pointer::Seq(sent[0]),
+            remove: Vec::new(),
+        },
+    );
+    babak.wait(&server, |event| matches!(event, Event::Sent { .. }));
+    let Event::Deleted { target_seq, .. } =
+        sara.wait(&server, |event| matches!(event, Event::Deleted { .. }))
+    else {
+        unreachable!();
+    };
+    assert_eq!(target_seq, sent[0]);
+}
+
+#[test]
 fn a_question_and_its_answer_are_sealed_checked_by_core_and_the_answer_can_change() {
     let server = open_server();
     let (mut sara, mut babak, chat) = apps_on(&server);

@@ -165,6 +165,27 @@ pub struct Setting {
     pub value: serde_json::Value,
 }
 
+/// One group of [`Event::Emoji`], in Unicode's order.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmojiGroup {
+    /// `smileys_and_emotion`, `people_and_body`, `animals_and_nature`, `food_and_drink`,
+    /// `travel_and_places`, `activities`, `objects`, `symbols` or `flags`.
+    pub group: String,
+    pub emoji_list: Vec<EmojiItem>,
+}
+
+/// One emoji a reaction may be, with what a search matches: its English name and shortcodes.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmojiItem {
+    pub emoji: String,
+    pub name: String,
+    pub shortcode_list: Vec<String>,
+    /// Its skin tones, without the emoji itself, and empty when it has none.
+    pub tone_list: Vec<String>,
+}
+
 /// The most recent stickers `recent.stickers` holds, newest first.
 pub const RECENT_STICKERS: usize = 20;
 /// The most recent reactions `recent.reactions` holds, newest first.
@@ -425,6 +446,15 @@ pub enum Command {
         #[serde(default)]
         reply: Option<Pointer>,
     },
+    /// A reaction on a message, refused here unless `emoji` is one the `emojis` crate knows. `on`
+    /// is inside the encryption, as a reply's is, and it waits for a pending message's sequence id.
+    SendReaction {
+        chat: Ulid,
+        emoji: String,
+        on: Pointer,
+    },
+    /// Every emoji a reaction may be, answered as [`Event::Emoji`].
+    Emoji,
     /// A tree of questions, with an optional intro. Clients have no screen for it: an agent sends
     /// them. Refused here unless the tree holds together.
     SendQuestion {
@@ -783,6 +813,12 @@ pub struct Shown {
     /// A sticker message's sticker.
     #[serde(default)]
     pub sticker: Option<Ulid>,
+    /// A reaction's emoji, one the `emojis` crate knows, with `on`.
+    #[serde(default)]
+    pub emoji: Option<String>,
+    /// The sequence id of the message a reaction is on, from inside its encryption.
+    #[serde(default)]
+    pub on: Option<u64>,
     /// A question message's tree, once it holds together. Its intro is `text`.
     #[serde(default)]
     pub question: Option<Question>,
@@ -914,6 +950,9 @@ pub enum Event {
         /// A sticker message's sticker.
         #[serde(default)]
         sticker: Option<Ulid>,
+        /// A reaction's emoji. What it is on is `target`.
+        #[serde(default)]
+        emoji: Option<String>,
         /// An answer, or an answer's edit.
         #[serde(default)]
         answer: Option<Answer>,
@@ -978,6 +1017,10 @@ pub enum Event {
     /// A sticker the server no longer has.
     StickerMissing {
         sticker: Ulid,
+    },
+    /// The answer to [`Command::Emoji`]: every emoji a reaction may be, by group, in Unicode's order.
+    Emoji {
+        group_list: Vec<EmojiGroup>,
     },
     /// An account's profile as far as this device can open it, sent again whenever it changes.
     Profile {
@@ -1266,6 +1309,8 @@ struct Content {
     handles: Vec<u64>,
     /// A sticker message's sticker, for its pending message.
     sticker: Option<Ulid>,
+    /// A reaction's emoji, for its pending message.
+    emoji: Option<String>,
     /// An answer or an answer's edit, for its pending message.
     answer: Option<Answer>,
 }
@@ -1723,14 +1768,17 @@ struct Opened {
     call: Option<CallBody>,
     reply: Option<u64>,
     sticker: Option<Ulid>,
+    emoji: Option<String>,
+    on: Option<u64>,
     question: Option<Question>,
     answer: Option<Answer>,
 }
 
 /// A message's text and files, `{"text": "...", "files": [...]}`, each optional, a call's start,
-/// `{"video": ..., "voice": ...}`, a sticker, `{"sticker": "..."}`, a question's tree, `{"text"?,
-/// "first", "nodes"}`, or an answer, `{"question", "answers", "skipped"?}`. A tree that does not hold
-/// together is left out.
+/// `{"video": ..., "voice": ...}`, a sticker, `{"sticker": "..."}`, a reaction, `{"emoji", "on"}`,
+/// a question's tree, `{"text"?, "first", "nodes"}`, or an answer, `{"question", "answers",
+/// "skipped"?}`. A tree that does not hold together is left out, and so is a reaction whose emoji the
+/// `emojis` crate does not know.
 fn content_of(plaintext: &[u8]) -> Opened {
     #[derive(Deserialize)]
     struct Plain {
@@ -1746,6 +1794,10 @@ fn content_of(plaintext: &[u8]) -> Opened {
         reply: Option<u64>,
         #[serde(default)]
         sticker: Option<Ulid>,
+        #[serde(default)]
+        emoji: Option<String>,
+        #[serde(default)]
+        on: Option<u64>,
         #[serde(default)]
         first: Option<String>,
         #[serde(default)]
@@ -1777,6 +1829,11 @@ fn content_of(plaintext: &[u8]) -> Opened {
                 }),
                 None => None,
             };
+            // Written as the crate writes it, so a chip is one per emoji however it was typed.
+            let (emoji, on) = match (plain.emoji.as_deref().and_then(emojis::get), plain.on) {
+                (Some(emoji), Some(on)) => (Some(emoji.as_str().to_string()), Some(on)),
+                _ => (None, None),
+            };
             Opened {
                 reply: plain.reply,
                 text: plain.text.map(Secret),
@@ -1786,6 +1843,8 @@ fn content_of(plaintext: &[u8]) -> Opened {
                     _ => None,
                 },
                 sticker: plain.sticker,
+                emoji,
+                on,
                 question,
                 answer,
             }
@@ -1828,6 +1887,8 @@ fn shown(
         call,
         reply,
         sticker,
+        emoji,
+        on,
         question,
         answer,
     } = opened;
@@ -1848,6 +1909,8 @@ fn shown(
         call_outcome: end.map(|(outcome, _)| outcome),
         call_ended_at: end.map(|(_, at)| at),
         sticker,
+        emoji,
+        on,
         question,
         answer,
         problem: None,
@@ -2496,6 +2559,58 @@ impl Client {
                     },
                 );
             }
+            Command::SendReaction { chat, emoji, on } => {
+                let Some(emoji) = emojis::get(&emoji) else {
+                    return self.error("bad_emoji", "That is not an emoji a reaction can be");
+                };
+                let emoji = emoji.as_str().to_string();
+                let fields = serde_json::json!({ "emoji": emoji }).to_string();
+                self.push_content(
+                    chat,
+                    Kind::Content,
+                    Some(on),
+                    Content {
+                        content_kind: Some(ContentKind::Reaction),
+                        fields: Some(Secret(fields)),
+                        emoji: Some(emoji),
+                        ..Content::default()
+                    },
+                );
+            }
+            Command::Emoji => {
+                let group_list = emojis::Group::iter()
+                    .map(|group| EmojiGroup {
+                        group: match group {
+                            emojis::Group::SmileysAndEmotion => "smileys_and_emotion",
+                            emojis::Group::PeopleAndBody => "people_and_body",
+                            emojis::Group::AnimalsAndNature => "animals_and_nature",
+                            emojis::Group::FoodAndDrink => "food_and_drink",
+                            emojis::Group::TravelAndPlaces => "travel_and_places",
+                            emojis::Group::Activities => "activities",
+                            emojis::Group::Objects => "objects",
+                            emojis::Group::Symbols => "symbols",
+                            emojis::Group::Flags => "flags",
+                        }
+                        .to_string(),
+                        emoji_list: group
+                            .emojis()
+                            .map(|emoji| EmojiItem {
+                                emoji: emoji.as_str().to_string(),
+                                name: emoji.name().to_string(),
+                                shortcode_list: emoji.shortcodes().map(str::to_string).collect(),
+                                tone_list: match emoji.skin_tones() {
+                                    Some(tones) => tones
+                                        .skip(1)
+                                        .map(|tone| tone.as_str().to_string())
+                                        .collect(),
+                                    None => Vec::new(),
+                                },
+                            })
+                            .collect(),
+                    })
+                    .collect();
+                self.event(Event::Emoji { group_list });
+            }
             Command::SendQuestion {
                 chat,
                 text,
@@ -2958,6 +3073,7 @@ impl Client {
             fields,
             handles,
             sticker,
+            emoji,
             answer,
         } = content;
         let item = Item::Content {
@@ -2980,6 +3096,7 @@ impl Client {
             text,
             handles,
             sticker,
+            emoji,
             answer,
         });
     }
@@ -3217,6 +3334,7 @@ impl Client {
                 fields: None,
                 handles,
                 sticker: None,
+                emoji: None,
                 answer: None,
             },
         );
@@ -4265,6 +4383,7 @@ impl Client {
                             fields,
                             handles: Vec::new(),
                             sticker: None,
+                            emoji: None,
                             answer: None,
                         };
                         self.send_content(outgoing.id, chat, kind, outgoing.pointer_seq, content);
@@ -4371,8 +4490,14 @@ impl Client {
             }
             (Kind::Content | Kind::Edit, text) => {
                 let mut plain = serde_json::Map::new();
-                if let (Kind::Content, Some(reply)) = (kind, pointer_seq) {
-                    plain.insert("reply".to_string(), serde_json::Value::from(reply));
+                // A reaction's target is `on`, any other content's `reply`.
+                if let (Kind::Content, Some(seq)) = (kind, pointer_seq) {
+                    let key = if content_kind == Some(ContentKind::Reaction) {
+                        "on"
+                    } else {
+                        "reply"
+                    };
+                    plain.insert(key.to_string(), serde_json::Value::from(seq));
                 }
                 if let Some(mut text) = text {
                     let text = std::mem::take(&mut text.0);

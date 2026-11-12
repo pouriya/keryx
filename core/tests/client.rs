@@ -4233,6 +4233,116 @@ fn edits_and_deletes_reach_the_other_side_and_a_deleted_message_stays_removed() 
 }
 
 #[test]
+fn a_reaction_is_one_known_emoji_on_a_message_inside_its_encryption_and_waits_for_its_target() {
+    let (mut world, omid, mina, chat) = pair();
+    // The reaction points at a message still waiting for its sequence id, and its emoji is typed
+    // without the variation selector, so it goes as the crate writes it.
+    world.phones[omid].frame_faults.push(("send", Fault::Lose));
+    let first = world.say(omid, chat, "one");
+    world.command(
+        omid,
+        Command::SendReaction {
+            chat,
+            emoji: "\u{2764}".to_string(),
+            on: Pointer::Local(first),
+        },
+    );
+    world.settle();
+    world.cut(omid);
+    world.advance(2 * SECOND);
+    let seq = world.sent_seq(omid, first).unwrap();
+    let mut pending = Vec::new();
+    for event in &world.phones[omid].events {
+        if let Event::Pending {
+            content_kind: Some(ContentKind::Reaction),
+            target,
+            emoji,
+            ..
+        } = event
+        {
+            pending.push((*target, emoji.clone()));
+        }
+    }
+    assert_eq!(
+        pending,
+        vec![(
+            Some(Pointer::Local(first)),
+            Some("\u{2764}\u{fe0f}".to_string())
+        )]
+    );
+    let mut reactions = Vec::new();
+    for event in &world.phones[mina].events {
+        if let Event::Message { message } = event
+            && message.content_kind == Some(ContentKind::Reaction)
+        {
+            reactions.push((message.on, message.emoji.clone(), message.reply));
+        }
+    }
+    assert_eq!(
+        reactions,
+        vec![(Some(seq), Some("\u{2764}\u{fe0f}".to_string()), None)]
+    );
+
+    // Anything else is refused before it is queued.
+    let before = world.phones[omid].events.len();
+    world.command(
+        omid,
+        Command::SendReaction {
+            chat,
+            emoji: "x".to_string(),
+            on: Pointer::Seq(seq),
+        },
+    );
+    world.settle();
+    assert_eq!(error_count(&world, omid, "bad_emoji"), 1);
+    assert!(
+        !world.phones[omid].events[before..]
+            .iter()
+            .any(|event| matches!(event, Event::Pending { .. }))
+    );
+
+    // The picker's list: every group in Unicode's order, with names, shortcodes and tones.
+    world.command(mina, Command::Emoji);
+    let group_list = world.phones[mina]
+        .events
+        .iter()
+        .find_map(|event| match event {
+            Event::Emoji { group_list } => Some(group_list.clone()),
+            _ => None,
+        })
+        .unwrap();
+    let groups: Vec<&str> = group_list
+        .iter()
+        .map(|group| group.group.as_str())
+        .collect();
+    assert_eq!(
+        groups,
+        [
+            "smileys_and_emotion",
+            "people_and_body",
+            "animals_and_nature",
+            "food_and_drink",
+            "travel_and_places",
+            "activities",
+            "objects",
+            "symbols",
+            "flags"
+        ]
+    );
+    let grinning = &group_list[0].emoji_list[0];
+    assert_eq!(grinning.emoji, "😀");
+    assert_eq!(grinning.name, "grinning face");
+    assert!(grinning.shortcode_list.contains(&"grinning".to_string()));
+    assert!(grinning.tone_list.is_empty());
+    let thumbs = group_list[1]
+        .emoji_list
+        .iter()
+        .find(|item| item.emoji == "👍")
+        .unwrap();
+    assert_eq!(thumbs.tone_list, ["👍🏻", "👍🏼", "👍🏽", "👍🏾", "👍🏿"]);
+}
+
+#[test]
 fn a_revocation_from_an_unknown_account_is_checked_once_its_keys_arrive() {
     let (mut world, _, mina, _) = pair();
     let sara = world.person("sara", WORDS);

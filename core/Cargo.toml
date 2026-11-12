@@ -51,6 +51,11 @@ aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "al
 # platform hands it small RGBA pixels.
 blurhash = { version = "0.2.3", default-features = false }
 
+# Every Unicode emoji with its group, name, shortcodes and skin tones, chosen by the author, so every
+# client's reaction picker shows one set and a reaction's emoji is checked against it. Pure data
+# with no I/O, built on phf; its only feature, serde, stays off.
+emojis = { version = "0.9.1", default-features = false }
+
 # SFrame (RFC 9605) for call media, chosen by the author: its MLS key scheme and the RFC's test
 # vectors. The RustCrypto backend builds to WASM; it brings aes-gcm 0.11 beside openmls's 0.10.
 sframe = { version = "2.1.0", default-features = false, features = ["rust-crypto"] }

@@ -54,7 +54,7 @@ not claim it passed without running it.
 | `make fmt` | Rewrites formatting in place |
 | `make lint` | `clippy` + `check-style`, no build |
 | `make test` | `cargo test --target …`. `TEST=name` runs only the tests whose names hold it; empty runs them all |
-| `make coverage` | Runs the tests under `cargo-llvm-cov` and **rewrites the table** in [tests/AGENTS.md](tests/AGENTS.md) |
+| `make coverage` | Removes the workspace's old coverage build, runs the tests under `cargo-llvm-cov` and **rewrites the table** in [tests/AGENTS.md](tests/AGENTS.md) |
 | `make docker` | The image `keryx:<version>` and `keryx:latest` from the root `Dockerfile`. `DOCKER_REGISTRY` prefixes the base images |
 | `make clean` / `dist-clean` | Drop `target/` / also `build/` |
 
@@ -83,7 +83,8 @@ src/stickers/     The bundled Default sticker pack's 15 WebP files, include_byte
 server.toml       The commented example configuration
 tests/            Integration tests. See tests/AGENTS.md
 examples/drive.rs Drives core as a real client against a running server, to send what a phone cannot,
-                  such as a question. Not a test. Built by `make drive`, chosen by the author
+                  such as a question. Not a test. Built by `make drive`, chosen by the author.
+                  `react <seq> <emoji>` and `delete <seq>` for reactions, chosen by the author
 Makefile          Every build and check entry point
 ```
 

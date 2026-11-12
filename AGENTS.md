@@ -890,6 +890,13 @@ Whatever is saved to show later gets the next number. Whatever is not saved gets
 - **A reply is a property inside the encrypted plaintext, chosen by the author:** `{"text": "...", "reply": <seq>}`.
   The signed header's `pointer_seq` stays empty for content, so the server never sees the reply graph. The queue
   holds a reply to a pending message until that message has its sequence id.
+- **A reaction's plaintext is `{"emoji": "👍", "on": <seq>}`, chosen by the author**, its pointer inside
+  the encryption like a reply's. **Core refuses an emoji the `emojis` crate does not know**, when sending
+  and when opening, so a reaction is always one real emoji. **A person may put several on one message,
+  chosen by the author**, each its own message, removed by a delete pointing at it. **Clients add them up
+  from their own archive, chosen by the author:** core hands each reaction over opened, and the platform
+  groups them by `on`, leaving out removed ones, **one chip per exact emoji, chosen by the author**, so 👍
+  and 👍🏽 are two.
 - **A message's times are server times only, chosen by the author.** A `times` frame {ref, chat, seq} is
   answered with `times` {ref, chat, seq, member_list: [{account, received_at?, seen_at?}]}, and REST has the same
   at `GET /api/v1/chats/{id}/messages/{seq}/times`. It needs a registered device and membership, with no new
@@ -1836,8 +1843,8 @@ first, as everywhere.
 **Not yet tested on the phone**
 
 - **Receiving a sticker from another account**, and **a deleted question's answer showing "Message
-  unavailable"**. `server/examples/drive.rs` cannot send a sticker or delete a message yet, so two commands
-  for those come with the test.
+  unavailable"**. `server/examples/drive.rs` cannot send a sticker yet, so a command for it comes with the
+  test. It can delete one of its own messages with `delete <seq>`, chosen by the author with reactions.
 
 **Access**
 

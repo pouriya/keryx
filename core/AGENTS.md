@@ -142,6 +142,19 @@ breaks both sides at compile time.
 
 **`serde_json` is a real dependency, chosen by the author**, for the plaintext and REST bodies.
 
+**`emojis` gives every client the same emoji, chosen by the author**, so web, desktop and Android show
+one set in the reaction picker, and a reaction's emoji is checked against it. `Command::Emoji` is
+answered by `Event::Emoji` with `group_list: [{group, emoji_list: [{emoji, name, shortcode_list,
+tone_list}]}]`, in Unicode's order, `tone_list` empty for an emoji with no skin tones. `group` is the
+crate's group in snake case, `smileys_and_emotion` through `flags`, and `tone_list` leaves out the emoji
+itself. **It is a command answered by an event, chosen by the author**, like everything else core does,
+and a platform asks once per run. **`Command::SendReaction {chat, emoji, on}`** seals `{"emoji", "on"}`,
+waiting in the queue like a reply while its target has no sequence id, and an unknown emoji is refused
+with `bad_emoji` before it is queued. The emoji goes, and is shown, as the crate writes it, so `❤` typed
+without its variation selector is `❤️`, and one emoji is always one chip. `Event::Pending` carries the
+`emoji`, its target being `target`, and `Shown` carries `emoji` and `on`, both left out when the emoji is
+unknown.
+
 **`serde_bytes` marks the snapshot slots as bytes, chosen by the author**, on `Loaded`, `Opened` and
 `Save`, so they reach JavaScript as a `Uint8Array` rather than an array of numbers. It was already in
 `Cargo.lock`, and JSON comes out the same.
