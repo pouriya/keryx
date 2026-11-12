@@ -389,7 +389,18 @@ internal fun ChatScreen(
                 val other = if (type == 1) marks.firstOrNull { it.account != me }?.account else null
                 val person = if (type == 0) me else other
                 val handle = other?.let { people[it]?.username }?.let { "@$it" }
-                TopBar(title, person, if (link == Link.Connected) handle else statusText(link), ink, onBack) {
+                // A direct chat's header shows the state, or when they were last in the app, chosen by the author.
+                val presence = if (link == Link.Connected) other?.let { LocalProfiles.current?.presence?.get(it) } else null
+                val line = presenceLine(presence)
+                TopBar(
+                    title,
+                    person,
+                    if (link != Link.Connected) statusText(link) else line ?: handle,
+                    presenceTone(presence?.state)?.takeIf { line != null },
+                    presence?.state,
+                    ink,
+                    onBack,
+                ) {
                     person?.let(onProfile)
                 }
             }
@@ -667,6 +678,8 @@ private fun TopBar(
     title: String,
     person: String?,
     status: String?,
+    statusTone: Color?,
+    state: String?,
     ink: Ink,
     onBack: () -> Unit,
     onPerson: () -> Unit,
@@ -681,7 +694,10 @@ private fun TopBar(
                 .then(if (person != null) Modifier.clickable(role = Role.Button, onClick = onPerson) else Modifier),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Avatar(person, title, 40.dp, Modifier.padding(start = 2.dp, end = 10.dp))
+            Box(Modifier.padding(start = 2.dp, end = 10.dp)) {
+                Avatar(person, title, 40.dp)
+                PresenceDot(state, 8.dp, 2.dp, ink.page, Modifier.align(Alignment.BottomEnd))
+            }
             Column(Modifier.weight(1f)) {
                 Text(
                     title,
@@ -694,7 +710,7 @@ private fun TopBar(
                 if (status != null) {
                     Text(
                         status,
-                        color = ink.muted,
+                        color = statusTone ?: ink.muted,
                         fontSize = 12.sp,
                         maxLines = 1,
                         style = TextStyle(textDirection = TextDirection.Content),
@@ -1631,6 +1647,7 @@ internal class Stickers(
     val packs: List<StickerPack>?,
     val file: (String) -> java.io.File?,
     val gone: (String) -> Boolean,
+    val recent: List<String> = emptyList(),
 )
 
 /** A WebP no larger than `px` on its longest side, or null if it cannot be read. */
@@ -1771,7 +1788,8 @@ private fun StickerBubble(
 
 /**
  * The picker, in the keyboard's place: a strip of pack icons, each its pack's first sticker, over every
- * pack in one grid under its name. An icon jumps to its pack, and the strip follows the scroll.
+ * pack in one grid under its name. An icon jumps to its pack, and the strip follows the scroll. Recent
+ * stickers come first, with a clock in the strip, chosen by the author, and hide while there are none.
  */
 @Composable
 private fun StickerPanel(
@@ -1780,14 +1798,23 @@ private fun StickerPanel(
     ink: Ink,
     onPick: (String) -> Unit,
 ) {
+    val known = stickers.packs.orEmpty().flatMap { it.sticker_list }.associateBy { it.id }
+    val recent = stickers.recent.mapNotNull { id -> known[id]?.takeIf { !stickers.gone(id) } }
     val packs =
         stickers.packs.orEmpty().mapNotNull { pack ->
             val shown = pack.sticker_list.filter { !stickers.gone(it.id) }
             if (shown.isEmpty()) null else pack to shown
         }
+    val recentName = stringResource(R.string.stickers_recent)
+    // Each section: its key, its name and its stickers, Recent first while it has any.
+    val sections =
+        buildList {
+            if (recent.isNotEmpty()) add(Triple("recent", recentName, recent))
+            for ((pack, shown) in packs) add(Triple("pack-${pack.id}", pack.name, shown))
+        }
     val heads = ArrayList<Int>()
     var at = 0
-    for ((_, shown) in packs) {
+    for ((_, _, shown) in sections) {
         heads.add(at)
         at += 1 + shown.size
     }
@@ -1805,16 +1832,18 @@ private fun StickerPanel(
             Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 8.dp, vertical = 6.dp),
             horizontalArrangement = Arrangement.spacedBy(4.dp),
         ) {
-            packs.forEachIndexed { index, (pack, shown) ->
+            sections.forEachIndexed { index, (key, name, shown) ->
                 Box(
                     Modifier
                         .size(40.dp)
                         .clip(RoundedCornerShape(10.dp))
                         .background(if (index == current) accent.copy(alpha = 0.22f) else Color.Transparent)
-                        .semantics { contentDescription = pack.name }
+                        .semantics { contentDescription = name }
                         .clickable(role = Role.Button) { scope.launch { grid.animateScrollToItem(heads[index]) } },
                     contentAlignment = Alignment.Center,
-                ) { StickerArt(stickers.file(shown.first().id), 34.dp) }
+                ) {
+                    if (key == "recent") Glyph(Glyphs.clock, ink.muted, 24.dp) else StickerArt(stickers.file(shown.first().id), 34.dp)
+                }
             }
         }
         Box(Modifier.fillMaxWidth().height(1.dp).background(ink.line))
@@ -1823,10 +1852,10 @@ private fun StickerPanel(
             modifier = Modifier.weight(1f).fillMaxWidth().padding(horizontal = 8.dp),
             state = grid,
         ) {
-            for ((pack, shown) in packs) {
-                item(key = "pack-${pack.id}", span = { GridItemSpan(maxLineSpan) }) {
+            for ((key, name, shown) in sections) {
+                item(key = key, span = { GridItemSpan(maxLineSpan) }) {
                     Text(
-                        pack.name,
+                        name,
                         Modifier.padding(start = 4.dp, top = 10.dp, bottom = 4.dp),
                         color = ink.muted,
                         fontSize = 12.sp,
@@ -1834,7 +1863,7 @@ private fun StickerPanel(
                     )
                 }
                 for (sticker in shown) {
-                    item(key = sticker.id) {
+                    item(key = "$key-${sticker.id}") {
                         Box(
                             Modifier
                                 .aspectRatio(1f)

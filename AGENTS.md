@@ -52,6 +52,13 @@ error paths, are still to do:** see [core/tests/AGENTS.md](core/tests/AGENTS.md)
   chats. On the author's phone: up to 20 folders and the 21st refused, the sheet's create, rename,
   remove, default and drag, move, copy and remove from a folder, pins per folder, unread counts per tab,
   and an arrangement saved offline reaching the server on reconnect.
+- **Presence and the per-account settings (`kv`) are done in core and the server**, tested by the server's
+  tests driving core. **Android's dots, Active and Connected lines, `lang` and `theme` and the stickers'
+  Recent row passed the author's phone test**, with `server/examples/drive.rs` as the other person and as a
+  second device of the phone's own account: away, online and offline, `theme` and `lang` from another device
+  live and after the app was stopped, and Recent kept across a restart. The red dot of a call is not tested
+  yet, as `drive.rs` cannot join a call. Reactions, and their Recent row, wait for Android's reactions: see
+  [android/AGENTS.md](android/AGENTS.md).
 - **Next, chosen by the author: calls, then Android for files and calls.** Both clients stay as they
   are and grow only what testing needs; standard screens and a full redesign come after.
 
@@ -1121,13 +1128,6 @@ Whatever is saved to show later gets the next number. Whatever is not saved gets
 - **Client-reported values are claims.** Platform, OS and versions come from the device
   and can be faked, and browsers hide or freeze some of them. So can the IP, unless a
   proxy overwrites those headers: see What this costs.
-
-### The client queue
-
-**Client SDKs keep a priority queue for outgoing messages, with priority based on
-message type.** Some types go first so they reach the connection quickly:
-
-| Level | What | Order |
 - **Each device keeps two times, chosen by the author: last connected and last in the app.** Last connected
   is when it last had a live connection. Last in the app is when its person last had keryx open on screen,
   which only the device can say, since Android keeps the connection while the app is in the background. A
@@ -1212,6 +1212,13 @@ settings.
 - **Built server and core first, tested by the server's integration tests, then Android, chosen by the
   author:** dots in the list, header and profile, the Active and Connected lines, `lang` and `theme`
   through `kv`, and a Recent row in the sticker and reaction pickers.
+
+### The client queue
+
+**Client SDKs keep a priority queue for outgoing messages, with priority based on
+message type.** Some types go first so they reach the connection quickly:
+
+| Level | What | Order |
 |-------|------|-------|
 | 0 | MLS commits, key changes | First |
 | 1 | Is typing, stop typing | Next |
@@ -1298,22 +1305,22 @@ POST /api/v1/devices                device, public_key, stamp, platform, os, os_
                                     web_platform?, web_platform_version?
 POST /api/v1/devices/{id}/terminate signature
 POST /api/v1/devices/{id}/logout    signature
+PUT  /api/v1/devices/{id}/presence  this session's own device: in_app -> presence_list
+GET  /api/v1/kv?version=            -> version, and kv_list when the version differs
+PATCH /api/v1/kv                    version, set, remove -> version, or kv_stale with the whole set
 
 A named permission
 POST /api/v1/accounts               account.create: username, admin?, display_name? -> account, link
 GET  /api/v1/accounts?search=       directory.search -> account_list
+GET  /api/v1/accounts/{id}/presence presence.in_app or presence.connected -> account, state?,
+                                    in_app_at?, connected_at?
 
 A registered device, under the limit
 POST /api/v1/key_packages           body_list -> count
-PUT  /api/v1/devices/{id}/presence  this session's own device: in_app -> presence_list
-GET  /api/v1/kv?version=            -> version, and kv_list when the version differs
-PATCH /api/v1/kv                    version, set, remove -> version, or kv_stale with the whole set
 POST /api/v1/accounts/{id}/key_packages/claim  -> key_package_list{device, body}
 POST /api/v1/chats                  chat.create_direct: account -> chat, created. Your own id gives
                                     your self chat
 GET  /api/v1/chats/{id}/group_info  member -> epoch, group_info
-GET  /api/v1/accounts/{id}/presence presence.in_app or presence.connected -> account, state?,
-                                    in_app_at?, connected_at?
 GET  /api/v1/chats/{id}/devices     member -> device_list, with ended devices and their statements
 GET  /api/v1/chats/{id}/wraps       member -> wrap_list{epoch, account, wrapped}
 POST /api/v1/chat_folders/id       folder.create -> folder, kept for this account for 5 minutes
@@ -1464,6 +1471,7 @@ accepts the first for each step. The loser gets a rejection, catches up and retr
   call_frame = "256KiB"     # one frame on a call's state, audio or video track. Larger: that device leaves
   call_cache = "16MiB"      # the relay's room for older groups. Newest groups are always kept
   folders = 20              # an account's folders, not counting all
+  kv_keys = 64              # an account's settings
 
   [limits.body]             # one message's body. A file's bytes upload separately
   text = "64KiB"
@@ -1471,7 +1479,6 @@ accepts the first for each step. The loser gets a rejection, catches up and retr
   voice = "16KiB"
   image = "16KiB"
   music = "16KiB"
-  kv_keys = 64              # an account's settings
   video = "16KiB"
   doc = "16KiB"
   file = "16KiB"
@@ -1482,6 +1489,7 @@ accepts the first for each step. The loser gets a rejection, catches up and retr
   sticker = "1KiB"
   draft = "64KiB" # an account's sealed draft in one chat. Not a message
   folder_name = "256B"      # one sealed folder name
+  kv_value = "4KiB"         # one setting's value, as the client sent it
 
   [limits.upload]           # one file's encrypted bytes, by the type its uploader declares
   voice = "50MiB"
@@ -1489,7 +1497,6 @@ accepts the first for each step. The loser gets a rejection, catches up and retr
   music = "200MiB"
   video = "2GiB"
   doc = "100MiB"
-  kv_value = "4KiB"         # one setting's value, as the client sent it
   file = "2GiB"
   sticker = "256KiB"        # one sticker's WebP. Not encrypted: everyone on the server sees it
   photo = "1MiB"            # one profile photo, sealed. An account's file, not a chat's

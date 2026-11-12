@@ -153,6 +153,9 @@ class Engine(
 
     @Volatile private var client = -1L
 
+    /** Whether the app is on screen, kept so each new client starts with it. */
+    private var inApp = false
+
     /** The client's handle, for the call's own threads. */
     val handle get() = client
 
@@ -551,6 +554,13 @@ class Engine(
 
     fun send(command: Command) = thread.execute { handle(command) }
 
+    /** The app came on screen or left it: core sends it now if connected, and on every connection. */
+    fun inApp(on: Boolean) =
+        thread.execute {
+            inApp = on
+            if (client >= 0) feed(Input.Run(Command.InApp(on)))
+        }
+
     /** Opens the last account kept for this server. The name check stays with the list. */
     fun openLast(address: String) {
         thread.execute { start(address.trim().trimEnd('/')) }
@@ -616,6 +626,7 @@ class Engine(
         }
         client = Core.create(wire.encodeToString(Platform.serializer(), platform))
         generation += 1
+        feed(Input.Run(Command.InApp(inApp)))
     }
 
     /** Resumes the last account's own snapshot, kept by its id, at start. */

@@ -16,6 +16,7 @@ import kotlinx.serialization.encoding.Decoder
 import kotlinx.serialization.encoding.Encoder
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonDecoder
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonEncoder
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
@@ -334,6 +335,28 @@ sealed interface Command {
         val answer: Answer,
     ) : Command
 
+    /** The app came on screen or left it. Core keeps it and sends it on every connection. */
+    @Serializable
+    @SerialName("in_app")
+    data class InApp(
+        val in_app: Boolean,
+    ) : Command
+
+    /** Someone's presence, asked once, for a person sharing no chat: answered as `Event.Presence`. */
+    @Serializable
+    @SerialName("presence_of")
+    data class PresenceOf(
+        val account: String,
+    ) : Command
+
+    /** Changes this account's settings, shown at once as `Event.Kv` and kept until the server takes it. */
+    @Serializable
+    @SerialName("kv")
+    data class Kv(
+        val set: List<Setting> = emptyList(),
+        val remove: List<String> = emptyList(),
+    ) : Command
+
     /** The server's sticker packs, answered as `Event.Stickers`. */
     @Serializable
     @SerialName("stickers")
@@ -485,6 +508,25 @@ data class StickerPack(
     val id: String,
     val name: String,
     val sticker_list: List<StickerItem>,
+)
+
+/** One of this account's settings, opened: its name and its JSON value. */
+@Serializable
+data class Setting(
+    val key: String,
+    val value: JsonElement,
+)
+
+/**
+ * Where someone is: `online`, `call`, `away` or `offline`, with the times this account may see, in
+ * server milliseconds. What it may not see is missing.
+ */
+@Serializable
+data class PresenceItem(
+    val account: String,
+    val state: String? = null,
+    val in_app_at: Long? = null,
+    val connected_at: Long? = null,
 )
 
 /** A picture's small pixels, from which core makes its BlurHash. */
@@ -1179,6 +1221,20 @@ sealed interface Event {
     @SerialName("stickers")
     data class Stickers(
         val pack_list: List<StickerPack>,
+    ) : Event
+
+    /** Where someone sharing a chat is, on every change, or the answer to `Command.PresenceOf`. */
+    @Serializable
+    @SerialName("presence")
+    data class Presence(
+        val presence: PresenceItem,
+    ) : Event
+
+    /** This account's settings, opened, whenever they change here or on the server. */
+    @Serializable
+    @SerialName("kv")
+    data class Kv(
+        val setting_list: List<Setting>,
     ) : Event
 
     /** One sticker's WebP, as base64. Not encrypted: everyone on the server can see it. */

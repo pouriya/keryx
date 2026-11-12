@@ -56,6 +56,11 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.core.content.FileProvider
+import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
 import java.nio.ByteBuffer
 import java.util.Locale
 
@@ -106,8 +111,14 @@ class MainActivity : ComponentActivity() {
     private val people = mutableStateMapOf<String, AccountBrief>()
     private val me = mutableStateOf<String?>(null)
 
-    /** The open account's theme, kept in its folder: true dark, false light, null the phone's. */
-    private val theme = mutableStateOf<Boolean?>(null)
+    /** The open account's settings from `kv`, opened, with a copy kept in its folder for a start offline. */
+    private val settings = mutableStateMapOf<String, JsonElement>()
+
+    /** A language from `kv` that waits for the call to end, since changing it rebuilds the screen. */
+    private var pendingLanguage: String? = null
+
+    /** Set while a new account sets up its words, so its first language is the welcome screen's. */
+    private var freshAccount = false
 
     /** True for a moment as each connection try starts, so Connecting… drops its dots and shows a retry. */
     private val trying = mutableStateOf(false)
@@ -256,7 +267,13 @@ class MainActivity : ComponentActivity() {
                     Place.Welcome, Place.Chats -> Unit
                 }
             }
-            CompositionLocalProvider(LocalDark provides theme.value, LocalTrying provides trying.value) {
+            val dark =
+                when ((settings["theme"] as? JsonPrimitive)?.contentOrNull) {
+                    "dark" -> true
+                    "light" -> false
+                    else -> null
+                }
+            CompositionLocalProvider(LocalDark provides dark, LocalTrying provides trying.value) {
                 MaterialTheme(colorScheme = if (isDark()) darkColorScheme() else lightColorScheme()) {
                     CompositionLocalProvider(LocalProfiles provides profiles) { Screen(joined) }
                 }
@@ -379,7 +396,10 @@ class MainActivity : ComponentActivity() {
                                 onBack = { profileOf.value = null },
                                 onDevices = {},
                                 onLogOut = ::logOut,
-                                onTheme = ::setTheme,
+                                theme = (settings["theme"] as? JsonPrimitive)?.contentOrNull ?: "system",
+                                onTheme = { setSetting("theme", JsonPrimitive(it)) },
+                                language = language.value,
+                                onLanguage = { setSetting("lang", JsonPrimitive(it)) },
                             )
                         }
                     }
@@ -434,26 +454,79 @@ class MainActivity : ComponentActivity() {
         val base = vault.note("server") ?: return
         val last = vault.note("last") ?: return
         if (last !in vault.accounts(base) || vault.get(base, last, "token") == null) return
-        loadTheme(base, last)
+        loadSettings(base, last)
         place.value = Place.Chats
         linkState.value = if (netUp) Link.Connecting else Link.Waiting
         engine.openLast(base)
         if (linkState.value == Link.Connecting) probe()
     }
 
-    /** This account's theme from its folder, so the list opens in it before the engine says who it is. */
-    private fun loadTheme(
+    /**
+     * This account's settings from the copy in its folder, so the list opens in its theme before the
+     * engine says who it is, and offline. The phone keeps a copy of the whole `kv`, chosen by the author.
+     */
+    private fun loadSettings(
         base: String,
         account: String?,
     ) {
-        theme.value = account?.let { vault.get(base, it, "theme") }?.singleOrNull()?.let { it == DARK }
+        settings.clear()
+        val kept = account?.let { vault.get(base, it, "kv") } ?: return
+        val list =
+            try {
+                wire.decodeFromString(ListSerializer(Setting.serializer()), kept.toString(Charsets.UTF_8))
+            } catch (_: IllegalArgumentException) {
+                return
+            }
+        for (setting in list) settings[setting.key] = setting.value
     }
 
-    /** The switch on your own profile: saved for this account only, on this phone. */
-    private fun setTheme(dark: Boolean) {
-        val account = me.value ?: return
-        vault.put(server.value, account, "theme", byteArrayOf(if (dark) DARK else LIGHT))
-        theme.value = dark
+    /** `kv`'s settings as core opened them: kept as this account's copy, and its language applied. */
+    private fun settingsChanged(list: List<Setting>) {
+        settings.clear()
+        for (setting in list) settings[setting.key] = setting.value
+        me.value?.let { vault.put(server.value, it, "kv", wire.encodeToString(ListSerializer(Setting.serializer()), list).toByteArray()) }
+        val code = (settings["lang"] as? JsonPrimitive)?.contentOrNull?.takeIf { it == "en" || it == "fa" } ?: return
+        if (code == language.value) {
+            pendingLanguage = null
+        } else if (session.value != null) {
+            // A call is never cut by another device's language, chosen by the author.
+            pendingLanguage = code
+        } else {
+            switchLanguage(code)
+        }
+    }
+
+    /** One setting of this account, shown at once and kept by core until the server takes it. */
+    private fun setSetting(
+        key: String,
+        value: JsonElement,
+    ) = engine.send(Command.Kv(set = listOf(Setting(key, value))))
+
+    /** Kept as the plain note the next start reads, and the activity is built again so the screen mirrors. */
+    private fun switchLanguage(code: String) {
+        pendingLanguage = null
+        vault.setNote("lang", code)
+        recreate()
+    }
+
+    /** A sticker just sent goes first in Recent, at most 20, as `recent.stickers` in `kv`. */
+    private fun recentSticker(id: String) {
+        val now = recentStickers()
+        val next = (listOf(id) + now.filter { it != id }).take(RECENT_STICKERS)
+        if (next != now) setSetting("recent.stickers", JsonArray(next.map(::JsonPrimitive)))
+    }
+
+    private fun recentStickers(): List<String> =
+        (settings["recent.stickers"] as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }.orEmpty()
+
+    override fun onStart() {
+        super.onStart()
+        engine.inApp(true)
+    }
+
+    override fun onStop() {
+        engine.inApp(false)
+        super.onStop()
     }
 
     /** Each try drops the title's dots for half a second, chosen by the author. */
@@ -471,7 +544,7 @@ class MainActivity : ComponentActivity() {
     /** The list closes with nothing said. The address stays. The name and the password do not. */
     private fun leaveForLogin() {
         profileOf.value = null
-        theme.value = null
+        settings.clear()
         probeGen++
         leaving = false
         username.value = ""
@@ -964,8 +1037,13 @@ class MainActivity : ComponentActivity() {
             }
             is Event.SignedIn -> {
                 me.value = event.account
-                loadTheme(server.value, event.account)
+                loadSettings(server.value, event.account)
                 if (event.device != null) words.value = null
+                // A new account takes the welcome screen's language as its first value, chosen by the author.
+                if (event.device != null && freshAccount) {
+                    freshAccount = false
+                    setSetting("lang", JsonPrimitive(language.value))
+                }
                 busy.value = false
                 afterCheck = After.None
                 if (event.device != null && (place.value == Place.Words || place.value == Place.Setup)) {
@@ -992,7 +1070,9 @@ class MainActivity : ComponentActivity() {
                 if (linkState.value == Link.Connecting && place.value == Place.Chats) probe()
             }
             is Event.Account -> people[event.account.id] = event.account
+            is Event.Kv -> settingsChanged(event.setting_list)
             is Event.NeedWords -> {
+                freshAccount = !event.restore
                 busy.value = false
                 afterCheck = After.None
                 wordsRestore.value = event.restore
@@ -1120,7 +1200,8 @@ class MainActivity : ComponentActivity() {
                 unreadCounts.clear()
                 chosen.value = null
                 me.value = null
-                theme.value = null
+                settings.clear()
+                pendingLanguage = null
                 if (place.value != Place.Welcome) {
                     val own = leaving
                     leaving = false
@@ -1183,6 +1264,7 @@ class MainActivity : ComponentActivity() {
                 session.value?.close()
                 session.value = null
                 window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                pendingLanguage?.let(::switchLanguage)
             }
             else -> Unit
         }
@@ -1390,9 +1472,13 @@ class MainActivity : ComponentActivity() {
                         val packs = stickerPacks.value
                         stickersGone[id] == true || (packs != null && packs.none { pack -> pack.sticker_list.any { it.id == id } })
                     },
+                    recent = recentStickers(),
                 ),
             onStickers = { engine.send(Command.Stickers) },
-            onSticker = { id, reply -> engine.send(Command.SendSticker(chat, id, reply?.let(::pointer))) },
+            onSticker = { id, reply ->
+                engine.send(Command.SendSticker(chat, id, reply?.let(::pointer)))
+                recentSticker(id)
+            },
             onAnswer = { question, answer, editing ->
                 val tree = question.question
                 if (tree != null) {
@@ -1535,6 +1621,5 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-/** How a theme is kept in the account's folder: one byte. */
-private const val DARK: Byte = 1
-private const val LIGHT: Byte = 0
+/** The most stickers `recent.stickers` keeps, as core's `RECENT_STICKERS`. */
+private const val RECENT_STICKERS = 20

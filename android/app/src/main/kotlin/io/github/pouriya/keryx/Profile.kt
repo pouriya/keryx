@@ -51,8 +51,8 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.Switch
-import androidx.compose.material3.SwitchDefaults
+import androidx.compose.material3.RadioButton
+import androidx.compose.material3.RadioButtonDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -61,6 +61,7 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -117,6 +118,11 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
+import java.time.Instant
+import java.time.LocalDate
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import java.time.format.FormatStyle
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -161,6 +167,9 @@ internal class Profiles(
     val saves = mutableStateOf(0)
     val refusal = mutableStateOf<Event.Error?>(null)
 
+    /** Where each person is, from the server; dropped while this device is offline, as it cannot know. */
+    val presence = mutableStateMapOf<String, PresenceItem>()
+
     /** A new photo while it goes up, drawn on your page with a turning ring. */
     val uploading = mutableStateOf<ImageBitmap?>(null)
     private var me: String? = null
@@ -181,6 +190,8 @@ internal class Profiles(
                     shown[it.account] = it.copy(username = event.account.username, display_name = event.account.display_name)
                 }
             is Event.Photo -> bump(event.photo)
+            is Event.Presence -> presence[event.presence.account] = event.presence
+            is Event.Offline -> presence.clear()
             is Event.ProfileSaved -> {
                 saving.value = false
                 uploading.value = null
@@ -195,6 +206,7 @@ internal class Profiles(
                 }
             is Event.LoggedOut -> {
                 shown.clear()
+                presence.clear()
                 kept.clear()
                 me = null
                 saving.value = false
@@ -232,7 +244,11 @@ internal class Profiles(
         id: String,
     ) = engine.photo(account, id)
 
-    fun open(account: String) = engine.send(Command.Profile(account))
+    fun open(account: String) {
+        engine.send(Command.Profile(account))
+        // Someone sharing no chat is asked about once, as the root AGENTS.md says.
+        if (account != me && account !in presence) engine.send(Command.PresenceOf(account))
+    }
 
     /** Sends an editor's change, which closes it once saved or shows the refusal. */
     fun save(command: Command) {
@@ -328,7 +344,10 @@ internal fun ProfileScreen(
     onBack: () -> Unit,
     onDevices: () -> Unit,
     onLogOut: () -> Unit,
-    onTheme: (Boolean) -> Unit,
+    theme: String,
+    onTheme: (String) -> Unit,
+    language: String,
+    onLanguage: (String) -> Unit,
 ) {
     val profiles = LocalProfiles.current ?: return
     val dark = isDark()
@@ -410,7 +429,7 @@ internal fun ProfileScreen(
                     { viewing = it },
                     onDevices,
                     onLogOut,
-                    onTheme,
+                    Looks(theme, onTheme, language, onLanguage),
                 )
             }
         }
@@ -441,9 +460,10 @@ private fun Page(
     onFull: (String) -> Unit,
     onDevices: () -> Unit,
     onLogOut: () -> Unit,
-    onTheme: (Boolean) -> Unit,
+    looks: Looks,
 ) {
     val clipboard = LocalClipboardManager.current
+    var choosing by remember { mutableStateOf<String?>(null) }
     val uri = LocalUriHandler.current
     val copied = stringResource(R.string.chat_copied)
     var toast by remember { mutableStateOf<String?>(null) }
@@ -497,6 +517,10 @@ private fun Page(
                                         style = TextStyle(textDirection = TextDirection.Ltr),
                                     )
                                 }
+                                val state = profiles.presence[account]?.state
+                                presenceState(state)?.let {
+                                    Text(it, Modifier.padding(top = 4.dp), color = presenceTone(state) ?: ink.muted, fontSize = 15.sp)
+                                }
                             }
                         }
                         val links = profile?.link_list.orEmpty()
@@ -532,13 +556,27 @@ private fun Page(
                                 ) { onEdit(Editing.Links) }
                             }
                             Spacer(Modifier.fillMaxWidth().height(8.dp).background(band))
-                            val dark = isDark()
-                            Line(Glyphs.moon, stringResource(R.string.profile_dark), null, null, ink, trailing = {
-                                Switch(dark, onTheme, colors = SwitchDefaults.colors(checkedTrackColor = accent))
-                            }) { onTheme(!dark) }
+                            Line(
+                                Glyphs.globe,
+                                languageName(looks.language),
+                                stringResource(R.string.profile_language),
+                                null,
+                                ink,
+                            ) { choosing = "lang" }
+                            Line(
+                                Glyphs.moon,
+                                themeName(looks.theme),
+                                stringResource(R.string.profile_theme),
+                                null,
+                                ink,
+                            ) { choosing = "theme" }
                             Line(Glyphs.devices, stringResource(R.string.devices), null, null, ink, onClick = onDevices)
                             Line(Glyphs.out, stringResource(R.string.log_out), null, null, ink, danger = true, onClick = onLogOut)
                         } else {
+                            offlineTimes(profiles.presence[account])?.let { times ->
+                                PresenceLines(times, ink)
+                                Spacer(Modifier.fillMaxWidth().height(8.dp).background(band))
+                            }
                             profile?.bio?.let { bio ->
                                 Line(Glyphs.info, bio, stringResource(R.string.profile_bio), null, ink, onClick = null)
                             }
@@ -551,6 +589,30 @@ private fun Page(
                     }
                 }
             }
+        }
+        when (choosing) {
+            "lang" ->
+                Choices(
+                    stringResource(R.string.profile_language),
+                    listOf("en" to languageName("en"), "fa" to languageName("fa")),
+                    looks.language,
+                    ink,
+                    { choosing = null },
+                ) {
+                    choosing = null
+                    looks.onLanguage(it)
+                }
+            "theme" ->
+                Choices(
+                    stringResource(R.string.profile_theme),
+                    listOf("system", "light", "dark").map { it to themeName(it) },
+                    looks.theme,
+                    ink,
+                    { choosing = null },
+                ) {
+                    choosing = null
+                    looks.onTheme(it)
+                }
         }
         toast?.let {
             Text(
@@ -568,6 +630,27 @@ private fun Page(
         }
     }
 }
+
+/** Your own page's Language and Theme lines: kv's `lang` and `theme`, and what changes them. */
+internal class Looks(
+    val theme: String,
+    val onTheme: (String) -> Unit,
+    val language: String,
+    val onLanguage: (String) -> Unit,
+)
+
+/** Each language in its own words, so it can be found whichever is on. */
+private fun languageName(code: String) = if (code == "fa") "فارسی" else "English"
+
+@Composable
+private fun themeName(theme: String) =
+    stringResource(
+        when (theme) {
+            "light" -> R.string.theme_light
+            "dark" -> R.string.theme_dark
+            else -> R.string.theme_system
+        },
+    )
 
 /** The page's photo, 128 dp, chosen by the author. */
 private val HEAD = 128.dp
@@ -627,6 +710,15 @@ private fun Head(
             }
         } else {
             Avatar(account, name, HEAD, Modifier.clip(CircleShape).then(tap))
+        }
+        if (!mine) {
+            PresenceDot(
+                profiles.presence[account]?.state,
+                14.dp,
+                3.dp,
+                ink.page,
+                Modifier.align(Alignment.BottomEnd).offset((-6).dp, (-6).dp),
+            )
         }
         if (mine) {
             val label = stringResource(R.string.profile_change_photo)
@@ -1391,6 +1483,10 @@ internal object Glyphs {
     val copy = listOf(box(8f, 8f, 12f, 12f, 2f), "M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2")
     val star = listOf("M12 4l2.4 5 5.6.8-4 3.9.9 5.5L12 16.6 7.1 19.2 8 13.7 4 9.8l5.6-.8z")
     val edit = listOf("M4 20h4L19 9l-4-4L4 16z")
+    val clock = listOf(circle(12f, 12f, 9f), "M12 7v5l3 2")
+    val eye = listOf("M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z", circle(12f, 12f, 3f))
+    val plug = listOf("M5 9a10 10 0 0 1 14 0", "M8 12.5a5.5 5.5 0 0 1 8 0", circle(12f, 16.5f, 1.3f))
+    val globe = listOf(circle(12f, 12f, 9f), "M3 12h18", "M12 3a14 14 0 0 1 0 18a14 14 0 0 1 0-18")
 }
 
 @Composable
@@ -1407,6 +1503,163 @@ internal fun Glyph(
             for (path in parsed) {
                 if (filled) drawPath(path, color)
                 drawPath(path, color, style = Stroke(width, cap = StrokeCap.Round, join = StrokeJoin.Round))
+            }
+        }
+    }
+}
+
+/** Each state's dot, from `tmp/design/presence.html`: green online, red in a call, orange away. */
+internal fun presenceTone(state: String?): Color? =
+    when (state) {
+        "online" -> Color(0xFF2EAD5B)
+        "call" -> Color(0xFFD94040)
+        "away" -> Color(0xFFE8912D)
+        else -> null
+    }
+
+/**
+ * The dot on a person's photo, with a thin ring of the background's colour: 9 dp on the list's 48 dp
+ * photo, 8 dp on the header's 40 dp and 14 dp on the profile's, chosen by the author. Nothing while
+ * offline or hidden.
+ */
+@Composable
+internal fun PresenceDot(
+    state: String?,
+    dot: Dp,
+    ring: Dp,
+    page: Color,
+    modifier: Modifier = Modifier,
+) {
+    val tone = presenceTone(state) ?: return
+    Box(
+        modifier
+            .size(dot + ring * 2)
+            .clip(CircleShape)
+            .background(page)
+            .padding(ring)
+            .clip(CircleShape)
+            .background(tone),
+    )
+}
+
+/** The clock, read again every 30 seconds, so "4m ago" moves on. */
+@Composable
+internal fun rememberNow(): Long {
+    val now by produceState(System.currentTimeMillis()) {
+        while (true) {
+            delay(30_000)
+            value = System.currentTimeMillis()
+        }
+    }
+    return now
+}
+
+private fun timeText(at: Long): String =
+    DateTimeFormatter.ofLocalizedTime(FormatStyle.SHORT).format(Instant.ofEpochMilli(at).atZone(ZoneId.systemDefault()))
+
+private fun dayOf(at: Long): LocalDate = Instant.ofEpochMilli(at).atZone(ZoneId.systemDefault()).toLocalDate()
+
+/** "3 Nov", with the year only when it is not this one. */
+private fun dateText(at: Long): String {
+    val day = dayOf(at)
+    val pattern = if (day.year == LocalDate.now().year) "d MMM" else "d MMM yyyy"
+    return DateTimeFormatter.ofPattern(pattern).format(day)
+}
+
+/**
+ * A direct chat's header line: the state's word, or offline "active" and when they were last in the
+ * app, chosen by the author: minutes for the first hour, then the time, yesterday and the time, or
+ * the date and time. Null when nothing may be shown, and the @username stays.
+ */
+@Composable
+internal fun presenceLine(item: PresenceItem?): String? {
+    item ?: return null
+    when (item.state) {
+        "online" -> return stringResource(R.string.presence_online)
+        "call" -> return stringResource(R.string.presence_call)
+        "away" -> return stringResource(R.string.presence_away)
+    }
+    val at = item.in_app_at ?: return null
+    val now = rememberNow()
+    val minutes = (now - at) / 60_000
+    val today = LocalDate.now()
+    return when {
+        minutes < 60 -> stringResource(R.string.presence_active_ago, minutes.coerceAtLeast(1).toInt())
+        dayOf(at) == today -> stringResource(R.string.presence_active_at, timeText(at))
+        dayOf(at) == today.minusDays(1) -> stringResource(R.string.presence_active_yesterday, timeText(at))
+        else -> stringResource(R.string.presence_active_at, "${dateText(at)} ${timeText(at)}")
+    }
+}
+
+/** The profile's state under the @username, in the dot's colour. */
+@Composable
+internal fun presenceState(state: String?): String? =
+    when (state) {
+        "online" -> stringResource(R.string.presence_state_online)
+        "call" -> stringResource(R.string.presence_state_call)
+        "away" -> stringResource(R.string.presence_state_away)
+        else -> null
+    }
+
+/** A profile line's full day and time, with how long ago inside the first hour. */
+@Composable
+private fun presenceWhen(at: Long): String {
+    val now = rememberNow()
+    val today = LocalDate.now()
+    val day =
+        when (dayOf(at)) {
+            today -> stringResource(R.string.presence_today, timeText(at))
+            today.minusDays(1) -> stringResource(R.string.presence_yesterday, timeText(at))
+            else -> stringResource(R.string.presence_on, dateText(at), timeText(at))
+        }
+    val minutes = (now - at) / 60_000
+    return if (minutes < 60) stringResource(R.string.presence_ago, day, minutes.coerceAtLeast(1).toInt()) else day
+}
+
+/**
+ * Offline, the times the profile's Active and Connected lines show, or null for none. Connected is left
+ * out when Active shows and is the same or later, chosen by the author, since it then says nothing more.
+ */
+private fun offlineTimes(item: PresenceItem?): Pair<Long?, Long?>? {
+    item ?: return null
+    if (presenceTone(item.state) != null) return null
+    val active = item.in_app_at
+    val connected = item.connected_at?.takeIf { active == null || it > active }
+    return if (active == null && connected == null) null else active to connected
+}
+
+@Composable
+private fun PresenceLines(
+    times: Pair<Long?, Long?>,
+    ink: Ink,
+) {
+    times.first?.let { Line(Glyphs.eye, presenceWhen(it), stringResource(R.string.presence_active), null, ink, onClick = null) }
+    times.second?.let { Line(Glyphs.plug, presenceWhen(it), stringResource(R.string.presence_connected), null, ink, onClick = null) }
+}
+
+/** A small list of choices in the middle of the screen; a tap chooses and closes it. */
+@Composable
+private fun Choices(
+    title: String,
+    options: List<Pair<String, String>>,
+    chosen: String,
+    ink: Ink,
+    onCancel: () -> Unit,
+    onChoose: (String) -> Unit,
+) {
+    Dialog(isDark(), onCancel) {
+        Text(title, Modifier.padding(bottom = 8.dp), color = ink.text, fontSize = 17.sp, fontWeight = FontWeight.Bold)
+        for ((value, label) in options) {
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(10.dp))
+                    .clickable(role = Role.RadioButton) { onChoose(value) }
+                    .padding(vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                RadioButton(value == chosen, { onChoose(value) }, colors = RadioButtonDefaults.colors(selectedColor = accent))
+                Text(label, color = ink.text, fontSize = 16.sp)
             }
         }
     }

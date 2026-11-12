@@ -1103,6 +1103,9 @@ private fun Conversation(
                     Modifier
                 },
             )
+            if (row.type == DIRECT && person != null && !(selecting && selected)) {
+                PresenceDot(LocalProfiles.current?.presence?.get(person)?.state, 9.dp, 2.dp, ink.page, Modifier.align(Alignment.BottomEnd))
+            }
             if (selecting && selected) {
                 Box(
                     Modifier
@@ -1703,7 +1706,7 @@ private val badgeText =
 
 /** A box in the middle, above the keyboard, over a dimmed screen. */
 @Composable
-private fun Dialog(
+internal fun Dialog(
     dark: Boolean,
     onCancel: () -> Unit,
     content: @Composable () -> Unit,
