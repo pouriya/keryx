@@ -115,8 +115,10 @@ code is looked at again when calls are built.
   under the options modal, with no double tap; the row shows the newest of `recent.reactions` first,
   then 👍 ❤️ 😂 😮 😢 🙏 not already there, six in all, then +; a reaction shows as a chip inside the
   bubble under its text, one per emoji with its count, yours tinted; tapping your chip removes it and
-  tapping another adds the same. **Still to ask:** what + opens (Google's `emoji2-emojipicker`, a new
-  dependency, or a grid keryx draws from its own list), and whether a person has one reaction per
-  message or several
+  tapping another adds the same. **A person may put several reactions on one message, chosen by the
+  author**, each its own reaction message, so tapping one of yours removes only that one. **+ opens a
+  picker whose emoji list comes from core, through the `emojis` crate, chosen by the author**, so web
+  and desktop show the same set later; each client draws its own grid. How core hands it over, and the
+  picker's look, are still to ask
 - The folder layout and code style, once the first slice works
 - Release signing, the store, and how the app reaches people
