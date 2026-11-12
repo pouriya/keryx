@@ -146,6 +146,7 @@ impl Server {
             (method, body) => {
                 let mut request = match method {
                     "PUT" => agent.put(&url),
+                    "PATCH" => agent.patch(&url),
                     _ => agent.post(&url),
                 };
                 if token.is_some() {

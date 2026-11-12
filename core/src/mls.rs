@@ -44,6 +44,7 @@ const DRAFT_LABEL: &[u8] = b"keryx v1 draft";
 const PROFILE_KEY_LABEL: &[u8] = b"keryx v1 profile key";
 const PROFILE_LABEL: &[u8] = b"keryx v1 profile";
 const FOLDER_NAME_LABEL: &[u8] = b"keryx v1 folder name";
+const KV_LABEL: &[u8] = b"keryx v1 kv";
 const BODY_VERSION: u8 = 1;
 /// The account id, device id, master public key and stamp.
 const CREDENTIAL_SIZE: usize = 128;
@@ -444,6 +445,16 @@ fn folder_name_data(account: Ulid, folder: Ulid) -> Vec<u8> {
     data.extend_from_slice(FOLDER_NAME_LABEL);
     data.extend_from_slice(account.bytes());
     data.extend_from_slice(folder.bytes());
+    data
+}
+
+/// **Permanent:** one setting's associated data, which binds it to its account and its name, so a
+/// server cannot move a value to another setting or another account.
+fn kv_data(account: Ulid, key: &str) -> Vec<u8> {
+    let mut data = Vec::with_capacity(KV_LABEL.len() + 16 + key.len());
+    data.extend_from_slice(KV_LABEL);
+    data.extend_from_slice(account.bytes());
+    data.extend_from_slice(key.as_bytes());
     data
 }
 
@@ -1433,6 +1444,24 @@ impl Device {
             return Err(MlsError::NoProfileKey { account });
         };
         open_under(profile_key, &folder_name_data(account, folder), sealed)
+    }
+
+    /// One of this account's settings, sealed under its profile key like a folder name: unsigned, as
+    /// only this account's own devices ever read it.
+    pub fn seal_kv(&self, key: &str, plaintext: &[u8]) -> Result<Vec<u8>, MlsError> {
+        let account = self.record.account;
+        let Some(profile_key) = self.profile_keys.get(&account) else {
+            return Err(MlsError::NoProfileKey { account });
+        };
+        seal_under(profile_key, &kv_data(account, key), plaintext)
+    }
+
+    pub fn open_kv(&self, key: &str, sealed: &[u8]) -> Result<Zeroizing<Vec<u8>>, MlsError> {
+        let account = self.record.account;
+        let Some(profile_key) = self.profile_keys.get(&account) else {
+            return Err(MlsError::NoProfileKey { account });
+        };
+        open_under(profile_key, &kv_data(account, key), sealed)
     }
 
     /// Sign an unencrypted message, whose body is its content.

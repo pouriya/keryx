@@ -13,17 +13,17 @@ use std::time::Duration;
 use keryx_core::protocol::{
     AccountBrief, Bytes, CallEvent, CallEventKind, ChatDevice, ChatFolders, ChatItem, ChatMode,
     ChatType, ContentKind, DeviceItem, DeviceLogItem, DraftItem, FolderItem, KeyPackageItem, Kind,
-    MarkItem, MessageFrame, ProfileKeyItem, ProfileReply, SessionItem, SignedProfile, StickerItem,
-    StickerPack, SyncPosition, TimesItem, WrapEntry,
+    KvChange, KvItem, KvReply, MarkItem, MessageFrame, ProfileKeyItem, ProfileReply, SessionItem,
+    SignedProfile, StickerItem, StickerPack, SyncPosition, TimesItem, WrapEntry,
 };
 use keryx_core::ulid::Ulid;
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
 use super::{
     Account, Appended, BuiltInRole, ChatAccess, DeviceKey, DeviceUsage, Error, GroupInfoPut,
-    MessageBrief, NamesSaved, NewAccount, NewDevice, NewFile, NewMessage, NewNames, NewPhoto,
-    NewProfile, NewSession, NewSticker, NewWrap, Position, PositionReport, ProfileSaved,
-    Registered, Result, Session, SetupLink, Storage, StoredFile, SyncFrom, SyncPage,
+    KvChanged, MessageBrief, NamesSaved, NewAccount, NewDevice, NewFile, NewMessage, NewNames,
+    NewPhoto, NewProfile, NewSession, NewSticker, NewWrap, Position, PositionReport, PresenceTimes,
+    ProfileSaved, Registered, Result, Session, SetupLink, Storage, StoredFile, SyncFrom, SyncPage,
 };
 
 /// How long a connection waits for a lock another process holds, such as a backup.
@@ -133,6 +133,37 @@ impl Sqlite {
 /// A sequence id or epoch as SQLite holds it. A larger number than any stored can match nothing.
 fn int(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+/// An account's settings: their version, and the whole set unless the version is `known`.
+fn kv_of(connection: &Connection, account: Ulid, known: Option<u64>) -> rusqlite::Result<KvReply> {
+    let version: i64 = connection.query_row(
+        "SELECT kv_version FROM account WHERE id = ?1",
+        params![account.bytes()],
+        |row| row.get(0),
+    )?;
+    let version = u64::try_from(version).unwrap_or(0);
+    if known == Some(version) {
+        return Ok(KvReply {
+            version,
+            kv_list: None,
+        });
+    }
+    let mut statement =
+        connection.prepare("SELECT key, value FROM kv WHERE account_id = ?1 ORDER BY key")?;
+    let mut kv_list = Vec::new();
+    for item in statement.query_map(params![account.bytes()], |row| {
+        Ok(KvItem {
+            key: row.get(0)?,
+            value: Bytes(row.get(1)?),
+        })
+    })? {
+        kv_list.push(item?);
+    }
+    Ok(KvReply {
+        version,
+        kv_list: Some(kv_list),
+    })
 }
 
 /// Ids stored side by side, 16 bytes each, as a folder's chats and pins are.
@@ -1136,6 +1167,99 @@ impl Storage for Sqlite {
                 params![id.bytes(), now],
             )?;
             Ok(())
+        })
+        .await
+    }
+
+    async fn device_presence(
+        &self,
+        id: Ulid,
+        connected_at: Option<i64>,
+        in_app_at: Option<i64>,
+    ) -> Result<()> {
+        self.write(move |connection| {
+            connection.execute(
+                "UPDATE device SET last_connected_at = coalesce(?2, last_connected_at),
+                 last_in_app_at = coalesce(?3, last_in_app_at) WHERE id = ?1",
+                params![id.bytes(), connected_at, in_app_at],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn presence_times(&self, account_list: Vec<Ulid>) -> Result<Vec<PresenceTimes>> {
+        self.read(move |connection| {
+            let mut statement = connection.prepare(
+                "SELECT max(last_connected_at), max(last_in_app_at) FROM device
+                 WHERE account_id = ?1",
+            )?;
+            let mut times = Vec::with_capacity(account_list.len());
+            for account in account_list {
+                let (connected_at, in_app_at) = statement
+                    .query_row(params![account.bytes()], |row| {
+                        Ok((row.get(0)?, row.get(1)?))
+                    })?;
+                times.push(PresenceTimes {
+                    account,
+                    connected_at,
+                    in_app_at,
+                });
+            }
+            Ok(times)
+        })
+        .await
+    }
+
+    async fn kv(&self, account: Ulid, known: Option<u64>) -> Result<KvReply> {
+        self.read(move |connection| kv_of(connection, account, known))
+            .await
+    }
+
+    async fn change_kv(&self, account: Ulid, change: KvChange, max_keys: u64) -> Result<KvChanged> {
+        self.write(move |connection| {
+            let version: i64 = connection.query_row(
+                "SELECT kv_version FROM account WHERE id = ?1",
+                params![account.bytes()],
+                |row| row.get(0),
+            )?;
+            let version = u64::try_from(version).unwrap_or(0);
+            if version != change.version {
+                return Ok(KvChanged::Stale(kv_of(connection, account, None)?));
+            }
+            let mut key_set: HashSet<String> = HashSet::new();
+            let mut statement = connection.prepare("SELECT key FROM kv WHERE account_id = ?1")?;
+            for key in statement.query_map(params![account.bytes()], |row| row.get(0))? {
+                key_set.insert(key?);
+            }
+            for key in &change.remove {
+                key_set.remove(key);
+            }
+            for item in &change.set {
+                key_set.insert(item.key.clone());
+            }
+            if u64::try_from(key_set.len()).unwrap_or(u64::MAX) > max_keys {
+                return Ok(KvChanged::TooMany);
+            }
+            for key in &change.remove {
+                connection.execute(
+                    "DELETE FROM kv WHERE account_id = ?1 AND key = ?2",
+                    params![account.bytes(), key],
+                )?;
+            }
+            for item in &change.set {
+                connection.execute(
+                    "INSERT INTO kv (account_id, key, value) VALUES (?1, ?2, ?3)
+                     ON CONFLICT (account_id, key) DO UPDATE SET value = excluded.value",
+                    params![account.bytes(), item.key, item.value.0],
+                )?;
+            }
+            let version = version + 1;
+            connection.execute(
+                "UPDATE account SET kv_version = ?2 WHERE id = ?1",
+                params![account.bytes(), int(version)],
+            )?;
+            Ok(KvChanged::Saved(version))
         })
         .await
     }

@@ -5,8 +5,9 @@ use std::future::Future;
 
 use keryx_core::protocol::{
     AccountBrief, CallEvent, ChatDevice, ChatFolders, ChatItem, ChatMode, ChatType, ContentKind,
-    DeviceItem, DraftItem, KeyPackageItem, Kind, MarkItem, MessageFrame, ProfileKeyItem,
-    ProfileReply, SessionItem, StickerItem, StickerPack, SyncPosition, TimesItem, WrapEntry,
+    DeviceItem, DraftItem, KeyPackageItem, Kind, KvChange, KvReply, MarkItem, MessageFrame,
+    ProfileKeyItem, ProfileReply, SessionItem, StickerItem, StickerPack, SyncPosition, TimesItem,
+    WrapEntry,
 };
 use keryx_core::ulid::Ulid;
 
@@ -21,6 +22,23 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// One account's presence times, the newest over its devices.
+pub struct PresenceTimes {
+    pub account: Ulid,
+    pub connected_at: Option<i64>,
+    pub in_app_at: Option<i64>,
+}
+
+/// What became of a change to an account's settings.
+pub enum KvChanged {
+    /// Saved, under this new version.
+    Saved(u64),
+    /// Based on an older version: the server's, which wins.
+    Stale(KvReply),
+    /// It would leave the account with more keys than it may have.
+    TooMany,
+}
 
 /// One of the built-in roles, which are only ever added when missing.
 pub struct BuiltInRole {
@@ -442,6 +460,31 @@ pub trait Storage: Send + Sync + 'static {
     fn device_offline(&self, id: Ulid, now: i64) -> impl Future<Output = Result<()>> + Send;
     /// Closes every open row. At startup these are what a crash left, and at shutdown what is left.
     fn close_device_logs(&self, now: i64) -> impl Future<Output = Result<()>> + Send;
+    /// Writes a device's presence times. A `None` leaves its column as it is.
+    fn device_presence(
+        &self,
+        id: Ulid,
+        connected_at: Option<i64>,
+        in_app_at: Option<i64>,
+    ) -> impl Future<Output = Result<()>> + Send;
+    /// Each account's newest last-connected and last-in-app times over its devices. An account with
+    /// no device, or none that ever announced itself, has none.
+    fn presence_times(
+        &self,
+        account_list: Vec<Ulid>,
+    ) -> impl Future<Output = Result<Vec<PresenceTimes>>> + Send;
+
+    /// This account's settings: their version, and the whole set unless the version is `known`.
+    fn kv(&self, account: Ulid, known: Option<u64>)
+    -> impl Future<Output = Result<KvReply>> + Send;
+    /// Applies a change based on its version, in one step: refused with the whole set when the
+    /// account has moved on, and with nothing changed when it would hold more than `max_keys`.
+    fn change_kv(
+        &self,
+        account: Ulid,
+        change: KvChange,
+        max_keys: u64,
+    ) -> impl Future<Output = Result<KvChanged>> + Send;
 
     /// The new total, or `None` if the upload would pass `limit` and nothing was saved.
     fn add_key_packages(

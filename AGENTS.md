@@ -854,10 +854,11 @@ holds it in memory only for that request and sends it back in its answer, so req
 match over one socket: a `send` gets its sequence id this way, and a `sync` its pages. **The
 server never stores a client's ULID, and it is not in the signed header.** What is saved goes by
 its sequence id, from 1. REST carries the same bodies. A client sends `send`,
-`seen`, `received`, `typing`, `sync`, `group_info`, `wraps`, `profile_keys`, `call_event`, `times`, `draft`, `folder_id`, `chat_folders` and `ping`. The server sends `features`, `sent`, `done`,
-`refused`, `message`, `chats`, `welcome`, `typing`, `marks`, `revoked`, `call_event`, `times`, `draft`, `folder_id`, `chat_folders`, `profile` and `profile_keys`. `group_info` and `wraps` are not
+`seen`, `received`, `typing`, `sync`, `group_info`, `wraps`, `profile_keys`, `call_event`, `times`, `draft`, `folder_id`, `chat_folders`, `presence`, `presence_of`, `kv`, `kv_set` and `ping`. The server sends `features`, `sent`, `done`,
+`refused`, `message`, `chats`, `welcome`, `typing`, `marks`, `revoked`, `call_event`, `times`, `draft`, `folder_id`, `chat_folders`, `profile`, `profile_keys`, `presence`, `presence_of` and `kv`. `group_info` and `wraps` are not
 messages, so they take no sequence id and stay out of history, and what has no sequence id is
-answered with `done`. Binary fields are standard base64 with padding, through `base64ct`, which is
+answered with `done`. **`typing` and `presence` are events, not requests, chosen by the author:** they
+carry no `ref` and get no answer. Binary fields are standard base64 with padding, through `base64ct`, which is
 already in the tree and constant-time. Kinds and modes are the schema's numbers. **A commit is a `send` with kind 3 plus its wraps, welcomes,
 epoch and group info**, so there is one path into the task. A separate type would add a second path, for
 something stored as a message anyway. Later parts add their own types.
@@ -1127,6 +1128,90 @@ Whatever is saved to show later gets the next number. Whatever is not saved gets
 message type.** Some types go first so they reach the connection quickly:
 
 | Level | What | Order |
+- **Each device keeps two times, chosen by the author: last connected and last in the app.** Last connected
+  is when it last had a live connection. Last in the app is when its person last had keryx open on screen,
+  which only the device can say, since Android keeps the connection while the app is in the background. A
+  person shows the newest of their devices.
+  - **Two server permissions, `presence.in_app` and `presence.connected`, held by member, moderator and
+    admin, chosen by the author.** `presence.in_app` covers the state too: green, red and orange. **Orange is
+    shown under `presence.in_app` as well, chosen by the author**, though it tells that a device is connected.
+    `presence.connected` covers only the Connected time. **Whoever holds one sees anyone's on the server, not
+    only people sharing a chat, chosen by the author.** **There is no switch to hide your own for now, chosen
+    by the author.**
+  - **Kept in two columns on `device`, `last_connected_at` and `last_in_app_at`, chosen by the author**, not
+    worked out from `device_session`, whose rows the log's retention deletes.
+  - **XMPP's way, chosen by the author:** a connection counts for nothing until its device sends a `presence`
+    frame `{in_app}`. **It is an event, like `typing`, with no `ref` and no answer, chosen by the author.**
+    **Before that the device is not there to others, chosen by the author**, and last connected is written at
+    that first frame and again when the connection ends. After the first one the server sends **one
+    `presence` frame per person sharing a chat, chosen by the author**, and tells those people's announced
+    devices about this one. Later frames, on every app open and close, are pushed to them the same way. **When a direct chat is made, each of its two people is sent the other's `presence` the same way, chosen by
+    the author**, since they share a chat from then on and neither may change for hours. **A connection that drops while the app is open sets last in the app to when the
+    server noticed, chosen by the author.** Red comes from the call socket the server already admits.
+  - **`PUT /api/v1/devices/{id}/presence {in_app}` does the same over REST and answers with the list,
+    chosen by the author:** `presence_list`, everyone sharing a chat.
+  - **One answer per account, chosen by the author:** `presence {account, state, in_app_at?, connected_at?}`,
+    `state` `online`, `call`, `away` or `offline`, the server merging the devices (in a call over online over
+    away, the newest times), and leaving out what the viewer's permissions hide. It never shows how many
+    devices someone has.
+  - **Someone sharing no chat is asked about once, chosen by the author:** a `presence_of {ref, account}`
+    frame answered with `presence_of {ref, presence}`, and `GET /api/v1/accounts/{id}/presence`. It is not
+    updated live.
+  - **Core sends the first `presence` on every connect, chosen by the author**, with the in-app state the
+    platform last gave it, and hands others' back as `Event::Presence`.
+  - **A dot on the person's photo shows their state, in the chat list, a direct chat's header and the
+    profile page, chosen by the author:** green while online, red while in a call, orange while away
+    (connected with the app in the background, or stepped away), and no dot while offline, when the time
+    they were last here or connected shows instead. **It is 9 dp on the list's 48 dp photo, 8 dp on the
+    header's 40 dp and 14 dp on the profile's 112 dp, with a thin ring of the background's colour, chosen by
+    the author.** **On a phone the app in the background is away; how long without input counts as away on a
+    desktop or browser is decided with that client, chosen by the author.**
+  - **A direct chat's header shows only last in the app; the profile page shows both, chosen by the
+    author.** Drawn in `tmp/design/presence.html`. **The words are short, chosen by the author:** online, in
+    a call, away, and offline "active 4m ago", "active 09:12", "active yesterday 21:40", "active 3 Nov
+    18:05", **the time always shown, in the header too, chosen by the author**, with the profile's line
+    called Active, chosen by the author over "seen". **Last connected is not shown when last in the app is
+    shown and is the same or later, chosen by the author**, since it then says nothing more.
+
+### Settings kept per account (`kv`)
+
+**Each account has a key-value store on the server, chosen by the author**, so every device shows the same
+settings.
+
+- **It holds `lang`, `theme`, the recent stickers and the recent reactions to begin with, chosen by the
+  author:** `lang` `"en"` or `"fa"`, `theme` `"light"`, `"dark"` or `"system"`, `recent.stickers` sticker
+  ids newest first, at most 20, and `recent.reactions` emoji newest first, at most 8. **Any key name of
+  `a-z`, `0-9`, `_` and `.`, 1 to 64 long, chosen by the author**, with a count limit: `[limits] kv_keys =
+  64`, and a value at most `[limits.body] kv_value = "4KiB"`.
+- **Values are bytes to the server, and the client decides what is sealed, chosen by the author.** A later
+  key the server must act on is one its code knows by name. **Core seals these four one by one with AES-GCM
+  under the profile key, chosen by the author**, associated data `keryx v1 kv`, the account id and the key
+  name, so a value cannot be moved to another key or account. The plaintext is JSON.
+- **A version number, not a hash, chosen by the author**, as the cheaper check: the server bumps one
+  counter per account on every change. **A device asks with its own frame on every connect, chosen by the
+  author:** `kv {ref, version?}`, answered with `kv {ref, version}` when equal, and with the whole set,
+  `kv_list: [{key, value}]`, and the version when not. `GET /api/v1/kv?version=N` does the same.
+- **A change names only what changed, chosen by the author:** `kv_set {ref, version, set: [{key, value}],
+  remove: [key]}`, or `PATCH /api/v1/kv` with the same body, answered with the new version. A key named
+  twice, or broken, is `bad_body`, a value over `kv_value` `body_too_large`, and a change leaving more than
+  `kv_keys` keys `too_many_keys`.
+- **The server wins, chosen by the author:** a change based on an older version is refused with
+  `kv_stale`, **and the refusal carries the whole set and its version, chosen by the author**, as
+  `call_open` carries `call_seq`, so the device takes the server's set in one round trip.
+- **The account's other online devices get only the change, chosen by the author:** `kv {from, version,
+  set, remove}`. A device on `from` applies it, and one on another version asks with `kv {version}`.
+- **Kept in a `kv` table, `account_id`, `key` and `value`, with `kv_version` on `account`, chosen by the
+  author**, written in one transaction.
+- **Core keeps the set and its version in the snapshot and asks on every connect, chosen by the author**,
+  so platforms call a set command and get `Event::Kv`.
+- **No permission, like drafts, chosen by the author:** any registered device of the account reads and
+  changes its own.
+- **After login the account's language wins, chosen by the author.** The Welcome screen's choice covers only
+  the screens before login, and a new account takes it as its first value.
+- **It is called `kv` on the wire and in the schema, chosen by the author.**
+- **Built server and core first, tested by the server's integration tests, then Android, chosen by the
+  author:** dots in the list, header and profile, the Active and Connected lines, `lang` and `theme`
+  through `kv`, and a Recent row in the sticker and reaction pickers.
 |-------|------|-------|
 | 0 | MLS commits, key changes | First |
 | 1 | Is typing, stop typing | Next |
@@ -1220,10 +1305,15 @@ GET  /api/v1/accounts?search=       directory.search -> account_list
 
 A registered device, under the limit
 POST /api/v1/key_packages           body_list -> count
+PUT  /api/v1/devices/{id}/presence  this session's own device: in_app -> presence_list
+GET  /api/v1/kv?version=            -> version, and kv_list when the version differs
+PATCH /api/v1/kv                    version, set, remove -> version, or kv_stale with the whole set
 POST /api/v1/accounts/{id}/key_packages/claim  -> key_package_list{device, body}
 POST /api/v1/chats                  chat.create_direct: account -> chat, created. Your own id gives
                                     your self chat
 GET  /api/v1/chats/{id}/group_info  member -> epoch, group_info
+GET  /api/v1/accounts/{id}/presence presence.in_app or presence.connected -> account, state?,
+                                    in_app_at?, connected_at?
 GET  /api/v1/chats/{id}/devices     member -> device_list, with ended devices and their statements
 GET  /api/v1/chats/{id}/wraps       member -> wrap_list{epoch, account, wrapped}
 POST /api/v1/chat_folders/id       folder.create -> folder, kept for this account for 5 minutes
@@ -1381,6 +1471,7 @@ accepts the first for each step. The loser gets a rejection, catches up and retr
   voice = "16KiB"
   image = "16KiB"
   music = "16KiB"
+  kv_keys = 64              # an account's settings
   video = "16KiB"
   doc = "16KiB"
   file = "16KiB"
@@ -1398,6 +1489,7 @@ accepts the first for each step. The loser gets a rejection, catches up and retr
   music = "200MiB"
   video = "2GiB"
   doc = "100MiB"
+  kv_value = "4KiB"         # one setting's value, as the client sent it
   file = "2GiB"
   sticker = "256KiB"        # one sticker's WebP. Not encrypted: everyone on the server sees it
   photo = "1MiB"            # one profile photo, sealed. An account's file, not a chat's

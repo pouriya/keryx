@@ -84,6 +84,11 @@ good.
     PUT  /chats/{id}/draft                {draft?: {epoch, body}}: keeps your sealed draft, or clears it
     POST /chat_folders/id                 -> folder: a new folder's id, yours for 5 minutes
     PUT  /chat_folders                    {folder_list, default}: your whole arrangement of folders
+    PUT  /devices/{id}/presence           this session's device: {in_app} -> presence_list
+    GET  /accounts/{id}/presence          presence.in_app or presence.connected -> account, state?,
+                                          in_app_at?, connected_at?
+    GET  /kv?version=                     -> version, and kv_list{key, value} when yours differs
+    PATCH /kv                             {version, set: [{key, value}], remove: [key]} -> version
     GET  /accounts/{id}/profile           yourself, or sharing a chat -> account, username,
                                           display_name?, version, profile?{sealed, signature,
                                           device, device_public, stamp}, photo?
@@ -135,11 +140,12 @@ itself. To check the server yourself, send a WebSocket ping, or a `ping` frame, 
 Every frame is JSON with a `type`. A request's `ref` is a ULID you make, which comes back in its answer.
 
 You send: `send`, `seen`, `received`, `typing`, `sync`, `group_info`, `wraps`, `profile_keys`,
-`call_event`, `times`, `draft`, `folder_id`, `chat_folders`, `ping`.
+`call_event`, `times`, `draft`, `folder_id`, `chat_folders`, `presence`, `presence_of`, `kv`,
+`kv_set`, `ping`.
 
 The server sends: `features`, `sent`, `done`, `refused`, `message`, `chats`, `welcome`, `typing`,
 `marks`, `revoked`, `call_event`, `times`, `draft`, `folder_id`, `chat_folders`, `profile`,
-`profile_keys`.
+`profile_keys`, `presence`, `presence_of`, `kv`.
 
 `profile` carries an `account` sharing a chat with you, or your own, with its `version`, `username` and
 `display_name`, whenever its names, photo, bio or links change. Each `chats` entry carries every
@@ -167,6 +173,19 @@ first page of `chats` carries yours in `chat_folders`. A change you may not make
 more than `folders` folders `too_many_folders`, an id neither yours nor issued to you
 `unknown_folder`, a sealed name over its limit `body_too_large`, and a broken shape `bad_body`; any
 of them refuses the whole arrangement.
+`presence` carries `in_app`, whether your app is on screen. Like `typing`, it is an event with no `ref`,
+and nothing answers it. Until a connection sends one, its device is not there to anyone. After the first,
+you get one `presence` per person sharing a chat with you. Send another on every open and close. Each
+`presence` is one account: `state` (`online`, `call`, `away` or `offline`) and `in_app_at` under
+`presence.in_app`, `connected_at` under `presence.connected`, the server merging its devices. Whenever it changes, everyone sharing a chat gets it
+on their devices that sent theirs, and so does each person of a direct chat when it is made. `presence_of` carries `account`, anyone's, and is answered with
+`presence_of` and `presence`, once.
+`kv` carries `version?` and is answered with `kv`: `version`, and `kv_list`, your whole set, when yours
+differs. `kv_set` carries `version`, `set` and `remove` and is answered with `kv` and the new version.
+One based on an older version is refused with `kv_stale`, carrying `version` and `kv_list`. Your other
+online devices get `kv` with `from`, `version`, `set` and `remove`. A name is 1 to 64 of a-z, 0-9, _ and
+., and a value is bytes the server never reads, at most `kv_value`; more than `kv_keys` names is
+`too_many_keys`.
 `times` carries `chat` and `seq` and is answered with `times`: `member_list` of each member but the
 sender, with the server's time for `received_at` and `seen_at`.
 

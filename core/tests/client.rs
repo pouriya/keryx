@@ -368,7 +368,16 @@ fn connecting_syncs_and_tops_key_packages_up_to_ten() {
     let (mut client, _, _) = ready();
     let out = client.step(Input::Connected, NOW);
     assert!(events(&out).contains(&Event::Online));
-    assert!(matches!(frames(&out)[0], ClientFrame::Sync { .. }));
+    // This device's presence goes first, then the settings are asked for, then the sync.
+    assert!(matches!(
+        frames(&out)[0],
+        ClientFrame::Presence { in_app: false, .. }
+    ));
+    assert!(matches!(
+        frames(&out)[1],
+        ClientFrame::Kv { version: None, .. }
+    ));
+    assert!(matches!(frames(&out)[2], ClientFrame::Sync { .. }));
     let (asked, _, path, body) = request(&out);
     assert_eq!(path, "/api/v1/key_packages");
     assert_eq!(body["body_list"], json!([]));
@@ -1212,6 +1221,8 @@ fn refused(reference: Ulid, code: &str) -> ServerFrame {
         code: code.to_string(),
         message: "Refused".to_string(),
         call_seq: None,
+        version: None,
+        kv_list: None,
     }
 }
 
@@ -1236,6 +1247,10 @@ fn kind_of(frame: &ClientFrame) -> &'static str {
         ClientFrame::Wraps { .. } => "wraps",
         ClientFrame::CallEvent { .. } => "call_event",
         ClientFrame::ProfileKeys { .. } => "profile_keys",
+        ClientFrame::Presence { .. } => "presence",
+        ClientFrame::PresenceOf { .. } => "presence_of",
+        ClientFrame::Kv { .. } => "kv",
+        ClientFrame::KvSet { .. } => "kv_set",
     }
 }
 
@@ -1253,8 +1268,11 @@ fn reference_of(frame: &ClientFrame) -> Ulid {
         | ClientFrame::Ping { reference }
         | ClientFrame::Wraps { reference, .. }
         | ClientFrame::CallEvent { reference, .. }
-        | ClientFrame::ProfileKeys { reference, .. } => *reference,
-        ClientFrame::Typing { .. } => Ulid::from_bytes([0; 16]),
+        | ClientFrame::ProfileKeys { reference, .. }
+        | ClientFrame::PresenceOf { reference, .. }
+        | ClientFrame::Kv { reference, .. }
+        | ClientFrame::KvSet { reference, .. } => *reference,
+        ClientFrame::Typing { .. } | ClientFrame::Presence { .. } => Ulid::from_bytes([0; 16]),
     }
 }
 
@@ -2634,10 +2652,29 @@ impl World {
                 );
                 Some(ServerFrame::Done { reference })
             }
-            // Profiles and folders are driven against the real server, in the server's tests.
+            // Profiles, folders, presence and settings are driven against the real server, in the
+            // server's tests.
             ClientFrame::ProfileKeys { reference, .. }
             | ClientFrame::FolderId { reference }
-            | ClientFrame::ChatFolders { reference, .. } => Some(ServerFrame::Done { reference }),
+            | ClientFrame::ChatFolders { reference, .. }
+            | ClientFrame::PresenceOf { reference, .. } => Some(ServerFrame::Done { reference }),
+            ClientFrame::Kv { reference, version } => Some(ServerFrame::Kv {
+                reference: Some(reference),
+                version: 0,
+                kv_list: (version != Some(0)).then(Vec::new),
+                from: None,
+                set: None,
+                remove: None,
+            }),
+            ClientFrame::KvSet { reference, change } => Some(ServerFrame::Kv {
+                reference: Some(reference),
+                version: change.version + 1,
+                kv_list: None,
+                from: None,
+                set: None,
+                remove: None,
+            }),
+            ClientFrame::Presence { .. } => None,
             ClientFrame::Typing { chat, on } => {
                 let member_list = self.hub_chat(chat).member_list.clone();
                 self.deliver(

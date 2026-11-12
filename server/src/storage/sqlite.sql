@@ -51,6 +51,9 @@ CREATE TABLE account (
     -- [Account profile] moves on every change of the names, photo, bio or links, so a client that
     -- was offline knows to fetch the profile again.
     profile_version     INTEGER NOT NULL DEFAULT 0 CHECK (profile_version >= 0),
+    -- [Settings] moves on every change to the account's `kv` rows, so a device that holds this
+    -- version is answered with nothing, and a change based on an older one is refused.
+    kv_version          INTEGER NOT NULL DEFAULT 0 CHECK (kv_version >= 0),
     -- [Admin] when the account was made.
     created_at          INTEGER NOT NULL
 ) WITHOUT ROWID, STRICT;
@@ -192,6 +195,12 @@ CREATE TABLE device (
     created_at            INTEGER NOT NULL,
     -- [Reduced view] the last-active day a password-only session is shown.
     last_active_at        INTEGER NOT NULL,
+    -- [Presence] when it last had a connection that had announced itself: written at its first
+    -- `presence` and when that connection ended. Not taken from device_session, whose rows expire.
+    last_connected_at     INTEGER,
+    -- [Presence] when its person last had keryx open on screen: written on every app open and
+    -- close, and when a connection with the app open ended.
+    last_in_app_at        INTEGER,
     -- [Termination, Logout, Device limit] set means stopped: no delivery, no longer counted.
     terminated_at         INTEGER,
     -- [Termination, Logout] the signed statement members verify before removing the device
@@ -430,6 +439,20 @@ CREATE TABLE folder (
 CREATE UNIQUE INDEX folder_place ON folder (account_id, place);
 CREATE UNIQUE INDEX folder_default ON folder (account_id) WHERE is_default = 1;
 CREATE UNIQUE INDEX folder_all ON folder (account_id) WHERE name IS NULL;
+
+-- [Settings] an account's key-value store, so every device shows the same settings. Values are
+-- bytes the server never reads: the client decides what is sealed.
+CREATE TABLE kv (
+    -- [Settings] whose.
+    account_id  BLOB NOT NULL REFERENCES account (id) ON DELETE CASCADE,
+    -- [Settings] a-z, 0-9, _ and ., 1 to 64 long.
+    key         TEXT NOT NULL CHECK (
+                    length(key) BETWEEN 1 AND 64 AND key NOT GLOB '*[^a-z0-9_.]*'
+                ),
+    -- [Settings] at most `[limits.body] kv_value`, checked in the code.
+    value       BLOB NOT NULL,
+    PRIMARY KEY (account_id, key)
+) WITHOUT ROWID, STRICT;
 
 -- [RBAC] chat-scope roles held by a member.
 CREATE TABLE member_role (

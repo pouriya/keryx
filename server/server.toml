@@ -66,6 +66,7 @@ key_packages = 100        # the most one device may keep on the server
 call_frame = "256KiB"     # one frame on a call's state, audio or video track. Larger: that device leaves
 call_cache = "16MiB"      # the relay's room for older groups. Newest groups are always kept
 folders = 20              # an account's folders, not counting all
+kv_keys = 64              # how many settings an account may keep
 
 [limits.body]             # one message's body. A file's bytes upload separately
 text = "64KiB"
@@ -83,6 +84,7 @@ answer = "16KiB"
 sticker = "1KiB"
 draft = "64KiB"            # an account's sealed draft in one chat. Not a message
 folder_name = "256B"      # one sealed folder name
+kv_value = "4KiB"         # one setting's value, sealed or not as its client decides
 
 [limits.upload]           # one file's encrypted bytes, by the type its uploader declares
 voice = "50MiB"

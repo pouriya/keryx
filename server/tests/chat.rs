@@ -8,14 +8,15 @@ use std::time::Duration;
 
 use common::{OPERATOR_TOKEN, Server};
 use keryx_core::client::{
-    Command, Draft, Event, FileSpec, Folder, Pointer, Secret, ShownProfile, Thumbnail,
+    Command, Draft, Event, FileSpec, Folder, Pointer, Secret, Setting, ShownProfile, Thumbnail,
 };
 use keryx_core::file;
 use keryx_core::mls::{AccountWrap, Commit, Device};
 use keryx_core::protocol::{
     Answer, Bytes, CallEvent, CallEventKind, CallOutcome, ChatFolders, ChatType, ClientFrame,
-    ContentKind, FolderItem, Header, Kind, MessageFrame, ProfileKeyShare, ProfileLink, Question,
-    SendFrame, ServerFrame, SyncPosition, WelcomeItem, WrapItem,
+    ContentKind, FolderItem, Header, Kind, KvChange, KvItem, MessageFrame, PresenceItem,
+    PresenceState, ProfileKeyShare, ProfileLink, Question, SendFrame, ServerFrame, SyncPosition,
+    WelcomeItem, WrapItem,
 };
 use keryx_core::ulid::Ulid;
 use person::{
@@ -70,7 +71,9 @@ fn reference_of(frame: &ServerFrame) -> Option<Ulid> {
         | ServerFrame::Done { reference }
         | ServerFrame::Refused { reference, .. }
         | ServerFrame::Chats { reference, .. }
-        | ServerFrame::FolderId { reference, .. } => Some(*reference),
+        | ServerFrame::FolderId { reference, .. }
+        | ServerFrame::PresenceOf { reference, .. } => Some(*reference),
+        ServerFrame::Kv { reference, .. } => *reference,
         _ => None,
     }
 }
@@ -4653,4 +4656,642 @@ fn a_profile_is_sealed_to_those_sharing_a_chat_and_changes_reach_them_live() {
             profile.bio.as_deref() == Some("Hello")
         })
     });
+}
+
+/// The next `presence` about this account that `wanted` takes, keeping the rest.
+fn presence_about(
+    socket: &mut Socket,
+    account: Ulid,
+    wanted: impl Fn(&PresenceItem) -> bool,
+) -> PresenceItem {
+    let frame = socket.next_where(|frame| {
+        matches!(frame, ServerFrame::Presence(item) if item.account == account && wanted(item))
+    });
+    let ServerFrame::Presence(item) = frame else {
+        unreachable!();
+    };
+    *item
+}
+
+fn is_state(state: PresenceState) -> impl Fn(&PresenceItem) -> bool {
+    move |item| item.state == Some(state)
+}
+
+/// This device's `presence`, an event with no answer.
+fn announce(socket: &mut Socket, in_app: bool) {
+    socket.send(&ClientFrame::Presence { in_app });
+}
+
+fn presence_asked(socket: &mut Socket, account: Ulid) -> ServerFrame {
+    let wanted = reference();
+    socket.request(
+        &ClientFrame::PresenceOf {
+            reference: wanted,
+            account,
+        },
+        wanted,
+    )
+}
+
+fn presence_answer(frame: ServerFrame) -> PresenceItem {
+    match frame {
+        ServerFrame::PresenceOf { presence, .. } => presence,
+        other => panic!("Wanted a presence, and got {other:?}"),
+    }
+}
+
+/// Takes a permission from every built-in role, straight in the database, since nothing manages
+/// roles yet. The server reads the role tables on every operation.
+fn take_permission(server: &Server, permission: &str) {
+    let connection = rusqlite::Connection::open(server.path("keryx.db")).unwrap();
+    connection.busy_timeout(Duration::from_secs(10)).unwrap();
+    connection
+        .execute(
+            "DELETE FROM role_permission WHERE permission = ?1",
+            [permission],
+        )
+        .unwrap();
+}
+
+#[test]
+fn presence_counts_once_a_device_announces_itself_and_reaches_whoever_shares_a_chat() {
+    let mut pair = pair();
+    let (sara, babak, chat) = (pair.sara.id, pair.babak.id, pair.chat);
+    let babak_device = pair.babak.device.record().device;
+    let sara_device = pair.sara.device.record().device;
+
+    // Sara's first `presence` brings everyone sharing a chat. Babak's socket has not announced
+    // itself, so he is not there, with the time his client was last connected.
+    announce(&mut pair.sara_socket, true);
+    let seen = presence_about(&mut pair.sara_socket, babak, |_| true);
+    assert_eq!(seen.state, Some(PresenceState::Offline));
+    assert!(seen.connected_at.is_some());
+    assert_eq!(seen.in_app_at, None);
+
+    // Babak announces with his app in the background: he gets her online, and she gets him away.
+    announce(&mut pair.babak_socket, false);
+    let first = presence_about(
+        &mut pair.babak_socket,
+        sara,
+        is_state(PresenceState::Online),
+    );
+    assert!(first.in_app_at.is_some() && first.connected_at.is_some());
+    presence_about(&mut pair.sara_socket, babak, is_state(PresenceState::Away));
+
+    // Her app leaves the screen: away, and her time in the app moves to now.
+    announce(&mut pair.sara_socket, false);
+    let away = presence_about(&mut pair.babak_socket, sara, is_state(PresenceState::Away));
+    assert!(away.in_app_at >= first.in_app_at);
+    let asked = presence_answer(presence_asked(&mut pair.babak_socket, sara));
+    assert_eq!(asked.state, Some(PresenceState::Away));
+
+    // In a call, red; the call ending brings her back.
+    let call_seq = seq_of(post(&mut pair.sara_socket, call_frame(&pair.sara, chat)));
+    pair.babak_socket.message(chat, call_seq);
+    let call = join_call(&pair.server, &pair.sara, chat, call_seq);
+    presence_about(&mut pair.babak_socket, sara, is_state(PresenceState::Call));
+    done(decline(&mut pair.babak_socket, chat, call_seq));
+    call_closed(&call);
+    presence_about(&mut pair.babak_socket, sara, is_state(PresenceState::Away));
+
+    // Someone sharing no chat is asked about once, and an unknown account is refused.
+    let stranger = sign_up(&pair.server, "mina_x", SARA_WORDS);
+    let asked = presence_answer(presence_asked(&mut pair.babak_socket, stranger.id));
+    assert_eq!(asked.state, Some(PresenceState::Offline));
+    assert!(asked.connected_at.is_some());
+    assert_refused(
+        presence_asked(&mut pair.babak_socket, Ulid::new().unwrap()),
+        "no_such_account",
+    );
+
+    // The moment her connection drops she is offline, connected until then.
+    pair.sara_socket.inner.close(None).unwrap();
+    pair.sara_socket.closed();
+    let gone = presence_about(
+        &mut pair.babak_socket,
+        sara,
+        is_state(PresenceState::Offline),
+    );
+    assert!(gone.connected_at > first.connected_at);
+
+    // A new connection counts for nothing until it announces itself.
+    pair.sara_socket = connect(&pair.server, &pair.sara.token);
+    let asked = presence_answer(presence_asked(&mut pair.babak_socket, sara));
+    assert_eq!(asked.state, Some(PresenceState::Offline));
+    announce(&mut pair.sara_socket, true);
+    presence_about(
+        &mut pair.babak_socket,
+        sara,
+        is_state(PresenceState::Online),
+    );
+
+    // Over REST: only the session's own device, answered with everyone sharing a chat.
+    let route = format!("/api/v1/devices/{babak_device}/presence");
+    let (status, reply) = pair.server.call(
+        "PUT",
+        &route,
+        Some(&pair.babak.token),
+        Some(&json!({"in_app": true})),
+    );
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(
+        reply["data"]["presence_list"],
+        json!([{"account": sara.to_string(), "state": "online",
+                "in_app_at": reply["data"]["presence_list"][0]["in_app_at"],
+                "connected_at": reply["data"]["presence_list"][0]["connected_at"]}])
+    );
+    presence_about(
+        &mut pair.sara_socket,
+        babak,
+        is_state(PresenceState::Online),
+    );
+    let (status, reply) = pair.server.call(
+        "PUT",
+        &format!("/api/v1/devices/{sara_device}/presence"),
+        Some(&pair.babak.token),
+        Some(&json!({"in_app": true})),
+    );
+    assert_eq!(
+        (status, reply["code"].as_str()),
+        (404, Some("no_such_device"))
+    );
+    let (status, reply) = pair.server.call(
+        "GET",
+        &format!("/api/v1/accounts/{sara}/presence"),
+        Some(&pair.babak.token),
+        None,
+    );
+    assert_eq!(
+        (status, reply["data"]["state"].as_str()),
+        (200, Some("online"))
+    );
+
+    // Without `presence.connected`, the Connected time is hidden; without `presence.in_app` too,
+    // nothing is seen at all.
+    take_permission(&pair.server, "presence.connected");
+    announce(&mut pair.sara_socket, false);
+    let hidden = presence_about(&mut pair.babak_socket, sara, is_state(PresenceState::Away));
+    assert_eq!(hidden.connected_at, None);
+    assert!(hidden.in_app_at.is_some());
+    take_permission(&pair.server, "presence.in_app");
+    assert_refused(
+        presence_asked(&mut pair.babak_socket, sara),
+        "no_permission",
+    );
+    let (status, reply) = pair.server.call(
+        "PUT",
+        &route,
+        Some(&pair.babak.token),
+        Some(&json!({"in_app": false})),
+    );
+    assert_eq!((status, &reply["data"]["presence_list"]), (200, &json!([])));
+}
+
+#[test]
+fn a_new_chat_tells_each_side_where_the_other_is() {
+    let mut pair = pair();
+    announce(&mut pair.babak_socket, false);
+    let mina = sign_up(&pair.server, "mina_x", SARA_WORDS);
+    let mut mina_socket = connect(&pair.server, &mina.token);
+    announce(&mut mina_socket, true);
+
+    // Neither changes anything after the chat is made, and each still hears of the other at once.
+    let (status, reply) = pair.server.call(
+        "POST",
+        "/api/v1/chats",
+        Some(&pair.babak.token),
+        Some(&json!({"account": mina.id.to_string()})),
+    );
+    assert_eq!(
+        (status, reply["data"]["created"].as_bool()),
+        (200, Some(true)),
+        "{reply}"
+    );
+    presence_about(
+        &mut pair.babak_socket,
+        mina.id,
+        is_state(PresenceState::Online),
+    );
+    presence_about(
+        &mut mina_socket,
+        pair.babak.id,
+        is_state(PresenceState::Away),
+    );
+}
+
+fn kv_item(key: &str, value: &[u8]) -> KvItem {
+    KvItem {
+        key: key.to_string(),
+        value: Bytes(value.to_vec()),
+    }
+}
+
+/// This account's settings over the socket: the version, and the whole set when it differs.
+fn kv_asked(socket: &mut Socket, version: Option<u64>) -> (u64, Option<Vec<KvItem>>) {
+    let wanted = reference();
+    match socket.request(
+        &ClientFrame::Kv {
+            reference: wanted,
+            version,
+        },
+        wanted,
+    ) {
+        ServerFrame::Kv {
+            version, kv_list, ..
+        } => (version, kv_list),
+        other => panic!("Wanted the settings, and got {other:?}"),
+    }
+}
+
+fn kv_change(socket: &mut Socket, version: u64, set: Vec<KvItem>, remove: &[&str]) -> ServerFrame {
+    let wanted = reference();
+    socket.request(
+        &ClientFrame::KvSet {
+            reference: wanted,
+            change: KvChange {
+                version,
+                set,
+                remove: remove.iter().map(|key| key.to_string()).collect(),
+            },
+        },
+        wanted,
+    )
+}
+
+fn kv_saved(frame: ServerFrame) -> u64 {
+    match frame {
+        ServerFrame::Kv {
+            reference: Some(_),
+            version,
+            kv_list: None,
+            ..
+        } => version,
+        other => panic!("Wanted it saved, and got {other:?}"),
+    }
+}
+
+#[test]
+fn settings_go_by_version_the_server_wins_and_other_devices_get_only_the_change() {
+    let server = Server::start("", "[registration]\nallow = true\n[limits]\nkv_keys = 2\n");
+    let mut pair = pair_on(server);
+    let second_token = log_in(&pair.server, &pair.sara.username);
+    add_device(&pair.server, pair.sara.id, &pair.sara.keys, &second_token);
+    let mut second = connect(&pair.server, &second_token);
+
+    // A new account has none, at version 0, and a device on the server's version gets only that.
+    assert_eq!(kv_asked(&mut pair.sara_socket, None), (0, Some(Vec::new())));
+    assert_eq!(kv_asked(&mut pair.sara_socket, Some(0)), (0, None));
+
+    // A change is answered with the new version, and the account's other device gets the change.
+    let lang = kv_item("lang", b"sealed fa");
+    let version = kv_saved(kv_change(&mut pair.sara_socket, 0, vec![lang.clone()], &[]));
+    assert_eq!(version, 1);
+    let pushed = second.next_where(|frame| {
+        matches!(
+            frame,
+            ServerFrame::Kv {
+                reference: None,
+                ..
+            }
+        )
+    });
+    let ServerFrame::Kv {
+        version,
+        from,
+        set,
+        remove,
+        kv_list,
+        ..
+    } = pushed
+    else {
+        unreachable!();
+    };
+    assert_eq!(
+        (version, from, set, remove, kv_list),
+        (1, Some(0), Some(vec![lang.clone()]), Some(Vec::new()), None)
+    );
+
+    // One based on an older version is refused, with the server's whole set.
+    let theme = kv_item("theme", b"sealed dark");
+    match kv_change(&mut second, 0, vec![theme.clone()], &[]) {
+        ServerFrame::Refused {
+            code,
+            version,
+            kv_list,
+            ..
+        } => assert_eq!(
+            (code.as_str(), version, kv_list),
+            ("kv_stale", Some(1), Some(vec![lang.clone()]))
+        ),
+        other => panic!("Wanted it stale, and got {other:?}"),
+    }
+    assert_eq!(
+        kv_saved(kv_change(&mut second, 1, vec![theme.clone()], &[])),
+        2
+    );
+
+    // `kv_keys` counts what the change leaves, so a removal makes room in the same change.
+    let stickers = kv_item("recent.stickers", b"sealed list");
+    assert_refused(
+        kv_change(&mut pair.sara_socket, 2, vec![stickers.clone()], &[]),
+        "too_many_keys",
+    );
+    assert_eq!(
+        kv_saved(kv_change(
+            &mut pair.sara_socket,
+            2,
+            vec![stickers.clone()],
+            &["lang"]
+        )),
+        3
+    );
+    assert_eq!(
+        kv_asked(&mut pair.sara_socket, Some(1)),
+        (3, Some(vec![stickers.clone(), theme.clone()]))
+    );
+
+    // Names are 1 to 64 of a-z, 0-9, _ and ., each once, and a value fits `kv_value`.
+    let long = "a".repeat(65);
+    for key in ["Lang", "", "lang-x", long.as_str()] {
+        assert_refused(
+            kv_change(&mut pair.sara_socket, 3, vec![kv_item(key, b"x")], &[]),
+            "bad_body",
+        );
+    }
+    assert_refused(
+        kv_change(
+            &mut pair.sara_socket,
+            3,
+            vec![kv_item("lang", b"x"), kv_item("lang", b"y")],
+            &[],
+        ),
+        "bad_body",
+    );
+    assert_refused(
+        kv_change(
+            &mut pair.sara_socket,
+            3,
+            vec![kv_item("lang", b"x")],
+            &["lang"],
+        ),
+        "bad_body",
+    );
+    assert_refused(
+        kv_change(
+            &mut pair.sara_socket,
+            3,
+            vec![kv_item("lang", &[0; 4097])],
+            &[],
+        ),
+        "body_too_large",
+    );
+
+    // Each account has its own.
+    assert_eq!(
+        kv_asked(&mut pair.babak_socket, None),
+        (0, Some(Vec::new()))
+    );
+
+    // The same over REST.
+    let token = Some(pair.sara.token.as_str());
+    let (status, reply) = pair.server.call("GET", "/api/v1/kv?version=3", token, None);
+    assert_eq!((status, &reply["data"]), (200, &json!({"version": 3})));
+    let (status, reply) = pair.server.call("GET", "/api/v1/kv", token, None);
+    assert_eq!(status, 200);
+    assert_eq!(reply["data"]["kv_list"][1]["key"], "theme");
+    let body =
+        json!({"version": 3, "set": [serde_json::to_value(&lang).unwrap()], "remove": ["theme"]});
+    let (status, reply) = pair.server.call("PATCH", "/api/v1/kv", token, Some(&body));
+    assert_eq!((status, &reply["data"]), (200, &json!({"version": 4})));
+    second.next_where(|frame| {
+        matches!(
+            frame,
+            ServerFrame::Kv {
+                reference: None,
+                from: Some(3),
+                version: 4,
+                ..
+            }
+        )
+    });
+    let (status, reply) = pair.server.call("PATCH", "/api/v1/kv", token, Some(&body));
+    assert_eq!((status, reply["code"].as_str()), (409, Some("kv_stale")));
+    assert_eq!(reply["version"], 4);
+    assert_eq!(
+        reply["kv_list"],
+        json!([
+            serde_json::to_value(&lang).unwrap(),
+            serde_json::to_value(&stickers).unwrap()
+        ])
+    );
+}
+
+/// The next settings an app shows that `wanted` takes.
+fn settings_shown(
+    app: &mut App,
+    server: &Server,
+    wanted: impl Fn(&[Setting]) -> bool,
+) -> Vec<Setting> {
+    loop {
+        let Event::Kv { setting_list } =
+            app.wait(server, |event| matches!(event, Event::Kv { .. }))
+        else {
+            unreachable!();
+        };
+        if wanted(&setting_list) {
+            return setting_list;
+        }
+    }
+}
+
+/// The same, reading `meanwhile` too, whose client has something to send first.
+fn settings_shown_beside(
+    app: &mut App,
+    meanwhile: &mut App,
+    server: &Server,
+    wanted: impl Fn(&[Setting]) -> bool,
+) -> Vec<Setting> {
+    let started = std::time::Instant::now();
+    loop {
+        while let Some(index) = app
+            .events
+            .iter()
+            .position(|event| matches!(event, Event::Kv { .. }))
+        {
+            let Some(Event::Kv { setting_list }) = app.events.remove(index) else {
+                unreachable!();
+            };
+            if wanted(&setting_list) {
+                return setting_list;
+            }
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "No settings came"
+        );
+        meanwhile.read_once(server);
+        app.read_once(server);
+    }
+}
+
+fn setting(key: &str, value: Value) -> Setting {
+    Setting {
+        key: key.to_string(),
+        value,
+    }
+}
+
+#[test]
+fn core_seals_settings_shows_them_on_every_device_and_hands_presence_back() {
+    let server = open_server();
+    let (mut sara, mut babak, _chat) = apps_on(&server);
+
+    // Presence: the platform says the app is on screen, and the other side's core shows it.
+    babak.command(&server, Command::InApp { in_app: true });
+    let babak_id = babak.id();
+    sara.wait(&server, |event| {
+        matches!(event, Event::Presence { presence }
+            if presence.account == babak_id && presence.state == Some(PresenceState::Online))
+    });
+    let stranger = App::sign_up(&server, "mina_x", SARA_WORDS);
+    let stranger_id = stranger.id();
+    sara.command(
+        &server,
+        Command::PresenceOf {
+            account: stranger_id,
+        },
+    );
+    sara.wait(
+        &server,
+        |event| matches!(event, Event::Presence { presence } if presence.account == stranger_id),
+    );
+
+    // A setting shows at once, and only checked values are taken.
+    sara.command(
+        &server,
+        Command::Kv {
+            set: vec![setting("lang", json!("fa"))],
+            remove: Vec::new(),
+        },
+    );
+    settings_shown(&mut sara, &server, |list| {
+        list == [setting("lang", json!("fa"))]
+    });
+    for bad in [
+        setting("lang", json!("de")),
+        setting("theme", json!("blue")),
+        setting("recent.stickers", json!(["not an id"])),
+        setting("recent.reactions", json!(vec!["👍"; 9])),
+        setting("Lang", json!("fa")),
+    ] {
+        sara.command(
+            &server,
+            Command::Kv {
+                set: vec![bad],
+                remove: Vec::new(),
+            },
+        );
+        sara.wait(
+            &server,
+            |event| matches!(event, Event::Error { code, .. } if code == "bad_setting"),
+        );
+    }
+
+    // A second device, from the words alone, gets them on connecting, and the server holds them
+    // sealed.
+    let mut second = App::new();
+    second.command(
+        &server,
+        Command::LogIn {
+            username: "sara_x".to_string(),
+            password: Secret(PASSWORD.to_string()),
+            captcha: None,
+        },
+    );
+    second.wait(&server, |event| {
+        matches!(event, Event::NeedWords { restore: true })
+    });
+    second.command(
+        &server,
+        Command::Restore {
+            words: Secret(SARA_WORDS.to_string()),
+        },
+    );
+    settings_shown(&mut second, &server, |list| {
+        list == [setting("lang", json!("fa"))]
+    });
+    let (status, reply) = server.call("GET", "/api/v1/kv", sara.token.as_deref(), None);
+    assert_eq!(status, 200);
+    let sealed: KvItem = serde_json::from_value(reply["data"]["kv_list"][0].clone()).unwrap();
+    assert_eq!(sealed.key, "lang");
+    assert!(!sealed.value.0.windows(2).any(|pair| pair == b"fa"));
+
+    // A change on one device reaches the other live.
+    let stickers = json!([Ulid::new().unwrap().to_string()]);
+    second.command(
+        &server,
+        Command::Kv {
+            set: vec![
+                setting("theme", json!("dark")),
+                setting("recent.stickers", stickers.clone()),
+            ],
+            remove: Vec::new(),
+        },
+    );
+    let both = vec![
+        setting("lang", json!("fa")),
+        setting("recent.stickers", stickers.clone()),
+        setting("theme", json!("dark")),
+    ];
+    settings_shown(&mut sara, &server, |list| list == both.as_slice());
+
+    // A change made offline goes on reconnecting when nothing changed meanwhile.
+    let mut sara = reopen_offline(&server, sara);
+    sara.command(
+        &server,
+        Command::Kv {
+            set: Vec::new(),
+            remove: vec!["recent.stickers".to_string()],
+        },
+    );
+    let removed = vec![
+        setting("lang", json!("fa")),
+        setting("theme", json!("dark")),
+    ];
+    settings_shown(&mut sara, &server, |list| list == removed.as_slice());
+    sara.offline = false;
+    sara.command(&server, Command::NetworkBack);
+    settings_shown_beside(&mut second, &mut sara, &server, |list| {
+        list == removed.as_slice()
+    });
+
+    // One made offline on a version another device moved on from gives way to the server's.
+    let mut sara = reopen_offline(&server, sara);
+    sara.command(
+        &server,
+        Command::Kv {
+            set: vec![setting("lang", json!("en"))],
+            remove: Vec::new(),
+        },
+    );
+    settings_shown(&mut sara, &server, |list| {
+        list.contains(&setting("lang", json!("en")))
+    });
+    second.command(
+        &server,
+        Command::Kv {
+            set: vec![setting("theme", json!("light"))],
+            remove: Vec::new(),
+        },
+    );
+    let server_set = vec![
+        setting("lang", json!("fa")),
+        setting("theme", json!("light")),
+    ];
+    settings_shown(&mut second, &server, |list| list == server_set.as_slice());
+    sara.offline = false;
+    sara.command(&server, Command::NetworkBack);
+    settings_shown(&mut sara, &server, |list| list == server_set.as_slice());
+    let (status, reply) = server.call("GET", "/api/v1/kv", sara.token.as_deref(), None);
+    assert_eq!((status, reply["data"]["version"].as_u64()), (200, Some(4)));
 }

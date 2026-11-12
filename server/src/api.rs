@@ -41,11 +41,11 @@ use keryx_core::protocol::{
     ContentKind, CountReply, CreateAccountBody, CreateChatBody, CreateFileBody, CreatePackBody,
     CreatedAccountReply, DeviceListReply, DeviceReply, DevicesReply, DraftBody, DraftRequest,
     EmptyReply, FeaturesReply, FileReply, FileStatusReply, FolderReply, GroupInfoReply,
-    KeyPackageListReply, KeyPackagesBody, LoginBody, LoginReply, NamesBody, PackReply, PhotoReply,
-    ProfileReply, PutProfileBody, ReducedDeviceItem, ReducedDeviceListReply, RegisterBody,
-    RegisterDeviceBody, ResetBody, SelfChatReply, ServerFrame, SessionListReply, SetupBody,
-    SetupReply, SignedBody, StickerItem, StickerListReply, StickerReply, TimesReply, VersionReply,
-    WrapListReply,
+    KeyPackageListReply, KeyPackagesBody, KvChange, KvReply, LoginBody, LoginReply, NamesBody,
+    PackReply, PhotoReply, PresenceBody, PresenceItem, PresenceListReply, ProfileReply,
+    PutProfileBody, ReducedDeviceItem, ReducedDeviceListReply, RegisterBody, RegisterDeviceBody,
+    ResetBody, SelfChatReply, ServerFrame, SessionListReply, SetupBody, SetupReply, SignedBody,
+    StickerItem, StickerListReply, StickerReply, TimesReply, VersionReply, WrapListReply,
 };
 use keryx_core::ulid::Ulid;
 use serde::de::DeserializeOwned;
@@ -65,8 +65,9 @@ use crate::file;
 use crate::moq;
 use crate::storage::sqlite::Sqlite;
 use crate::storage::{
-    self, BuiltInRole, NamesSaved, NewAccount, NewDevice, NewFile, NewNames, NewPhoto, NewProfile,
-    NewSession, NewSticker, ProfileSaved, Registered, Session, Storage, StoredFile, SyncFrom,
+    self, BuiltInRole, KvChanged, NamesSaved, NewAccount, NewDevice, NewFile, NewNames, NewPhoto,
+    NewProfile, NewSession, NewSticker, ProfileSaved, Registered, Session, Storage, StoredFile,
+    SyncFrom,
 };
 
 pub const CHAT_CREATE_DIRECT: &str = "chat.create_direct";
@@ -86,6 +87,8 @@ pub const FOLDER_REORDER: &str = "folder.reorder";
 pub const FOLDER_DEFAULT: &str = "folder.default";
 pub const FOLDER_CHATS: &str = "folder.chats";
 pub const CHAT_PIN: &str = "chat.pin";
+pub const PRESENCE_IN_APP: &str = "presence.in_app";
+pub const PRESENCE_CONNECTED: &str = "presence.connected";
 
 /// The closed list of permission names. A stored role holding any other name stops startup, so a
 /// typo in a role cannot silently grant nothing.
@@ -120,6 +123,8 @@ pub const PERMISSION_LIST: &[&str] = &[
     FOLDER_DEFAULT,
     FOLDER_CHATS,
     CHAT_PIN,
+    PRESENCE_IN_APP,
+    PRESENCE_CONNECTED,
 ];
 
 /// Everyone's built-in roles hold the whole list, except these, which are the admin's alone.
@@ -311,6 +316,8 @@ pub struct Limits {
     pub call_cache: usize,
     /// An account's folders, not counting `all`.
     pub folders: usize,
+    /// How many settings an account may keep.
+    pub kv_keys: u64,
     pub body: BodyLimits,
     pub upload: UploadLimits,
 }
@@ -329,6 +336,7 @@ impl Default for Limits {
             call_frame: 256 * 1024,
             call_cache: 16 * 1024 * 1024,
             folders: 20,
+            kv_keys: 64,
             body: BodyLimits::default(),
             upload: UploadLimits::default(),
         }
@@ -355,6 +363,8 @@ pub struct BodyLimits {
     pub draft: u64,
     /// One sealed folder name.
     pub folder_name: u64,
+    /// One setting's value.
+    pub kv_value: u64,
 }
 
 impl Default for BodyLimits {
@@ -375,6 +385,7 @@ impl Default for BodyLimits {
             sticker: 1024,
             draft: 64 * 1024,
             folder_name: 256,
+            kv_value: 4 * 1024,
         }
     }
 }
@@ -530,6 +541,8 @@ pub struct Refused {
     pub message: String,
     /// Only for `call_open`: the open call's sequence id, so the client joins that one.
     pub call_seq: Option<u64>,
+    /// Only for `kv_stale`: the server's version of the settings, and its whole set.
+    pub kv: Option<KvReply>,
 }
 
 pub fn refused(status: u16, code: &'static str, message: &str) -> Refused {
@@ -538,6 +551,7 @@ pub fn refused(status: u16, code: &'static str, message: &str) -> Refused {
         code,
         message: message.to_string(),
         call_seq: None,
+        kv: None,
     }
 }
 
@@ -679,6 +693,7 @@ pub async fn check(app: &App, caller: &Caller, need: Need) -> Result<(), Refused
                     code: "device_limit",
                     message: format!("This account may have {limit} devices"),
                     call_seq: None,
+                    kv: None,
                 });
             }
             Ok(())
@@ -751,6 +766,7 @@ fn fixed<const N: usize>(bytes: &Bytes, field: &str) -> Result<[u8; N], Refused>
             code: "bad_body",
             message: format!("{field} must be {N} bytes"),
             call_seq: None,
+            kv: None,
         }),
     }
 }
@@ -1332,6 +1348,7 @@ pub async fn run_register_device(
             code: "device_limit",
             message: format!("This account may have {limit} devices"),
             call_seq: None,
+            kv: None,
         }),
         Registered::Saved(notice) => {
             app.hub.deliver(
@@ -1537,6 +1554,31 @@ pub async fn run_create_chat(
         .storage
         .direct_chat(new_id()?, low, high, Ulid::now())
         .await?;
+    // The two now share a chat: each is told where the other is, on its announced devices, as when
+    // a presence changes, chosen by the author. The chat already exists, so a failure is only
+    // written down.
+    if created && low != high {
+        let told = async {
+            for item in presence_now(app, vec![low, high]).await? {
+                let viewer = if item.account == low { high } else { low };
+                if !app.hub.announced(viewer) {
+                    continue;
+                }
+                if let Some(seen) = seen_by(&item, sight_of(app, viewer).await?) {
+                    app.hub
+                        .deliver_announced(viewer, &ServerFrame::Presence(Box::new(seen)));
+                }
+            }
+            Ok::<(), Refused>(())
+        }
+        .await;
+        if let Err(refusal) = told {
+            tracing::error!(
+                msg = "Could not tell a new chat's people where the other is",
+                code = refusal.code
+            );
+        }
+    }
     Ok(ChatReply { chat, created })
 }
 
@@ -1747,6 +1789,7 @@ pub async fn run_put_chat_folders(
                 app.settings.limits.folders
             ),
             call_seq: None,
+            kv: None,
         });
     }
     for folder in &mut folders.folder_list {
@@ -2437,6 +2480,311 @@ pub async fn run_remove_photo(app: &App, caller: &Caller, id: Ulid) -> Result<Em
     Ok(EmptyReply {})
 }
 
+// -------------------------------------------------------------------------------------------------
+// Presence
+// -------------------------------------------------------------------------------------------------
+
+/// What one viewer may see of anyone's presence: the state and last in the app, and last connected.
+#[derive(Clone, Copy)]
+struct Sight {
+    in_app: bool,
+    connected: bool,
+}
+
+async fn sight_of(app: &App, viewer: Ulid) -> Result<Sight, Refused> {
+    Ok(Sight {
+        in_app: app
+            .storage
+            .server_permitted(viewer, PRESENCE_IN_APP)
+            .await?,
+        connected: app
+            .storage
+            .server_permitted(viewer, PRESENCE_CONNECTED)
+            .await?,
+    })
+}
+
+/// These accounts' presence as it is now, before any viewer's permissions take parts away.
+async fn presence_now(app: &App, account_list: Vec<Ulid>) -> Result<Vec<PresenceItem>, Refused> {
+    Ok(app
+        .storage
+        .presence_times(account_list)
+        .await?
+        .into_iter()
+        .map(|times| PresenceItem {
+            account: times.account,
+            state: Some(app.hub.presence_state(times.account)),
+            in_app_at: times.in_app_at,
+            connected_at: times.connected_at,
+        })
+        .collect())
+}
+
+/// What a viewer sees of one presence, or nothing when it may see none of it.
+fn seen_by(item: &PresenceItem, sight: Sight) -> Option<PresenceItem> {
+    if !sight.in_app && !sight.connected {
+        return None;
+    }
+    Some(PresenceItem {
+        account: item.account,
+        state: item.state.filter(|_| sight.in_app),
+        in_app_at: item.in_app_at.filter(|_| sight.in_app),
+        connected_at: item.connected_at.filter(|_| sight.connected),
+    })
+}
+
+/// Everyone sharing a chat with this account, not the account itself.
+async fn sharing(app: &App, account: Ulid) -> Result<Vec<Ulid>, Refused> {
+    let mut account_list = app.storage.accounts_sharing(account).await?;
+    account_list.retain(|other| *other != account);
+    Ok(account_list)
+}
+
+/// Tells everyone sharing a chat with the account where it is now, on their devices that have
+/// announced themselves, each as its permissions allow.
+async fn presence_changed(app: &App, account: Ulid) -> Result<(), Refused> {
+    let Some(item) = presence_now(app, vec![account]).await?.pop() else {
+        return Ok(());
+    };
+    for viewer in sharing(app, account).await? {
+        if !app.hub.announced(viewer) {
+            continue;
+        }
+        if let Some(seen) = seen_by(&item, sight_of(app, viewer).await?) {
+            app.hub
+                .deliver_announced(viewer, &ServerFrame::Presence(Box::new(seen)));
+        }
+    }
+    Ok(())
+}
+
+/// The same, for what already happened, such as a call's join or a dropped connection, so a failure
+/// is only written down.
+pub async fn presence_moved(app: &App, account: Ulid) {
+    if let Err(refusal) = presence_changed(app, account).await {
+        tracing::error!(
+            msg = "Could not tell where an account is",
+            code = refusal.code
+        );
+    }
+}
+
+/// Everyone sharing a chat with the viewer, as it may see them.
+async fn presence_for(app: &App, viewer: Ulid) -> Result<Vec<PresenceItem>, Refused> {
+    let sight = sight_of(app, viewer).await?;
+    Ok(presence_now(app, sharing(app, viewer).await?)
+        .await?
+        .iter()
+        .filter_map(|item| seen_by(item, sight))
+        .collect())
+}
+
+/// A device's presence: its first on a connection announces it, XMPP's way, and every later one is
+/// its app opening or closing. Writes its times and tells everyone sharing a chat. `true` if this was
+/// the connection's first, so the device is owed everyone else's.
+async fn announce(app: &App, session: Session, in_app: bool) -> Result<bool, Refused> {
+    let device = session.device()?;
+    let now = Ulid::now();
+    let before = app.hub.announce(session.account, device, in_app);
+    let first = matches!(before, None | Some(None));
+    let was_in_app = matches!(before, Some(Some(true)));
+    // With no live connection, as over REST, the device is there for this moment only.
+    let connected_at = first.then_some(now);
+    let in_app_at = (in_app || was_in_app).then_some(now);
+    app.storage
+        .device_presence(device, connected_at, in_app_at)
+        .await?;
+    presence_changed(app, session.account).await?;
+    Ok(matches!(before, Some(None)))
+}
+
+/// The `presence` frame: an event with no answer, and the first on a connection is followed by one
+/// `presence` per person sharing a chat.
+pub async fn run_presence(app: &App, caller: &Caller, in_app: bool) -> Result<(), Refused> {
+    check(app, caller, Need::Device).await?;
+    let session = caller.session()?;
+    let device = session.device()?;
+    if announce(app, session, in_app).await? {
+        for item in presence_for(app, session.account).await? {
+            app.hub.deliver_to_device(
+                session.account,
+                device,
+                &ServerFrame::Presence(Box::new(item)),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `PUT /api/v1/devices/{id}/presence`: the same over REST, for this session's own device, answered
+/// with everyone sharing a chat.
+pub async fn run_put_presence(
+    app: &App,
+    caller: &Caller,
+    device: Ulid,
+    input: PresenceBody,
+) -> Result<PresenceListReply, Refused> {
+    check(app, caller, Need::Device).await?;
+    let session = caller.session()?;
+    if session.device()? != device {
+        return Err(refused(404, "no_such_device", "That device does not exist"));
+    }
+    announce(app, session, input.in_app).await?;
+    Ok(PresenceListReply {
+        presence_list: presence_for(app, session.account).await?,
+    })
+}
+
+/// Anyone's presence, asked once, as the asker's permissions allow.
+pub async fn run_presence_of(
+    app: &App,
+    caller: &Caller,
+    account: Ulid,
+) -> Result<PresenceItem, Refused> {
+    check(app, caller, Need::Device).await?;
+    let session = caller.session()?;
+    let sight = sight_of(app, session.account).await?;
+    if !sight.in_app && !sight.connected {
+        return Err(refused(403, "no_permission", "You may not do this"));
+    }
+    if app.storage.account_by_id(account).await?.is_none() {
+        return Err(refused(
+            404,
+            "no_such_account",
+            "That account does not exist",
+        ));
+    }
+    match presence_now(app, vec![account]).await?.pop() {
+        Some(item) => seen_by(&item, sight)
+            .ok_or_else(|| refused(403, "no_permission", "You may not do this")),
+        None => Err(refused(
+            404,
+            "no_such_account",
+            "That account does not exist",
+        )),
+    }
+}
+
+/// A connection that had announced itself ended, or a newer one replaced it: the device was connected
+/// until now, and in the app until now if it was open.
+async fn connection_gone(app: &App, account: Ulid, device: Ulid, in_app: bool) {
+    let now = Ulid::now();
+    if let Err(error) = app
+        .storage
+        .device_presence(device, Some(now), in_app.then_some(now))
+        .await
+    {
+        tracing::error!(msg = "Could not write where a device was", error = %error);
+    }
+    presence_moved(app, account).await;
+}
+
+// -------------------------------------------------------------------------------------------------
+// Settings kept per account
+// -------------------------------------------------------------------------------------------------
+
+/// The longest a setting's name is.
+const KV_KEY_CHARS: usize = 64;
+
+fn check_kv_key(key: &str) -> Result<(), Refused> {
+    let fits = !key.is_empty()
+        && key.len() <= KV_KEY_CHARS
+        && key.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'.'
+        });
+    if fits {
+        Ok(())
+    } else {
+        Err(refused(
+            400,
+            "bad_body",
+            "A setting's name is 1 to 64 of a-z, 0-9, _ and .",
+        ))
+    }
+}
+
+/// This account's settings: the version alone when the device holds it, the whole set otherwise.
+pub async fn run_kv(app: &App, caller: &Caller, version: Option<u64>) -> Result<KvReply, Refused> {
+    check(app, caller, Need::Device).await?;
+    let session = caller.session()?;
+    Ok(app.storage.kv(session.account, version).await?)
+}
+
+/// A change based on the version the device holds. The server wins: one based on an older version is
+/// refused with the server's whole set. Saved, it goes to the account's other online devices.
+pub async fn run_kv_set(
+    app: &App,
+    caller: &Caller,
+    change: KvChange,
+) -> Result<VersionReply, Refused> {
+    check(app, caller, Need::Device).await?;
+    let session = caller.session()?;
+    let mut key_list: Vec<&str> = Vec::with_capacity(change.set.len() + change.remove.len());
+    for key in change
+        .set
+        .iter()
+        .map(|item| item.key.as_str())
+        .chain(change.remove.iter().map(String::as_str))
+    {
+        check_kv_key(key)?;
+        if key_list.contains(&key) {
+            return Err(refused(400, "bad_body", "A setting is named twice"));
+        }
+        key_list.push(key);
+    }
+    if change
+        .set
+        .iter()
+        .any(|item| item.value.0.len() as u64 > app.settings.limits.body.kv_value)
+    {
+        return Err(refused(
+            413,
+            "body_too_large",
+            "That setting is larger than this server keeps",
+        ));
+    }
+    let from = change.version;
+    let (set, remove) = (change.set.clone(), change.remove.clone());
+    match app
+        .storage
+        .change_kv(session.account, change, app.settings.limits.kv_keys)
+        .await?
+    {
+        KvChanged::Saved(version) => {
+            app.hub.deliver(
+                &[session.account],
+                session.device,
+                &ServerFrame::Kv {
+                    reference: None,
+                    version,
+                    kv_list: None,
+                    from: Some(from),
+                    set: Some(set),
+                    remove: Some(remove),
+                },
+            );
+            Ok(VersionReply { version })
+        }
+        KvChanged::Stale(kv) => Err(Refused {
+            status: 409,
+            code: "kv_stale",
+            message: "These settings changed on another device".to_string(),
+            call_seq: None,
+            kv: Some(kv),
+        }),
+        KvChanged::TooMany => Err(Refused {
+            status: 413,
+            code: "too_many_keys",
+            message: format!(
+                "This account may keep {} settings",
+                app.settings.limits.kv_keys
+            ),
+            call_seq: None,
+            kv: None,
+        }),
+    }
+}
+
 /// What a device's frames do: reads answer here, and everything else goes through the chat's task.
 pub async fn run_frame(
     app: &Arc<App>,
@@ -2458,6 +2806,55 @@ pub async fn run_frame(
                     chat: reply.chat,
                     seq: reply.seq,
                     member_list: reply.member_list,
+                })
+            });
+            return Some(answer_of(reference, result));
+        }
+        ClientFrame::Presence { in_app } => {
+            let in_app = *in_app;
+            let result = operation!("Presence", "presence", run_presence(app, &caller, in_app));
+            if let Err(refusal) = result {
+                tracing::debug!(msg = "Dropped a presence event", code = refusal.code);
+            }
+            return None;
+        }
+        ClientFrame::PresenceOf { reference, account } => {
+            let (reference, account) = (*reference, *account);
+            let result = operation!("PresenceOf", "presence_of", async {
+                let presence = run_presence_of(app, &caller, account).await?;
+                Ok(ServerFrame::PresenceOf {
+                    reference,
+                    presence,
+                })
+            });
+            return Some(answer_of(reference, result));
+        }
+        ClientFrame::Kv { reference, version } => {
+            let (reference, version) = (*reference, *version);
+            let result = operation!("Kv", "kv", async {
+                let reply = run_kv(app, &caller, version).await?;
+                Ok(ServerFrame::Kv {
+                    reference: Some(reference),
+                    version: reply.version,
+                    kv_list: reply.kv_list,
+                    from: None,
+                    set: None,
+                    remove: None,
+                })
+            });
+            return Some(answer_of(reference, result));
+        }
+        ClientFrame::KvSet { reference, change } => {
+            let (reference, change) = (*reference, change.clone());
+            let result = operation!("KvSet", "kv_set", async {
+                let reply = run_kv_set(app, &caller, change).await?;
+                Ok(ServerFrame::Kv {
+                    reference: Some(reference),
+                    version: reply.version,
+                    kv_list: None,
+                    from: None,
+                    set: None,
+                    remove: None,
                 })
             });
             return Some(answer_of(reference, result));
@@ -2622,16 +3019,17 @@ impl IntoResponse for Refused {
             Ok(status) => status,
             Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        (
-            status,
-            [(CONTENT_TYPE, "application/json")],
-            match self.call_seq {
-                Some(call_seq) => json!({"ok": false, "code": self.code, "message": self.message,
-                    "call_seq": call_seq}),
-                None => json!({"ok": false, "code": self.code, "message": self.message}),
+        (status, [(CONTENT_TYPE, "application/json")], {
+            let mut body = json!({"ok": false, "code": self.code, "message": self.message});
+            if let Some(call_seq) = self.call_seq {
+                body["call_seq"] = json!(call_seq);
             }
-            .to_string(),
-        )
+            if let Some(kv) = self.kv {
+                body["version"] = json!(kv.version);
+                body["kv_list"] = json!(kv.kv_list);
+            }
+            body.to_string()
+        })
             .into_response()
     }
 }
@@ -2915,6 +3313,44 @@ async fn logout(
     respond(operation!("Logout", "logout", async {
         let caller = caller_of(&app, &headers).await?;
         run_logout(&app, &caller, path_id(&id)?, parse(body)?).await
+    }))
+}
+
+async fn put_presence(
+    State(app): Shared,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Body,
+) -> Response {
+    respond(operation!("PutPresence", "put_presence", async {
+        let caller = caller_of(&app, &headers).await?;
+        run_put_presence(&app, &caller, path_id(&id)?, parse(body)?).await
+    }))
+}
+
+async fn presence_of(State(app): Shared, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    respond(operation!("PresenceOf", "presence_of", async {
+        let caller = caller_of(&app, &headers).await?;
+        run_presence_of(&app, &caller, path_id(&id)?).await
+    }))
+}
+
+#[derive(Deserialize)]
+struct KvQuery {
+    version: Option<u64>,
+}
+
+async fn kv(State(app): Shared, headers: HeaderMap, Query(query): Query<KvQuery>) -> Response {
+    respond(operation!("Kv", "kv", async {
+        let caller = caller_of(&app, &headers).await?;
+        run_kv(&app, &caller, query.version).await
+    }))
+}
+
+async fn patch_kv(State(app): Shared, headers: HeaderMap, body: Body) -> Response {
+    respond(operation!("KvSet", "kv_set", async {
+        let caller = caller_of(&app, &headers).await?;
+        run_kv_set(&app, &caller, parse(body)?).await
     }))
 }
 
@@ -3370,9 +3806,14 @@ async fn connection(
     }
     let (outgoing, mut buffer) = mpsc::channel(limits.outgoing_frames.max(1));
     let kill = Arc::new(Notify::new());
-    let connection_id =
+    let (connection_id, replaced) =
         app.hub
             .connect(session.account, device, outgoing.clone(), Arc::clone(&kill));
+    // The old connection's end writes nothing now, so its times are written here, and the device is
+    // not there to others until this one announces itself.
+    if let Some(in_app) = replaced {
+        connection_gone(&app, session.account, device, in_app).await;
+    }
     if let Err(error) = app
         .storage
         .device_online(device, ip, Ulid::now(), DEVICE_LOG_GRACE_MS)
@@ -3487,10 +3928,13 @@ async fn connection(
         }
     }
     drop(requests);
-    if app.hub.disconnect(session.account, device, connection_id)
-        && let Err(error) = app.storage.device_offline(device, Ulid::now()).await
-    {
-        tracing::error!(msg = "Could not write the device log", error = %error);
+    if let Some(announced) = app.hub.disconnect(session.account, device, connection_id) {
+        if let Err(error) = app.storage.device_offline(device, Ulid::now()).await {
+            tracing::error!(msg = "Could not write the device log", error = %error);
+        }
+        if let Some(in_app) = announced {
+            connection_gone(&app, session.account, device, in_app).await;
+        }
     }
     if let Err(error) = worker.await {
         tracing::error!(msg = "A connection's task failed", error = %error);
@@ -3510,6 +3954,8 @@ fn bad_frame(text: &str) -> Option<Message> {
             code: "bad_frame".to_string(),
             message: "That frame is not what this needs".to_string(),
             call_seq: None,
+            version: None,
+            kv_list: None,
         };
         if let Some(text) = encode(&answer) {
             return Some(Message::Text(text));
@@ -3621,6 +4067,9 @@ fn router(app: Arc<App>, www: &FilePath) -> Router {
         .route("/api/v1/devices/id", post(device_id))
         .route("/api/v1/devices/{id}/terminate", post(terminate))
         .route("/api/v1/devices/{id}/logout", post(logout))
+        .route("/api/v1/devices/{id}/presence", put(put_presence))
+        .route("/api/v1/accounts/{id}/presence", get(presence_of))
+        .route("/api/v1/kv", get(kv).patch(patch_kv))
         .route("/api/v1/key_packages", post(key_packages))
         .route(
             "/api/v1/accounts/{id}/key_packages/claim",

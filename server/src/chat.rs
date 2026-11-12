@@ -15,8 +15,8 @@ use std::time::Duration;
 use axum::extract::ws::Utf8Bytes;
 use keryx_core::protocol::{
     Bytes, CallEvent, CallEventKind, CallOutcome, CallText, ChatMode, ChatType, ClientFrame,
-    ContentKind, Kind, MessageFrame, ProfileKeyShare, SendFrame, ServerFrame, WelcomeItem,
-    WrapItem,
+    ContentKind, Kind, MessageFrame, PresenceState, ProfileKeyShare, SendFrame, ServerFrame,
+    WelcomeItem, WrapItem,
 };
 use keryx_core::ulid::Ulid;
 use tokio::sync::{Notify, mpsc, oneshot};
@@ -25,7 +25,7 @@ use tokio::time::Instant;
 
 use crate::api::{
     App, Caller, DELETE_OWN, EDIT_OWN, MESSAGE_COMMIT, Need, Refused, SEND_UNENCRYPTED, TRACE,
-    check, current_trace, new_id, operation, refused, send_permission,
+    check, current_trace, new_id, operation, presence_moved, refused, send_permission,
 };
 use crate::file;
 use crate::moq::{self, Closer, Joined};
@@ -59,6 +59,9 @@ struct Connection {
     outgoing: mpsc::Sender<Out>,
     /// Told when `outgoing` is full, since nothing more can be put in it to say so.
     kill: Arc<Notify>,
+    /// `None` until the device sends its first `presence`, XMPP's way: until then it is not there
+    /// to anyone. Then whether its app is open.
+    in_app: Option<bool>,
 }
 
 struct ChatTask {
@@ -104,6 +107,9 @@ pub struct Hub {
     next_connection: AtomicU64,
     connections: Mutex<HashMap<Ulid, HashMap<Ulid, Connection>>>,
     chats: Mutex<HashMap<Ulid, ChatTask>>,
+    /// Each device in a call, with its account and the call's chat. A device leaves it on its
+    /// `leave`, or when the call ends.
+    calls: Mutex<HashMap<Ulid, (Ulid, Ulid)>>,
 }
 
 fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -133,39 +139,139 @@ pub fn encode(frame: &ServerFrame) -> Option<Utf8Bytes> {
 }
 
 impl Hub {
-    /// Registers a device's connection. A device has one, so an older one is closed.
+    /// Registers a device's connection. A device has one, so an older one is closed. Gives the new
+    /// connection's id, and whether the old one had announced itself with its app open, since its
+    /// end then writes nothing.
     pub fn connect(
         &self,
         account: Ulid,
         device: Ulid,
         outgoing: mpsc::Sender<Out>,
         kill: Arc<Notify>,
-    ) -> u64 {
+    ) -> (u64, Option<bool>) {
         let id = self.next_connection.fetch_add(1, Ordering::Relaxed);
         let mut connections = locked(&self.connections);
         let devices = connections.entry(account).or_default();
-        let connection = Connection { id, outgoing, kill };
-        if let Some(old) = devices.insert(device, connection) {
-            old.kill.notify_one();
+        let connection = Connection {
+            id,
+            outgoing,
+            kill,
+            in_app: None,
+        };
+        match devices.insert(device, connection) {
+            Some(old) => {
+                old.kill.notify_one();
+                (id, old.in_app)
+            }
+            None => (id, None),
         }
-        id
     }
 
-    /// `true` if this was still the device's connection, so it has gone offline.
-    pub fn disconnect(&self, account: Ulid, device: Ulid, id: u64) -> bool {
+    /// `Some` if this was still the device's connection, so it has gone offline, holding whether it
+    /// had announced itself with its app open.
+    pub fn disconnect(&self, account: Ulid, device: Ulid, id: u64) -> Option<Option<bool>> {
         let mut connections = locked(&self.connections);
-        let Some(devices) = connections.get_mut(&account) else {
-            return false;
-        };
+        let devices = connections.get_mut(&account)?;
         match devices.get(&device) {
             Some(connection) if connection.id == id => {}
-            _ => return false,
+            _ => return None,
         }
-        devices.remove(&device);
+        let gone = devices
+            .remove(&device)
+            .and_then(|connection| connection.in_app);
         if devices.is_empty() {
             connections.remove(&account);
         }
-        true
+        Some(gone)
+    }
+
+    /// The device's connection announces itself, or its app opened or closed. `None` if it has no
+    /// connection; otherwise what it had announced before, `None` for its first.
+    pub fn announce(&self, account: Ulid, device: Ulid, in_app: bool) -> Option<Option<bool>> {
+        let mut connections = locked(&self.connections);
+        let connection = connections.get_mut(&account)?.get_mut(&device)?;
+        Some(connection.in_app.replace(in_app))
+    }
+
+    /// Whether any of this account's connections has announced itself, so it gets presence.
+    pub fn announced(&self, account: Ulid) -> bool {
+        let connections = locked(&self.connections);
+        match connections.get(&account) {
+            Some(devices) => devices
+                .values()
+                .any(|connection| connection.in_app.is_some()),
+            None => false,
+        }
+    }
+
+    /// Where an account is now, its devices merged: in a call over in the app over connected with
+    /// the app in the background. A connection that has not announced itself counts for nothing.
+    pub fn presence_state(&self, account: Ulid) -> PresenceState {
+        if locked(&self.calls)
+            .values()
+            .any(|(holder, _)| *holder == account)
+        {
+            return PresenceState::Call;
+        }
+        let connections = locked(&self.connections);
+        let Some(devices) = connections.get(&account) else {
+            return PresenceState::Offline;
+        };
+        devices
+            .values()
+            .map(|connection| match connection.in_app {
+                Some(true) => PresenceState::Online,
+                Some(false) => PresenceState::Away,
+                None => PresenceState::Offline,
+            })
+            .max()
+            .unwrap_or(PresenceState::Offline)
+    }
+
+    /// To the account's connections that have announced themselves.
+    pub fn deliver_announced(&self, account: Ulid, frame: &ServerFrame) {
+        let Some(text) = encode(frame) else {
+            return;
+        };
+        let connections = locked(&self.connections);
+        if let Some(devices) = connections.get(&account) {
+            for connection in devices.values() {
+                if connection.in_app.is_some() {
+                    push(&connection.outgoing, &connection.kill, text.clone());
+                }
+            }
+        }
+    }
+
+    /// A device joined a call. `true` if it was in none, so its account's presence may have moved.
+    pub fn call_joined(&self, account: Ulid, device: Ulid, chat: Ulid) -> bool {
+        locked(&self.calls)
+            .insert(device, (account, chat))
+            .is_none()
+    }
+
+    /// A device left its call: its account, if it was in one.
+    pub fn call_left(&self, device: Ulid) -> Option<Ulid> {
+        locked(&self.calls)
+            .remove(&device)
+            .map(|(account, _)| account)
+    }
+
+    /// A chat's call ended: the accounts whose devices were still in it.
+    pub fn call_ended(&self, chat: Ulid) -> Vec<Ulid> {
+        let mut calls = locked(&self.calls);
+        let mut account_list = Vec::new();
+        calls.retain(|_, (account, held)| {
+            if *held == chat {
+                if !account_list.contains(account) {
+                    account_list.push(*account);
+                }
+                false
+            } else {
+                true
+            }
+        });
+        account_list
     }
 
     pub fn is_online(&self, account: Ulid, device: Ulid) -> bool {
@@ -614,10 +720,15 @@ async fn handle(app: &Arc<App>, state: &mut ChatState, job: Job) {
                     );
                     Some(answer_of(reference, result))
                 }
+                // Never reaches a chat's task, and an event has no answer to refuse with.
+                ClientFrame::Presence { .. } => None,
                 ClientFrame::Sync { reference, .. }
                 | ClientFrame::Draft { reference, .. }
                 | ClientFrame::FolderId { reference }
                 | ClientFrame::ChatFolders { reference, .. }
+                | ClientFrame::PresenceOf { reference, .. }
+                | ClientFrame::Kv { reference, .. }
+                | ClientFrame::KvSet { reference, .. }
                 | ClientFrame::Times { reference, .. }
                 | ClientFrame::Ping { reference } => Some(answer_of(
                     reference,
@@ -642,6 +753,8 @@ pub fn answer_of(reference: Ulid, result: Result<ServerFrame, Refused>) -> Serve
             code: refusal.code.to_string(),
             message: refusal.message,
             call_seq: refusal.call_seq,
+            version: refusal.kv.as_ref().map(|kv| kv.version),
+            kv_list: refusal.kv.and_then(|kv| kv.kv_list),
         },
     }
 }
@@ -827,6 +940,7 @@ async fn run_send(
                     code: "call_open",
                     message: "This chat already has an open call".to_string(),
                     call_seq: Some(call.seq),
+                    kv: None,
                 });
             }
         }
@@ -1098,6 +1212,9 @@ async fn run_join(
             &ServerFrame::CallEvent(Box::new(event)),
         );
     }
+    if app.hub.call_joined(session.account, device, chat) {
+        presence_moved(app, session.account).await;
+    }
     Ok(joined)
 }
 
@@ -1134,8 +1251,23 @@ async fn run_gone(
     Ok(())
 }
 
-/// A device left the call. The last one to leave ends it, by that device.
+/// A device left the call, and its account's presence moves.
 async fn leave(
+    app: &Arc<App>,
+    chat: Ulid,
+    state: &mut ChatState,
+    device: Ulid,
+) -> Result<(), Refused> {
+    let left = app.hub.call_left(device);
+    let result = write_leave(app, chat, state, device).await;
+    if let Some(account) = left {
+        presence_moved(app, account).await;
+    }
+    result
+}
+
+/// A device's `leave`. The last one to leave ends the call, by that device.
+async fn write_leave(
     app: &Arc<App>,
     chat: Ulid,
     state: &mut ChatState,
@@ -1260,6 +1392,9 @@ async fn end_call(
             except,
             &ServerFrame::CallEvent(Box::new(event)),
         );
+    }
+    for account in app.hub.call_ended(chat) {
+        presence_moved(app, account).await;
     }
     Ok(())
 }

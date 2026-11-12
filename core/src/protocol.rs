@@ -353,6 +353,98 @@ pub enum ClientFrame {
         call_seq: u64,
         kind: CallEventKind,
     },
+    /// This device's presence, XMPP's way: a connection counts for nothing to others until its
+    /// first one. Sent on connecting and on every app open and close. An event, like `typing`, so
+    /// it has no `ref` and no answer. The first on a connection is followed by one `presence` per
+    /// person sharing a chat.
+    Presence {
+        in_app: bool,
+    },
+    /// Someone's presence, asked once, for a person sharing no chat. Answered with `presence_of`.
+    PresenceOf {
+        #[serde(rename = "ref")]
+        reference: Ulid,
+        account: Ulid,
+    },
+    /// This account's settings. Answered with `kv`: the version alone when it is `version`, the
+    /// whole set with it otherwise.
+    Kv {
+        #[serde(rename = "ref")]
+        reference: Ulid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        version: Option<u64>,
+    },
+    /// A change to this account's settings, based on `version`. Answered with `kv` and the new
+    /// version, or refused with `kv_stale` and the server's whole set.
+    KvSet {
+        #[serde(rename = "ref")]
+        reference: Ulid,
+        #[serde(flatten)]
+        change: KvChange,
+    },
+}
+
+/// Where someone is: on a call, in the app, connected with the app in the background, or not there.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PresenceState {
+    Offline,
+    Away,
+    Online,
+    Call,
+}
+
+/// One account's presence, its devices merged: the state from `presence.in_app`, and each time only
+/// to whoever holds its permission. The newest of the account's devices.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PresenceItem {
+    pub account: Ulid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<PresenceState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_app_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connected_at: Option<i64>,
+}
+
+/// `PUT /api/v1/devices/{id}/presence`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PresenceBody {
+    pub in_app: bool,
+}
+
+/// `PUT /api/v1/devices/{id}/presence`'s answer: everyone sharing a chat.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PresenceListReply {
+    pub presence_list: Vec<PresenceItem>,
+}
+
+/// One setting: its name, and its value as bytes the server never reads.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvItem {
+    pub key: String,
+    pub value: Bytes,
+}
+
+/// A change to an account's settings, based on `version`. Also the body of `PATCH /api/v1/kv`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvChange {
+    pub version: u64,
+    #[serde(default)]
+    pub set: Vec<KvItem>,
+    #[serde(default)]
+    pub remove: Vec<String>,
+}
+
+/// `GET /api/v1/kv?version=N`: the version alone when it is `N`, the whole set with it otherwise.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvReply {
+    pub version: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_list: Option<Vec<KvItem>>,
 }
 
 /// What happened inside a call, numbered from 1 within it: one row of the `call` table. The same JSON
@@ -1184,6 +1276,11 @@ pub enum ServerFrame {
         /// Only for `call_open`: the open call's sequence id, so the client joins that one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         call_seq: Option<u64>,
+        /// Only for `kv_stale`: the server's version of the settings, and its whole set.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        version: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kv_list: Option<Vec<KvItem>>,
     },
     Message(Box<MessageFrame>),
     /// A `times` request's answer: who got and saw the message, and when.
@@ -1260,6 +1357,31 @@ pub enum ServerFrame {
     ProfileKeys {
         chat: Ulid,
         profile_key_list: Vec<ProfileKeyItem>,
+    },
+    /// Someone sharing a chat: after this device's first `presence`, once per person, and again on
+    /// each change.
+    Presence(Box<PresenceItem>),
+    /// A `presence_of`'s answer.
+    PresenceOf {
+        #[serde(rename = "ref")]
+        reference: Ulid,
+        presence: PresenceItem,
+    },
+    /// This account's settings. Answering `kv`: `version`, and `kv_list` when it differed. Answering
+    /// `kv_set`: the new `version`. Pushed to the account's other devices after a change, with no
+    /// `ref`: the change from `from` to `version`, which a device on another version asks for whole.
+    Kv {
+        #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
+        reference: Option<Ulid>,
+        version: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kv_list: Option<Vec<KvItem>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        set: Option<Vec<KvItem>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remove: Option<Vec<String>>,
     },
 }
 
@@ -1632,6 +1754,11 @@ pub struct RefusedReply {
     /// Only for `call_open`: the open call's sequence id, so the client joins that one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call_seq: Option<u64>,
+    /// Only for `kv_stale`: the server's version of the settings, and its whole set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_list: Option<Vec<KvItem>>,
 }
 
 /// Where a `sync` page ended: its last row's server time, chat, sequence id, and `n`, which is 0 for a

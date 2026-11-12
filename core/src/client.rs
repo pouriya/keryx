@@ -37,12 +37,12 @@ use crate::protocol::{
     ChatReply, ChatType, ClientFrame, ContentKind, CountReply, CreateChatBody, CreateFileBody,
     DeviceProof, DeviceReply, DevicesReply, DraftBody, DraftItem, EmptyReply, FeaturesReply,
     FileReply, FolderItem, GroupInfoReply, Header, KeyPackageItem, KeyPackageListReply,
-    KeyPackagesBody, Kind, LoginBody, LoginReply, MarkItem, MessageFrame, NamesBody, PhotoReply,
-    ProfileBody, ProfileKeyItem, ProfileKeyShare, ProfileLink, ProfilePhoto, ProfileReply,
-    PutProfileBody, Question, RefusedReply, RegisterBody, RegisterDeviceBody, SendFrame,
-    ServerFrame, SetupBody, SetupReply, SignedBody, SignedProfile, StickerListReply, StickerPack,
-    SyncPosition, TimesItem, VersionReply, WelcomeItem, WrapEntry, WrapItem, WrapListReply,
-    call_text_header,
+    KeyPackagesBody, Kind, KvChange, KvItem, LoginBody, LoginReply, MarkItem, MessageFrame,
+    NamesBody, PhotoReply, PresenceItem, ProfileBody, ProfileKeyItem, ProfileKeyShare, ProfileLink,
+    ProfilePhoto, ProfileReply, PutProfileBody, Question, RefusedReply, RegisterBody,
+    RegisterDeviceBody, SendFrame, ServerFrame, SetupBody, SetupReply, SignedBody, SignedProfile,
+    StickerListReply, StickerPack, SyncPosition, TimesItem, VersionReply, WelcomeItem, WrapEntry,
+    WrapItem, WrapListReply, call_text_header,
 };
 use crate::queue::{Level, Queue, Target};
 use crate::seed::{self, AccountKeys};
@@ -153,6 +153,89 @@ pub struct FileSpec {
     pub artist: Option<String>,
     #[serde(default)]
     pub duration: Option<u64>,
+}
+
+/// One of this account's settings, opened: its name and its JSON value. Every value is sealed under
+/// the profile key, and `lang`, `theme`, `recent.stickers` and `recent.reactions` are checked here.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Setting {
+    pub key: String,
+    #[cfg_attr(feature = "wasm", tsify(type = "unknown"))]
+    pub value: serde_json::Value,
+}
+
+/// The most recent stickers `recent.stickers` holds, newest first.
+pub const RECENT_STICKERS: usize = 20;
+/// The most recent reactions `recent.reactions` holds, newest first.
+pub const RECENT_REACTIONS: usize = 8;
+
+/// A setting's name, as the server takes it: 1 to 64 of a-z, 0-9, _ and .
+fn setting_name_fits(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 64
+        && key.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'.'
+        })
+}
+
+/// Whether a setting's value is one this client may keep: the four it knows are checked, and any
+/// other is any JSON.
+fn setting_fits(setting: &Setting) -> bool {
+    let value = &setting.value;
+    let strings = |most: usize| match value.as_array() {
+        Some(list) => {
+            list.len() <= most
+                && list
+                    .iter()
+                    .all(|item| item.as_str().is_some_and(|text| !text.is_empty()))
+        }
+        None => false,
+    };
+    setting_name_fits(&setting.key)
+        && match setting.key.as_str() {
+            "lang" => matches!(value.as_str(), Some("en" | "fa")),
+            "theme" => matches!(value.as_str(), Some("light" | "dark" | "system")),
+            "recent.stickers" => {
+                strings(RECENT_STICKERS)
+                    && value.as_array().is_some_and(|list| {
+                        list.iter()
+                            .all(|item| item.as_str().and_then(|id| Ulid::parse(id).ok()).is_some())
+                    })
+            }
+            "recent.reactions" => strings(RECENT_REACTIONS),
+            _ => true,
+        }
+}
+
+/// `newer` on top of `older`: a key set or removed in `newer` wins.
+fn merge_change(older: Option<KvChange>, newer: KvChange) -> KvChange {
+    let Some(mut merged) = older else {
+        return newer;
+    };
+    for item in newer.set {
+        merged.remove.retain(|key| *key != item.key);
+        merged.set.retain(|kept| kept.key != item.key);
+        merged.set.push(item);
+    }
+    for key in newer.remove {
+        merged.set.retain(|kept| kept.key != key);
+        if !merged.remove.contains(&key) {
+            merged.remove.push(key);
+        }
+    }
+    merged
+}
+
+/// Applies a change to sealed settings kept sorted by name.
+fn apply_change(kv: &mut Vec<KvItem>, set: &[KvItem], remove: &[String]) {
+    kv.retain(|item| !remove.contains(&item.key));
+    for item in set {
+        match kv.binary_search_by(|kept| kept.key.cmp(&item.key)) {
+            Ok(at) => kv[at] = item.clone(),
+            Err(at) => kv.insert(at, item.clone()),
+        }
+    }
 }
 
 /// What the person does.
@@ -280,6 +363,25 @@ pub enum Command {
     Times {
         chat: Ulid,
         seq: u64,
+    },
+    /// The app came on screen or left it. Kept, sent as `presence` now if connected, and on every
+    /// connection as its first frame.
+    InApp {
+        in_app: bool,
+    },
+    /// Someone's presence, asked once, for a person sharing no chat: answered as
+    /// [`Event::Presence`].
+    PresenceOf {
+        account: Ulid,
+    },
+    /// Changes this account's settings: each value sealed here, shown at once as [`Event::Kv`], and
+    /// kept until the server takes it. The server wins: a change it refuses as based on an older
+    /// version gives way to its set.
+    Kv {
+        #[serde(default)]
+        set: Vec<Setting>,
+        #[serde(default)]
+        remove: Vec<String>,
     },
     Devices,
     /// Needs the words, from any device.
@@ -854,6 +956,16 @@ pub enum Event {
         seq: u64,
         member_list: Vec<TimesItem>,
     },
+    /// Where someone sharing a chat is, after this device's first `presence` on each connection and
+    /// on every change, or the answer to [`Command::PresenceOf`]. What the account may not see is
+    /// missing.
+    Presence {
+        presence: PresenceItem,
+    },
+    /// This account's settings, opened, whenever they change here or on the server.
+    Kv {
+        setting_list: Vec<Setting>,
+    },
     /// The server's sticker packs.
     Stickers {
         pack_list: Vec<StickerPack>,
@@ -1228,6 +1340,10 @@ enum Waiting {
     Folders {
         folders: ChatFolders,
     },
+    /// A `kv` frame: this account's settings.
+    Kv,
+    /// A `kv_set` frame: the change in flight.
+    KvSet,
     Done,
 }
 
@@ -1301,6 +1417,14 @@ struct Shelf {
     /// An arrangement the server has not taken yet.
     #[serde(default)]
     folders_out: Option<ChatFolders>,
+    /// This account's settings, still sealed, with any change of this device's own on top.
+    #[serde(default)]
+    kv: Vec<KvItem>,
+    #[serde(default)]
+    kv_version: Option<u64>,
+    /// A change the server has not taken yet.
+    #[serde(default)]
+    kv_out: Option<KvChange>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1450,6 +1574,18 @@ pub struct Client {
     folders: Option<ChatFolders>,
     /// An arrangement the server has not taken yet, sent on every connection until it is.
     folders_out: Option<ChatFolders>,
+    /// Whether the app is on screen, as the platform last said, sent as `presence`.
+    in_app: bool,
+    /// This account's settings, still sealed, sorted by name, with this device's changes on top.
+    kv: Vec<KvItem>,
+    /// The server's version of them, once it has said.
+    kv_version: Option<u64>,
+    /// Changes not yet sent, which go once the server's version is known on this connection.
+    kv_out: Option<KvChange>,
+    /// The change sent and not yet answered.
+    kv_flight: Option<KvChange>,
+    /// This connection's `kv` has been answered, so a change can be based on its version.
+    kv_ready: bool,
     /// Ending statements waiting for their account's master key.
     revocations: Vec<(Ulid, Ulid, Vec<u8>)>,
     uploads: HashMap<u64, Upload>,
@@ -1760,6 +1896,12 @@ impl Client {
             chat_cache: Vec::new(),
             folders: None,
             folders_out: None,
+            in_app: false,
+            kv: Vec::new(),
+            kv_version: None,
+            kv_out: None,
+            kv_flight: None,
+            kv_ready: false,
             revocations: Vec::new(),
             uploads: HashMap::new(),
             next_upload: 0,
@@ -1989,6 +2131,12 @@ impl Client {
             profile_list: self.profiles.values().cloned().collect(),
             folders: self.folders.clone(),
             folders_out: self.folders_out.clone(),
+            kv: self.kv.clone(),
+            kv_version: self.kv_version,
+            kv_out: match (self.kv_flight.clone(), self.kv_out.clone()) {
+                (flight, Some(out)) => Some(merge_change(flight, out)),
+                (flight, None) => flight,
+            },
         };
         let Some(device) = self.device.as_mut() else {
             return;
@@ -2268,6 +2416,55 @@ impl Client {
                 self.dirty = true;
                 self.show_folders();
                 self.send_folders();
+            }
+            Command::InApp { in_app } => {
+                self.in_app = in_app;
+                if self.socket == Socket::Up {
+                    self.send(&ClientFrame::Presence { in_app });
+                }
+            }
+            Command::PresenceOf { account } => {
+                let reference = reference();
+                let frame = ClientFrame::PresenceOf { reference, account };
+                if !self.ask(frame, reference, Waiting::Done) {
+                    self.error(
+                        "offline",
+                        "Not connected, so the presence could not be read",
+                    );
+                }
+            }
+            Command::Kv { set, remove } => {
+                if set.iter().any(|setting| !setting_fits(setting))
+                    || remove.iter().any(|key| !setting_name_fits(key))
+                {
+                    return self.error("bad_setting", "A setting is not one this client may keep");
+                }
+                let Some(device) = self.device.as_ref() else {
+                    return;
+                };
+                let mut sealed_list = Vec::with_capacity(set.len());
+                for setting in set {
+                    let Ok(plain) = serde_json::to_vec(&setting.value) else {
+                        return self.error("internal", "A setting could not be written");
+                    };
+                    match device.seal_kv(&setting.key, &plain) {
+                        Ok(sealed) => sealed_list.push(KvItem {
+                            key: setting.key,
+                            value: Bytes(sealed),
+                        }),
+                        Err(_) => return self.error("seal", "A setting could not be sealed"),
+                    }
+                }
+                apply_change(&mut self.kv, &sealed_list, &remove);
+                let change = KvChange {
+                    version: 0,
+                    set: sealed_list,
+                    remove,
+                };
+                self.kv_out = Some(merge_change(self.kv_out.take(), change));
+                self.dirty = true;
+                self.show_kv();
+                self.send_kv();
             }
             Command::Times { chat, seq } => {
                 let reference = reference();
@@ -3588,6 +3785,11 @@ impl Client {
         self.last_heard = self.now;
         self.ping_sent_at = None;
         self.event(Event::Online);
+        // The first frame: until it, this device is not there to others.
+        self.send(&ClientFrame::Presence {
+            in_app: self.in_app,
+        });
+        self.ask_kv(self.kv_version);
         let body = KeyPackagesBody {
             body_list: Vec::new(),
         };
@@ -3632,6 +3834,14 @@ impl Client {
         self.verifying = 0;
         self.ping = None;
         self.waiting.clear();
+        // A change whose answer never came goes again, under what was made since.
+        self.kv_ready = false;
+        if let Some(flight) = self.kv_flight.take() {
+            self.kv_out = Some(match self.kv_out.take() {
+                Some(out) => merge_change(Some(flight), out),
+                None => flight,
+            });
+        }
         // A `sync` starts again on the next connection, so what it kept goes, and a page still being
         // kept asks for nothing more.
         self.sync_run = None;
@@ -3878,6 +4088,10 @@ impl Client {
         self.folders = shelf.folders.clone();
         self.folders_out = shelf.folders_out.clone();
         self.show_folders();
+        self.kv = shelf.kv.clone();
+        self.kv_version = shelf.kv_version;
+        self.kv_out = shelf.kv_out.clone();
+        self.show_kv();
         let mut shown = Vec::with_capacity(shelf.chat_list.len());
         let mut preview_list = Vec::new();
         for mut item in shelf.chat_list {
@@ -4769,12 +4983,54 @@ impl Client {
                 reference,
                 code,
                 message,
+                version,
+                kv_list,
                 ..
+            } => match self.waiting.remove(&reference) {
+                Some(Waiting::KvSet) => self.kv_refused(&code, &message, version, kv_list),
+                Some(waiting) => self.refused(waiting, &code, &message),
+                None => {}
+            },
+            ServerFrame::Presence(presence) => self.event(Event::Presence {
+                presence: *presence,
+            }),
+            ServerFrame::PresenceOf {
+                reference,
+                presence,
             } => {
-                if let Some(waiting) = self.waiting.remove(&reference) {
-                    self.refused(waiting, &code, &message);
+                if self.waiting.remove(&reference).is_some() {
+                    self.event(Event::Presence { presence });
                 }
             }
+            ServerFrame::Kv {
+                reference,
+                version,
+                kv_list,
+                from,
+                set,
+                remove,
+            } => match reference {
+                Some(reference) => match self.waiting.remove(&reference) {
+                    Some(Waiting::Kv) => self.kv_answered(version, kv_list),
+                    Some(Waiting::KvSet) => {
+                        self.kv_version = Some(version);
+                        self.kv_flight = None;
+                        self.dirty = true;
+                        if self.kv_ready {
+                            self.send_kv();
+                        } else {
+                            self.ask_kv(self.kv_version);
+                        }
+                    }
+                    _ => {}
+                },
+                None => self.kv_pushed(
+                    from,
+                    version,
+                    set.unwrap_or_default(),
+                    remove.unwrap_or_default(),
+                ),
+            },
             ServerFrame::Message(message) => self.live(*message),
             ServerFrame::Chats {
                 reference,
@@ -5130,6 +5386,8 @@ impl Client {
                     self.show_folders();
                 }
             }
+            Waiting::Kv => self.error(code, message),
+            Waiting::KvSet => self.kv_refused(code, message, None, None),
             Waiting::Done => self.error(code, message),
         }
     }
@@ -5246,6 +5504,133 @@ impl Client {
             draft: Some(draft),
             saved_at: item.saved_at,
         });
+    }
+
+    /// Asks for this account's settings: the whole set unless `version` is the server's. Nothing
+    /// pending goes out until the answer.
+    fn ask_kv(&mut self, version: Option<u64>) {
+        self.kv_ready = false;
+        let reference = reference();
+        self.ask(
+            ClientFrame::Kv { reference, version },
+            reference,
+            Waiting::Kv,
+        );
+    }
+
+    /// The answer to `kv`. A whole set replaces what this device holds, and a change of its own made
+    /// on an older version gives way to it, as the server would refuse it. One made before this
+    /// device ever had the settings, as a new account's first language, stays on top.
+    fn kv_answered(&mut self, version: u64, kv_list: Option<Vec<KvItem>>) {
+        if let Some(mut kv_list) = kv_list {
+            kv_list.sort_by(|one, other| one.key.cmp(&other.key));
+            if self.kv_version.is_some() {
+                self.kv_out = None;
+            }
+            self.kv = kv_list;
+            if let Some(out) = &self.kv_out {
+                apply_change(&mut self.kv, &out.set, &out.remove);
+            }
+            self.dirty = true;
+            self.show_kv();
+        }
+        self.kv_version = Some(version);
+        self.kv_ready = true;
+        self.send_kv();
+    }
+
+    /// Another device's change. On this device's version it applies, with this device's own still
+    /// waiting on top; on another, the whole set is asked for. While an answer is awaited, it waits
+    /// for that answer.
+    fn kv_pushed(
+        &mut self,
+        from: Option<u64>,
+        version: u64,
+        set: Vec<KvItem>,
+        remove: Vec<String>,
+    ) {
+        if self.kv_flight.is_some() || !self.kv_ready {
+            self.kv_ready = false;
+            return;
+        }
+        if from.is_none() || from != self.kv_version {
+            return self.ask_kv(self.kv_version);
+        }
+        apply_change(&mut self.kv, &set, &remove);
+        if let Some(out) = &self.kv_out {
+            apply_change(&mut self.kv, &out.set, &out.remove);
+        }
+        self.kv_version = Some(version);
+        self.dirty = true;
+        self.show_kv();
+        self.send_kv();
+    }
+
+    /// A refused change. On `kv_stale` the server's set wins, and comes with the refusal; any
+    /// other refusal is reported, and the whole set is asked for again.
+    fn kv_refused(
+        &mut self,
+        code: &str,
+        message: &str,
+        version: Option<u64>,
+        kv_list: Option<Vec<KvItem>>,
+    ) {
+        self.kv_flight = None;
+        self.dirty = true;
+        if code == "kv_stale"
+            && let (Some(version), Some(mut kv_list)) = (version, kv_list)
+        {
+            kv_list.sort_by(|one, other| one.key.cmp(&other.key));
+            self.kv = kv_list;
+            self.kv_version = Some(version);
+            self.kv_out = None;
+            self.kv_ready = true;
+            return self.show_kv();
+        }
+        self.error(code, message);
+        self.ask_kv(None);
+    }
+
+    /// Sends this device's own change still waiting, once the settings are known on this
+    /// connection and nothing else is in flight.
+    fn send_kv(&mut self) {
+        if !self.kv_ready || self.kv_flight.is_some() {
+            return;
+        }
+        let Some(mut change) = self.kv_out.take() else {
+            return;
+        };
+        change.version = self.kv_version.unwrap_or(0);
+        let reference = reference();
+        let frame = ClientFrame::KvSet {
+            reference,
+            change: change.clone(),
+        };
+        if self.ask(frame, reference, Waiting::KvSet) {
+            self.kv_flight = Some(change);
+        } else {
+            self.kv_out = Some(change);
+        }
+    }
+
+    /// Shows this account's settings, opened. One that does not open or read is left out.
+    fn show_kv(&mut self) {
+        let Some(device) = self.device.as_ref() else {
+            return;
+        };
+        let mut setting_list = Vec::with_capacity(self.kv.len());
+        for item in &self.kv {
+            let Ok(opened) = device.open_kv(&item.key, &item.value.0) else {
+                continue;
+            };
+            if let Ok(value) = serde_json::from_slice(&opened) {
+                setting_list.push(Setting {
+                    key: item.key.clone(),
+                    value,
+                });
+            }
+        }
+        self.event(Event::Kv { setting_list });
     }
 
     /// Sends the arrangement still waiting, if connected. Offline, the next connection sends it.

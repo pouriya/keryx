@@ -360,6 +360,8 @@ fn every_server_frame_has_the_agreed_shape() {
                 code: "too_many_devices".to_string(),
                 message: "No".to_string(),
                 call_seq: None,
+                version: None,
+                kv_list: None,
             },
             json!({"type": "refused", "ref": REF, "code": "too_many_devices", "message": "No"}),
         ),
