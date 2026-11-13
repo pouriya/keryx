@@ -99,6 +99,7 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.PlatformTextStyle
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.text.TextStyle
@@ -109,6 +110,7 @@ import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.text.style.LineHeightStyle
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextDirection
@@ -226,6 +228,7 @@ internal fun ChatScreen(
     wouldLeave: (Bubble) -> Boolean,
     onAccept: (Bubble) -> Unit,
     onDecline: (Bubble) -> Unit,
+    onFolder: (String) -> Unit,
     onProfile: (String) -> Unit,
 ) {
     val dark = isDark()
@@ -503,6 +506,7 @@ internal fun ChatScreen(
                                     }
                                 },
                                 onDecline = { onDecline(row.bubble) },
+                                onFolder = onFolder,
                             )
                     }
                 }
@@ -917,6 +921,7 @@ private fun MessageRow(
     onAnswer: () -> Unit,
     onAccept: () -> Unit,
     onDecline: () -> Unit,
+    onFolder: (String) -> Unit,
 ) {
     val rtl = LocalLayoutDirection.current == LayoutDirection.Rtl
     val density = LocalDensity.current
@@ -1004,7 +1009,7 @@ private fun MessageRow(
             if (suggestion != null && !bubble.locked) {
                 SuggestionBubble(
                     bubble, suggestion, type, me, people, marks, talk, selecting, dark, ink, fill, onFill, quiet,
-                    onOpen, onSelect, onCopy, onTime, onJump, onAccept, onDecline,
+                    onOpen, onSelect, onCopy, onTime, onJump, onAccept, onDecline, onFolder,
                 ) {
                     Chips(chips, onBubble = true, mine = bubble.mine, dark = dark, ink = ink, enabled = !selecting, onChip = onChip)
                 }
@@ -1889,10 +1894,20 @@ private fun StickerArt(
     }
 }
 
+/** A suggestion's pill word, as tall as its letters, so the pill centres them and not the font's spare room. */
+private val pillText =
+    TextStyle(
+        lineHeight = 12.sp,
+        platformStyle = PlatformTextStyle(includeFontPadding = false),
+        lineHeightStyle = LineHeightStyle(LineHeightStyle.Alignment.Center, LineHeightStyle.Trim.Both),
+    )
+
 /**
  * A suggestion, drawn in `tmp/design/suggestions.html` and approved by the author: the label and time on
  * top, its text, the folder with Copy or Move, then Decline and Accept, which become the state at the same
- * height once this account has an ack. Its own account's suggestion shows the other person's ack instead.
+ * height once this account has an ack. Once accepted the folder's pill says Open and the row opens that
+ * folder; once declined the row is the name alone. Its own account's suggestion shows the other person's
+ * ack instead, and keeps its pill.
  */
 @Composable
 private fun SuggestionBubble(
@@ -1916,6 +1931,7 @@ private fun SuggestionBubble(
     onJump: (Long) -> Unit,
     onAccept: () -> Unit,
     onDecline: () -> Unit,
+    onFolder: (String) -> Unit,
     chips: @Composable () -> Unit,
 ) {
     val own = bubble.mine
@@ -1994,6 +2010,16 @@ private fun SuggestionBubble(
             SuggestionState(Glyphs.info, stringResource(R.string.suggestion_newer), quiet, tint)
         } else {
             val name = folder.name.trim()
+            val mineAck = seq?.let { talk.ackOf(it) }
+            // Once accepted the folder exists, so its row opens it; once declined the row is only its name.
+            val opens = !own && mineAck?.accepted == true
+            val pill =
+                when {
+                    opens -> R.string.suggestion_open
+                    !own && mineAck != null -> null
+                    folder.move -> R.string.suggestion_move
+                    else -> R.string.suggestion_copy
+                }
             Row(
                 Modifier
                     .padding(top = 10.dp)
@@ -2001,6 +2027,7 @@ private fun SuggestionBubble(
                     .height(40.dp)
                     .clip(RoundedCornerShape(10.dp))
                     .background(tint)
+                    .clickable(enabled = opens && !selecting, role = Role.Button) { onFolder(name) }
                     .padding(start = 10.dp, end = 8.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
@@ -2014,19 +2041,25 @@ private fun SuggestionBubble(
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
-                Text(
-                    stringResource(if (folder.move) R.string.suggestion_move else R.string.suggestion_copy),
-                    Modifier
-                        .height(24.dp)
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(badge)
-                        .padding(horizontal = 10.dp, vertical = 4.dp),
-                    color = onBadge,
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.SemiBold,
-                )
+                if (pill != null) {
+                    Box(
+                        Modifier
+                            .height(24.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(badge)
+                            .padding(horizontal = 10.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            stringResource(pill),
+                            color = onBadge,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            style = pillText,
+                        )
+                    }
+                }
             }
-            val mineAck = seq?.let { talk.ackOf(it) }
             when {
                 own -> {
                     val theirs = seq?.let { talk.theirAck(it) }

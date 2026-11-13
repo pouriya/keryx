@@ -1111,6 +1111,11 @@ suggestions and cannot build them, as with questions.
   phone test showed a bare "Declined".
   **A move's state does not say how many folders the chat left, chosen by the author**, keeping it on one
   row. **Tapping the state does nothing of its own, chosen by the author**, as any bubble's text.
+- **Once you accepted, the folder's pill says Open and tapping the folder's row opens the chat list on
+  that folder's tab, as tapping it in the tab row does; once you declined, the row is the folder's name
+  alone and a tap does what tapping the bubble does, chosen by the author** after the phone test showed
+  Copy and Move still there on handled suggestions. A suggestion your own account sent keeps its Copy or
+  Move pill, since the folder is the other person's. The pill's word sits in its middle.
 - **Accepting a move asks first only when the chat would leave other folders, chosen by the author:** a
   move that takes it out of no folder but `all` stays one tap. **Its words, chosen by the author as drawn:**
   "Move this chat to Lunch?", "It leaves your other folders and stays in All.", Cancel and Move, in Persian

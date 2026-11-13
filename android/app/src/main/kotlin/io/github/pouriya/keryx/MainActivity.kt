@@ -1658,6 +1658,13 @@ class MainActivity : ComponentActivity() {
                     engine.send(Command.DeclineSuggestion(chat, seq))
                 }
             },
+            onFolder = { name ->
+                val wanted = Core.fold(name)
+                folders.shown?.folders?.firstOrNull { folder -> folder.name?.let { Core.fold(it) == wanted } == true }?.let {
+                    folders.tab = it.id
+                    talk.close()
+                }
+            },
             onProfile = { profileOf.value = it },
         )
     }

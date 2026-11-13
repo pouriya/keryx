@@ -123,6 +123,7 @@
     <string name="suggestion_unknown">Suggestion</string>
     <string name="suggestion_copy">Copy</string>
     <string name="suggestion_move">Move</string>
+    <string name="suggestion_open">Open</string>
     <string name="suggestion_accept">Accept</string>
     <string name="suggestion_decline">Decline</string>
     <string name="suggestion_copied">Copied to %s</string>

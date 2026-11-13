@@ -123,6 +123,7 @@
     <string name="suggestion_unknown">پیشنهاد</string>
     <string name="suggestion_copy">کپی</string>
     <string name="suggestion_move">انتقال</string>
+    <string name="suggestion_open">باز کردن</string>
     <string name="suggestion_accept">قبول</string>
     <string name="suggestion_decline">رد</string>
     <string name="suggestion_copied">کپی شد به %s</string>
