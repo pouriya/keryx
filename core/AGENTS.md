@@ -172,6 +172,20 @@ come. **It stops at 20 hits, chosen by the author**, and `more` says whether old
 ی, ك as ک, Arabic and Persian digits as ASCII ones, and ZWNJ and the short vowel marks left out, so "10"
 finds "۱۰" and "علي" finds "علی".
 
+**It accepts and declines suggestions, chosen by the author**, so every client does it the same way: see
+Suggestions in the root [AGENTS.md](../AGENTS.md). `Command::SendSuggestion {chat, text?, suggestion}`
+is for agents and `drive.rs`, refused with `bad_suggestion` unless its action is a known one that holds
+together. `Command::AcceptSuggestion {chat, seq, suggestion}` takes the suggestion as shown, finds its
+folder by its name folded as search folds, or asks for a new id and puts the folder last, builds the
+arrangement as `Command::Folders` does and keeps the ack until the server answers that arrangement with
+`done`; a refusal drops the ack with an `Event::Error`, and an arrangement replaced before it went carries
+its ack to the new one. Nothing to change sends the ack at once. `Command::DeclineSuggestion {chat, seq}`
+sends the ack alone. Waiting acks are memory only, like the queue. `Shown` carries `suggestion`, the
+action or `Unknown` for one from a newer keryx, and `ack`, each left out when it does not hold together,
+and `Event::Pending` carries a pending `ack`, so the platform shows its suggestion handled at once.
+**`client::fold_name` is public, chosen by the author for Android's question before a move:** a name
+trimmed and folded as accepting matches it, so a client knows which folder accepting will choose.
+
 **A delete wipes its target in the same save, chosen by the author**, as soon as the server confirms
 it, by its `sent` reply or by the delete arriving from another device, not at the next `sync`. Core adds
 a wiped row for each delete's target to the page it hands the platform to save, and the platform wipes

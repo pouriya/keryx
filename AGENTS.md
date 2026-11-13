@@ -207,7 +207,8 @@ the WASM build, because there is one `Cargo.lock`. Make targets stay inside
   `content_kind`, so roles can allow or refuse each one. **Music is an MP3, apart from voice, which
   is a recorded note, chosen by the author.** It is numbered 4, right after image, and every kind
   from video on moved up one, so the numbers are text 0, voice 1, reaction 2, image 3, music 4,
-  video 5, doc 6, file 7, call 8, media_bundle 9, question 10, answer 11 and sticker 12.
+  video 5, doc 6, file 7, call 8, media_bundle 9, question 10, answer 11, sticker 12, suggestion 13 and
+  ack 14.
 - **A reaction is content.** It does not affect the unread count, but it brings the chat up in
   the sorted list and shows as the preview, like "Sara reacted 👍", until the next message.
 - **A recording, when it is built, is saved at the lowest quality for now:**
@@ -1042,6 +1043,90 @@ Whatever is saved to show later gets the next number. Whatever is not saved gets
   - **`keryx sticker list` marks it `(built in)`, chosen by the author**, so the operator knows its ids
     cannot be removed.
 
+### Suggestions
+
+**An agent can suggest what to do with a chat, and the person accepts or declines it, all chosen by the
+author.** The first action is a folder: an agent that makes a group for a task suggests the folder it
+belongs in, so it arranges the person's folders under the person's own permissions. Clients show
+suggestions and cannot build them, as with questions.
+
+- **Two new content kinds, `suggestion` (13) and `ack` (14), chosen by the author**, each with its own
+  permission, `message.send.suggestion` and `message.send.ack`, which member, moderator and admin hold, as
+  for questions, in groups too. Both are encrypted and signed like text. Their limits are `[limits.body]
+  suggestion = "4KiB"` and `ack = "1KiB"`. **Neither can be edited, chosen by the author:** the server
+  refuses with `cannot_edit`, as for stickers, so an ack always agrees to what it saw. Deleting your ack,
+  which is always allowed, brings the buttons back, and does not undo the folder change. **Android does not
+  offer it, chosen by the author:** see below.
+- **A suggestion is general, with one action per message, chosen by the author:** a later action is a new
+  key beside `folder`, not a new kind. **Its plaintext, chosen by the author:** `{"text"?, "folder":
+  {"name", "move"}}`, exactly one action key. `text` is an optional message of at most 500 characters,
+  shown above the buttons. `name` is 1 to 32 characters, the clients' limit for a folder's name, which core
+  checks. **A suggestion always means the chat it is sent in, chosen by the author.**
+- **An action this client does not know is opened, with no buttons, chosen by the author:** core hands it
+  over with its text and an unknown action, and the client says it needs a newer keryx.
+- **Copy adds the chat to the folder, creating it when needed. Move also takes it out of every other
+  folder but `all`, chosen by the author.** **Pins follow the folders' rules, chosen by the author:** a
+  move drops the chat's pins in the folders it leaves, it goes into the target folder unpinned, by its
+  time, and a chat already there keeps its pin there.
+- **The folder is found by its name folded as search folds, chosen by the author:** trimmed, case
+  ignored, and Arabic and Persian forms, digits, ZWNJ and the short vowel marks matched as in Search, so an
+  agent writing Arabic ي does not make a twin of a Persian folder. When several match, the first in tab
+  order is used.
+- **A folder made by accepting goes last among the tabs, chosen by the author**, as one made from the
+  sheet does, so the rest of the arrangement never shifts.
+- **The ack's plaintext, chosen by the author:** `{"suggestion": <seq>, "accepted": true|false,
+  "created"?: bool, "left"?: <count>}`, the pointer encrypted like an answer's. **It says what changed,
+  chosen by the author:** `created` when the folder was made for it, and `left` the number of folders a
+  move took the chat out of, never their names, since in a group every member reads it. **A decline holds
+  only `suggestion` and `accepted`, chosen by the author**, since it changed nothing.
+- **Declining sends an ack too, chosen by the author**, so every device of the account and the agent know
+  it was handled, and the buttons go everywhere.
+- **Accepting runs in core, chosen by the author**, so every client does it the same way:
+  `AcceptSuggestion {chat, seq, suggestion}`, with the suggestion as the platform shows it, as `SendAnswer`
+  takes its question, chosen by the author, finds the folder, builds the new arrangement, saves it as `Folders` does
+  and waits for its `done`, then sends the ack; `DeclineSuggestion {chat, seq}` sends the ack alone. A new folder needs its id
+  from the server first, so accepting one that makes a folder needs a connection. A
+  folder change that is refused, such as `too_many_folders`, sends no ack, and the client shows why with
+  the buttons still there. Matching by name makes accepting again change nothing, so an ack lost before
+  it was sent costs only a second tap.
+- **The buttons show only on suggestions another account sent, and go once this account has an ack,
+  chosen by the author**, as Answer does.
+- **In a group each account acks for itself, chosen by the author**, and every member sees each ack. Groups
+  are not built yet, so this runs in direct chats until they are.
+- **A suggestion counts like text, and an ack is quiet, chosen by the author:** a suggestion counts as
+  unread, moves the chat up and is the preview, its text or what it suggests. An ack does not count, does
+  not move the chat and does not change the preview, so a group is not bumped by each person's ack.
+- **Android folds the ack into the suggestion's bubble, chosen by the author:** no bubble of its own, and
+  under the suggestion's text its state, such as "Accepted: moved to Apollo" or "You declined", in a group
+  yours and a count of the others. Drawn in `tmp/design/suggestions.html` before it is built.
+- **The bubble's label is "Suggested folder", in Persian پوشهٔ پیشنهادی, chosen by the author** over
+  "Folder suggestion", since it names the folder written right under it. An action this client does not
+  know is labelled "Suggestion".
+- **The design is approved as drawn in `tmp/design/suggestions.html`, chosen by the author:** a top row
+  with the folder icon, the label and the time; the text; the folder's name with a "Copy" or "Move" pill;
+  Decline and Accept in one row, which becomes the state at the same height: "Copied to Apollo", "Moved to
+  Apollo" or "You declined", with a clock until the server has the ack. Its Persian texts are as drafted there.
+  **Your own decline reads "You declined", in Persian «شما رد کردید», and the other person's, on a
+  suggestion your account sent, reads "Babak declined", «بابک رد کرد», chosen by the author** after the
+  phone test showed a bare "Declined".
+  **A move's state does not say how many folders the chat left, chosen by the author**, keeping it on one
+  row. **Tapping the state does nothing of its own, chosen by the author**, as any bubble's text.
+- **Accepting a move asks first only when the chat would leave other folders, chosen by the author:** a
+  move that takes it out of no folder but `all` stays one tap. **Its words, chosen by the author as drawn:**
+  "Move this chat to Lunch?", "It leaves your other folders and stays in All.", Cancel and Move, in Persian
+  «این گفتگو به Lunch منتقل شود؟», «از پوشه‌های دیگرتان بیرون می‌رود و در «همه» می‌ماند.», لغو and انتقال.
+- **Android tells whether the chat would leave other folders with core's own fold, over JNI, chosen by the
+  author:** `Core.fold`, so the question and core always agree on which folder is meant.
+- **A refusal other than too many folders or no connection shows the folder sheet's own words, chosen by
+  the author:** its lines for `no_permission`, `unknown_folder` and any other refusal. The red line stays
+  until Accept or Decline is tapped again, or the chat closes.
+- **Android does not offer deleting an ack, chosen by the author:** once accepted or declined, the state
+  stays. **The bubble's menu is a question's, chosen by the author:** Reply, and Delete on a suggestion of
+  your own, with no Copy and no Edit.
+- **Built server and core first, tested by the server's integration tests driving core, then Android on
+  the author's phone, chosen by the author**, with `server/examples/drive.rs`'s `suggest move|copy
+  <folder> [text]` sending one and printing the ack it gets back.
+
 ### Read state
 
 - **`seen` is not per message.** A client sends one at some point in time, and it covers
@@ -1522,6 +1607,8 @@ accepts the first for each step. The loser gets a rejection, catches up and retr
   question = "64KiB"
   answer = "16KiB"
   sticker = "1KiB"
+  suggestion = "4KiB"
+  ack = "1KiB"
   draft = "64KiB" # an account's sealed draft in one chat. Not a message
   folder_name = "256B"      # one sealed folder name
   kv_value = "4KiB"         # one setting's value, as the client sent it
