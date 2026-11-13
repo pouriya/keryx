@@ -1373,6 +1373,33 @@ impl Phone {
                     call_list,
                 }
             }
+            // Newest first by server time, chat and sequence id, after where the last read stopped.
+            Output::ScanRows { id, before, limit } => {
+                let at = |message: &MessageFrame| {
+                    (
+                        message.server_saved_at.unwrap_or(0),
+                        message.chat,
+                        message.seq,
+                    )
+                };
+                let mut message_list: Vec<MessageFrame> = self
+                    .archive
+                    .values()
+                    .filter(|message| {
+                        before.is_none_or(|before| {
+                            at(message) < (before.saved_at, before.chat, before.seq)
+                        })
+                    })
+                    .cloned()
+                    .collect();
+                message_list.sort_by_key(|message| std::cmp::Reverse(at(message)));
+                message_list.truncate(usize::try_from(limit).unwrap());
+                Input::RowsScanned {
+                    id,
+                    message_list,
+                    total: u64::try_from(self.archive.len()).unwrap(),
+                }
+            }
             _ => unreachable!("not archive work"),
         }
     }
@@ -1489,7 +1516,7 @@ impl World {
                 | Output::CallKey { .. }
                 | Output::LeaveCall { .. }
                 | Output::CallText { .. } => phone.call_outputs.push(output),
-                Output::SaveRows { .. } | Output::ReadRows { .. } => {
+                Output::SaveRows { .. } | Output::ReadRows { .. } | Output::ScanRows { .. } => {
                     phone.archive_work.push_back(output)
                 }
                 Output::WriteChunk {

@@ -55,6 +55,11 @@ const KEY_PACKAGES: u64 = 10;
 const RETRY_MS: [i64; 6] = [1_000, 2_000, 4_000, 8_000, 16_000, 30_000];
 /// How many messages one read of the archive asks for, when a chat opens or scrolls up.
 const PAGE: u32 = 50;
+/// How many rows one read of the archive asks for while a search scans it.
+const SCAN_ROWS: u32 = 200;
+/// How many found messages a search hands over before it stops and waits for more to be asked,
+/// chosen by the author.
+const SEARCH_HITS: usize = 20;
 /// A profile's bio, in characters, and its links, each name and address in characters. See the
 /// root AGENTS.md.
 const BIO_CHARS: usize = 140;
@@ -316,6 +321,13 @@ pub enum Command {
     Search {
         text: String,
     },
+    /// Looks through this device's archive for messages holding `text`, newest first, and stops
+    /// after a page of hits, handed over as [`Event::MessageHits`]. Replaces any search under way.
+    SearchMessages {
+        text: Secret,
+    },
+    /// The next page of the search under way, older than the last.
+    SearchOlder,
     /// `reply` names the message answered, by its sequence id or its pending local id. The message
     /// then waits for that id if it has none yet, and carries it inside its encryption.
     SendText {
@@ -609,6 +621,13 @@ pub enum Input {
         message_list: Vec<MessageFrame>,
         call_list: Vec<CallEvent>,
     },
+    /// [`Output::ScanRows`]'s answer: the messages, newest first, and how many rows the archive
+    /// holds in all, for the search's progress.
+    RowsScanned {
+        id: u64,
+        message_list: Vec<MessageFrame>,
+        total: u64,
+    },
 }
 
 /// Everything [`Client::step`] asks the platform to do, in order.
@@ -720,8 +739,9 @@ pub enum Output {
     },
     /// Keep these rows in the archive, exactly as they are, in one transaction, then answer with
     /// [`Input::RowsSaved`] or [`Input::RowsSaveFailed`]. A row already kept stays, except that a
-    /// removed message, with only `chat`, `seq` and `server_saved_at`, replaces its copy, and a
-    /// removed call message takes that call's rows with it.
+    /// removed message, with only `chat`, `seq` and `server_saved_at`, replaces its copy, and takes
+    /// with it the edits pointing at it, as the server wipes them too, and a removed call message
+    /// that call's rows.
     SaveRows {
         id: u64,
         message_list: Vec<MessageFrame>,
@@ -735,6 +755,36 @@ pub enum Output {
         before_seq: Option<u64>,
         limit: u32,
     },
+    /// Read up to `limit` messages of every chat, newest by server time first, then by chat and
+    /// sequence id, all below `before` when given, and answer with [`Input::RowsScanned`].
+    ScanRows {
+        id: u64,
+        before: Option<ScanAt>,
+        limit: u32,
+    },
+}
+
+/// Where a search's scan of the archive has reached: a message's server time, chat and sequence id.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ScanAt {
+    pub saved_at: i64,
+    pub chat: Ulid,
+    pub seq: u64,
+}
+
+/// A message a search found: the words it matched in, split around the match.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify), tsify(missing_as_null))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Hit {
+    pub chat: Ulid,
+    pub seq: u64,
+    pub account: Option<Ulid>,
+    pub mine: bool,
+    pub saved_at: i64,
+    pub before: Secret,
+    pub matched: Secret,
+    pub after: Secret,
 }
 
 /// Why a message cannot be shown as it is. It still appears, so the timeline has no hole.
@@ -1054,6 +1104,18 @@ pub enum Event {
     },
     SearchResults {
         account_list: Vec<AccountBrief>,
+    },
+    /// What one read of the archive found for the search under way, and how far it has looked:
+    /// `scanned` of `total` rows. `done` once this page of hits is full or the archive is
+    /// through, and `more` while older rows are left for [`Command::SearchOlder`]. `text` is what
+    /// was looked for, so a platform can drop what an earlier search still had on its way.
+    MessageHits {
+        text: Secret,
+        hit_list: Vec<Hit>,
+        scanned: u64,
+        total: u64,
+        done: bool,
+        more: bool,
     },
     DeviceList {
         reply: DevicesReply,
@@ -1653,6 +1715,8 @@ pub struct Client {
     rows_saving: HashMap<u64, RowsSave>,
     /// Archive reads under way: the chat, and whether it is older messages.
     reading: HashMap<u64, Ulid>,
+    /// The search through the archive, while one is under way or can go on.
+    scan: Option<Scan>,
     /// This account's devices, as handed to the platform.
     own_devices: Vec<Ulid>,
     profiles: HashMap<Ulid, ProfileState>,
@@ -1758,6 +1822,65 @@ fn refused_for_safety(error: &MlsError) -> bool {
             | MlsError::MasterKeyChanged { .. }
             | MlsError::Credential
     )
+}
+
+/// A search through the archive: what it looks for, folded, how far it has read, and which
+/// messages it has already judged by their newest text.
+struct Scan {
+    text: Secret,
+    needle: Vec<char>,
+    /// The archive read under way, whose answer is the only one taken.
+    reading: Option<u64>,
+    before: Option<ScanAt>,
+    scanned: u64,
+    /// Hits in the page under way.
+    found: usize,
+    /// Messages already judged, by a newer edit or a delete.
+    edited: HashSet<(Ulid, u64)>,
+    more: bool,
+}
+
+/// Text as a search compares it, chosen by the author: lower case, Arabic ي, ى and ك as Persian ی
+/// and ک, Persian and Arabic digits as ASCII ones, and no ZWNJ or short vowel marks. Each folded
+/// character carries the index of the character it came from.
+fn fold(text: &str) -> (Vec<char>, Vec<usize>) {
+    let mut folded = Vec::with_capacity(text.len());
+    let mut from = Vec::with_capacity(text.len());
+    for (at, character) in text.chars().enumerate() {
+        let one = match character {
+            '\u{200C}' | '\u{064B}'..='\u{065F}' | '\u{0670}' => continue,
+            '\u{064A}' | '\u{0649}' => '\u{06CC}',
+            '\u{0643}' => '\u{06A9}',
+            '\u{0660}'..='\u{0669}' => {
+                char::from_digit(u32::from(character) - 0x0660, 10).unwrap_or(character)
+            }
+            '\u{06F0}'..='\u{06F9}' => {
+                char::from_digit(u32::from(character) - 0x06F0, 10).unwrap_or(character)
+            }
+            other => other,
+        };
+        for lower in one.to_lowercase() {
+            folded.push(lower);
+            from.push(at);
+        }
+    }
+    (folded, from)
+}
+
+/// The field split around the first place it holds `needle`, both folded, or nothing.
+fn found_in(field: &str, needle: &[char]) -> Option<(String, String, String)> {
+    let (folded, from) = fold(field);
+    let start = folded
+        .windows(needle.len())
+        .position(|window| window == needle)?;
+    let first = from[start];
+    let last = from[start + needle.len() - 1] + 1;
+    let characters: Vec<char> = field.chars().collect();
+    Some((
+        characters[..first].iter().collect(),
+        characters[first..last].iter().collect(),
+        characters[last..].iter().collect(),
+    ))
 }
 
 /// What a message holds once opened.
@@ -1979,6 +2102,7 @@ impl Client {
             behind: Vec::new(),
             rows_saving: HashMap::new(),
             reading: HashMap::new(),
+            scan: None,
             own_devices: Vec::new(),
             profiles: HashMap::new(),
             profile_asked: HashSet::new(),
@@ -2045,6 +2169,11 @@ impl Client {
                 message_list,
                 call_list,
             } => self.rows_read(id, message_list, call_list),
+            Input::RowsScanned {
+                id,
+                message_list,
+                total,
+            } => self.rows_scanned(id, message_list, total),
         }
         loop {
             self.run_plans();
@@ -2339,6 +2468,32 @@ impl Client {
                     Some(&body),
                     Asked::CreateChat { account },
                 );
+            }
+            Command::SearchMessages { text } => {
+                let (needle, _) = fold(text.0.trim());
+                self.scan = None;
+                if !needle.is_empty() {
+                    self.scan = Some(Scan {
+                        text: text.clone(),
+                        needle,
+                        reading: None,
+                        before: None,
+                        scanned: 0,
+                        found: 0,
+                        edited: HashSet::new(),
+                        more: true,
+                    });
+                    self.scan_rows();
+                }
+            }
+            Command::SearchOlder => {
+                if let Some(scan) = self.scan.as_mut()
+                    && scan.reading.is_none()
+                    && scan.more
+                {
+                    scan.found = 0;
+                    self.scan_rows();
+                }
             }
             Command::Search { text } => {
                 let mut encoded = String::new();
@@ -3006,6 +3161,148 @@ impl Client {
         };
         self.open_list(chat, message_list, true, true);
         self.event(Event::PageLoaded { chat, has_older });
+    }
+
+    /// Asks the archive for the next rows the search under way has not looked at.
+    fn scan_rows(&mut self) {
+        let id = self.next_id;
+        self.next_id += 1;
+        let Some(scan) = self.scan.as_mut() else {
+            return;
+        };
+        scan.reading = Some(id);
+        self.out.push(Output::ScanRows {
+            id,
+            before: scan.before,
+            limit: SCAN_ROWS,
+        });
+    }
+
+    /// The archive's answer to `scan_rows`. Each message is checked and opened as when shown, and
+    /// matched by its newest text: an edit is met before what it edits, as rows come newest first.
+    fn rows_scanned(&mut self, id: u64, message_list: Vec<MessageFrame>, total: u64) {
+        let Some(mut scan) = self.scan.take() else {
+            return;
+        };
+        if scan.reading != Some(id) {
+            self.scan = Some(scan);
+            return;
+        }
+        scan.reading = None;
+        let read = message_list.len();
+        let mut hit_list = Vec::new();
+        let mut looked: usize = 0;
+        for message in &message_list {
+            looked += 1;
+            scan.before = Some(ScanAt {
+                saved_at: message.server_saved_at.unwrap_or(0),
+                chat: message.chat,
+                seq: message.seq,
+            });
+            if let Some(hit) = self.scanned_one(&mut scan, message) {
+                hit_list.push(hit);
+                scan.found += 1;
+                if scan.found >= SEARCH_HITS {
+                    break;
+                }
+            }
+        }
+        scan.scanned += u64::try_from(looked).unwrap_or(u64::MAX);
+        scan.more = looked < read || u32::try_from(read).is_ok_and(|read| read >= SCAN_ROWS);
+        let done = scan.found >= SEARCH_HITS || !scan.more;
+        self.event(Event::MessageHits {
+            text: scan.text.clone(),
+            hit_list,
+            scanned: scan.scanned,
+            total: total.max(scan.scanned),
+            done,
+            more: scan.more,
+        });
+        self.scan = Some(scan);
+        if !done {
+            self.scan_rows();
+        }
+    }
+
+    /// One row of a search: a hit when its newest text, a caption or a file's name, description,
+    /// title or artist holds what is looked for. Anything that does not check out is passed over.
+    /// A delete passes over what it points at, which the archive may hold until a `sync` wipes it.
+    fn scanned_one(&self, scan: &mut Scan, message: &MessageFrame) -> Option<Hit> {
+        let kind = message.kind?;
+        let shown = match (kind, message.pointer_seq) {
+            (Kind::Content, None) => message.seq,
+            (Kind::Edit, Some(target)) => target,
+            (Kind::Delete, Some(target)) => {
+                scan.edited.insert((message.chat, target));
+                return None;
+            }
+            _ => return None,
+        };
+        if !scan.edited.insert((message.chat, shown)) {
+            return None;
+        }
+        if !matches!(
+            message.content_kind,
+            None | Some(
+                ContentKind::Text
+                    | ContentKind::Image
+                    | ContentKind::Music
+                    | ContentKind::Video
+                    | ContentKind::Doc
+                    | ContentKind::File
+                    | ContentKind::MediaBundle
+            )
+        ) {
+            return None;
+        }
+        let known = self.devices.get(&message.device?).copied()?;
+        let signature = fixed::<64>(&message.signature.as_ref()?.0)?;
+        let header = message.header()?;
+        let body = message
+            .body
+            .as_ref()
+            .map(|body| body.0.clone())
+            .unwrap_or_default();
+        verify_message(&header, &body, &signature, &known.public).ok()?;
+        let opened = if header.encrypted {
+            let plaintext = self
+                .device
+                .as_ref()?
+                .open(&header, &body, &signature, &known.public)
+                .ok()?;
+            content_of(&plaintext)
+        } else {
+            content_of(&body)
+        };
+        let mut fields: Vec<&str> = Vec::new();
+        if let Some(text) = &opened.text {
+            fields.push(&text.0);
+        }
+        for file in &opened.files {
+            if file.kind == ContentKind::Voice {
+                continue;
+            }
+            fields.push(&file.name);
+            for extra in [&file.description, &file.title, &file.artist]
+                .into_iter()
+                .flatten()
+            {
+                fields.push(extra);
+            }
+        }
+        let (before, matched, after) = fields
+            .iter()
+            .find_map(|field| found_in(field, &scan.needle))?;
+        Some(Hit {
+            chat: message.chat,
+            seq: shown,
+            account: Some(known.account),
+            mine: self.account == Some(known.account),
+            saved_at: message.server_saved_at.unwrap_or(0),
+            before: Secret(before),
+            matched: Secret(matched),
+            after: Secret(after),
+        })
     }
 
     /// Fetches the chat's device list, unless one is already coming. It decides every message
@@ -6007,14 +6304,37 @@ impl Client {
         self.save_rows(message_list, call_list, last, Some(page));
     }
 
-    /// Hands rows to the platform to keep.
+    /// Hands rows to the platform to keep. A delete the server has saved, this device's own once
+    /// answered or another's as it arrives, brings its target's removed row with it, as the server
+    /// already wiped it, so the archive never holds a deleted message until the next `sync`.
     fn save_rows(
         &mut self,
-        message_list: Vec<MessageFrame>,
+        mut message_list: Vec<MessageFrame>,
         call_list: Vec<CallEvent>,
         last: Option<SyncPosition>,
         page: Option<PageSaved>,
     ) {
+        let wiped: Vec<MessageFrame> = message_list
+            .iter()
+            .filter(|message| message.kind == Some(Kind::Delete))
+            .filter_map(|message| {
+                Some(MessageFrame {
+                    chat: message.chat,
+                    seq: message.pointer_seq?,
+                    device: None,
+                    kind: None,
+                    content_kind: None,
+                    encrypted: None,
+                    epoch: None,
+                    pointer_seq: None,
+                    client_sent_at: None,
+                    server_saved_at: message.server_saved_at,
+                    body: None,
+                    signature: None,
+                })
+            })
+            .collect();
+        message_list.extend(wiped);
         let id = self.next_id;
         self.next_id += 1;
         self.rows_saving.insert(id, RowsSave { last, page });

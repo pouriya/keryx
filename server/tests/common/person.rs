@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use keryx_core::client::{Auth, Client, Command, Event, Input, Output, Platform, Secret};
 use keryx_core::mls::{AccountKey, Device, stamp_account_key};
-use keryx_core::protocol::{Bytes, CallEvent, ChatType, MessageFrame};
+use keryx_core::protocol::{Bytes, CallEvent, ChatType, Kind, MessageFrame};
 use keryx_core::seed::{AccountKeys, derive};
 use keryx_core::ulid::Ulid;
 use serde_json::{Value, json};
@@ -307,6 +307,27 @@ impl App {
                         if message.kind.is_none() {
                             self.archive_calls
                                 .retain(|(chat, call_seq, _), _| (*chat, *call_seq) != key);
+                            for kept in self.archive.values_mut() {
+                                if kept.chat == key.0
+                                    && kept.kind == Some(Kind::Edit)
+                                    && kept.pointer_seq == Some(key.1)
+                                {
+                                    *kept = MessageFrame {
+                                        chat: kept.chat,
+                                        seq: kept.seq,
+                                        device: None,
+                                        kind: None,
+                                        content_kind: None,
+                                        encrypted: None,
+                                        epoch: None,
+                                        pointer_seq: None,
+                                        client_sent_at: None,
+                                        server_saved_at: message.server_saved_at,
+                                        body: None,
+                                        signature: None,
+                                    };
+                                }
+                            }
                             self.archive.insert(key, message);
                         } else {
                             self.archive.entry(key).or_insert(message);
@@ -346,6 +367,37 @@ impl App {
                         id,
                         message_list,
                         call_list,
+                    })
+                }
+                // Newest by server time first, then by chat and sequence id, as an app's archive
+                // answers a search.
+                Output::ScanRows { id, before, limit } => {
+                    let mut message_list: Vec<MessageFrame> = self
+                        .archive
+                        .values()
+                        .filter(|message| {
+                            before.is_none_or(|before| {
+                                (
+                                    message.server_saved_at.unwrap_or(0),
+                                    message.chat,
+                                    message.seq,
+                                ) < (before.saved_at, before.chat, before.seq)
+                            })
+                        })
+                        .cloned()
+                        .collect();
+                    message_list.sort_by_key(|message| {
+                        std::cmp::Reverse((
+                            message.server_saved_at.unwrap_or(0),
+                            message.chat,
+                            message.seq,
+                        ))
+                    });
+                    message_list.truncate(usize::try_from(limit).unwrap());
+                    Some(Input::RowsScanned {
+                        id,
+                        message_list,
+                        total: u64::try_from(self.archive.len()).unwrap(),
                     })
                 }
                 Output::Event { event } => {

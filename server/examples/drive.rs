@@ -2,7 +2,8 @@
 //! cannot, such as a question. Not part of the server, and not a test. Reads one command per line on
 //! stdin: `signup` or `login` with a username, password and words, `find <username>`, `say <text>`,
 //! `many <n>`, `seen`, `call`, `question`, `bio <text>`, `link <name> <url>`, `photo <file.jpg>`,
-//! `app <on|off>`, `kv <key> <json>`, `react <seq> <emoji>`, `delete <seq>`, `pump <ms>` and `quit`.
+//! `app <on|off>`, `kv <key> <json>`, `react <seq> <emoji>`, `delete <seq>`, `sticker [n]`, `pump <ms>`
+//! and `quit`.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
@@ -254,6 +255,12 @@ impl App {
                         call_list: Vec::new(),
                     })
                 }
+                // Nothing here searches its archive.
+                Output::ScanRows { id, .. } => Some(Input::RowsScanned {
+                    id,
+                    message_list: Vec::new(),
+                    total: 0,
+                }),
                 Output::Event { event } => {
                     if let Event::Chats { chat_list } = &event {
                         for item in chat_list {
@@ -573,6 +580,43 @@ fn main() {
                 });
                 app.wait(|event| matches!(event, Event::Sent { .. }));
                 println!("deleted {rest}");
+            }
+            // The nth sticker of the bundled Default pack, from 1, the first when none is given,
+            // chosen by the author. Prints its sequence id, as `react` does.
+            "sticker" => {
+                let chat = app.chat.expect("no chat");
+                let n: usize = if rest.is_empty() {
+                    1
+                } else {
+                    rest.parse().unwrap()
+                };
+                app.events
+                    .retain(|event| !matches!(event, Event::Stickers { .. }));
+                app.command(Command::Stickers);
+                let Event::Stickers { pack_list } =
+                    app.wait(|event| matches!(event, Event::Stickers { .. }))
+                else {
+                    unreachable!()
+                };
+                let pack = pack_list
+                    .iter()
+                    .find(|pack| pack.name == "Default")
+                    .expect("no Default pack");
+                let Some(sticker) = n.checked_sub(1).and_then(|at| pack.sticker_list.get(at))
+                else {
+                    println!("no sticker {n}");
+                    continue;
+                };
+                app.command(Command::SendSticker {
+                    chat,
+                    sticker: sticker.id,
+                    reply: None,
+                });
+                let Event::Sent { seq, .. } = app.wait(|event| matches!(event, Event::Sent { .. }))
+                else {
+                    unreachable!()
+                };
+                println!("sticker {seq}");
             }
             "pump" => {
                 let ms: u64 = rest.parse().unwrap_or(1000);

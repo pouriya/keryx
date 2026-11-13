@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use common::{OPERATOR_TOKEN, Server};
 use keryx_core::client::{
-    Command, Draft, Event, FileSpec, Folder, Pointer, Secret, Setting, ShownProfile, Thumbnail,
+    Command, Draft, Event, FileSpec, Folder, Hit, Pointer, Secret, Setting, ShownProfile, Thumbnail,
 };
 use keryx_core::file;
 use keryx_core::mls::{AccountWrap, Commit, Device};
@@ -5365,4 +5365,224 @@ fn core_seals_settings_shows_them_on_every_device_and_hands_presence_back() {
     settings_shown(&mut sara, &server, |list| list == server_set.as_slice());
     let (status, reply) = server.call("GET", "/api/v1/kv", sara.token.as_deref(), None);
     assert_eq!((status, reply["data"]["version"].as_u64()), (200, Some(4)));
+}
+
+/// Sends text and gives back its sequence id once the other side has it.
+fn say_to(server: &Server, from: &mut App, to: &mut App, chat: Ulid, text: &str) -> u64 {
+    from.command(
+        server,
+        Command::SendText {
+            chat,
+            text: Secret(text.to_string()),
+            reply: None,
+        },
+    );
+    let Event::Sent { seq, .. } = from.wait(server, |event| matches!(event, Event::Sent { .. }))
+    else {
+        unreachable!();
+    };
+    to.wait(server, |event| {
+        matches!(event, Event::Message { message } | Event::Edited { message, .. }
+            if message.chat == chat && message.seq == seq)
+    });
+    seq
+}
+
+/// A search's hits until its page is done, and whether older rows are left.
+fn hits_of(server: &Server, app: &mut App) -> (Vec<Hit>, bool, u64, u64) {
+    let mut list = Vec::new();
+    loop {
+        let Event::MessageHits {
+            text: _,
+            hit_list,
+            done,
+            more,
+            scanned,
+            total,
+        } = app.wait(server, |event| matches!(event, Event::MessageHits { .. }))
+        else {
+            unreachable!();
+        };
+        list.extend(hit_list);
+        if done {
+            return (list, more, scanned, total);
+        }
+    }
+}
+
+fn search(server: &Server, app: &mut App, text: &str) -> (Vec<Hit>, bool, u64, u64) {
+    app.command(
+        server,
+        Command::SearchMessages {
+            text: Secret(text.to_string()),
+        },
+    );
+    hits_of(server, app)
+}
+
+#[test]
+fn a_search_opens_the_archive_newest_first_by_newest_text_a_page_at_a_time() {
+    let server = open_server();
+    let (mut sara, mut babak, chat) = apps_on(&server);
+
+    // Edited text is found by its newest words only, under the message it edits.
+    let edited = say_to(&server, &mut sara, &mut babak, chat, "the old apple pie");
+    sara.command(
+        &server,
+        Command::Edit {
+            chat,
+            target: Pointer::Seq(edited),
+            text: Secret("a Banana bread".to_string()),
+            files: Vec::new(),
+            remove: Vec::new(),
+        },
+    );
+    sara.wait(&server, |event| matches!(event, Event::Sent { .. }));
+    babak.wait(
+        &server,
+        |event| matches!(event, Event::Edited { target_seq, .. } if *target_seq == edited),
+    );
+    // Arabic yeh and kaf, a ZWNJ and Persian digits, as a Persian keyboard may not type them.
+    let persian = say_to(
+        &server,
+        &mut sara,
+        &mut babak,
+        chat,
+        "سلام علي كو\u{200C}چک ۱۲",
+    );
+    let gone = say_to(&server, &mut sara, &mut babak, chat, "drop the apple");
+    sara.command(
+        &server,
+        Command::Edit {
+            chat,
+            target: Pointer::Seq(gone),
+            text: Secret("drop the apple now".to_string()),
+            files: Vec::new(),
+            remove: Vec::new(),
+        },
+    );
+    let Event::Sent { seq: gone_edit, .. } =
+        sara.wait(&server, |event| matches!(event, Event::Sent { .. }))
+    else {
+        unreachable!();
+    };
+    babak.wait(
+        &server,
+        |event| matches!(event, Event::Edited { target_seq, .. } if *target_seq == gone),
+    );
+    sara.command(
+        &server,
+        Command::Delete {
+            chat,
+            target: Pointer::Seq(gone),
+            remove: Vec::new(),
+        },
+    );
+    sara.wait(&server, |event| matches!(event, Event::Sent { .. }));
+    babak.wait(
+        &server,
+        |event| matches!(event, Event::Deleted { target_seq, .. } if *target_seq == gone),
+    );
+    // The server answered the delete, so both archives hold the target wiped, with no wait for a sync.
+    for app in [&sara, &babak] {
+        for seq in [gone, gone_edit] {
+            let row = &app.archive[&(chat, seq)];
+            assert_eq!((row.kind, row.body.as_ref()), (None, None));
+        }
+    }
+    // A file is found by its name, and a voice note never is.
+    sara.files.insert(1, pattern(10, 1));
+    sara.files.insert(2, pattern(10, 2));
+    sara.command(
+        &server,
+        Command::SendFiles {
+            chat,
+            files: vec![spec(1, ContentKind::Doc, 10)],
+            text: None,
+        },
+    );
+    sara.wait(&server, |event| matches!(event, Event::Sent { .. }));
+    sara.command(
+        &server,
+        Command::SendFiles {
+            chat,
+            files: vec![spec(2, ContentKind::Voice, 10)],
+            text: None,
+        },
+    );
+    sara.wait(&server, |event| matches!(event, Event::Sent { .. }));
+    let mut pears = Vec::new();
+    for n in 1..=23 {
+        pears.push(say_to(
+            &server,
+            &mut sara,
+            &mut babak,
+            chat,
+            &format!("pear {n}"),
+        ));
+    }
+
+    let (found, more, scanned, total) = search(&server, &mut babak, "BANANA");
+    assert_eq!(found.len(), 1);
+    assert_eq!((found[0].chat, found[0].seq), (chat, edited));
+    assert!(!found[0].mine);
+    assert_eq!(found[0].account, Some(sara.id()));
+    assert_eq!(
+        (
+            &found[0].before.0[..],
+            &found[0].matched.0[..],
+            &found[0].after.0[..]
+        ),
+        ("a ", "Banana", " bread")
+    );
+    assert!(!more);
+    assert_eq!(scanned, total);
+    assert!(search(&server, &mut babak, "apple").0.is_empty());
+
+    let (found, ..) = search(&server, &mut babak, "علی کوچک 12");
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].seq, persian);
+    assert_eq!(found[0].matched.0, "علي كو\u{200C}چک ۱۲");
+    assert_eq!(found[0].before.0, "سلام ");
+
+    let (found, ..) = search(&server, &mut babak, "file-");
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].matched.0, "file-");
+    assert_eq!(found[0].after.0, "1");
+
+    // The sender finds their own, marked mine.
+    let (found, ..) = search(&server, &mut sara, "pear 23");
+    assert_eq!(found.len(), 1);
+    assert!(found[0].mine);
+
+    // A page is 20 hits, newest first, and the rest come when asked.
+    let (first, more, scanned, total) = search(&server, &mut babak, "pear");
+    let seqs: Vec<u64> = first.iter().map(|hit| hit.seq).collect();
+    let newest: Vec<u64> = pears.iter().rev().take(20).copied().collect();
+    assert_eq!(seqs, newest);
+    assert!(more);
+    assert!(scanned < total);
+    babak.command(&server, Command::SearchOlder);
+    let (rest, more, scanned, total) = hits_of(&server, &mut babak);
+    let seqs: Vec<u64> = rest.iter().map(|hit| hit.seq).collect();
+    assert_eq!(seqs, vec![pears[2], pears[1], pears[0]]);
+    assert!(!more);
+    assert_eq!(scanned, total);
+    // Once through, asking for more does nothing, and an empty search looks for nothing.
+    babak.command(&server, Command::SearchOlder);
+    babak.command(
+        &server,
+        Command::SearchMessages {
+            text: Secret(" \u{200C}".to_string()),
+        },
+    );
+    babak.command(
+        &server,
+        Command::SearchMessages {
+            text: Secret("nothing like this".to_string()),
+        },
+    );
+    let (found, more, ..) = hits_of(&server, &mut babak);
+    assert!(found.is_empty());
+    assert!(!more);
 }
