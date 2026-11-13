@@ -693,6 +693,7 @@ class MainActivity : ComponentActivity() {
             CONTENT_QUESTION -> text ?: bubble.question?.let(::firstQuestion).orEmpty()
             CONTENT_ANSWER -> getString(R.string.kind_answered)
             CONTENT_STICKER -> getString(R.string.kind_sticker)
+            CONTENT_SUGGESTION -> text ?: suggestionPreview(bubble.suggestion)
             else -> text.orEmpty()
         }
     }
@@ -712,9 +713,14 @@ class MainActivity : ComponentActivity() {
             CONTENT_QUESTION -> text ?: message.question?.let(::firstQuestion).orEmpty()
             CONTENT_ANSWER -> getString(R.string.kind_answered)
             CONTENT_STICKER -> getString(R.string.kind_sticker)
+            CONTENT_SUGGESTION -> text ?: suggestionPreview(message.suggestion)
             else -> text.orEmpty()
         }
     }
+
+    /** A suggestion with no text: the folder it suggests, or "Suggestion" for an action this client does not know. */
+    private fun suggestionPreview(suggestion: Suggestion?): String =
+        suggestion?.folder?.let { getString(R.string.suggestion_preview, it.name.trim()) } ?: getString(R.string.suggestion_unknown)
 
     /** A call's preview: missed or not, and video when the caller had it on. */
     private fun callLabel(
@@ -1292,6 +1298,7 @@ class MainActivity : ComponentActivity() {
             }
             is Event.Error -> {
                 happened[0] = "Error: ${event.code}"
+                talk.refused(event.code)
                 timesAnswer.value?.let { if (it.member_list == null) timesAnswer.value = it.copy(member_list = emptyList()) }
                 busy.value = false
                 if (place.value == Place.Chats && searches > 0) searchAnswered(emptyList())
@@ -1636,8 +1643,38 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             },
+            wouldLeave = { bubble -> wouldLeave(chat, bubble) },
+            onAccept = { bubble ->
+                val seq = bubble.seq
+                val suggestion = bubble.suggestion
+                if (seq != null && suggestion != null) {
+                    talk.answering(seq, accepting = true)
+                    engine.send(Command.AcceptSuggestion(chat, seq, suggestion))
+                }
+            },
+            onDecline = { bubble ->
+                bubble.seq?.let { seq ->
+                    talk.answering(seq, accepting = false)
+                    engine.send(Command.DeclineSuggestion(chat, seq))
+                }
+            },
             onProfile = { profileOf.value = it },
         )
+    }
+
+    /**
+     * Whether accepting a move takes `chat` out of a folder besides All: one other than the folder core
+     * will choose, found by its name folded as core folds it, the first in tab order.
+     */
+    private fun wouldLeave(
+        chat: String,
+        bubble: Bubble,
+    ): Boolean {
+        val name = bubble.suggestion?.folder?.name ?: return false
+        val list = folders.shown?.folders ?: return false
+        val wanted = Core.fold(name)
+        val target = list.indexOfFirst { folder -> folder.name?.let { Core.fold(it) == wanted } == true }
+        return list.withIndex().any { (at, folder) -> at != target && folder.name != null && folder.chat_list?.contains(chat) == true }
     }
 
     private fun choose(chat: String) {

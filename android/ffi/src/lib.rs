@@ -1,6 +1,6 @@
 //! The hand-written JNI glue around `keryx-core`'s client and `keryx-moq`'s call, and nothing else:
-//! `Core.create`, `Core.step`, `Core.stepBytes`, `Core.chunk`, `Core.blurhash` and `Core.drop`,
-//! then `Core.callConnect`, `Core.callAudio`, `Core.callVideo`, `Core.callState` and
+//! `Core.create`, `Core.step`, `Core.stepBytes`, `Core.chunk`, `Core.blurhash`, `Core.fold` and
+//! `Core.drop`, then `Core.callConnect`, `Core.callAudio`, `Core.callVideo`, `Core.callState` and
 //! `Core.callNext` on the Kotlin side. The flow is in `core/src/client.rs`. Inputs and outputs
 //! cross as JSON text in core's own serde shapes, and media, file chunks and a new photo as raw
 //! bytes. The app does the socket, the requests, the locked files, the timer and the call's capture
@@ -232,6 +232,23 @@ pub extern "system" fn Java_io_github_pouriya_keryx_Core_blurhash<'caller>(
                     Ok(pixels) => env.byte_array_from_slice(&pixels),
                     Err(_) => Ok(JByteArray::default()),
                 }
+            },
+        )
+        .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
+}
+
+/// A folder's name trimmed and folded as accepting a suggestion matches it, so the app knows which
+/// folder accepting will choose before it asks.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_pouriya_keryx_Core_fold<'caller>(
+    mut unowned: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    name: JString<'caller>,
+) -> JString<'caller> {
+    unowned
+        .with_env(
+            |env: &mut Env<'caller>| -> jni::errors::Result<JString<'caller>> {
+                JString::from_str(env, keryx_core::client::fold_name(&name.to_string()))
             },
         )
         .resolve::<jni::errors::ThrowRuntimeExAndDefault>()

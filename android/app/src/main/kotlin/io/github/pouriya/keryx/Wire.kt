@@ -19,6 +19,7 @@ import kotlinx.serialization.json.JsonDecoder
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonEncoder
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -90,6 +91,50 @@ object PointerShape : KSerializer<Pointer> {
         return Pointer(shape["seq"]?.jsonPrimitive?.long, shape["local"]?.jsonPrimitive?.long)
     }
 }
+
+/** A suggestion's action: a folder, or none for one from a newer keryx, which core writes as `"unknown"`. */
+@Serializable(with = SuggestionShape::class)
+data class Suggestion(
+    val folder: FolderSuggestion? = null,
+)
+
+/** The folder a chat goes in. `move` also takes it out of every other folder but All. */
+@Serializable
+data class FolderSuggestion(
+    val name: String,
+    val move: Boolean,
+)
+
+/** Core's suggestion is a Rust enum: `{"folder": {...}}`, or the bare string of an action it does not know. */
+object SuggestionShape : KSerializer<Suggestion> {
+    override val descriptor: SerialDescriptor =
+        buildClassSerialDescriptor("Suggestion") {
+            element<FolderSuggestion?>("folder")
+        }
+
+    override fun serialize(
+        encoder: Encoder,
+        value: Suggestion,
+    ) = (encoder as JsonEncoder).encodeJsonElement(
+        value.folder?.let { folder ->
+            buildJsonObject { put("folder", wire.encodeToJsonElement(FolderSuggestion.serializer(), folder)) }
+        } ?: JsonPrimitive("unknown"),
+    )
+
+    override fun deserialize(decoder: Decoder): Suggestion {
+        val folder = ((decoder as JsonDecoder).decodeJsonElement() as? JsonObject)?.get("folder")
+        return Suggestion(folder?.let { runCatching { wire.decodeFromJsonElement(FolderSuggestion.serializer(), it) }.getOrNull() })
+    }
+}
+
+/** One account's accepting or declining a suggestion: `created` and `left` only when it accepted. */
+@Serializable
+data class Ack(
+    val suggestion: Long,
+    val accepted: Boolean,
+    val created: Boolean? = null,
+    val left: Int? = null,
+)
 
 @Serializable
 sealed interface Command {
@@ -359,6 +404,26 @@ sealed interface Command {
         val target: Pointer,
         val question: Question,
         val answer: Answer,
+    ) : Command
+
+    /**
+     * Accepts the suggestion at `seq`, as shown: core finds or makes its folder, saves the arrangement,
+     * then sends the ack. A refusal comes back as `Event.Error`, with no ack.
+     */
+    @Serializable
+    @SerialName("accept_suggestion")
+    data class AcceptSuggestion(
+        val chat: String,
+        val seq: Long,
+        val suggestion: Suggestion,
+    ) : Command
+
+    /** Declines the suggestion at `seq`: the ack alone. */
+    @Serializable
+    @SerialName("decline_suggestion")
+    data class DeclineSuggestion(
+        val chat: String,
+        val seq: Long,
     ) : Command
 
     /** The app came on screen or left it. Core keeps it and sends it on every connection. */
@@ -986,6 +1051,9 @@ data class Shown(
     val sticker: String? = null,
     val question: Question? = null,
     val answer: Answer? = null,
+    /** A suggestion's action. Its text is `text`. */
+    val suggestion: Suggestion? = null,
+    val ack: Ack? = null,
     /** A reaction's emoji, with the sequence id of the message it is on in `on`. */
     val emoji: String? = null,
     val on: Long? = null,
@@ -1182,6 +1250,8 @@ sealed interface Event {
         val answer: Answer? = null,
         /** A reaction's emoji, its message in `target`. */
         val emoji: String? = null,
+        /** An ack, so its suggestion shows handled at once. */
+        val ack: Ack? = null,
     ) : Event
 
     @Serializable

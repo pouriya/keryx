@@ -182,7 +182,7 @@ class Archive private constructor(
         }
     }
 
-    /** Content after the seen position, not reactions, not calls, and not this account's own. */
+    /** Content after the seen position, not reactions, not calls, not acks, and not this account's own. */
     fun unread(): Map<String, Int> {
         val counts = LinkedHashMap<String, Int>()
         db.rawQuery(UNREAD, null).use { cursor ->
@@ -231,6 +231,7 @@ class Archive private constructor(
         private const val EDIT = 1
         private const val REACTION = 2
         private const val CALL = 8
+        private const val ACK = 14
 
         private const val KEEP_MESSAGE =
             "INSERT OR IGNORE INTO message (chat, seq, kind, content_kind, device, pointer, saved_at, frame) " +
@@ -253,6 +254,7 @@ class Archive private constructor(
               AND message.content_kind IS NOT NULL
               AND message.content_kind != $REACTION
               AND message.content_kind != $CALL
+              AND message.content_kind != $ACK
               AND message.seq > COALESCE(seen.seen_seq, 0)
               AND NOT EXISTS (SELECT 1 FROM own_device WHERE own_device.device = message.device)
             GROUP BY message.chat

@@ -79,6 +79,9 @@ object Core {
         height: Int,
     ): ByteArray?
 
+    /** A folder's name trimmed and folded as accepting a suggestion matches it. */
+    @JvmStatic external fun fold(name: String): String
+
     @JvmStatic external fun drop(handle: Long)
 
     /** Connects the call the last `join_call` named. Blocks for up to 10 seconds. */

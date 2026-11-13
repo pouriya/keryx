@@ -52,6 +52,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -165,6 +166,12 @@ private sealed interface Modal {
     data class Times(
         val bubble: Bubble,
     ) : Modal
+
+    /** Accepting a move would take the chat out of other folders: asked first, chosen by the author. */
+    data class MoveAsk(
+        val bubble: Bubble,
+        val folder: String,
+    ) : Modal
 }
 
 /** The thread's items, oldest first: a day's separator, then its messages. */
@@ -216,6 +223,9 @@ internal fun ChatScreen(
     onReact: (Bubble, String) -> Unit,
     onUnreact: (Reaction) -> Unit,
     onAnswer: (question: Bubble, answer: Answer, editing: Bubble?) -> Unit,
+    wouldLeave: (Bubble) -> Boolean,
+    onAccept: (Bubble) -> Unit,
+    onDecline: (Bubble) -> Unit,
     onProfile: (String) -> Unit,
 ) {
     val dark = isDark()
@@ -484,6 +494,15 @@ internal fun ChatScreen(
                                     val tree = row.bubble.question
                                     if (tree != null) openForm(Form(row.bubble, tree, null, null))
                                 },
+                                onAccept = {
+                                    val folder = row.bubble.suggestion?.folder
+                                    if (folder != null && folder.move && wouldLeave(row.bubble)) {
+                                        modal = Modal.MoveAsk(row.bubble, folder.name.trim())
+                                    } else {
+                                        onAccept(row.bubble)
+                                    }
+                                },
+                                onDecline = { onDecline(row.bubble) },
                             )
                     }
                 }
@@ -687,6 +706,16 @@ internal fun ChatScreen(
                             me = me,
                             ink = ink,
                         ) { modal = null }
+                    is Modal.MoveAsk ->
+                        MoveAskModal(
+                            folder = shown.folder,
+                            ink = ink,
+                            onCancel = { modal = null },
+                            onMove = {
+                                modal = null
+                                onAccept(shown.bubble)
+                            },
+                        )
                 }
             }
         }
@@ -886,6 +915,8 @@ private fun MessageRow(
     chips: List<Chip>,
     onChip: (Chip) -> Unit,
     onAnswer: () -> Unit,
+    onAccept: () -> Unit,
+    onDecline: () -> Unit,
 ) {
     val rtl = LocalLayoutDirection.current == LayoutDirection.Rtl
     val density = LocalDensity.current
@@ -966,6 +997,16 @@ private fun MessageRow(
             if (sticker != null && !bubble.locked) {
                 StickerBubble(bubble, sticker, type, me, people, marks, talk, selecting, stickers, ink, onOpen, onSelect, onJump) {
                     Chips(chips, onBubble = false, mine = false, dark = dark, ink = ink, enabled = !selecting, onChip = onChip)
+                }
+                return@Row
+            }
+            val suggestion = bubble.suggestion
+            if (suggestion != null && !bubble.locked) {
+                SuggestionBubble(
+                    bubble, suggestion, type, me, people, marks, talk, selecting, dark, ink, fill, onFill, quiet,
+                    onOpen, onSelect, onCopy, onTime, onJump, onAccept, onDecline,
+                ) {
+                    Chips(chips, onBubble = true, mine = bubble.mine, dark = dark, ink = ink, enabled = !selecting, onChip = onChip)
                 }
                 return@Row
             }
@@ -1102,6 +1143,10 @@ private fun quoteLine(bubble: Bubble): String {
     if (bubble.sticker != null) return stringResource(R.string.kind_sticker)
     if (bubble.answer != null) return stringResource(R.string.kind_answered)
     bubble.question?.let { return firstQuestion(it) }
+    bubble.suggestion?.let { suggestion ->
+        val folder = suggestion.folder ?: return stringResource(R.string.suggestion_unknown)
+        return stringResource(R.string.suggestion_preview, folder.name.trim())
+    }
     if (bubble.call != null || bubble.kind == CONTENT_CALL) {
         return stringResource(if (bubble.call?.video == true) R.string.call_video else R.string.call_voice)
     }
@@ -1541,6 +1586,33 @@ private fun ConfirmModal(
 }
 
 @Composable
+private fun MoveAskModal(
+    folder: String,
+    ink: Ink,
+    onCancel: () -> Unit,
+    onMove: () -> Unit,
+) {
+    Text(
+        stringResource(R.string.suggestion_ask_title, folder),
+        Modifier.padding(start = 18.dp, end = 18.dp, top = 16.dp, bottom = 4.dp),
+        color = ink.text,
+        fontSize = 17.sp,
+        fontWeight = FontWeight.Bold,
+    )
+    Text(
+        stringResource(R.string.suggestion_ask_body),
+        Modifier.padding(start = 18.dp, end = 18.dp, top = 6.dp, bottom = 14.dp),
+        color = ink.muted,
+        fontSize = 14.sp,
+        lineHeight = 20.sp,
+    )
+    ModalButtons(
+        Triple(stringResource(R.string.suggestion_cancel), accent, onCancel),
+        Triple(stringResource(R.string.suggestion_ask_move), accent, onMove),
+    )
+}
+
+@Composable
 private fun TimesModal(
     bubble: Bubble,
     answer: TimesAnswer?,
@@ -1814,6 +1886,281 @@ private fun StickerArt(
                 },
             )
         }
+    }
+}
+
+/**
+ * A suggestion, drawn in `tmp/design/suggestions.html` and approved by the author: the label and time on
+ * top, its text, the folder with Copy or Move, then Decline and Accept, which become the state at the same
+ * height once this account has an ack. Its own account's suggestion shows the other person's ack instead.
+ */
+@Composable
+private fun SuggestionBubble(
+    bubble: Bubble,
+    suggestion: Suggestion,
+    type: Int,
+    me: String?,
+    people: Map<String, AccountBrief>,
+    marks: List<MarkItem>,
+    talk: Talk,
+    selecting: Boolean,
+    dark: Boolean,
+    ink: Ink,
+    fill: Color,
+    onFill: Color,
+    quiet: Color,
+    onOpen: () -> Unit,
+    onSelect: () -> Unit,
+    onCopy: (String) -> Unit,
+    onTime: () -> Unit,
+    onJump: (Long) -> Unit,
+    onAccept: () -> Unit,
+    onDecline: () -> Unit,
+    chips: @Composable () -> Unit,
+) {
+    val own = bubble.mine
+    val tint =
+        when {
+            own -> Color.White.copy(alpha = 0.10f)
+            dark -> Color.White.copy(alpha = 0.06f)
+            else -> tile.copy(alpha = 0.07f)
+        }
+    val badge =
+        if (own) {
+            Color.White.copy(alpha = 0.16f)
+        } else if (dark) {
+            tile
+        } else {
+            Color(0xFFDCE7F7)
+        }
+    val onBadge =
+        if (own) {
+            Color.White
+        } else if (dark) {
+            Color(0xFFDCE7F7)
+        } else {
+            tile
+        }
+    val green = if (own || dark) Color(0xFF6FCF97) else Color(0xFF1B7F4A)
+    val red = if (own || dark) Color(0xFFE26767) else RED
+    val width = minOf(256f, LocalConfiguration.current.screenWidthDp * 0.84f).dp
+    val folder = suggestion.folder
+    val seq = bubble.seq
+    Column(
+        Modifier
+            .width(width)
+            .clip(RoundedCornerShape(16.dp))
+            .background(fill)
+            .pointerInput(bubble.key, selecting) {
+                detectTapGestures(
+                    onTap = { if (selecting) onSelect() else onOpen() },
+                    onLongPress = { if (!selecting) onSelect() },
+                )
+            }.padding(start = 12.dp, end = 12.dp, top = 10.dp, bottom = 12.dp),
+    ) {
+        Row(Modifier.fillMaxWidth().height(28.dp), verticalAlignment = Alignment.CenterVertically) {
+            Box(Modifier.size(28.dp).clip(CircleShape).background(badge), contentAlignment = Alignment.Center) {
+                Glyph(Glyphs.folder, onBadge, 16.dp)
+            }
+            Text(
+                stringResource(if (folder != null) R.string.suggestion_label else R.string.suggestion_unknown),
+                Modifier.padding(start = 8.dp).weight(1f),
+                color = quiet,
+                fontSize = 12.5.sp,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                timeOf(bubble.at),
+                Modifier
+                    .clip(RoundedCornerShape(8.dp))
+                    .clickable(enabled = !selecting && seq != null, role = Role.Button, onClick = onTime)
+                    .padding(horizontal = 4.dp, vertical = 1.dp),
+                color = quiet,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Medium,
+            )
+            if (own) Ticks(bubble, type, me, marks, quiet)
+        }
+        if (bubble.reply != null || bubble.replyLocal != null) {
+            Box(Modifier.padding(top = 8.dp)) { Quote(bubble, talk, me, people, own, ink, onJump) }
+        }
+        val text = bubble.text
+        if (!text.isNullOrBlank()) {
+            Box(Modifier.padding(top = 8.dp)) { CopyText(text, onFill, selecting, onOpen, onSelect, onCopy) }
+        }
+        if (folder == null) {
+            SuggestionState(Glyphs.info, stringResource(R.string.suggestion_newer), quiet, tint)
+        } else {
+            val name = folder.name.trim()
+            Row(
+                Modifier
+                    .padding(top = 10.dp)
+                    .fillMaxWidth()
+                    .height(40.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(tint)
+                    .padding(start = 10.dp, end = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Glyph(Glyphs.folder, onFill, 16.dp)
+                Text(
+                    name,
+                    Modifier.padding(horizontal = 8.dp).weight(1f),
+                    color = onFill,
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    stringResource(if (folder.move) R.string.suggestion_move else R.string.suggestion_copy),
+                    Modifier
+                        .height(24.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(badge)
+                        .padding(horizontal = 10.dp, vertical = 4.dp),
+                    color = onBadge,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+            val mineAck = seq?.let { talk.ackOf(it) }
+            when {
+                own -> {
+                    val theirs = seq?.let { talk.theirAck(it) }
+                    if (theirs != null) {
+                        val who =
+                            theirs.account?.let { people[it] }?.let { it.display_name?.takeIf { name -> name.isNotBlank() } ?: it.username }
+                                .orEmpty()
+                        if (theirs.accepted) {
+                            SuggestionState(Glyphs.check, stringResource(R.string.suggestion_they_accepted, who), green, tint)
+                        } else {
+                            SuggestionState(Glyphs.cross, stringResource(R.string.suggestion_they_declined, who), quiet, tint)
+                        }
+                    }
+                }
+                mineAck != null -> {
+                    val waiting = mineAck.seq == null
+                    if (mineAck.accepted) {
+                        SuggestionState(
+                            if (waiting) Glyphs.clock else Glyphs.check,
+                            stringResource(if (folder.move) R.string.suggestion_moved else R.string.suggestion_copied, name),
+                            if (waiting) quiet else green,
+                            tint,
+                        )
+                    } else {
+                        SuggestionState(
+                            if (waiting) Glyphs.clock else Glyphs.cross,
+                            stringResource(R.string.suggestion_declined),
+                            quiet,
+                            tint,
+                        )
+                    }
+                }
+                seq != null -> {
+                    val saving = talk.accepting == seq
+                    Row(Modifier.padding(top = 10.dp).fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Box(
+                            Modifier
+                                .weight(1f)
+                                .height(38.dp)
+                                .alpha(if (saving) 0.5f else 1f)
+                                .clip(RoundedCornerShape(10.dp))
+                                .border(1.5.dp, if (own) Color.White.copy(alpha = 0.35f) else ink.line, RoundedCornerShape(10.dp))
+                                .clickable(enabled = !selecting && !saving, role = Role.Button, onClick = onDecline),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Text(
+                                stringResource(R.string.suggestion_decline),
+                                color = onFill,
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                        }
+                        Box(
+                            Modifier
+                                .weight(1f)
+                                .height(38.dp)
+                                .alpha(if (saving) 0.5f else 1f)
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(accent)
+                                .clickable(enabled = !selecting && !saving, role = Role.Button, onClick = onAccept),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            if (saving) {
+                                CircularProgressIndicator(
+                                    Modifier.size(16.dp),
+                                    color = onAccent,
+                                    strokeWidth = 2.dp,
+                                    strokeCap = StrokeCap.Round,
+                                )
+                            } else {
+                                Text(
+                                    stringResource(R.string.suggestion_accept),
+                                    color = onAccent,
+                                    fontSize = 14.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                )
+                            }
+                        }
+                    }
+                    talk.refusals[seq]?.let { code ->
+                        Row(Modifier.padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Glyph(Glyphs.alert, red, 15.dp)
+                            Text(
+                                stringResource(
+                                    when (code) {
+                                        "too_many_folders" -> R.string.suggestion_full
+                                        "offline" -> R.string.suggestion_offline
+                                        "no_permission" -> R.string.folders_refused_permission
+                                        "unknown_folder" -> R.string.folders_refused_unknown
+                                        else -> R.string.folders_refused
+                                    },
+                                ),
+                                Modifier.padding(start = 6.dp),
+                                color = red,
+                                fontSize = 13.sp,
+                                lineHeight = 18.sp,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        chips()
+    }
+}
+
+/** A suggestion's state, at the buttons' height: an icon and one line, cut with an ellipsis. */
+@Composable
+private fun SuggestionState(
+    icon: List<String>,
+    words: String,
+    color: Color,
+    tint: Color,
+) {
+    Row(
+        Modifier
+            .padding(top = 10.dp)
+            .fillMaxWidth()
+            .height(38.dp)
+            .clip(RoundedCornerShape(10.dp))
+            .background(tint)
+            .padding(horizontal = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Glyph(icon, color, 16.dp)
+        Text(
+            words,
+            Modifier.padding(start = 8.dp),
+            color = color,
+            fontSize = 13.5.sp,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
     }
 }
 

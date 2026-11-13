@@ -1699,6 +1699,8 @@ internal object Glyphs {
     val star = listOf("M12 4l2.4 5 5.6.8-4 3.9.9 5.5L12 16.6 7.1 19.2 8 13.7 4 9.8l5.6-.8z")
     val edit = listOf("M4 20h4L19 9l-4-4L4 16z")
     val clock = listOf(circle(12f, 12f, 9f), "M12 7v5l3 2")
+    val cross = listOf("M7 7l10 10M17 7L7 17")
+    val alert = listOf(circle(12f, 12f, 9f), "M12 7.5v5", "M12 16.2v.3")
     val eye = listOf("M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z", circle(12f, 12f, 3f))
     val plug = listOf("M5 9a10 10 0 0 1 14 0", "M8 12.5a5.5 5.5 0 0 1 8 0", circle(12f, 16.5f, 1.3f))
     val globe = listOf(circle(12f, 12f, 9f), "M3 12h18", "M12 3a14 14 0 0 1 0 18a14 14 0 0 1 0-18")

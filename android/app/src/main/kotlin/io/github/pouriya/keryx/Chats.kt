@@ -118,6 +118,8 @@ internal data class ChatRow(
     val waiting: Boolean,
     /** Set when the preview is a call: video, or voice. */
     val callVideo: Boolean? = null,
+    /** The preview says what a suggestion with no text suggests, drawn after a folder icon. */
+    val suggests: Boolean = false,
 )
 
 /** One account's folders, the whole arrangement in tab order, and the one to open on. */
@@ -377,6 +379,7 @@ internal class ChatRows {
                     mine = if (old != null && kept) old.mine else false,
                     waiting = if (old != null && kept) old.waiting else false,
                     callVideo = if (old != null && kept) old.callVideo else null,
+                    suggests = old != null && kept && old.suggests,
                 ),
             )
         }
@@ -391,6 +394,9 @@ internal class ChatRows {
             showCall(message, preview)
             return
         }
+        // An ack is quiet: it moves neither the chat nor its preview.
+        if (kind == CONTENT_ACK) return
+        val suggests = kind == CONTENT_SUGGESTION && message.text.isNullOrBlank()
         val index = rows.indexOfFirst { it.id == message.chat }
         if (index < 0) {
             rows.add(
@@ -404,6 +410,7 @@ internal class ChatRows {
                     preview = preview,
                     mine = message.mine,
                     waiting = false,
+                    suggests = suggests,
                 ),
             )
             return
@@ -418,6 +425,7 @@ internal class ChatRows {
                 mine = message.mine,
                 waiting = false,
                 callVideo = null,
+                suggests = suggests,
             )
         val newer = row.waiting || row.lastSeq == null || message.seq > row.lastSeq
         if (newer) {
@@ -435,7 +443,7 @@ internal class ChatRows {
         val index = rows.indexOfFirst { it.id == chat }
         if (index < 0) return
         val row = rows[index]
-        val next = row.copy(preview = text ?: row.preview, mine = true, waiting = true, callVideo = null)
+        val next = row.copy(preview = text ?: row.preview, mine = true, waiting = true, callVideo = null, suggests = false)
         rows.removeAt(index)
         rows.add(0, next)
     }
@@ -498,7 +506,15 @@ internal class ChatRows {
         val row = rows[index]
         if (row.lastSeq != null && event.seq < row.lastSeq) return
         rows[index] =
-            row.copy(lastSeq = event.seq, preview = preview, lastAt = event.saved_at, mine = false, waiting = false, callVideo = null)
+            row.copy(
+                lastSeq = event.seq,
+                preview = preview,
+                lastAt = event.saved_at,
+                mine = false,
+                waiting = false,
+                callVideo = null,
+                suggests = false,
+            )
     }
 
     /** The call's end names it missed or not, once that row is already the preview. */
@@ -541,7 +557,7 @@ internal class ChatRows {
         val previous = talk.bubbles.lastOrNull { it.seq != null && it.seq < last && it.kind != null }
         rows[index] =
             if (previous == null) {
-                row.copy(lastSeq = null, preview = "", mine = false, waiting = false, callVideo = null)
+                row.copy(lastSeq = null, preview = "", mine = false, waiting = false, callVideo = null, suggests = false)
             } else {
                 row.copy(
                     lastSeq = previous.seq,
@@ -549,6 +565,7 @@ internal class ChatRows {
                     mine = previous.mine,
                     waiting = false,
                     callVideo = if (previous.kind == CALL) previous.call?.video == true else null,
+                    suggests = previous.kind == CONTENT_SUGGESTION && previous.text.isNullOrBlank(),
                 )
             }
     }
@@ -1223,6 +1240,9 @@ private fun Conversation(
             }
             Row(Modifier.padding(top = 2.dp), verticalAlignment = Alignment.CenterVertically) {
                 Tick(row, me, if (seen(row, me)) accentText else ink.muted)
+                if (row.suggests && row.preview.isNotEmpty()) {
+                    Box(Modifier.padding(end = 4.dp)) { Glyph(Glyphs.folder, ink.muted, 16.dp) }
+                }
                 Text(
                     previewText(row),
                     Modifier.weight(1f),

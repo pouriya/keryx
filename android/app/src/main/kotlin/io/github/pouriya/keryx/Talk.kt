@@ -33,13 +33,15 @@ internal data class Bubble(
     val notice: String? = null,
     /** An answer message's answer. */
     val answer: Answer? = null,
+    /** A suggestion message's action. Its text is `text`. */
+    val suggestion: Suggestion? = null,
 ) {
     val key: String get() = if (seq != null) "s$seq" else "l$local"
 
     /** This device holds no key for it: nothing opened, and it is not a call or a file. */
     val locked: Boolean get() =
         text == null && files.isEmpty() && call == null && kind != CONTENT_CALL &&
-            sticker == null && question == null && answer == null
+            sticker == null && question == null && answer == null && suggestion == null
 }
 
 /** One reaction in the open chat: confirmed (a sequence id) or still waiting (a local id), on a message by either. */
@@ -50,6 +52,16 @@ internal data class Reaction(
     val onLocal: Long?,
     val emoji: String,
     val mine: Boolean,
+)
+
+/** One ack in the open chat, folded into its suggestion's bubble: confirmed (a sequence id) or still waiting (a local id). */
+internal data class AckMark(
+    val seq: Long?,
+    val local: Long?,
+    val on: Long,
+    val accepted: Boolean,
+    val mine: Boolean,
+    val account: String?,
 )
 
 /** One chip under a message: an exact emoji, how many reactions carry it, and this account's newest of them. */
@@ -69,6 +81,8 @@ internal const val CONTENT_CALL = 8
 internal const val CONTENT_QUESTION = 10
 internal const val CONTENT_ANSWER = 11
 internal const val CONTENT_STICKER = 12
+internal const val CONTENT_SUGGESTION = 13
+internal const val CONTENT_ACK = 14
 
 /** The open chat's messages, oldest first, kept up to date from core's events. */
 internal class Talk {
@@ -80,6 +94,16 @@ internal class Talk {
 
     /** This account's reactions with a delete waiting, by key, hidden until the delete lands or fails. */
     private val unreacting = mutableStateMapOf<String, Long>()
+
+    /** The open chat's acks, each shown in its suggestion's bubble and never as a bubble of its own. */
+    val acks = mutableStateListOf<AckMark>()
+
+    /** The suggestion being accepted, by sequence id, until its ack is pending or core refuses it. */
+    var accepting by mutableStateOf<Long?>(null)
+        private set
+
+    /** Why accepting a suggestion was refused, by its sequence id: core's code, until Accept or Decline is tapped again. */
+    val refusals = mutableStateMapOf<Long, String>()
 
     /** Messages removed for everyone, so a reply to one can say so. */
     val gone = mutableStateMapOf<Long, Boolean>()
@@ -105,6 +129,9 @@ internal class Talk {
         bubbles.clear()
         reactions.clear()
         unreacting.clear()
+        acks.clear()
+        accepting = null
+        refusals.clear()
         selected.clear()
         gone.clear()
         hasOlder = false
@@ -119,6 +146,9 @@ internal class Talk {
         bubbles.clear()
         reactions.clear()
         unreacting.clear()
+        acks.clear()
+        accepting = null
+        refusals.clear()
         selected.clear()
         gone.clear()
         seeking = null
@@ -165,6 +195,34 @@ internal class Talk {
         return on.groupBy { it.emoji }.map { (emoji, list) -> Chip(emoji, list.size, list.lastOrNull { it.mine }) }
     }
 
+    /** This account's newest ack on the suggestion at `seq`, waiting or confirmed. */
+    fun ackOf(seq: Long): AckMark? = acks.lastOrNull { it.on == seq && it.mine }
+
+    /** Another account's newest ack on the suggestion at `seq`. */
+    fun theirAck(seq: Long): AckMark? = acks.lastOrNull { it.on == seq && !it.mine }
+
+    /** Accept or Decline was tapped: any earlier refusal goes, and Accept turns while it saves. */
+    fun answering(
+        seq: Long,
+        accepting: Boolean,
+    ) {
+        refusals.remove(seq)
+        if (accepting) this.accepting = seq
+    }
+
+    /** Core refused something: when a suggestion was being accepted, that is why, shown under its buttons. */
+    fun refused(code: String) {
+        val seq = accepting ?: return
+        accepting = null
+        refusals[seq] = code
+    }
+
+    private fun acked(shown: Shown) {
+        val ack = shown.ack ?: return
+        if (gone[shown.seq] == true || acks.any { it.seq == shown.seq }) return
+        acks.add(AckMark(shown.seq, null, ack.suggestion, ack.accepted, shown.mine, shown.account))
+    }
+
     private fun reactionKey(reaction: Reaction): String = if (reaction.seq != null) "s${reaction.seq}" else "l${reaction.local}"
 
     private fun reacted(shown: Shown) {
@@ -178,6 +236,7 @@ internal class Talk {
         if (shown.chat != chat) return
         val kind = shown.content_kind ?: return
         if (kind == CONTENT_REACTION) return reacted(shown)
+        if (kind == CONTENT_ACK) return acked(shown)
         val bubble =
             Bubble(
                 seq = shown.seq,
@@ -195,6 +254,7 @@ internal class Talk {
                 sticker = shown.sticker,
                 question = shown.question,
                 answer = shown.answer,
+                suggestion = shown.suggestion,
             )
         val at = bubbles.indexOfFirst { it.seq == shown.seq }
         if (at >= 0) {
@@ -253,6 +313,13 @@ internal class Talk {
             return
         }
         if (event.kind != KIND_CONTENT) return
+        val ack = event.ack
+        if (ack != null) {
+            acks.add(AckMark(null, event.local, ack.suggestion, ack.accepted, true, null))
+            refusals.remove(ack.suggestion)
+            if (accepting == ack.suggestion) accepting = null
+            return
+        }
         val emoji = event.emoji
         if (emoji != null) {
             reactions.add(Reaction(null, event.local, event.target?.seq, event.target?.local, emoji, true))
@@ -314,6 +381,11 @@ internal class Talk {
             val one = reactions[i]
             if (one.onLocal == event.local) reactions[i] = one.copy(on = event.seq, onLocal = null)
         }
+        val acked = acks.indexOfFirst { it.local == event.local }
+        if (acked >= 0) {
+            val ack = acks.removeAt(acked)
+            if (acks.none { it.seq == event.seq } && gone[event.seq] != true) acks.add(acked, ack.copy(seq = event.seq, local = null))
+        }
         val at = bubbles.indexOfFirst { it.local == event.local }
         if (bubbles.any { it.seq == event.seq }) {
             if (at >= 0) bubbles.removeAt(at)
@@ -333,6 +405,7 @@ internal class Talk {
         actions.remove(event.local)
         unreacting.entries.removeAll { it.value == event.local }
         reactions.removeAll { it.local == event.local }
+        acks.removeAll { it.local == event.local }
         val at = bubbles.indexOfFirst { it.local == event.local }
         if (at >= 0) bubbles[at] = bubbles[at].copy(failed = true)
     }
@@ -358,6 +431,7 @@ internal class Talk {
         gone[seq] = true
         reactions.removeAll { it.seq == seq }
         unreacting.remove("s$seq")
+        acks.removeAll { it.seq == seq }
         bubbles.removeAll { it.seq == seq }
         selected.remove("s$seq")
     }
