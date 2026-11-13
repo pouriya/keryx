@@ -63,6 +63,10 @@ error paths, are still to do:** see [core/tests/AGENTS.md](core/tests/AGENTS.md)
   the archive, tapping a chip to add or remove, twenty different emoji on one message wrapping in its bubble,
   the + picker's strip, search and skin tones, the chat list's "Reacted" preview with no unread count, and
   the other person's reaction and its removal arriving live. See [android/AGENTS.md](android/AGENTS.md).
+- **Message search is done in core and Android, and passed the author's phone test**, with `drive.rs` as
+  the other person: hits newest first with the match tinted, "10" finding "۱۰", a hit opening its chat at
+  the message, the tabs and their counts, See all and Show older, and a message deleted on another device
+  gone from the archive at once.
 - **Next, chosen by the author: calls, then Android for files and calls.** Both clients stay as they
   are and grow only what testing needs; standard screens and a full redesign come after.
 
@@ -315,12 +319,20 @@ the WASM build, because there is one `Cargo.lock`. Make targets stay inside
     `sqlite.sql` and `guide.md`, and core's `protocol.rs`, `mls.rs` and `client.rs`, replacing pins
     there. Server and core first, tested by the server's integration tests driving core, then Android,
     tested on the author's phone. **Pins went at once with no compatibility, chosen by the author.**
-- **Search, all chosen by the author, not built yet; designs in `tmp/design/search.html`.**
+- **Search, all chosen by the author, built in core and Android and tested on the author's phone; designs
+  in `tmp/design/search.html`.**
   - **Tabs All, Accounts and Messages**, All the default, at the bottom like the folders'. Accounts: chats
     in the list matched by name, plus the server's directory. Messages: text in this device's archive.
     All: both, people first.
   - **Messages are opened and scanned per search**, newest first, stopping at a page of hits, so no
     plaintext index is written. An index may come later, as an open question.
+  - **The scan runs in core, chosen by the author**, so every client matches the same way, and the
+    platform only reads its archive's rows for it: see [core/AGENTS.md](core/AGENTS.md).
+  - **It matches text, captions and file names, chosen by the author**, with a bundle's descriptions and
+    music's title and artist, and the newest text of an edited message. A deleted message is never found.
+  - **Case and Persian forms are folded, chosen by the author:** Arabic ي, ى and ك match Persian ی and ک,
+    Arabic and Persian digits match ASCII ones, and ZWNJ and the short vowel marks are ignored.
+  - **A page is 20 hits, chosen by the author**, and Show older goes on from there.
   - **A hit shows two lines around the match**, under its chat's name. While scanning, the search field's
     circle is a ring filling 0 to 100 with the percent and % inside.
   - **No recent searches for now.**
@@ -374,6 +386,9 @@ the WASM build, because there is one `Cargo.lock`. Make targets stay inside
   empty row and every device drops its copy, an expiry too, which has no delete message. It reveals
   only when the removal happened, which a delete row shows anyway.
 - **Deleting also removes the message's edits**, because an edit holds its newer text.
+- **A device wipes a deleted message from its archive as soon as the server confirms the delete, chosen
+  by the author:** by the `sent` reply to its own delete, or by the delete arriving from another device,
+  and not only at the next `sync`. Only a device that is offline keeps it until the delete reaches it.
 - **The notice's 7 days give a thief a way out:** after that, stolen words can erase it. The
   device list still shows the device, and contacts saw the join.
 - **One owner can destroy a whole group's history**, for everyone, with no undo, and a sole
@@ -480,12 +495,19 @@ own and others' shown wherever a person is. Groups and channels come with them.
   photos show in the chat list and the chat's header, and tapping the header opens their profile. **Tapping
   a photo in the chat list opens that person's profile, not the chat, chosen by the author.** **Saved
   messages shows your own photo, in the list and its header, and tapping it opens your profile, chosen by
-  the author.** **The page's photo is 128 dp, on your own page and others', chosen by the author.**
-  **Tapping someone else's photo opens it whole, chosen by the author:** as large as fits on black, with a
+  the author.** **The page is a big photo, chosen by the author from `tmp/design/profile-redesign.html`, its
+  B:** the photo fills the width, 300 dp high, under the status bar, with the name and the state over its
+  foot, and the rest in rounded cards with a title over each. **Once the photo scrolls away, a solid bar with
+  back and the name fades in, chosen by the author.** Someone else's page has Message, Voice call and Video
+  call under the photo, then their bio, links and @username; your own has Account (name, username, bio,
+  links), Settings (Language, Theme, Devices) and Log out, with "Add a bio" and "Add a link" where nothing is
+  set yet.
+  **Tapping the photo stays as it was, chosen by the author:** your own opens the photo sheet. **Tapping
+  someone else's photo opens it whole, chosen by the author:** as large as fits on black, with a
   back arrow, and no zoom; Back or the arrow returns to their profile. **It is
   drawn in `tmp/design/profile.html` and approved as drawn, chosen by the author:** the menu button opens
-  the profile; each line opens its own editor, saved with a check in the bar; others' name and @username show
-  under the photo, and your own page shows them only as lines, chosen by the author; a taken username shows on save as "That username is taken."; a link's
+  the profile; each line opens its own editor, saved with a check in the bar; your own name and username are
+  also lines in Account, as before; a taken username shows on save as "That username is taken."; a link's
   address starts with `https://` or `http://`, its name is at most 32 characters and its address 512, and
   tapping one opens the browser; someone with no photo keeps the letter, and one still loading shows its
   BlurHash; Remove photo asks nothing; the photo uploads when Done is tapped, under a turning ring.
@@ -1170,13 +1192,15 @@ Whatever is saved to show later gets the next number. Whatever is not saved gets
     updated live.
   - **Core sends the first `presence` on every connect, chosen by the author**, with the in-app state the
     platform last gave it, and hands others' back as `Event::Presence`.
-  - **A dot on the person's photo shows their state, in the chat list, a direct chat's header and the
-    profile page, chosen by the author:** green while online, red while in a call, orange while away
+  - **A dot on the person's photo shows their state, in the chat list and a direct chat's header, chosen by
+    the author:** green while online, red while in a call, orange while away
     (connected with the app in the background, or stepped away), and no dot while offline, when the time
-    they were last here or connected shows instead. **It is 9 dp on the list's 48 dp photo, 8 dp on the
-    header's 40 dp and 14 dp on the profile's 112 dp, with a thin ring of the background's colour, chosen by
-    the author.** **On a phone the app in the background is away; how long without input counts as away on a
-    desktop or browser is decided with that client, chosen by the author.**
+    they were last here or connected shows instead. **It is 10 dp on the list's 54 dp photo, 9 dp on the
+    header's 44 dp, with a thin ring of the background's colour, chosen by
+    the author**, growing with the photos when the author made the list and the header a little larger. **On a phone the app in the background is away; how long without input counts as away on a
+    desktop or browser is decided with that client, chosen by the author.** **The profile page has no dot
+    since its big photo, chosen by the author with that design:** the state's word sits under the name, over
+    the photo.
   - **A direct chat's header shows only last in the app; the profile page shows both, chosen by the
     author.** Drawn in `tmp/design/presence.html`. **The words are short, chosen by the author:** online, in
     a call, away, and offline "active 4m ago", "active 09:12", "active yesterday 21:40", "active 3 Nov
@@ -1839,16 +1863,15 @@ first, as everywhere.
 - **A rekey can be lost while a call connects.** `android/ffi/`'s `callConnect` takes the pending join and
   blocks up to 10 seconds. A `CallKey` arriving meanwhile finds no call and no join, and is dropped, so the
   phone seals under the old epoch and a device that joined with only the new key cannot hear or see it.
-- **Android's down button can count a message that is already on screen.** In the stickers and questions
-  phone test, it showed 1 after 15 messages had arrived. Not chased yet.
 - **`a_frame_over_call_frame_closes_its_socket_as_a_leave` is flaky.** Once under `make coverage` it saw
   `(1, "")` where it wanted `(4403, "frame_too_large")`, and passed on the next run. Not chased yet.
 
 **Not yet tested on the phone**
 
-- **Receiving a sticker from another account**, and **a deleted question's answer showing "Message
-  unavailable"**. `server/examples/drive.rs` cannot send a sticker yet, so a command for it comes with the
-  test. It can delete one of its own messages with `delete <seq>`, chosen by the author with reactions.
+- **A deleted question's answer showing "Message unavailable"**. `server/examples/drive.rs` can delete one
+  of its own messages with `delete <seq>`, chosen by the author with reactions. Receiving a sticker from
+  another account passed, sent by `drive.rs`'s `sticker [n]`, the nth of the Default pack, chosen by the
+  author.
 
 **Access**
 
@@ -1939,8 +1962,8 @@ first, as everywhere.
 **Attachments and search**
 
 - Quotas and retention for attachments
-- Local search: an index, once scanning per search is too slow; whether borhan's normalizer is reused,
-  and where it lives. **No module in the closed lists holds it yet**, and tantivy on WASM is unproven
+- Local search: an index, once scanning per search is too slow, and tantivy on WASM is unproven. The
+  scan's folding lives in `core/src/client.rs` for now; whether borhan's normalizer replaces it
 
 **MCP**
 

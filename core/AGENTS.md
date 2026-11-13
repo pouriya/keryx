@@ -155,6 +155,28 @@ without its variation selector is `❤️`, and one emoji is always one chip. `E
 `emoji`, its target being `target`, and `Shown` carries `emoji` and `on`, both left out when the emoji is
 unknown.
 
+**It searches the archive's messages, chosen by the author**, so every client matches the same way.
+`Command::SearchMessages {text}` starts a search, replacing any running one, and an empty or blank text
+stops it; `Command::SearchOlder` goes on past the last page of hits. Core asks the platform for archive
+rows with `Output::ScanRows {id, before?, limit}`, newest first by server time, chat and sequence id,
+`before` being the last row it read, `{saved_at, chat, seq}`, and `limit` 200. The platform answers
+`Input::RowsScanned {id, message_list, total}`, the rows as the server sent them and how many the archive
+holds, and an answer to an older id is dropped. Each row's signature is checked, it is opened with the
+epoch keys the snapshot holds, and its text, caption, file names, descriptions and music's title and
+artist are matched; a voice note is not. A newer edit's text is matched in place of the message's, and a
+deleted message is skipped. After each read, `Event::MessageHits {text, hit_list, scanned, total, done,
+more}` hands over what was found, each hit `{chat, seq, account, mine, saved_at, before, matched,
+after}`, the text around the match split in three, so a client can draw the ring and the hits as they
+come. **It stops at 20 hits, chosen by the author**, and `more` says whether older rows are left.
+**Case and Persian forms are folded, chosen by the author:** lower case, Arabic ي and ى read as Persian
+ی, ك as ک, Arabic and Persian digits as ASCII ones, and ZWNJ and the short vowel marks left out, so "10"
+finds "۱۰" and "علي" finds "علی".
+
+**A delete wipes its target in the same save, chosen by the author**, as soon as the server confirms
+it, by its `sent` reply or by the delete arriving from another device, not at the next `sync`. Core adds
+a wiped row for each delete's target to the page it hands the platform to save, and the platform wipes
+that row's edits with it. A device that is offline wipes it once the delete reaches it.
+
 **`serde_bytes` marks the snapshot slots as bytes, chosen by the author**, on `Loaded`, `Opened` and
 `Save`, so they reach JavaScript as a `Uint8Array` rather than an array of numbers. It was already in
 `Cargo.lock`, and JSON comes out the same.
