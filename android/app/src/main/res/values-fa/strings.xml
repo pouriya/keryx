@@ -180,7 +180,6 @@
     <string name="presence_active">فعال</string>
     <string name="presence_connected">متصل</string>
     <string name="profile_bio">درباره</string>
-    <string name="profile_bio_empty">چند کلمه درباره خودتان بنویسید</string>
     <string name="profile_bio_note">فقط کسانی که با شما گفتگویی دارند می‌توانند آن را بخوانند.</string>
     <string name="profile_links">پیوندها</string>
     <string name="profile_links_label">نام و نشانی</string>
@@ -197,6 +196,16 @@
     <string name="profile_done">تمام</string>
     <string name="profile_save">ذخیره</string>
     <string name="profile_remove_link">حذف پیوند</string>
+    <string name="profile_message">پیام</string>
+    <string name="profile_voice_call">تماس صوتی</string>
+    <string name="profile_video_call">تماس تصویری</string>
+    <string name="profile_account">حساب</string>
+    <string name="profile_settings">تنظیمات</string>
+    <string name="profile_info">اطلاعات</string>
+    <string name="profile_bio_add">افزودن درباره</string>
+    <string name="profile_bio_hint">چند کلمه درباره خودتان</string>
+    <string name="profile_links_up_to">تا ۳ پیوند</string>
+    <string name="profile_username_copy">نام کاربری · برای کپی بزنید</string>
     <string name="folders_all">همه</string>
     <string name="folders_title">پوشه‌ها</string>
     <string name="folders_save">ذخیره</string>
@@ -237,4 +246,18 @@
     <string name="folders_refused_permission">ذخیره نشد: این سرور اجازهٔ این تغییر را نمی‌دهد. چیزی تغییر نکرد.</string>
     <string name="folders_refused_unknown">ذخیره نشد: پوشه‌ای در دستگاه دیگری برداشته شد. چیزی تغییر نکرد.</string>
     <string name="folders_refused">پوشه‌ها ذخیره نشدند. چیزی تغییر نکرد.</string>
+    <string name="search_all">همه</string>
+    <string name="search_accounts">حساب‌ها</string>
+    <string name="search_messages">پیام‌ها</string>
+    <string name="search_see_all">همه را ببین</string>
+    <string name="search_in_chats">در گفت‌وگوهای شما</string>
+    <string name="search_on_server">در این سرور</string>
+    <string name="search_asking">در حال پرسیدن از سرور…</string>
+    <string name="search_new">تازه</string>
+    <string name="search_show_older">قدیمی‌ترها</string>
+    <string name="search_hint">حساب‌های این سرور و پیام‌های این گوشی را جست‌وجو کنید.</string>
+    <string name="search_nothing">چیزی پیدا نشد</string>
+    <string name="search_no_match">هیچ حساب یا پیامی با «%1$s» جور نیست.</string>
+    <string name="notice_new_device">دستگاه تازه: %1$s</string>
+    <string name="notice_new_device_bare">دستگاه تازه</string>
 </resources>

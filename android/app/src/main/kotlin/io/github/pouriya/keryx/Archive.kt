@@ -14,7 +14,7 @@ class Archive private constructor(
 ) {
     fun close() = db.close()
 
-    /** One transaction. A removed message replaces its row and drops that call's rows. */
+    /** One transaction. A removed message replaces its row, wipes the edits pointing at it and drops that call's rows. */
     fun save(
         messages: List<MessageFrame>,
         calls: List<CallRow>,
@@ -29,16 +29,25 @@ class Archive private constructor(
                         "chat = ? AND call_seq = ?",
                         arrayOf(message.chat, message.seq.toString()),
                     )
+                    val edits = ArrayList<Long>()
+                    db
+                        .query(
+                            "message",
+                            arrayOf("seq"),
+                            "chat = ? AND kind = $EDIT AND pointer = ?",
+                            arrayOf(message.chat, message.seq.toString()),
+                            null,
+                            null,
+                            null,
+                        ).use { cursor ->
+                            while (cursor.moveToNext()) edits.add(cursor.getLong(0))
+                        }
+                    for (seq in edits) {
+                        val wiped = MessageFrame(chat = message.chat, seq = seq, server_saved_at = message.server_saved_at)
+                        insert(REPLACE_MESSAGE, wiped, wire.encodeToString(MessageFrame.serializer(), wiped))
+                    }
                 }
-                insert(
-                    if (message.kind == null) REPLACE_MESSAGE else KEEP_MESSAGE,
-                    message.chat,
-                    message.seq,
-                    message.kind,
-                    message.content_kind,
-                    message.device,
-                    frame,
-                )
+                insert(if (message.kind == null) REPLACE_MESSAGE else KEEP_MESSAGE, message, frame)
             }
             for (event in calls) {
                 insertCall(event, wire.encodeToString(CallRow.serializer(), event))
@@ -81,6 +90,35 @@ class Archive private constructor(
             }
         return messages to calls
     }
+
+    /** Up to `limit` messages of every chat below `before`, newest by server time first, then chat and seq. */
+    fun scan(
+        before: ScanAt?,
+        limit: Int,
+    ): List<MessageFrame> {
+        val where = if (before == null) null else "(saved_at, chat, seq) < (?, ?, ?)"
+        val args = if (before == null) null else arrayOf(before.saved_at.toString(), before.chat, before.seq.toString())
+        val messages = ArrayList<MessageFrame>()
+        db.query("message", arrayOf("frame"), where, args, null, null, "saved_at DESC, chat DESC, seq DESC", limit.toString()).use {
+                cursor ->
+            while (cursor.moveToNext()) {
+                messages.add(wire.decodeFromString(MessageFrame.serializer(), cursor.getString(0)))
+            }
+        }
+        return messages
+    }
+
+    /** One kept row, or none. */
+    fun frame(
+        chat: String,
+        seq: Long,
+    ): MessageFrame? =
+        db.query("message", arrayOf("frame"), "chat = ? AND seq = ?", arrayOf(chat, seq.toString()), null, null, null).use { cursor ->
+            if (cursor.moveToNext()) wire.decodeFromString(MessageFrame.serializer(), cursor.getString(0)) else null
+        }
+
+    /** How many rows the archive holds, for a search's progress. */
+    fun count(): Long = android.database.DatabaseUtils.queryNumEntries(db, "message")
 
     /** This device's own seen, kept until the next chat list says where the server has it. Never goes back. */
     fun seenUpTo(
@@ -157,20 +195,18 @@ class Archive private constructor(
 
     private fun insert(
         sql: String,
-        chat: String,
-        seq: Long,
-        kind: Int?,
-        contentKind: Int?,
-        device: String?,
+        message: MessageFrame,
         frame: String,
     ) {
         db.compileStatement(sql).use { statement ->
-            statement.bindString(1, chat)
-            statement.bindLong(2, seq)
-            bind(statement, 3, kind)
-            bind(statement, 4, contentKind)
-            bind(statement, 5, device)
-            statement.bindString(6, frame)
+            statement.bindString(1, message.chat)
+            statement.bindLong(2, message.seq)
+            bind(statement, 3, message.kind)
+            bind(statement, 4, message.content_kind)
+            bind(statement, 5, message.device)
+            bind(statement, 6, message.pointer_seq)
+            statement.bindLong(7, message.server_saved_at ?: 0)
+            statement.bindString(8, frame)
             statement.executeInsert()
         }
     }
@@ -192,13 +228,16 @@ class Archive private constructor(
 
     companion object {
         private const val CONTENT = 0
+        private const val EDIT = 1
         private const val REACTION = 2
         private const val CALL = 8
 
         private const val KEEP_MESSAGE =
-            "INSERT OR IGNORE INTO message (chat, seq, kind, content_kind, device, frame) VALUES (?, ?, ?, ?, ?, ?)"
+            "INSERT OR IGNORE INTO message (chat, seq, kind, content_kind, device, pointer, saved_at, frame) " +
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
         private const val REPLACE_MESSAGE =
-            "INSERT OR REPLACE INTO message (chat, seq, kind, content_kind, device, frame) VALUES (?, ?, ?, ?, ?, ?)"
+            "INSERT OR REPLACE INTO message (chat, seq, kind, content_kind, device, pointer, saved_at, frame) " +
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
         private const val KEEP_CALL =
             "INSERT OR IGNORE INTO call_row (chat, call_seq, n, kind, outcome, frame) VALUES (?, ?, ?, ?, ?, ?)"
         private const val UPSERT_SEEN =
@@ -224,8 +263,10 @@ class Archive private constructor(
             db.execSQL(
                 "CREATE TABLE IF NOT EXISTS message (" +
                     "chat TEXT NOT NULL, seq INTEGER NOT NULL, kind INTEGER, content_kind INTEGER, " +
-                    "device TEXT, frame TEXT NOT NULL, PRIMARY KEY (chat, seq))",
+                    "device TEXT, pointer INTEGER, saved_at INTEGER NOT NULL, frame TEXT NOT NULL, PRIMARY KEY (chat, seq))",
             )
+            // A search reads every chat newest first by server time.
+            db.execSQL("CREATE INDEX IF NOT EXISTS message_saved ON message (saved_at, chat, seq)")
             db.execSQL(
                 "CREATE TABLE IF NOT EXISTS call_row (" +
                     "chat TEXT NOT NULL, call_seq INTEGER NOT NULL, n INTEGER NOT NULL, kind INTEGER NOT NULL, " +
@@ -242,6 +283,14 @@ class Archive private constructor(
             value: Int?,
         ) {
             if (value == null) statement.bindNull(index) else statement.bindLong(index, value.toLong())
+        }
+
+        private fun bind(
+            statement: SQLiteStatement,
+            index: Int,
+            value: Long?,
+        ) {
+            if (value == null) statement.bindNull(index) else statement.bindLong(index, value)
         }
 
         private fun bind(

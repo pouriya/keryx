@@ -10,7 +10,6 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
@@ -61,6 +60,7 @@ import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
@@ -68,6 +68,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -101,10 +102,12 @@ import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextDirection
@@ -173,6 +176,10 @@ private sealed interface Line {
     data class One(
         val bubble: Bubble,
         val joined: Boolean,
+    ) : Line
+
+    data class Note(
+        val bubble: Bubble,
     ) : Line
 }
 
@@ -331,22 +338,27 @@ internal fun ChatScreen(
     }
     val newest = talk.bubbles.lastOrNull()
     val atBottom by remember { derivedStateOf { state.firstVisibleItemIndex == 0 && state.firstVisibleItemScrollOffset < 40 } }
-    var below by remember { mutableIntStateOf(0) }
     var previous by remember { mutableStateOf<String?>(null) }
     LaunchedEffect(newest?.key) {
         val before = previous
         previous = newest?.key
         if (newest == null || before == null) return@LaunchedEffect
-        // The old newest message still on screen means the reader was at the end: follow, else only count.
+        // The old newest message still on screen means the reader was at the end: follow.
         val wasAtEnd = state.layoutInfo.visibleItemsInfo.any { it.key == before }
-        if (wasAtEnd || newest.mine) {
-            state.scrollToItem(0)
-        } else if (!newest.mine) {
-            below++
-        }
+        if (wasAtEnd || newest.mine) state.scrollToItem(0)
     }
-    LaunchedEffect(atBottom) {
-        if (atBottom) below = 0
+    // The newest message that has been on screen. The down button counts the others' messages after it,
+    // so a batch counts each of its messages, and one already seen never counts.
+    var lookedAt by remember(talk.chat) { mutableLongStateOf(0L) }
+    LaunchedEffect(state, talk.chat) {
+        snapshotFlow {
+            state.layoutInfo.visibleItemsInfo.maxOfOrNull { item ->
+                (item.key as? String)?.takeIf { it.startsWith("s") }?.drop(1)?.toLongOrNull() ?: 0L
+            } ?: 0L
+        }.collect { if (it > lookedAt) lookedAt = it }
+    }
+    val below by remember(talk.chat) {
+        derivedStateOf { talk.bubbles.count { !it.mine && it.notice == null && (it.seq ?: 0L) > lookedAt } }
     }
     val lastOther = talk.bubbles.lastOrNull { !it.mine && it.seq != null }?.seq
     LaunchedEffect(lastOther, atBottom) {
@@ -377,8 +389,10 @@ internal fun ChatScreen(
         val at = rows.indexOfFirst { it is Line.One && it.bubble.key == key }
         if (at >= 0) state.animateScrollToItem(at)
     }
-    LaunchedEffect(talk.seeking, rows.size, talk.hasOlder) {
+    LaunchedEffect(talk.seeking, rows.size, talk.hasOlder, talk.paged) {
         val seq = talk.seeking ?: return@LaunchedEffect
+        // A chat opened at a message, from search, waits for its first page before looking further up.
+        if (!talk.paged) return@LaunchedEffect
         if (rows.any { it is Line.One && it.bubble.seq == seq }) {
             flash = "s$seq"
             talk.seeking = null
@@ -429,6 +443,7 @@ internal fun ChatScreen(
                 items(rows, key = { rowKey(it) }) { row ->
                     when (row) {
                         is Line.Day -> DayRow(row.at, ink, dark)
+                        is Line.Note -> NoteRow(row.bubble, ink, dark)
                         is Line.One ->
                             MessageRow(
                                 bubble = row.bubble,
@@ -688,6 +703,7 @@ private fun rowKey(row: Line): String =
     when (row) {
         is Line.Day -> "day-${row.at}"
         is Line.One -> row.bubble.key
+        is Line.Note -> row.bubble.key
     }
 
 private fun dayOf(at: Long): LocalDate = Instant.ofEpochMilli(at).atZone(ZoneId.systemDefault()).toLocalDate()
@@ -702,6 +718,11 @@ private fun rowsOf(list: List<Bubble>): List<Line> {
             out.add(Line.Day(bubble.at))
             day = today
             before = null
+        }
+        if (bubble.notice != null) {
+            out.add(Line.Note(bubble))
+            before = null
+            continue
         }
         out.add(Line.One(bubble, before != null && before.mine == bubble.mine))
         before = bubble
@@ -738,8 +759,8 @@ private fun TopBar(
     onPerson: () -> Unit,
 ) {
     val rtl = LocalLayoutDirection.current == LayoutDirection.Rtl
-    Row(Modifier.fillMaxWidth().height(60.dp).padding(start = 4.dp, end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-        IconButton(stringResource(R.string.back), onBack) { BackMark(ink.text, rtl) }
+    Row(Modifier.fillMaxWidth().height(64.dp).padding(start = 4.dp, end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+        IconButton(stringResource(R.string.back), onBack, 48.dp) { BackMark(ink.text, rtl) }
         Row(
             Modifier
                 .weight(1f)
@@ -748,14 +769,14 @@ private fun TopBar(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Box(Modifier.padding(start = 2.dp, end = 10.dp)) {
-                Avatar(person, title, 40.dp)
-                PresenceDot(state, 8.dp, 2.dp, ink.page, Modifier.align(Alignment.BottomEnd))
+                Avatar(person, title, 44.dp)
+                PresenceDot(state, 9.dp, 2.dp, ink.page, Modifier.align(Alignment.BottomEnd))
             }
             Column(Modifier.weight(1f)) {
                 Text(
                     title,
                     color = ink.text,
-                    fontSize = 16.sp,
+                    fontSize = 17.sp,
                     fontWeight = FontWeight.Bold,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
@@ -764,7 +785,7 @@ private fun TopBar(
                     Text(
                         status,
                         color = statusTone ?: ink.muted,
-                        fontSize = 12.sp,
+                        fontSize = 13.sp,
                         maxLines = 1,
                         style = TextStyle(textDirection = TextDirection.Content),
                     )
@@ -788,6 +809,27 @@ private fun SelectionBar(
             color = ink.text,
             fontSize = 18.sp,
             fontWeight = FontWeight.Bold,
+        )
+    }
+}
+
+@Composable
+private fun NoteRow(
+    bubble: Bubble,
+    ink: Ink,
+    dark: Boolean,
+) {
+    val time = DateTimeFormatter.ofLocalizedTime(FormatStyle.SHORT).format(Instant.ofEpochMilli(bubble.at).atZone(ZoneId.systemDefault()))
+    Box(Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 6.dp), contentAlignment = Alignment.Center) {
+        Text(
+            "${bubble.notice} · $time",
+            Modifier
+                .clip(RoundedCornerShape(10.dp))
+                .background(if (dark) Color(0xFF1E2833) else Color(0xFFF1F3F6))
+                .padding(horizontal = 12.dp, vertical = 5.dp),
+            color = ink.muted,
+            fontSize = 13.sp,
+            textAlign = TextAlign.Center,
         )
     }
 }
@@ -2100,15 +2142,40 @@ private data class EmojiSection(
     val cells: List<EmojiCell>,
 )
 
-/** Puts a popup just above what it belongs to, kept inside the window. */
-private object Above : PopupPositionProvider {
+/** How many emoji the picker shows in a row. */
+private const val EMOJI_ROW = 8
+
+/** One line of the picker: a section's name, or a row of up to [EMOJI_ROW] of its emoji. */
+private sealed interface EmojiLine {
+    val key: String
+}
+
+private data class EmojiHead(
+    override val key: String,
+    val name: String,
+) : EmojiLine
+
+private data class EmojiRow(
+    override val key: String,
+    val cells: List<EmojiCell>,
+) : EmojiLine
+
+/**
+ * Puts a popup just above one of [count] equal columns of what it belongs to, column 0 at the left, kept
+ * inside the window.
+ */
+private class Above(
+    val column: Int,
+    val count: Int,
+) : PopupPositionProvider {
     override fun calculatePosition(
         anchorBounds: IntRect,
         windowSize: IntSize,
         layoutDirection: LayoutDirection,
         popupContentSize: IntSize,
     ): IntOffset {
-        val x = anchorBounds.left + (anchorBounds.width - popupContentSize.width) / 2
+        val width = anchorBounds.width / count
+        val x = anchorBounds.left + width * column + (width - popupContentSize.width) / 2
         val y = anchorBounds.top - popupContentSize.height
         return IntOffset(x.coerceIn(0, maxOf(0, windowSize.width - popupContentSize.width)), maxOf(0, y))
     }
@@ -2119,7 +2186,6 @@ private object Above : PopupPositionProvider {
  * scroll, and the groups in one grid, Recent first while it has any. Search matches the English names and
  * shortcodes. A long press on an emoji with tones shows them above it, and nothing is remembered.
  */
-@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
 private fun EmojiSheet(
     reactions: Reactions,
@@ -2135,58 +2201,100 @@ private fun EmojiSheet(
     var query by remember { mutableStateOf("") }
     var toned by remember { mutableStateOf<String?>(null) }
     val groups = reactions.groups.orEmpty()
+    val recent = reactions.recent
+    // Built once per list, not on every recomposition: there are about 1,900 emoji.
     val tones = remember(groups) { groups.flatMap { it.emoji_list }.associate { it.emoji to it.tone_list } }
     val names = groups.map { groupName(it.group) }
     val recentName = stringResource(R.string.stickers_recent)
     val sections =
-        buildList {
-            if (reactions.recent.isNotEmpty()) {
-                add(EmojiSection("recent", "🕘", recentName, reactions.recent.map { EmojiCell(it, tones[it].orEmpty()) }))
-            }
-            groups.forEachIndexed { index, group ->
-                val icon = GROUP_ICONS[group.group] ?: group.emoji_list.firstOrNull()?.emoji.orEmpty()
-                add(EmojiSection(group.group, icon, names[index], group.emoji_list.map { EmojiCell(it.emoji, it.tone_list) }))
+        remember(groups, recent, names, recentName) {
+            buildList {
+                if (recent.isNotEmpty()) {
+                    add(EmojiSection("recent", "🕘", recentName, recent.map { EmojiCell(it, tones[it].orEmpty()) }))
+                }
+                groups.forEachIndexed { index, group ->
+                    val icon = GROUP_ICONS[group.group] ?: group.emoji_list.firstOrNull()?.emoji.orEmpty()
+                    add(EmojiSection(group.group, icon, names[index], group.emoji_list.map { EmojiCell(it.emoji, it.tone_list) }))
+                }
             }
         }
     val needle = query.trim().trim(':').lowercase()
     val found =
-        if (needle.isEmpty()) {
-            null
-        } else {
-            groups
-                .flatMap { it.emoji_list }
-                .filter { item -> item.name.lowercase().contains(needle) || item.shortcode_list.any { it.contains(needle) } }
-                .map { EmojiCell(it.emoji, it.tone_list) }
+        remember(groups, needle) {
+            if (needle.isEmpty()) {
+                null
+            } else {
+                groups
+                    .flatMap { it.emoji_list }
+                    .filter { item -> item.name.lowercase().contains(needle) || item.shortcode_list.any { it.contains(needle) } }
+                    .map { EmojiCell(it.emoji, it.tone_list) }
+            }
         }
-    val heads = ArrayList<Int>()
-    var at = 0
-    for (section in sections) {
-        heads.add(at)
-        at += 1 + section.cells.size
-    }
-    val grid = rememberLazyGridState()
+    // A row of emoji is one item drawn on one canvas, not eight items each with its own text: composing
+    // and laying out every emoji as it scrolled in made the picker stutter.
+    val lines =
+        remember(sections) {
+            buildList {
+                for (section in sections) {
+                    add(EmojiHead(section.key, section.name))
+                    section.cells.chunked(EMOJI_ROW).forEachIndexed { n, row -> add(EmojiRow("${section.key}-$n", row)) }
+                }
+            }
+        }
+    val heads = remember(lines) { lines.indices.filter { lines[it] is EmojiHead } }
+    val foundLines = remember(found) { found?.chunked(EMOJI_ROW)?.mapIndexed { n, row -> EmojiRow("found-$n", row) } }
+    val grid = rememberLazyListState()
     val scope = rememberCoroutineScope()
-    val current = heads.indexOfLast { it <= grid.firstVisibleItemIndex }.coerceAtLeast(0)
+    val rtl = LocalLayoutDirection.current == LayoutDirection.Rtl
+    // Each emoji is laid out once while the sheet is open, then only drawn.
+    val measurer = rememberTextMeasurer(cacheSize = 0)
+    val density = LocalDensity.current
+    val glyphs = remember(density) { HashMap<String, TextLayoutResult>() }
+    val glyph = TextStyle(color = ink.text, fontSize = 24.sp)
 
     @Composable
-    fun Cell(
-        cell: EmojiCell,
-        key: String,
-    ) {
+    fun Line(row: EmojiRow) {
+        // The emoji under a point, counted from the start of the row whichever way the screen reads.
+        fun index(
+            x: Float,
+            width: Int,
+        ): Int {
+            val column = (x * EMOJI_ROW / width).toInt().coerceIn(0, EMOJI_ROW - 1)
+            return if (rtl) EMOJI_ROW - 1 - column else column
+        }
         Box(
             Modifier
-                .aspectRatio(1f)
-                .clip(RoundedCornerShape(10.dp))
-                .combinedClickable(
-                    role = Role.Button,
-                    onLongClick = if (cell.tones.isEmpty()) null else ({ toned = key }),
-                ) { onPick(cell.emoji) },
-            contentAlignment = Alignment.Center,
+                .fillMaxWidth()
+                .aspectRatio(EMOJI_ROW.toFloat())
+                .drawBehind {
+                    val width = size.width / EMOJI_ROW
+                    row.cells.forEachIndexed { index, cell ->
+                        val layout = glyphs.getOrPut(cell.emoji) { measurer.measure(cell.emoji, glyph) }
+                        val column = if (rtl) EMOJI_ROW - 1 - index else index
+                        drawText(
+                            layout,
+                            topLeft =
+                                Offset(
+                                    column * width + (width - layout.size.width) / 2,
+                                    (size.height - layout.size.height) / 2,
+                                ),
+                        )
+                    }
+                }.pointerInput(row, rtl) {
+                    detectTapGestures(
+                        onLongPress = { at ->
+                            val index = index(at.x, size.width)
+                            if (row.cells.getOrNull(index)?.tones?.isNotEmpty() == true) toned = "${row.key}/$index"
+                        },
+                        onTap = { at -> row.cells.getOrNull(index(at.x, size.width))?.let { onPick(it.emoji) } },
+                    )
+                },
         ) {
-            Text(cell.emoji, fontSize = 24.sp)
-            if (toned == key) {
+            val index = toned?.takeIf { it.startsWith("${row.key}/") }?.substringAfter('/')?.toInt()
+            val cell = index?.let { row.cells.getOrNull(it) }
+            if (index != null && cell != null) {
                 Popup(
-                    popupPositionProvider = Above,
+                    popupPositionProvider = Above(if (rtl) EMOJI_ROW - 1 - index else index, EMOJI_ROW),
                     onDismissRequest = { toned = null },
                     properties = PopupProperties(focusable = true),
                 ) {
@@ -2256,64 +2364,76 @@ private fun EmojiSheet(
                 },
             )
             if (found == null) {
-                Row(
-                    Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 8.dp, vertical = 6.dp),
-                    horizontalArrangement = Arrangement.spacedBy(2.dp),
-                ) {
-                    sections.forEachIndexed { index, section ->
-                        Box(
-                            Modifier
-                                .size(38.dp)
-                                .clip(RoundedCornerShape(10.dp))
-                                .background(if (index == current) accent.copy(alpha = 0.22f) else Color.Transparent)
-                                .semantics { contentDescription = section.name }
-                                .clickable(role = Role.Button) { scope.launch { grid.animateScrollToItem(heads[index]) } },
-                            contentAlignment = Alignment.Center,
-                        ) { Text(section.icon, fontSize = 20.sp) }
-                    }
-                }
+                GroupStrip(sections, heads, grid) { index -> scope.launch { grid.animateScrollToItem(heads[index]) } }
             } else {
                 Spacer(Modifier.height(8.dp))
             }
             Box(Modifier.fillMaxWidth().height(1.dp).background(ink.line))
-            LazyVerticalGrid(
-                columns = GridCells.Fixed(8),
+            LazyColumn(
                 modifier = Modifier.weight(1f).fillMaxWidth().padding(horizontal = 8.dp),
                 state = grid,
             ) {
-                if (found != null) {
-                    if (found.isEmpty()) {
-                        item(key = "none", span = { GridItemSpan(maxLineSpan) }) {
+                if (foundLines != null) {
+                    if (foundLines.isEmpty()) {
+                        item(key = "none") {
                             Text(
                                 stringResource(R.string.emoji_none),
-                                Modifier.padding(top = 24.dp),
+                                Modifier.fillMaxWidth().padding(top = 24.dp),
                                 color = ink.muted,
                                 fontSize = 14.sp,
                                 textAlign = TextAlign.Center,
                             )
                         }
                     }
-                    for (cell in found) {
-                        item(key = "found-${cell.emoji}") { Cell(cell, "found-${cell.emoji}") }
-                    }
+                    items(foundLines, key = { it.key }) { Line(it) }
                 } else {
-                    for (section in sections) {
-                        item(key = section.key, span = { GridItemSpan(maxLineSpan) }) {
-                            Text(
-                                section.name,
-                                Modifier.padding(start = 4.dp, top = 10.dp, bottom = 4.dp),
-                                color = ink.muted,
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.SemiBold,
-                            )
-                        }
-                        for (cell in section.cells) {
-                            val key = "${section.key}-${cell.emoji}"
-                            item(key = key) { Cell(cell, key) }
+                    items(lines, key = { it.key }, contentType = { it is EmojiHead }) { line ->
+                        when (line) {
+                            is EmojiHead ->
+                                Text(
+                                    line.name,
+                                    Modifier.padding(start = 4.dp, top = 10.dp, bottom = 4.dp),
+                                    color = ink.muted,
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                )
+                            is EmojiRow -> Line(line)
                         }
                     }
                 }
             }
+        }
+    }
+}
+
+/**
+ * The picker's strip of group icons. It alone reads the grid's scroll, so scrolling recomposes only the
+ * strip's highlight, never the sheet and its grid.
+ */
+@Composable
+private fun GroupStrip(
+    sections: List<EmojiSection>,
+    heads: List<Int>,
+    grid: androidx.compose.foundation.lazy.LazyListState,
+    onJump: (Int) -> Unit,
+) {
+    val current by remember(heads) {
+        derivedStateOf { heads.indexOfLast { it <= grid.firstVisibleItemIndex }.coerceAtLeast(0) }
+    }
+    Row(
+        Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 8.dp, vertical = 6.dp),
+        horizontalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        sections.forEachIndexed { index, section ->
+            Box(
+                Modifier
+                    .size(38.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(if (index == current) accent.copy(alpha = 0.22f) else Color.Transparent)
+                    .semantics { contentDescription = section.name }
+                    .clickable(role = Role.Button) { onJump(index) },
+                contentAlignment = Alignment.Center,
+            ) { Text(section.icon, fontSize = 20.sp) }
         }
     }
 }

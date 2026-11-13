@@ -19,11 +19,13 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.union
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.windowInsetsPadding
@@ -86,6 +88,7 @@ import androidx.compose.ui.text.style.LineHeightStyle
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDirection
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
@@ -485,6 +488,19 @@ internal class ChatRows {
             )
     }
 
+    /** A new device's notice as the self chat's preview, while nothing newer is there. */
+    fun notice(
+        event: Event.Notice,
+        preview: String,
+    ) {
+        val index = rows.indexOfFirst { it.id == event.chat }
+        if (index < 0) return
+        val row = rows[index]
+        if (row.lastSeq != null && event.seq < row.lastSeq) return
+        rows[index] =
+            row.copy(lastSeq = event.seq, preview = preview, lastAt = event.saved_at, mine = false, waiting = false, callVideo = null)
+    }
+
     /** The call's end names it missed or not, once that row is already the preview. */
     fun callStatus(
         chat: String,
@@ -565,7 +581,10 @@ internal fun Chats(
     found: List<AccountBrief>,
     foundFor: String,
     folders: FolderState,
+    search: MessageSearch,
     onSearch: (String) -> Unit,
+    onOlder: () -> Unit,
+    onHit: (Hit) -> Unit,
     onPerson: (AccountBrief) -> Unit,
     onOpen: (ChatRow) -> Unit,
     onProfile: (String) -> Unit,
@@ -579,6 +598,7 @@ internal fun Chats(
     var query by remember { mutableStateOf("") }
     var applied by remember { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }
+    var part by remember { mutableStateOf(SearchPart.All) }
     val focus = remember { FocusRequester() }
     LaunchedEffect(query, open) {
         if (!open || query.isEmpty()) {
@@ -610,6 +630,7 @@ internal fun Chats(
         query = ""
         applied = ""
         busy = false
+        part = SearchPart.All
     }
     BackHandler(enabled = open) { closeSearch() }
     // A long press on a row, not its photo, starts selecting, as messages do, chosen by the author.
@@ -652,7 +673,8 @@ internal fun Chats(
     // Search looks through every chat, whatever tab is open, chosen by the author.
     val shown =
         if (filtering) {
-            val matched = rows.filter { label(it, people, saved).startsWith(applied, ignoreCase = true) }
+            // Anywhere in the name, as the server's directory matches.
+            val matched = rows.filter { label(it, people, saved).contains(applied, ignoreCase = true) }
             val self = rows.firstOrNull { it.type == 0 }
             if (self != null && found.any { it.id == me } && matched.none { it.id == self.id }) {
                 listOf(self) + matched
@@ -735,7 +757,8 @@ internal fun Chats(
                     folders.saveEdit()
                 }
             } else if (open) {
-                SearchRow(query, busy, ink, focus, { query = it }, ::closeSearch)
+                val ring = if (applied.isNotEmpty() && search.text == applied && !search.done) search.percent else null
+                SearchRow(query, busy, ring, ink, focus, { query = it }, ::closeSearch)
             } else {
                 TitleRow(title, connected, ink, { me?.let(onProfile) }) { open = true }
             }
@@ -743,83 +766,122 @@ internal fun Chats(
                 Incoming(call, { onAnswer(call) }, { onDecline(call) })
             }
             val listInsets = if (arrangement == null) Modifier.windowInsetsPadding(WindowInsets.navigationBars) else Modifier
-            LazyColumn(Modifier.weight(1f).then(listInsets), state = listState) {
-                if (shown.isEmpty() && strangers.isEmpty()) {
-                    item {
-                        Text(
-                            stringResource(R.string.no_chats),
-                            Modifier.padding(horizontal = 16.dp, vertical = 28.dp),
-                            color = ink.muted,
-                            fontSize = 14.sp,
-                        )
-                    }
-                }
-                items(shown, key = { it.id }) { row ->
-                    val dragging = row.id == dragId
-                    val place =
-                        when {
-                            dragging -> Modifier.zIndex(1f).graphicsLayer { translationY = dragBy }
-                            selecting -> Modifier.animateItem(fadeInSpec = null, fadeOutSpec = null)
-                            else -> Modifier
-                        }
-                    val handle =
-                        if (handles && row.id in pinned) {
-                            Modifier.pointerInput(row.id) {
-                                detectVerticalDragGestures(
-                                    onDragStart = {
-                                        dragOrder = pinnedNow
-                                        dragId = row.id
-                                        dragBy = 0f
-                                    },
-                                    onDragEnd = { finishDrag(true) },
-                                    onDragCancel = { finishDrag(false) },
-                                ) { change, amount ->
-                                    change.consume()
-                                    dragBy += amount
-                                    dragStep()
-                                }
-                            }
-                        } else {
-                            null
-                        }
-                    Conversation(
-                        row,
-                        label(row, people, saved),
-                        me,
-                        unread[row.id] ?: 0,
-                        row.id in pins,
-                        ink,
-                        accentText,
-                        selecting,
-                        row.id in selected,
-                        handle,
-                        place.onSizeChanged { if (dragging || rowHeight == 0) rowHeight = it.height },
-                        onProfile,
-                        onLongClick = {
-                            folders.startEdit()
-                            if (folders.edit != null && row.id !in selected) selected.add(row.id)
-                        },
-                    ) {
-                        if (selecting) {
-                            if (row.id in selected) selected.remove(row.id) else selected.add(row.id)
-                            settle()
-                        } else {
-                            // Back from a chat opened through search lands on the first folder holding it.
-                            if (filtering) arrangement?.holding(row.id)?.let { folders.tab = it }
-                            onOpen(row)
-                        }
-                    }
-                }
-                items(strangers, key = { "person-${it.id}" }) { account ->
-                    PersonRow(account, ink) {
+            if (open) {
+                SearchBody(
+                    applied,
+                    part,
+                    if (filtering) shown else emptyList(),
+                    strangers,
+                    asking = busy || (applied.isNotEmpty() && foundFor != applied),
+                    search,
+                    rows,
+                    people,
+                    me,
+                    unread,
+                    ink,
+                    accentText,
+                    Modifier.weight(1f),
+                    onPart = { part = it },
+                    onRow = { row ->
+                        arrangement?.holding(row.id)?.let { folders.tab = it }
+                        closeSearch()
+                        onOpen(row)
+                    },
+                    onPerson = { account ->
                         closeSearch()
                         // A new chat is in All only.
                         arrangement?.all?.let { folders.tab = it.id }
                         onPerson(account)
+                    },
+                    onProfile = onProfile,
+                    onOlder = onOlder,
+                    onHit = { hit ->
+                        arrangement?.holding(hit.chat)?.let { folders.tab = it }
+                        closeSearch()
+                        onHit(hit)
+                    },
+                )
+            } else {
+                LazyColumn(Modifier.weight(1f).then(listInsets), state = listState) {
+                    if (shown.isEmpty() && strangers.isEmpty()) {
+                        item {
+                            Text(
+                                stringResource(R.string.no_chats),
+                                Modifier.padding(horizontal = 16.dp, vertical = 28.dp),
+                                color = ink.muted,
+                                fontSize = 14.sp,
+                            )
+                        }
+                    }
+                    items(shown, key = { it.id }) { row ->
+                        val dragging = row.id == dragId
+                        val place =
+                            when {
+                                dragging -> Modifier.zIndex(1f).graphicsLayer { translationY = dragBy }
+                                selecting -> Modifier.animateItem(fadeInSpec = null, fadeOutSpec = null)
+                                else -> Modifier
+                            }
+                        val handle =
+                            if (handles && row.id in pinned) {
+                                Modifier.pointerInput(row.id) {
+                                    detectVerticalDragGestures(
+                                        onDragStart = {
+                                            dragOrder = pinnedNow
+                                            dragId = row.id
+                                            dragBy = 0f
+                                        },
+                                        onDragEnd = { finishDrag(true) },
+                                        onDragCancel = { finishDrag(false) },
+                                    ) { change, amount ->
+                                        change.consume()
+                                        dragBy += amount
+                                        dragStep()
+                                    }
+                                }
+                            } else {
+                                null
+                            }
+                        Conversation(
+                            row,
+                            label(row, people, saved),
+                            me,
+                            unread[row.id] ?: 0,
+                            row.id in pins,
+                            ink,
+                            accentText,
+                            selecting,
+                            row.id in selected,
+                            handle,
+                            place.onSizeChanged { if (dragging || rowHeight == 0) rowHeight = it.height },
+                            onProfile,
+                            onLongClick = {
+                                folders.startEdit()
+                                if (folders.edit != null && row.id !in selected) selected.add(row.id)
+                            },
+                        ) {
+                            if (selecting) {
+                                if (row.id in selected) selected.remove(row.id) else selected.add(row.id)
+                                settle()
+                            } else {
+                                // Back from a chat opened through search lands on the first folder holding it.
+                                if (filtering) arrangement?.holding(row.id)?.let { folders.tab = it }
+                                onOpen(row)
+                            }
+                        }
                     }
                 }
             }
-            if (selecting && here != null) {
+            if (open) {
+                val accounts = if (filtering) shown.size + strangers.size else 0
+                SearchTabs(
+                    part,
+                    accounts.takeIf { applied.isNotEmpty() && !busy && foundFor == applied },
+                    search.hits.size.takeIf { applied.isNotEmpty() && search.text == applied && search.done },
+                    ink,
+                    accentText,
+                    dark,
+                ) { part = it }
+            } else if (selecting && here != null) {
                 Strip(
                     inAll,
                     chosen.isNotEmpty() && chosen.all { it in pins },
@@ -834,7 +896,7 @@ internal fun Chats(
                     onNew = { newFolder(chosen) },
                 )
             }
-            if (arrangement != null) {
+            if (arrangement != null && !open) {
                 Tabs(
                     arrangement,
                     here?.id,
@@ -987,6 +1049,7 @@ private fun TitleRow(
 private fun SearchRow(
     query: String,
     busy: Boolean,
+    ring: Int?,
     ink: Ink,
     focus: FocusRequester,
     onQuery: (String) -> Unit,
@@ -994,7 +1057,7 @@ private fun SearchRow(
 ) {
     val rtl = LocalLayoutDirection.current == LayoutDirection.Rtl
     Row(Modifier.fillMaxWidth().height(56.dp).padding(end = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-        IconButton(stringResource(R.string.back), onClose) { BackMark(ink.text, rtl) }
+        IconButton(stringResource(R.string.back), onClose, 48.dp) { BackMark(ink.text, rtl) }
         Row(
             Modifier
                 .weight(1f)
@@ -1018,7 +1081,9 @@ private fun SearchRow(
                     inner()
                 },
             )
-            if (busy) {
+            if (ring != null) {
+                Ring(ring, ink)
+            } else if (busy) {
                 CircularProgressIndicator(
                     Modifier.size(18.dp),
                     color = accent,
@@ -1036,6 +1101,7 @@ private fun SearchRow(
 private fun PersonRow(
     account: AccountBrief,
     ink: Ink,
+    tag: String? = null,
     onClick: () -> Unit,
 ) {
     val name = account.display_name?.takeIf { it.isNotBlank() } ?: account.username
@@ -1045,7 +1111,29 @@ private fun PersonRow(
     ) {
         Avatar(account.id, name, 48.dp)
         Column(Modifier.padding(start = 12.dp).weight(1f)) {
-            Text(name, color = ink.text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    name,
+                    Modifier.weight(1f, fill = false),
+                    color = ink.text,
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                if (tag != null) {
+                    Text(
+                        tag,
+                        Modifier
+                            .padding(start = 8.dp)
+                            .border(1.dp, ink.line, RoundedCornerShape(6.dp))
+                            .padding(horizontal = 5.dp),
+                        color = if (isDark()) Color(0xFFC5D4E8) else accent,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                }
+            }
             Text(
                 "@${account.username}",
                 color = ink.muted,
@@ -1096,7 +1184,7 @@ private fun Conversation(
             Avatar(
                 person,
                 name,
-                48.dp,
+                54.dp,
                 if (person != null) {
                     Modifier.clip(CircleShape).combinedClickable(role = Role.Button, onLongClick = {}) { onProfile(person) }
                 } else {
@@ -1104,7 +1192,7 @@ private fun Conversation(
                 },
             )
             if (row.type == DIRECT && person != null && !(selecting && selected)) {
-                PresenceDot(LocalProfiles.current?.presence?.get(person)?.state, 9.dp, 2.dp, ink.page, Modifier.align(Alignment.BottomEnd))
+                PresenceDot(LocalProfiles.current?.presence?.get(person)?.state, 10.dp, 2.dp, ink.page, Modifier.align(Alignment.BottomEnd))
             }
             if (selecting && selected) {
                 Box(
@@ -1124,13 +1212,13 @@ private fun Conversation(
                     name,
                     Modifier.weight(1f),
                     color = ink.text,
-                    fontSize = 16.sp,
+                    fontSize = 17.sp,
                     fontWeight = if (unread > 0) FontWeight.Bold else FontWeight.SemiBold,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
                 if (row.lastAt != null) {
-                    Text(chatWhen(row.lastAt), color = timeColor, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                    Text(chatWhen(row.lastAt), color = timeColor, fontSize = 13.sp, fontWeight = FontWeight.Medium)
                 }
             }
             Row(Modifier.padding(top = 2.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -1139,7 +1227,7 @@ private fun Conversation(
                     previewText(row),
                     Modifier.weight(1f),
                     color = ink.muted,
-                    fontSize = 14.sp,
+                    fontSize = 15.sp,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
@@ -1148,12 +1236,12 @@ private fun Conversation(
                         unread.toString(),
                         Modifier
                             .padding(start = 8.dp)
-                            .height(20.dp)
-                            .clip(RoundedCornerShape(10.dp))
+                            .height(22.dp)
+                            .clip(RoundedCornerShape(11.dp))
                             .background(accent)
-                            .padding(horizontal = 6.dp),
+                            .padding(horizontal = 7.dp),
                         color = onAccent,
-                        fontSize = 12.sp,
+                        fontSize = 13.sp,
                         fontWeight = FontWeight.SemiBold,
                         textAlign = TextAlign.Center,
                     )
@@ -1321,6 +1409,8 @@ private fun Tabs(
                             val span = x..(x + place.size.width)
                             if (placed[folder.id] != span) placed[folder.id] = span
                         }
+                        // A short name like All still makes a tab big enough for a thumb, chosen by the author.
+                        .widthIn(min = 64.dp)
                         .clip(RoundedCornerShape(10.dp))
                         .background(if (chosen) accent.copy(alpha = if (dark) 0.28f else 0.14f) else Color.Transparent)
                         .combinedClickable(
@@ -1329,7 +1419,7 @@ private fun Tabs(
                         ) { onTab(folder.id) }
                         .padding(horizontal = 10.dp, vertical = 6.dp),
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(5.dp),
+                    horizontalArrangement = Arrangement.spacedBy(5.dp, Alignment.CenterHorizontally),
                 ) {
                     Text(
                         folder.name ?: allName,
@@ -1928,11 +2018,12 @@ private fun Incoming(
 internal fun IconButton(
     label: String,
     onClick: () -> Unit,
+    size: Dp = 40.dp,
     mark: @Composable () -> Unit,
 ) {
     Box(
         Modifier
-            .size(40.dp)
+            .size(size)
             .clip(CircleShape)
             .semantics { contentDescription = label }
             .clickable(role = Role.Button, onClick = onClick),
@@ -2081,13 +2172,20 @@ internal fun BackMark(
     color: Color,
     rtl: Boolean,
 ) {
-    Canvas(Modifier.size(22.dp)) {
-        val stroke = Stroke(width = 2.dp.toPx(), cap = StrokeCap.Round)
-        val tip = if (rtl) size.width * 0.68f else size.width * 0.32f
-        val tail = if (rtl) size.width * 0.28f else size.width * 0.72f
-        drawLine(color, Offset(tail, size.height * 0.5f), Offset(tip, size.height * 0.5f), stroke.width)
-        drawLine(color, Offset(tip, size.height * 0.5f), Offset((tip + tail) / 2f, size.height * 0.28f), stroke.width)
-        drawLine(color, Offset(tip, size.height * 0.5f), Offset((tip + tail) / 2f, size.height * 0.72f), stroke.width)
+    // One path with rounded joins, so the shaft and both arms meet at the tip with no seam.
+    Canvas(Modifier.size(26.dp)) {
+        val unit = size.width / 24f
+
+        fun x(at: Float) = (if (rtl) 24f - at else at) * unit
+        val path =
+            Path().apply {
+                moveTo(x(11.5f), 5.5f * unit)
+                lineTo(x(5f), 12f * unit)
+                lineTo(x(11.5f), 18.5f * unit)
+                moveTo(x(5f), 12f * unit)
+                lineTo(x(19f), 12f * unit)
+            }
+        drawPath(path, color, style = Stroke(width = 2.4.dp.toPx(), cap = StrokeCap.Round, join = StrokeJoin.Round))
     }
 }
 
@@ -2111,5 +2209,372 @@ internal fun chatWhen(at: Long): String {
         days == 1L -> stringResource(R.string.yesterday)
         days < 7L -> DateTimeFormatter.ofPattern("EEE").format(then)
         else -> DateTimeFormatter.ofLocalizedDate(FormatStyle.SHORT).format(then)
+    }
+}
+
+/** The search's tabs, chosen by the author: All, then Accounts, then Messages. */
+internal enum class SearchPart { All, Accounts, Messages }
+
+/** How many of each part All shows before See all. */
+private const val ALL_SHOWS = 3
+
+/** How much of a hit's text before the match stays, so the match lands in its two lines. */
+private const val HIT_LEAD = 48
+
+/** The message part of a search: what was found so far, and how far the archive has been looked through. */
+internal class MessageSearch {
+    var text by mutableStateOf("")
+        private set
+    val hits = mutableStateListOf<Hit>()
+    private var scanned by mutableStateOf(0L)
+    private var total by mutableStateOf(0L)
+    var done by mutableStateOf(true)
+        private set
+    var more by mutableStateOf(false)
+        private set
+
+    /** How much of the archive has been looked through, 0 to 100. */
+    val percent: Int
+        get() = if (total <= 0) 0 else (scanned * 100 / total).toInt().coerceIn(0, 100)
+
+    fun start(text: String) {
+        this.text = text
+        hits.clear()
+        scanned = 0
+        total = 0
+        done = text.isEmpty()
+        more = false
+    }
+
+    fun older() {
+        if (more) done = false
+    }
+
+    /** One read's hits, unless they belong to a search typed over since. */
+    fun take(event: Event.MessageHits) {
+        if (event.text != text) return
+        hits.addAll(event.hit_list)
+        scanned = event.scanned
+        total = event.total
+        done = event.done
+        more = event.more
+    }
+}
+
+/** A ring filling 0 to 100 with the percent inside, while the archive is looked through, chosen by the author. */
+@Composable
+private fun Ring(
+    percent: Int,
+    ink: Ink,
+) {
+    val tint = if (isDark()) Color(0xFFC5D4E8) else accent
+    Box(Modifier.size(30.dp), contentAlignment = Alignment.Center) {
+        Canvas(Modifier.size(28.dp)) {
+            val stroke = 2.5.dp.toPx()
+            drawCircle(ink.line, style = Stroke(stroke))
+            drawArc(accent, -90f, 360f * percent / 100f, false, style = Stroke(stroke, cap = StrokeCap.Round))
+        }
+        Text("$percent%", color = tint, fontSize = 8.5.sp, fontWeight = FontWeight.Bold, maxLines = 1)
+    }
+}
+
+/** The search's tabs at the bottom, by the thumb, as the folders' are; a count shows once its part is finished. */
+@Composable
+private fun SearchTabs(
+    part: SearchPart,
+    accounts: Int?,
+    messages: Int?,
+    ink: Ink,
+    accentText: Color,
+    dark: Boolean,
+    onPart: (SearchPart) -> Unit,
+) {
+    Column(Modifier.fillMaxWidth().background(ink.page).windowInsetsPadding(WindowInsets.navigationBars.union(WindowInsets.ime))) {
+        Box(Modifier.fillMaxWidth().height(1.dp).background(ink.line))
+        Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            for (each in SearchPart.entries) {
+                val chosen = each == part
+                val count =
+                    when (each) {
+                        SearchPart.All -> null
+                        SearchPart.Accounts -> accounts
+                        SearchPart.Messages -> messages
+                    }
+                Row(
+                    Modifier
+                        .weight(1f)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(if (chosen) accent.copy(alpha = if (dark) 0.28f else 0.14f) else Color.Transparent)
+                        .clickable(role = Role.Tab) { onPart(each) }
+                        .padding(vertical = 7.dp),
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        stringResource(
+                            when (each) {
+                                SearchPart.All -> R.string.search_all
+                                SearchPart.Accounts -> R.string.search_accounts
+                                SearchPart.Messages -> R.string.search_messages
+                            },
+                        ),
+                        color = if (chosen) accentText else ink.muted,
+                        fontSize = 13.5.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                    )
+                    if (count != null) {
+                        Text(
+                            count.toString(),
+                            Modifier.padding(start = 4.dp),
+                            color = (if (chosen) accentText else ink.muted).copy(alpha = 0.75f),
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** A heading in the results, with See all at its end when there is more than shows. */
+@Composable
+private fun SearchHead(
+    text: String,
+    ink: Ink,
+    accentText: Color,
+    onAll: (() -> Unit)?,
+) {
+    Row(
+        Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text.uppercase(),
+            Modifier.weight(1f),
+            color = ink.muted,
+            fontSize = 12.5.sp,
+            fontWeight = FontWeight.Bold,
+            letterSpacing = 0.4.sp,
+        )
+        if (onAll != null) {
+            Text(
+                stringResource(R.string.search_see_all),
+                Modifier.clip(RoundedCornerShape(6.dp)).clickable(role = Role.Button, onClick = onAll).padding(4.dp),
+                color = accentText,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.SemiBold,
+            )
+        }
+    }
+}
+
+/** What a search shows above its tabs: accounts, messages or both, people first. */
+@Composable
+private fun SearchBody(
+    text: String,
+    part: SearchPart,
+    chats: List<ChatRow>,
+    strangers: List<AccountBrief>,
+    asking: Boolean,
+    search: MessageSearch,
+    rows: List<ChatRow>,
+    people: Map<String, AccountBrief>,
+    me: String?,
+    unread: Map<String, Int>,
+    ink: Ink,
+    accentText: Color,
+    modifier: Modifier,
+    onPart: (SearchPart) -> Unit,
+    onRow: (ChatRow) -> Unit,
+    onPerson: (AccountBrief) -> Unit,
+    onProfile: (String) -> Unit,
+    onOlder: () -> Unit,
+    onHit: (Hit) -> Unit,
+) {
+    val saved = stringResource(R.string.saved_messages)
+    val newTag = stringResource(R.string.search_new)
+    val hits = if (search.text == text) search.hits.toList() else emptyList()
+    val scanning = search.text == text && !search.done
+    if (text.isEmpty()) {
+        Column(modifier.fillMaxWidth().padding(horizontal = 28.dp, vertical = 60.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(stringResource(R.string.search), color = ink.text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+            Text(
+                stringResource(R.string.search_hint),
+                Modifier.padding(top = 4.dp),
+                color = ink.muted,
+                fontSize = 14.5.sp,
+                textAlign = TextAlign.Center,
+            )
+        }
+        return
+    }
+    val nothing = chats.isEmpty() && strangers.isEmpty() && hits.isEmpty() && !asking && !scanning
+    val accountsShown = part != SearchPart.Messages
+    val messagesShown = part != SearchPart.Accounts
+    val empty =
+        when (part) {
+            SearchPart.All -> nothing
+            SearchPart.Accounts -> chats.isEmpty() && strangers.isEmpty() && !asking
+            SearchPart.Messages -> hits.isEmpty() && !scanning
+        }
+    if (empty) {
+        Column(modifier.fillMaxWidth().padding(horizontal = 28.dp, vertical = 60.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(stringResource(R.string.search_nothing), color = ink.text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+            Text(
+                stringResource(R.string.search_no_match, text),
+                Modifier.padding(top = 4.dp),
+                color = ink.muted,
+                fontSize = 14.5.sp,
+                textAlign = TextAlign.Center,
+            )
+        }
+        return
+    }
+    LazyColumn(modifier.fillMaxWidth()) {
+        if (accountsShown) {
+            val all = part == SearchPart.All
+            val count = chats.size + strangers.size
+            if (all && (count > 0 || asking)) {
+                item(key = "head-accounts") {
+                    SearchHead(
+                        stringResource(R.string.search_accounts),
+                        ink,
+                        accentText,
+                        if (count > ALL_SHOWS) ({ onPart(SearchPart.Accounts) }) else null,
+                    )
+                }
+            }
+            val firstChats = if (all) chats.take(ALL_SHOWS) else chats
+            val firstStrangers = if (all) strangers.take((ALL_SHOWS - firstChats.size).coerceAtLeast(0)) else strangers
+            if (!all && firstChats.isNotEmpty()) {
+                item(key = "head-chats") { SearchHead(stringResource(R.string.search_in_chats), ink, accentText, null) }
+            }
+            items(firstChats, key = { "chat-${it.id}" }) { row ->
+                Conversation(
+                    row,
+                    label(row, people, saved),
+                    me,
+                    unread[row.id] ?: 0,
+                    false,
+                    ink,
+                    accentText,
+                    false,
+                    false,
+                    null,
+                    Modifier,
+                    onProfile,
+                    onLongClick = {},
+                ) { onRow(row) }
+            }
+            if (!all && (strangers.isNotEmpty() || asking)) {
+                item(key = "head-server") { SearchHead(stringResource(R.string.search_on_server), ink, accentText, null) }
+            }
+            items(firstStrangers, key = { "person-${it.id}" }) { account ->
+                PersonRow(account, ink, if (all) newTag else null) { onPerson(account) }
+            }
+            if (!all && asking && strangers.isEmpty()) {
+                item(key = "asking") {
+                    Text(
+                        stringResource(R.string.search_asking),
+                        Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+                        color = ink.muted,
+                        fontSize = 14.sp,
+                    )
+                }
+            }
+        }
+        if (messagesShown) {
+            val all = part == SearchPart.All
+            val shown = if (all) hits.take(ALL_SHOWS) else hits
+            if (all && hits.isNotEmpty()) {
+                item(key = "head-messages") {
+                    SearchHead(
+                        stringResource(R.string.search_messages),
+                        ink,
+                        accentText,
+                        if (hits.size > ALL_SHOWS || search.more) ({ onPart(SearchPart.Messages) }) else null,
+                    )
+                }
+            }
+            items(shown, key = { "hit-${it.chat}-${it.seq}" }) { hit ->
+                val row = rows.firstOrNull { it.id == hit.chat }
+                HitRow(hit, row, row?.let { label(it, people, saved) }.orEmpty(), me, ink) { onHit(hit) }
+            }
+            if (!all && search.done && search.more) {
+                item(key = "older") {
+                    Text(
+                        stringResource(R.string.search_show_older),
+                        Modifier
+                            .fillMaxWidth()
+                            .clickable(role = Role.Button, onClick = onOlder)
+                            .padding(horizontal = 16.dp, vertical = 12.dp),
+                        color = accentText,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                }
+            }
+        }
+    }
+}
+
+/** A found message: its chat's photo and name, its time, and two lines around the match, tinted. */
+@Composable
+private fun HitRow(
+    hit: Hit,
+    row: ChatRow?,
+    name: String,
+    me: String?,
+    ink: Ink,
+    onClick: () -> Unit,
+) {
+    val person =
+        when (row?.type) {
+            DIRECT -> row.let { other(it, me)?.account }
+            SELF -> me
+            else -> null
+        }
+    val mark = accent.copy(alpha = if (isDark()) 0.42f else 0.22f)
+    val lead = hit.before.replace('\n', ' ')
+    val cut =
+        if (lead.length > HIT_LEAD) {
+            // Cut at a word where one is near, so the line starts with a whole word.
+            val from = lead.length - HIT_LEAD
+            val space = lead.indexOf(' ', from)
+            val start = if (space in from until from + 12) space + 1 else from
+            "…" + lead.substring(if (Character.isLowSurrogate(lead[start])) start + 1 else start)
+        } else {
+            lead
+        }
+    val text =
+        androidx.compose.ui.text.buildAnnotatedString {
+            append(cut)
+            pushStyle(androidx.compose.ui.text.SpanStyle(background = mark, color = ink.text))
+            append(hit.matched.replace('\n', ' '))
+            pop()
+            append(hit.after.replace('\n', ' '))
+        }
+    Row(
+        Modifier.fillMaxWidth().clickable(role = Role.Button, onClick = onClick).padding(horizontal = 16.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Avatar(person, name, 44.dp)
+        Column(Modifier.padding(start = 12.dp).weight(1f)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    name,
+                    Modifier.weight(1f),
+                    color = ink.text,
+                    fontSize = 15.5.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(chatWhen(hit.saved_at), color = ink.muted, fontSize = 12.sp)
+            }
+            Text(text, Modifier.padding(top = 1.dp), color = ink.muted, fontSize = 14.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+        }
     }
 }

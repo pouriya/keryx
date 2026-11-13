@@ -168,6 +168,18 @@ sealed interface Command {
         val text: String,
     ) : Command
 
+    /** Looks through this phone's archive for messages holding `text`, a page of hits at a time. */
+    @Serializable
+    @SerialName("search_messages")
+    data class SearchMessages(
+        val text: String,
+    ) : Command
+
+    /** The next page of the search under way. */
+    @Serializable
+    @SerialName("search_older")
+    data object SearchOlder : Command
+
     @Serializable
     @SerialName("send_text")
     data class SendText(
@@ -688,6 +700,15 @@ sealed interface Input {
         val id: Long,
     ) : Input
 
+    /** `scan_rows`'s answer: messages newest first, and how many rows the archive holds. */
+    @Serializable
+    @SerialName("rows_scanned")
+    data class RowsScanned(
+        val id: Long,
+        val message_list: List<MessageFrame>,
+        val total: Long,
+    ) : Input
+
     /** `read_rows`'s answer: messages oldest first, and the call rows among them. */
     @Serializable
     @SerialName("rows_read")
@@ -819,6 +840,15 @@ sealed interface Output {
         val call_list: List<CallRow>,
     ) : Output
 
+    /** Read up to `limit` messages of every chat, newest first, below `before`, and answer with `rows_scanned`. */
+    @Serializable
+    @SerialName("scan_rows")
+    data class ScanRows(
+        val id: Long,
+        val before: ScanAt? = null,
+        val limit: Int,
+    ) : Output
+
     /** Read up to `limit` newest messages below `before_seq`, and answer with `rows_read`. */
     @Serializable
     @SerialName("read_rows")
@@ -873,6 +903,27 @@ data class MessageFrame(
     val server_saved_at: Long? = null,
     val body: String? = null,
     val signature: String? = null,
+)
+
+/** Where a search's scan of the archive has reached. */
+@Serializable
+data class ScanAt(
+    val saved_at: Long,
+    val chat: String,
+    val seq: Long,
+)
+
+/** A message a search found, its words split around the match. */
+@Serializable
+data class Hit(
+    val chat: String,
+    val seq: Long,
+    val account: String? = null,
+    val mine: Boolean = false,
+    val saved_at: Long,
+    val before: String,
+    val matched: String,
+    val after: String,
 )
 
 /** One row of a call, as `sync` and `save_rows` carry it. Kinds: 0 join, 1 leave, 2 decline, 3 text, 4 end. */
@@ -1220,6 +1271,18 @@ sealed interface Event {
     @SerialName("search_results")
     data class SearchResults(
         val account_list: List<AccountBrief>,
+    ) : Event
+
+    /** What one read of the archive found, and how far the search has looked. */
+    @Serializable
+    @SerialName("message_hits")
+    data class MessageHits(
+        val text: String,
+        val hit_list: List<Hit>,
+        val scanned: Long,
+        val total: Long,
+        val done: Boolean,
+        val more: Boolean,
     ) : Event
 
     @Serializable

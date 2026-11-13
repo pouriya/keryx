@@ -879,9 +879,11 @@ class Engine(
             is Output.WriteChunk -> writeChunk(output)
             is Output.SaveRows -> saveRows(output)
             is Output.ReadRows -> readRows(output)
+            is Output.ScanRows -> scanRows(output)
             is Output.Show -> {
                 val showing = rememberedCall(output.event)
                 ownProfile(showing)
+                var after = emptyList<Event>()
                 when (val event = showing) {
                     is Event.SignedIn -> {
                         bound = event.account
@@ -891,6 +893,7 @@ class Engine(
                     is Event.Chats -> {
                         archive?.seen(event.chat_list)
                         reportUnread()
+                        after = notices(event.chat_list)
                     }
                     is Event.OwnDevices -> {
                         archive?.devices(event.device_list)
@@ -922,6 +925,7 @@ class Engine(
                     else -> Unit
                 }
                 show(showing)
+                after.forEach { show(it) }
             }
         }
     }
@@ -1011,6 +1015,34 @@ class Engine(
         val (messages, calls) = read ?: (emptyList<MessageFrame>() to emptyList())
         feed(Input.RowsRead(asked.id, messages, calls))
     }
+
+    private fun scanRows(asked: Output.ScanRows) {
+        val read =
+            try {
+                archive?.let { it.scan(asked.before, asked.limit) to it.count() }
+            } catch (_: android.database.SQLException) {
+                null
+            }
+        val (messages, total) = read ?: (emptyList<MessageFrame>() to 0L)
+        feed(Input.RowsScanned(asked.id, messages, total))
+    }
+
+    /**
+     * A chat whose newest row is a device notice, which the server's list never names as its last content,
+     * shown again from the archive so the list can preview it after a restart.
+     */
+    private fun notices(list: List<ChatItem>): List<Event> =
+        list.mapNotNull { item ->
+            val seq = item.last_seq?.takeIf { item.last_kind == DEVICE_NOTICE } ?: return@mapNotNull null
+            val frame =
+                try {
+                    archive?.frame(item.chat, seq)
+                } catch (_: android.database.SQLException) {
+                    null
+                }
+            val device = frame?.device?.takeIf { frame.kind == DEVICE_NOTICE } ?: return@mapNotNull null
+            Event.Notice(item.chat, seq, device, frame.server_saved_at ?: 0)
+        }
 
     private fun request(
         base: String,

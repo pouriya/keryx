@@ -29,6 +29,8 @@ internal data class Bubble(
     val sticker: String? = null,
     /** A question message's tree. Its intro is `text`. */
     val question: Question? = null,
+    /** A new device's notice, shown as a line across the chat, with what it says. */
+    val notice: String? = null,
     /** An answer message's answer. */
     val answer: Answer? = null,
 ) {
@@ -58,6 +60,10 @@ internal data class Chip(
 )
 
 internal const val CONTENT_TEXT = 0
+
+/** A message kind: the server's notice of a new device, in the self chat. */
+internal const val DEVICE_NOTICE = 4
+
 internal const val CONTENT_REACTION = 2
 internal const val CONTENT_CALL = 8
 internal const val CONTENT_QUESTION = 10
@@ -82,6 +88,10 @@ internal class Talk {
     var hasOlder by mutableStateOf(false)
         private set
 
+    /** A page has come since the chat opened, so `hasOlder` says something. */
+    var paged by mutableStateOf(false)
+        private set
+
     /** A draft the server sent for the open chat, waiting for the screen to take it. */
     var restored by mutableStateOf<DraftText?>(null)
         private set
@@ -98,6 +108,7 @@ internal class Talk {
         selected.clear()
         gone.clear()
         hasOlder = false
+        paged = false
         seeking = null
         restored = drafts[chat]
     }
@@ -192,6 +203,33 @@ internal class Talk {
         }
         if (gone[shown.seq] == true) return
         var index = bubbles.indexOfFirst { it.seq == null || it.seq > shown.seq }
+        if (index < 0) index = bubbles.size
+        bubbles.add(index, bubble)
+    }
+
+    /** A new device's notice, as a line in the self chat, chosen by the author; shown again when its device's name is known. */
+    fun notice(
+        event: Event.Notice,
+        text: String,
+    ) {
+        if (event.chat != chat) return
+        val bubble =
+            Bubble(
+                seq = event.seq,
+                local = null,
+                mine = false,
+                account = null,
+                kind = null,
+                text = null,
+                at = event.saved_at,
+                notice = text,
+            )
+        val at = bubbles.indexOfFirst { it.seq == event.seq }
+        if (at >= 0) {
+            bubbles[at] = bubble
+            return
+        }
+        var index = bubbles.indexOfFirst { it.seq == null || it.seq > event.seq }
         if (index < 0) index = bubbles.size
         bubbles.add(index, bubble)
     }
@@ -300,6 +338,7 @@ internal class Talk {
     }
 
     fun edited(event: Event.Edited) {
+        if (event.message.chat != chat) return
         val at = bubbles.indexOfFirst { it.seq == event.target_seq }
         if (at >= 0) {
             val message = event.message
@@ -307,7 +346,13 @@ internal class Talk {
         }
     }
 
-    fun deleted(target: Long) = removed(target)
+    /** A message of [from] was removed, by a delete or as an empty row from the server. */
+    fun deleted(
+        from: String,
+        target: Long,
+    ) {
+        if (from == chat) removed(target)
+    }
 
     fun removed(seq: Long) {
         gone[seq] = true
@@ -319,6 +364,7 @@ internal class Talk {
 
     fun page(hasOlder: Boolean) {
         this.hasOlder = hasOlder
+        paged = true
     }
 
     fun toggle(bubble: Bubble) {

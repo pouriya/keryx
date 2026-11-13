@@ -116,7 +116,7 @@ class MainActivity : ComponentActivity() {
     /** The open account's settings from `kv`, opened, with a copy kept in its folder for a start offline. */
     private val settings = mutableStateMapOf<String, JsonElement>()
 
-    /** A language from `kv` that waits for the call to end, since changing it rebuilds the screen. */
+    /** A language from `kv` that waits for the call to end, so another device never changes a call's screen. */
     private var pendingLanguage: String? = null
 
     /** Set while a new account sets up its words, so its first language is the welcome screen's. */
@@ -132,6 +132,16 @@ class MainActivity : ComponentActivity() {
     private val foundFor = mutableStateOf("")
     private var searches = 0
     private var latestSearch = ""
+
+    /** New-device notices seen so far, by chat and seq, shown again once their device's name is known. */
+    private val notices = LinkedHashMap<Pair<String, Long>, Event.Notice>()
+
+    /** This account's devices by id, as "Android 15", for the notices. */
+    private val deviceNames = HashMap<String, String>()
+    private var devicesAsked = false
+
+    /** The message part of the list's search. */
+    private val messageSearch = MessageSearch()
     private val chosen = mutableStateOf<String?>(null)
     private val messages = mutableStateListOf<Shown>()
     private val talk = Talk()
@@ -214,6 +224,34 @@ class MainActivity : ComponentActivity() {
             granted = null
         }
 
+    /** The resources in the language chosen since this activity started, or none while it is the starting one. */
+    private var localized: android.content.res.Resources? = null
+
+    /** Moves each time the language or the screen changes, so the screen reads its resources again. */
+    private val shaped = androidx.compose.runtime.mutableIntStateOf(0)
+
+    override fun getResources(): android.content.res.Resources = localized ?: super.getResources()
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        if (localized != null) localize(language.value)
+        shaped.intValue++
+    }
+
+    /**
+     * Swaps the language in place, chosen by the author over rebuilding the activity, which closed the
+     * engine and its connection: strings and layout direction follow, and nothing reconnects.
+     */
+    private fun localize(code: String) {
+        val locale = Locale.forLanguageTag(code)
+        val config = Configuration(super.getResources().configuration)
+        config.setLocale(locale)
+        config.setLayoutDirection(locale)
+        localized = createConfigurationContext(config).resources
+        language.value = code
+        shaped.intValue++
+    }
+
     override fun attachBaseContext(newBase: Context) {
         val code = Vault(newBase).note("lang")?.takeIf { it == "en" || it == "fa" } ?: "en"
         val locale = Locale.forLanguageTag(code)
@@ -266,6 +304,14 @@ class MainActivity : ComponentActivity() {
         openSaved()
         setContent {
             val joined = session.value
+            val shape = shaped.intValue
+            val configuration = remember(shape) { Configuration(resources.configuration) }
+            val direction =
+                if (configuration.layoutDirection == android.view.View.LAYOUT_DIRECTION_RTL) {
+                    androidx.compose.ui.unit.LayoutDirection.Rtl
+                } else {
+                    androidx.compose.ui.unit.LayoutDirection.Ltr
+                }
             BackHandler(enabled = joined == null && place.value != Place.Welcome && place.value != Place.Chats) {
                 when (place.value) {
                     Place.Words -> if (!wordsBack()) place.value = Place.Setup
@@ -280,7 +326,12 @@ class MainActivity : ComponentActivity() {
                     "light" -> false
                     else -> null
                 }
-            CompositionLocalProvider(LocalDark provides dark, LocalTrying provides trying.value) {
+            CompositionLocalProvider(
+                androidx.compose.ui.platform.LocalConfiguration provides configuration,
+                androidx.compose.ui.platform.LocalLayoutDirection provides direction,
+                LocalDark provides dark,
+                LocalTrying provides trying.value,
+            ) {
                 MaterialTheme(colorScheme = if (isDark()) darkColorScheme() else lightColorScheme()) {
                     CompositionLocalProvider(LocalProfiles provides profiles) { Screen(joined) }
                 }
@@ -384,7 +435,16 @@ class MainActivity : ComponentActivity() {
                                 found = found,
                                 foundFor = foundFor.value,
                                 folders = folders,
+                                search = messageSearch,
                                 onSearch = ::searchPeople,
+                                onOlder = {
+                                    messageSearch.older()
+                                    engine.send(Command.SearchOlder)
+                                },
+                                onHit = { hit ->
+                                    openChat(hit.chat)
+                                    talk.seeking = hit.seq
+                                },
                                 onPerson = { account -> engine.send(Command.StartChat(account.id)) },
                                 onOpen = { row -> openChat(row.id) },
                                 onProfile = { profileOf.value = it },
@@ -407,6 +467,12 @@ class MainActivity : ComponentActivity() {
                                 onTheme = { setSetting("theme", JsonPrimitive(it)) },
                                 language = language.value,
                                 onLanguage = { setSetting("lang", JsonPrimitive(it)) },
+                                server =
+                                    listOfNotNull(
+                                        serverName.value?.takeIf { it.isNotBlank() },
+                                        hostOf(server.value),
+                                    ).joinToString(" · "),
+                                actions = actionsOf(account),
                             )
                         }
                     }
@@ -421,7 +487,7 @@ class MainActivity : ComponentActivity() {
             return
         }
         vault.setNote("lang", code)
-        recreate()
+        localize(code)
     }
 
     private fun normalized(raw: String) = raw.trim().trimEnd('/')
@@ -431,9 +497,20 @@ class MainActivity : ComponentActivity() {
         return if (host.isNullOrEmpty()) address else host
     }
 
+    /** A notice as the self chat's preview and as a line in it: "New device: Android 15", or bare until the name is known. */
+    private fun showNotice(event: Event.Notice) {
+        val name = deviceNames[event.device]
+        val text = if (name == null) getString(R.string.notice_new_device_bare) else getString(R.string.notice_new_device, name)
+        list.notice(event, text)
+        talk.notice(event, text)
+    }
+
     /** The directory, for a name that is not already a chat. An empty query drops the last answer. */
     private fun searchPeople(text: String) {
         latestSearch = text
+        // Messages are looked for in this phone's archive at the same time, chosen by the author.
+        messageSearch.start(text)
+        engine.send(Command.SearchMessages(text))
         if (text.isEmpty()) {
             searches = 0
             found.clear()
@@ -513,7 +590,7 @@ class MainActivity : ComponentActivity() {
     private fun switchLanguage(code: String) {
         pendingLanguage = null
         vault.setNote("lang", code)
-        recreate()
+        localize(code)
     }
 
     /** A sticker just sent goes first in Recent, at most 20, as `recent.stickers` in `kv`. */
@@ -1157,11 +1234,15 @@ class MainActivity : ComponentActivity() {
             is Event.Marks -> list.marks(event.chat, event.mark)
             is Event.Edited -> talk.edited(event)
             is Event.Deleted -> {
-                talk.deleted(event.target_seq)
+                // The server already walked this chat's preview and time back, and its list says how
+                // far, for a chat that is not open too.
+                val last = list.rows.any { it.id == event.chat && it.lastSeq == event.target_seq }
+                talk.deleted(event.chat, event.target_seq)
                 talk.chat?.let { list.walkBack(it, talk, ::previewOfBubble) }
+                if (last) engine.send(Command.ChatList)
             }
             is Event.Removed -> {
-                talk.removed(event.seq)
+                talk.deleted(event.chat, event.seq)
                 talk.chat?.let { list.walkBack(it, talk, ::previewOfBubble) }
             }
             is Event.PageLoaded -> {
@@ -1181,6 +1262,24 @@ class MainActivity : ComponentActivity() {
                 opening.remove(event.handle)?.let { mime -> open(event.handle, mime) }
             }
             is Event.TransferFailed -> transfers[event.handle] = "failed: ${event.code}"
+            is Event.MessageHits -> messageSearch.take(event)
+            is Event.Notice -> {
+                notices[event.chat to event.seq] = event
+                showNotice(event)
+                if (event.device !in deviceNames && !devicesAsked) {
+                    devicesAsked = true
+                    engine.send(Command.Devices)
+                }
+            }
+            is Event.DeviceList -> {
+                devicesAsked = false
+                for (device in event.reply.device_list) {
+                    val os = device.os?.replaceFirstChar { it.titlecase(Locale.ROOT) }
+                    val name = listOfNotNull(os ?: device.web_platform, device.os_version ?: device.web_platform_version).joinToString(" ")
+                    if (name.isNotBlank()) deviceNames[device.id] = name
+                }
+                notices.values.forEach(::showNotice)
+            }
             is Event.SearchResults -> {
                 if (place.value == Place.Chats) searchAnswered(event.account_list)
                 event.account_list.firstOrNull { it.username == lookingFor }?.let {
@@ -1427,6 +1526,25 @@ class MainActivity : ComponentActivity() {
             wantVideo = video && has(Manifest.permission.CAMERA)
             engine.send(Command.JoinCall(call.chat, call.seq))
         }
+    }
+
+    /**
+     * Someone else's page: Message opens your direct chat with them, or starts one, and the calls ring in
+     * that chat, so they show only once it exists. Your own page has none.
+     */
+    private fun actionsOf(account: String): ProfileActions {
+        if (account == me.value) return ProfileActions(null, null)
+        val direct = list.rows.firstOrNull { it.type == 1 && it.marks.any { mark -> mark.account == account } }?.id
+        return ProfileActions(
+            onMessage = {
+                profileOf.value = null
+                when {
+                    direct == null -> engine.send(Command.StartChat(account))
+                    talk.chat != direct -> openChat(direct)
+                }
+            },
+            onCall = direct?.let { chat -> { video -> startCall(chat, video) } },
+        )
     }
 
     private fun openChat(chat: String) {
