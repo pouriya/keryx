@@ -36,13 +36,11 @@ fn every_reply_is_wrapped_and_carries_the_headers() {
     let mut guide = raw(&server, "/api/v1");
     assert_eq!(guide.status(), 200);
     let headers = guide.headers().clone();
-    assert!(
-        headers["server"]
-            .to_str()
-            .unwrap()
-            .starts_with("keryx/0.1.0 (https://github.com/pouriya/keryx)")
-    );
-    assert_eq!(headers["x-keryx-version"], "0.1.0");
+    assert!(headers["server"].to_str().unwrap().starts_with(&format!(
+        "keryx/{} (https://github.com/pouriya/keryx)",
+        env!("CARGO_PKG_VERSION")
+    )));
+    assert_eq!(headers["x-keryx-version"], env!("CARGO_PKG_VERSION"));
     Ulid::parse(headers["x-trace-id"].to_str().unwrap()).unwrap();
     let text = guide.body_mut().read_to_string().unwrap();
     assert!(text.contains(&format!("{}/api/v1", server.origin)));
