@@ -1876,8 +1876,10 @@ impl Storage for Sqlite {
             }
             match message.kind {
                 Kind::Content => {
-                    // A call is the preview, and it leaves the chat's time where it was.
-                    if message.content_kind == Some(ContentKind::Call) {
+                    if message.content_kind == Some(ContentKind::Ack) {
+                        // An ack is quiet: it moves neither the chat's time nor its preview.
+                    } else if message.content_kind == Some(ContentKind::Call) {
+                        // A call is the preview, and it leaves the chat's time where it was.
                         connection.execute(
                             "UPDATE conversation SET last_content_seq = ?2 WHERE id = ?1",
                             params![chat.bytes(), seq],
@@ -1895,11 +1897,12 @@ impl Storage for Sqlite {
                         "UPDATE conversation SET
                          last_content_seq = (
                              SELECT seq FROM message WHERE conversation_id = ?1 AND kind = 0
+                             AND content_kind IS NOT 14
                              ORDER BY seq DESC LIMIT 1
                          ),
                          last_at = (
                              SELECT server_saved_at FROM message WHERE conversation_id = ?1
-                             AND kind IN (0, 4)
+                             AND kind IN (0, 4) AND content_kind IS NOT 14
                              ORDER BY seq DESC LIMIT 1
                          )
                          WHERE id = ?1",

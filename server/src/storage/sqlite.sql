@@ -306,10 +306,11 @@ CREATE TABLE conversation (
     last_seq          INTEGER NOT NULL DEFAULT 0,
     -- [Chat list] the newest message's kind.
     last_kind         INTEGER,
-    -- [Chat list] sorts the list by activity. A reaction moves this, so it brings the chat up.
+    -- [Chat list] sorts the list by activity. A reaction moves this, so it brings the chat up. An
+    -- ack does not.
     last_at           INTEGER,
     -- [Chat list] the preview. A reaction moves it, showing "Sara reacted" until the next message.
-    -- Commits and a call's own messages do not, and removing or editing the last message does.
+    -- Commits, acks and a call's own messages do not, and removing or editing the last message does.
     last_content_seq  INTEGER,
     -- [Chat list] sorts a chat with no messages yet.
     created_at        INTEGER NOT NULL,
@@ -495,8 +496,10 @@ CREATE TABLE message (
     -- 8 call (one per call, saved, and can be replied to; everything about it is in the call
     -- table, and this row holds nothing more), 9 media_bundle (several images and videos in one message),
     -- 10 question (a tree of questions), 11 answer (one account's answer to one), 12 sticker (names
-    -- one of the server's stickers inside its encryption).
-    content_kind       INTEGER CHECK (content_kind BETWEEN 0 AND 12),
+    -- one of the server's stickers inside its encryption), 13 suggestion (what to do with its chat,
+    -- such as its folder), 14 ack (one account's accepting or declining one; moves neither
+    -- `last_at` nor the preview).
+    content_kind       INTEGER CHECK (content_kind BETWEEN 0 AND 14),
     -- [Unencrypted messages] the flag that tells a client how to read the body.
     encrypted          INTEGER CHECK (encrypted IN (0, 1)),
     -- [Restore, Commit order] the key this was encrypted under, and for a commit, the step it

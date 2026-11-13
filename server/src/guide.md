@@ -123,7 +123,9 @@ kind 12, names it inside its encryption as `{"sticker": "<id>"}`, and cannot be 
 `Default` is built into the server and listed after the others unless `[stickers] default_pack` is false;
 its stickers are always served, and it cannot be changed, removed or named again. A question
 message, kind 10, holds a tree of questions, and an answer, kind 11, one account's answer to it, both
-sealed like text, so the server reads neither.
+sealed like text, so the server reads neither. A suggestion, kind 13, suggests what to do with its chat,
+such as the folder it goes in, and an ack, kind 14, is one account's accepting or declining it. Neither
+can be edited, and an ack moves neither the chat's time nor its preview.
 
 ## The WebSocket
 

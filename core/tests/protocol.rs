@@ -1,8 +1,8 @@
 use keryx_core::mls::{Device, verify_message};
 use keryx_core::protocol::{
-    Answer, Bytes, ChatFolders, ChatItem, ChatMode, ChatType, ClientFrame, ContentKind, FolderItem,
-    FormError, Header, Kind, MarkItem, MessageFrame, Question, SendFrame, ServerFrame,
-    SyncPosition, WelcomeItem, WrapItem,
+    Ack, Answer, Bytes, ChatFolders, ChatItem, ChatMode, ChatType, ClientFrame, ContentKind,
+    FolderItem, FolderSuggestion, FormError, Header, Kind, MarkItem, MessageFrame, Question,
+    SendFrame, ServerFrame, Suggestion, SyncPosition, WelcomeItem, WrapItem,
 };
 use keryx_core::seed::derive;
 use keryx_core::ulid::Ulid;
@@ -116,6 +116,8 @@ fn kinds_match_the_schema() {
         ContentKind::Question,
         ContentKind::Answer,
         ContentKind::Sticker,
+        ContentKind::Suggestion,
+        ContentKind::Ack,
     ];
     for (number, content_kind) in content_kinds.iter().enumerate() {
         assert_eq!(*content_kind as usize, number);
@@ -489,7 +491,7 @@ fn bad_frames_are_refused() {
     let good = to_value(ClientFrame::Send(Box::new(send_frame()))).unwrap();
     for (field, value) in [
         ("kind", json!(99)),
-        ("content_kind", json!(13)),
+        ("content_kind", json!(15)),
         ("body", json!("not base64!")),
         ("chat", json!("not a ulid")),
         ("type", json!("no_such_type")),
@@ -760,4 +762,85 @@ fn an_answer_follows_its_question_along_the_path_taken() {
         check(json!({"question": 5, "skipped": true, "answers": [{"node": "count", "number": 1}]})),
         Err(FormError::Answer)
     );
+}
+
+#[test]
+fn a_suggestion_holds_one_action_and_an_unknown_one_still_opens() {
+    let folder = Suggestion::Folder(FolderSuggestion {
+        name: "Apollo".to_string(),
+        r#move: true,
+    });
+    let open = |value: serde_json::Value| Suggestion::from_plaintext(value.to_string().as_bytes());
+    // The text and a reply sit beside the one action, which is written as its key.
+    assert_eq!(
+        to_value(&folder).unwrap(),
+        json!({"folder": {"name": "Apollo", "move": true}})
+    );
+    assert_eq!(
+        open(
+            json!({"text": "For the tasks", "reply": 4, "folder": {"name": "Apollo", "move": true}})
+        ),
+        Some(folder.clone())
+    );
+    assert_eq!(folder.check(), Ok(()));
+    // A later keryx's action opens as unknown, and is never sent.
+    assert_eq!(open(json!({"pin": {}})), Some(Suggestion::Unknown));
+    assert_eq!(Suggestion::Unknown.check(), Err(FormError::Suggestion));
+    // No action, two, a broken folder, a name out of range or a long text is not a suggestion.
+    for broken in [
+        json!({"text": "nothing to do"}),
+        json!({"folder": {"name": "A", "move": false}, "pin": {}}),
+        json!({"folder": {"name": "A"}}),
+        json!({"folder": {"name": " ", "move": false}}),
+        json!({"folder": {"name": "x".repeat(33), "move": false}}),
+        json!({"text": "x".repeat(501), "folder": {"name": "A", "move": false}}),
+        json!({"text": 5, "folder": {"name": "A", "move": false}}),
+    ] {
+        assert_eq!(open(broken.clone()), None, "{broken}");
+    }
+    assert_eq!(Suggestion::from_plaintext(b"not json"), None);
+    // 32 characters of Persian is within the limit.
+    assert!(open(json!({"folder": {"name": "ک".repeat(32), "move": false}})).is_some());
+}
+
+#[test]
+fn an_ack_says_what_changed_exactly_when_it_accepts() {
+    let accepted = Ack {
+        suggestion: 7,
+        accepted: true,
+        created: Some(true),
+        left: Some(2),
+    };
+    assert_eq!(
+        to_value(&accepted).unwrap(),
+        json!({"suggestion": 7, "accepted": true, "created": true, "left": 2})
+    );
+    assert_eq!(accepted.check(), Ok(()));
+    let declined = Ack {
+        suggestion: 7,
+        accepted: false,
+        created: None,
+        left: None,
+    };
+    assert_eq!(
+        to_value(&declined).unwrap(),
+        json!({"suggestion": 7, "accepted": false})
+    );
+    assert_eq!(declined.check(), Ok(()));
+    for broken in [
+        Ack {
+            created: None,
+            ..accepted.clone()
+        },
+        Ack {
+            left: None,
+            ..accepted.clone()
+        },
+        Ack {
+            created: Some(false),
+            ..declined.clone()
+        },
+    ] {
+        assert_eq!(broken.check(), Err(FormError::Ack));
+    }
 }

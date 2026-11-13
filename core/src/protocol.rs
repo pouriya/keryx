@@ -93,6 +93,8 @@ numbered!(
     /// inside it kept beside it. `MediaBundle` is several images and videos in one message. `Music` is
     /// an MP3, apart from `Voice`, which is a recorded note. `Question` is a tree of questions and
     /// `Answer` one account's answer to it. `Sticker` names one of the server's stickers.
+    /// `Suggestion` suggests what to do with its chat, and `Ack` is one account's accepting or
+    /// declining it.
     ContentKind {
         Text = 0,
         Voice = 1,
@@ -107,6 +109,8 @@ numbered!(
         Question = 10,
         Answer = 11,
         Sticker = 12,
+        Suggestion = 13,
+        Ack = 14,
     }
 );
 
@@ -538,6 +542,103 @@ pub const QUESTION_PATH: usize = 16;
 /// The most options one choice offers, beside the automatic "write your own", fixed by the author.
 pub const CHOICE_OPTIONS: usize = 8;
 
+/// The longest a suggestion's text may be, in characters, fixed by the author.
+pub const SUGGESTION_TEXT: usize = 500;
+/// The longest a folder's name may be, in characters: the clients' limit, which a suggestion is
+/// checked against.
+pub const FOLDER_NAME: usize = 32;
+
+/// A suggestion's action, inside its encryption, beside its optional `text`: exactly one key, so a
+/// later action is a new key and not a new kind. Written as `{"folder": {"name", "move"}}`.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Suggestion {
+    /// Put the chat it was sent in into a folder.
+    Folder(FolderSuggestion),
+    /// An action this client does not know, from a newer keryx. Shown with no buttons.
+    Unknown,
+}
+
+/// The folder a chat goes in, found by its folded name or made. `move` also takes the chat out of
+/// every other folder but `all`.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FolderSuggestion {
+    pub name: String,
+    pub r#move: bool,
+}
+
+/// One account's accepting or declining a suggestion, inside its encryption. `suggestion` is its
+/// sequence id, kept inside like a reply's. Accepted, it says what changed: `created` when the
+/// folder was made for it, and `left` how many folders the chat was taken out of. Declined, it
+/// holds neither.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ack {
+    pub suggestion: u64,
+    pub accepted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub left: Option<u32>,
+}
+
+impl Suggestion {
+    /// A suggestion's plaintext, `{"text"?, <action>}`, or `None` when it is not one: no action or
+    /// two, or a known action that does not hold together. Its text is the message's own.
+    pub fn from_plaintext(plaintext: &[u8]) -> Option<Self> {
+        let mut object =
+            serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(plaintext).ok()?;
+        if let Some(text) = object.remove("text")
+            && !matches!(&text, serde_json::Value::String(text) if !too_long(text, SUGGESTION_TEXT))
+        {
+            return None;
+        }
+        // The reply, which any content may carry, is not an action.
+        object.remove("reply");
+        let mut keys = object.into_iter();
+        let (key, value) = keys.next()?;
+        if keys.next().is_some() {
+            return None;
+        }
+        match key.as_str() {
+            "folder" => {
+                let suggestion = Suggestion::Folder(serde_json::from_value(value).ok()?);
+                suggestion.check().ok()?;
+                Some(suggestion)
+            }
+            _ => Some(Suggestion::Unknown),
+        }
+    }
+
+    /// Checks an action against the limits fixed in core: a folder's name 1 to [`FOLDER_NAME`]
+    /// characters once trimmed. An unknown action is never sent.
+    pub fn check(&self) -> Result<(), FormError> {
+        match self {
+            Suggestion::Folder(folder) => {
+                let name = folder.name.trim();
+                if name.is_empty() || too_long(name, FOLDER_NAME) {
+                    return Err(FormError::Suggestion);
+                }
+                Ok(())
+            }
+            Suggestion::Unknown => Err(FormError::Suggestion),
+        }
+    }
+}
+
+impl Ack {
+    /// `created` and `left` are there exactly when it was accepted.
+    pub fn check(&self) -> Result<(), FormError> {
+        if self.accepted == self.created.is_some() && self.accepted == self.left.is_some() {
+            Ok(())
+        } else {
+            Err(FormError::Ack)
+        }
+    }
+}
+
 /// A question message's tree, inside its encryption, beside its optional intro in `text`. Every
 /// question also takes written-in text, and any question can be skipped.
 #[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
@@ -637,7 +738,7 @@ pub struct AnswerItem {
     pub skipped: bool,
 }
 
-/// Why a question or an answer does not hold together.
+/// Why a question, an answer, a suggestion or an ack does not hold together.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum FormError {
     #[error("A question message holds 1 to {QUESTION_NODES} questions")]
@@ -662,6 +763,12 @@ pub enum FormError {
     Deep,
     #[error("An answer does not follow its question")]
     Answer,
+    #[error(
+        "A suggestion holds one known action, and a folder's name is 1 to {FOLDER_NAME} characters"
+    )]
+    Suggestion,
+    #[error("An ack says what changed exactly when it accepts")]
+    Ack,
 }
 
 fn decimal(number: &serde_json::Number) -> f64 {

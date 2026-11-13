@@ -13,10 +13,10 @@ use keryx_core::client::{
 use keryx_core::file;
 use keryx_core::mls::{AccountWrap, Commit, Device};
 use keryx_core::protocol::{
-    Answer, Bytes, CallEvent, CallEventKind, CallOutcome, ChatFolders, ChatType, ClientFrame,
-    ContentKind, FolderItem, Header, Kind, KvChange, KvItem, MessageFrame, PresenceItem,
-    PresenceState, ProfileKeyShare, ProfileLink, Question, SendFrame, ServerFrame, SyncPosition,
-    WelcomeItem, WrapItem,
+    Ack, Answer, Bytes, CallEvent, CallEventKind, CallOutcome, ChatFolders, ChatType, ClientFrame,
+    ContentKind, FolderItem, FolderSuggestion, Header, Kind, KvChange, KvItem, MessageFrame,
+    PresenceItem, PresenceState, ProfileKeyShare, ProfileLink, Question, SendFrame, ServerFrame,
+    Suggestion, SyncPosition, WelcomeItem, WrapItem,
 };
 use keryx_core::ulid::Ulid;
 use person::{
@@ -4451,6 +4451,231 @@ fn a_question_and_its_answer_are_sealed_checked_by_core_and_the_answer_can_chang
     };
     assert_eq!(target_seq, answered);
     assert_eq!(message.answer.as_ref(), Some(&skipped));
+}
+
+#[test]
+fn a_suggestion_and_its_ack_cannot_be_edited_and_an_ack_moves_neither_time_nor_preview() {
+    let mut pair = pair();
+    let chat = pair.chat;
+    let text = sealed(&pair.sara, chat, Kind::Content, None, br#"{"text":"hi"}"#);
+    let text_seq = seq_of(post(&mut pair.sara_socket, text));
+    let text_at = chat_item(&mut pair.sara_socket, chat).last_at;
+    let sara_epoch = pair.sara.device.epoch(chat).unwrap();
+    let suggestion = sealed_as(
+        &pair.sara,
+        chat,
+        Kind::Content,
+        Some(ContentKind::Suggestion),
+        sara_epoch,
+        None,
+        br#"{"folder":{"name":"Work","move":false}}"#,
+    );
+    let suggested = seq_of(post(&mut pair.sara_socket, suggestion));
+    let item = chat_item(&mut pair.babak_socket, chat);
+    assert_eq!(item.last_content_seq, Some(suggested));
+    let suggested_at = item.last_at;
+    assert!(suggested_at >= text_at);
+
+    // An ack is quiet: the chat's time and preview stay on the suggestion.
+    let babak_epoch = pair.babak.device.epoch(chat).unwrap();
+    let body = format!(r#"{{"suggestion":{suggested},"accepted":false}}"#);
+    let ack = sealed_as(
+        &pair.babak,
+        chat,
+        Kind::Content,
+        Some(ContentKind::Ack),
+        babak_epoch,
+        None,
+        body.as_bytes(),
+    );
+    let acked = seq_of(post(&mut pair.babak_socket, ack));
+    let item = chat_item(&mut pair.babak_socket, chat);
+    assert_eq!(item.last_content_seq, Some(suggested));
+    assert_eq!(item.last_at, suggested_at);
+    assert_eq!(
+        item.last_content.as_ref().map(|message| message.seq),
+        Some(suggested)
+    );
+
+    // Neither can be edited.
+    let edit = sealed(&pair.sara, chat, Kind::Edit, Some(suggested), b"{}");
+    assert_refused(post(&mut pair.sara_socket, edit), "cannot_edit");
+    let edit = sealed(&pair.babak, chat, Kind::Edit, Some(acked), b"{}");
+    assert_refused(post(&mut pair.babak_socket, edit), "cannot_edit");
+
+    // Deleting the suggestion walks the preview and the time back past the ack.
+    let delete = sealed(&pair.sara, chat, Kind::Delete, Some(suggested), b"");
+    seq_of(post(&mut pair.sara_socket, delete));
+    let item = chat_item(&mut pair.sara_socket, chat);
+    assert_eq!(item.last_content_seq, Some(text_seq));
+    assert_eq!(item.last_at, text_at);
+}
+
+#[test]
+fn a_folder_suggestion_is_accepted_by_core_saving_the_folder_before_its_ack() {
+    let server = Server::start("", "[registration]\nallow = true\n[limits]\nfolders = 2\n");
+    let (mut sara, mut babak, chat) = apps_on(&server);
+    let (_, all) = folders_shown(&mut babak, &server, |_| true);
+    let work = new_folder_id(&mut babak, &server);
+    babak.command(
+        &server,
+        Command::Folders {
+            folder_list: vec![
+                Folder {
+                    id: all,
+                    name: None,
+                    chat_list: None,
+                    pin_list: Vec::new(),
+                },
+                Folder {
+                    id: work,
+                    name: Some(Secret("کاری".to_string())),
+                    chat_list: Some(vec![chat]),
+                    pin_list: vec![chat],
+                },
+            ],
+            default: all,
+        },
+    );
+    folders_shown(&mut babak, &server, |(list, _)| list.len() == 2);
+    let suggest = |app: &mut App, text: Option<&str>, name: &str, r#move: bool| {
+        app.command(
+            &server,
+            Command::SendSuggestion {
+                chat,
+                text: text.map(|text| Secret(text.to_string())),
+                suggestion: Suggestion::Folder(FolderSuggestion {
+                    name: name.to_string(),
+                    r#move,
+                }),
+            },
+        );
+    };
+    let error_of = |app: &mut App| {
+        let Event::Error { code, .. } =
+            app.wait(&server, |event| matches!(event, Event::Error { .. }))
+        else {
+            unreachable!();
+        };
+        code
+    };
+    let sent = |app: &mut App| {
+        let Event::Sent { seq, .. } =
+            app.wait(&server, |event| matches!(event, Event::Sent { .. }))
+        else {
+            unreachable!();
+        };
+        seq
+    };
+
+    // Core refuses a folder's name outside 1 to 32 characters, and sends nothing.
+    suggest(&mut sara, None, "  ", false);
+    assert_eq!(error_of(&mut sara), "bad_suggestion");
+    suggest(&mut sara, None, &"x".repeat(33), false);
+    assert_eq!(error_of(&mut sara), "bad_suggestion");
+
+    // Arabic forms find the Persian folder, which already holds the chat: the ack goes at once and
+    // says nothing changed.
+    suggest(&mut sara, Some("Where this goes"), "كاري", false);
+    let first = sent(&mut sara);
+    let shown_first = shown(babak.wait(&server, |event| is_message(event, chat, first)));
+    assert_eq!(shown_first.content_kind, Some(ContentKind::Suggestion));
+    assert_eq!(text_of(&shown_first), Some("Where this goes"));
+    let suggestion = *shown_first.suggestion.unwrap();
+    assert_eq!(
+        suggestion,
+        Suggestion::Folder(FolderSuggestion {
+            name: "كاري".to_string(),
+            r#move: false,
+        })
+    );
+    babak.command(
+        &server,
+        Command::AcceptSuggestion {
+            chat,
+            seq: first,
+            suggestion,
+        },
+    );
+    let Event::Pending { ack: pending, .. } =
+        babak.wait(&server, |event| matches!(event, Event::Pending { .. }))
+    else {
+        unreachable!();
+    };
+    let unchanged = Ack {
+        suggestion: first,
+        accepted: true,
+        created: Some(false),
+        left: Some(0),
+    };
+    assert_eq!(pending, Some(unchanged.clone()));
+    let first_ack = sent(&mut babak);
+    let acked = shown(sara.wait(&server, |event| is_message(event, chat, first_ack)));
+    assert_eq!(acked.content_kind, Some(ContentKind::Ack));
+    assert_eq!(acked.ack.map(|ack| *ack), Some(unchanged));
+
+    // A move to a folder that does not exist makes it last, takes the chat and its pin out of the
+    // other, and acks once the server took the arrangement.
+    suggest(&mut sara, None, "Lunch", true);
+    let second = sent(&mut sara);
+    let suggestion = *shown(babak.wait(&server, |event| is_message(event, chat, second)))
+        .suggestion
+        .unwrap();
+    babak.command(
+        &server,
+        Command::AcceptSuggestion {
+            chat,
+            seq: second,
+            suggestion,
+        },
+    );
+    let (list, _) = folders_shown(&mut babak, &server, |(list, _)| list.len() == 3);
+    assert_eq!(
+        list[1],
+        (work, Some("کاری".to_string()), Some(Vec::new()), Vec::new())
+    );
+    assert_eq!(list[2].1.as_deref(), Some("Lunch"));
+    assert_eq!(list[2].2, Some(vec![chat]));
+    let second_ack = sent(&mut babak);
+    let acked = shown(sara.wait(&server, |event| is_message(event, chat, second_ack)));
+    assert_eq!(
+        acked.ack.map(|ack| *ack),
+        Some(Ack {
+            suggestion: second,
+            accepted: true,
+            created: Some(true),
+            left: Some(1),
+        })
+    );
+
+    // A change the server refuses sends no ack, and a decline is an ack alone.
+    suggest(&mut sara, None, "Third", false);
+    let third = sent(&mut sara);
+    let suggestion = *shown(babak.wait(&server, |event| is_message(event, chat, third)))
+        .suggestion
+        .unwrap();
+    babak.command(
+        &server,
+        Command::AcceptSuggestion {
+            chat,
+            seq: third,
+            suggestion,
+        },
+    );
+    assert_eq!(error_of(&mut babak), "too_many_folders");
+    babak.command(&server, Command::DeclineSuggestion { chat, seq: third });
+    let declined = sent(&mut babak);
+    assert_eq!(declined, third + 1);
+    let acked = shown(sara.wait(&server, |event| is_message(event, chat, declined)));
+    assert_eq!(
+        acked.ack.map(|ack| *ack),
+        Some(Ack {
+            suggestion: third,
+            accepted: false,
+            created: None,
+            left: None,
+        })
+    );
 }
 
 /// A third person's words, for someone who shares no chat.

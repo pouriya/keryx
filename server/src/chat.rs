@@ -862,6 +862,13 @@ async fn run_send(
                 if content_kind == ContentKind::Sticker {
                     return Err(refused(409, "cannot_edit", "A sticker cannot be edited"));
                 }
+                // An ack always agrees to what it saw, so neither changes.
+                if content_kind == ContentKind::Suggestion {
+                    return Err(refused(409, "cannot_edit", "A suggestion cannot be edited"));
+                }
+                if content_kind == ContentKind::Ack {
+                    return Err(refused(409, "cannot_edit", "An ack cannot be edited"));
+                }
                 body_limit = Some(app.settings.limits.body.of(content_kind));
             } else {
                 if !matches!(target.kind, Kind::Content | Kind::DeviceNotice) {

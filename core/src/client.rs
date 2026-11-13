@@ -31,18 +31,18 @@ use crate::mls::{
     verify_message, verify_revocation,
 };
 use crate::protocol::{
-    AccountBrief, AccountInfo, AccountKeysBody, AccountListReply, AccountReply, Answer, Bytes,
+    AccountBrief, AccountInfo, AccountKeysBody, AccountListReply, AccountReply, Ack, Answer, Bytes,
     CallBody, CallEvent, CallEventKind, CallOutcome, CallText, CaptchaAnswer, CaptchaReply,
     ChallengeBody, ChallengeReply, ChatDevice, ChatDeviceListReply, ChatFolders, ChatItem,
     ChatReply, ChatType, ClientFrame, ContentKind, CountReply, CreateChatBody, CreateFileBody,
     DeviceProof, DeviceReply, DevicesReply, DraftBody, DraftItem, EmptyReply, FeaturesReply,
-    FileReply, FolderItem, GroupInfoReply, Header, KeyPackageItem, KeyPackageListReply,
-    KeyPackagesBody, Kind, KvChange, KvItem, LoginBody, LoginReply, MarkItem, MessageFrame,
-    NamesBody, PhotoReply, PresenceItem, ProfileBody, ProfileKeyItem, ProfileKeyShare, ProfileLink,
-    ProfilePhoto, ProfileReply, PutProfileBody, Question, RefusedReply, RegisterBody,
-    RegisterDeviceBody, SendFrame, ServerFrame, SetupBody, SetupReply, SignedBody, SignedProfile,
-    StickerListReply, StickerPack, SyncPosition, TimesItem, VersionReply, WelcomeItem, WrapEntry,
-    WrapItem, WrapListReply, call_text_header,
+    FileReply, FolderItem, FolderSuggestion, GroupInfoReply, Header, KeyPackageItem,
+    KeyPackageListReply, KeyPackagesBody, Kind, KvChange, KvItem, LoginBody, LoginReply, MarkItem,
+    MessageFrame, NamesBody, PhotoReply, PresenceItem, ProfileBody, ProfileKeyItem,
+    ProfileKeyShare, ProfileLink, ProfilePhoto, ProfileReply, PutProfileBody, Question,
+    RefusedReply, RegisterBody, RegisterDeviceBody, SendFrame, ServerFrame, SetupBody, SetupReply,
+    SignedBody, SignedProfile, StickerListReply, StickerPack, Suggestion, SyncPosition, TimesItem,
+    VersionReply, WelcomeItem, WrapEntry, WrapItem, WrapListReply, call_text_header,
 };
 use crate::queue::{Level, Queue, Target};
 use crate::seed::{self, AccountKeys};
@@ -489,6 +489,29 @@ pub enum Command {
         question: Question,
         answer: Answer,
     },
+    /// What to do with this chat, with an optional text. Clients have no screen for it: an agent
+    /// sends them. Refused here unless its action is a known one that holds together.
+    SendSuggestion {
+        chat: Ulid,
+        #[serde(default)]
+        text: Option<Secret>,
+        suggestion: Suggestion,
+    },
+    /// Accepts the suggestion at `seq`, as shown. Its folder is found by its name folded as search
+    /// folds, the first in tab order, or made last among the tabs, which needs a connection for its
+    /// id. The arrangement is saved as [`Command::Folders`] saves it, and once the server took it the
+    /// ack goes, saying what changed. One the server refuses sends no ack, with an
+    /// [`Event::Error`] saying why. Nothing to change sends the ack at once.
+    AcceptSuggestion {
+        chat: Ulid,
+        seq: u64,
+        suggestion: Suggestion,
+    },
+    /// Declines the suggestion at `seq`: the ack alone.
+    DeclineSuggestion {
+        chat: Ulid,
+        seq: u64,
+    },
     /// The server's sticker packs, answered as [`Event::Stickers`].
     Stickers,
     /// One sticker's WebP, answered as [`Event::StickerImage`].
@@ -875,6 +898,13 @@ pub struct Shown {
     /// An answer message's answer.
     #[serde(default)]
     pub answer: Option<Answer>,
+    /// A suggestion message's action, once it holds together, or `Unknown` from a newer keryx. Its
+    /// text is `text`.
+    #[serde(default)]
+    pub suggestion: Option<Box<Suggestion>>,
+    /// An ack message's ack.
+    #[serde(default)]
+    pub ack: Option<Box<Ack>>,
     pub problem: Option<Problem>,
 }
 
@@ -1006,6 +1036,9 @@ pub enum Event {
         /// An answer, or an answer's edit.
         #[serde(default)]
         answer: Option<Answer>,
+        /// An ack, so the platform shows its suggestion handled at once.
+        #[serde(default)]
+        ack: Option<Ack>,
     },
     Sent {
         chat: Ulid,
@@ -1375,6 +1408,15 @@ struct Content {
     emoji: Option<String>,
     /// An answer or an answer's edit, for its pending message.
     answer: Option<Answer>,
+    /// An ack, for its pending message.
+    ack: Option<Ack>,
+}
+
+/// An ack waiting for the server to take the arrangement it accepted.
+struct WaitingAck {
+    folders: ChatFolders,
+    chat: Ulid,
+    ack: Ack,
 }
 
 /// The call this device has joined.
@@ -1443,6 +1485,12 @@ enum Waiting {
     },
     /// A new folder's id.
     FolderId,
+    /// A new folder's id for the suggestion at `seq` being accepted.
+    SuggestionFolder {
+        chat: Ulid,
+        seq: u64,
+        folder: FolderSuggestion,
+    },
     /// A `chat_folders` frame: kept until the server takes this arrangement.
     Folders {
         folders: ChatFolders,
@@ -1681,6 +1729,9 @@ pub struct Client {
     folders: Option<ChatFolders>,
     /// An arrangement the server has not taken yet, sent on every connection until it is.
     folders_out: Option<ChatFolders>,
+    /// Acks of accepted suggestions, each sent once the server takes its arrangement. Memory only,
+    /// like the queue: one lost costs a second tap, which changes nothing more.
+    acks_waiting: Vec<WaitingAck>,
     /// Whether the app is on screen, as the platform last said, sent as `presence`.
     in_app: bool,
     /// This account's settings, still sealed, sorted by name, with this device's changes on top.
@@ -1867,6 +1918,12 @@ fn fold(text: &str) -> (Vec<char>, Vec<usize>) {
     (folded, from)
 }
 
+/// A folder's name as accepting a suggestion matches it: trimmed, then folded as search folds. A
+/// client asks it to see which folder accepting will choose, before it does.
+pub fn fold_name(name: &str) -> String {
+    fold(name.trim()).0.into_iter().collect()
+}
+
 /// The field split around the first place it holds `needle`, both folded, or nothing.
 fn found_in(field: &str, needle: &[char]) -> Option<(String, String, String)> {
     let (folded, from) = fold(field);
@@ -1895,14 +1952,18 @@ struct Opened {
     on: Option<u64>,
     question: Option<Question>,
     answer: Option<Answer>,
+    suggestion: Option<Suggestion>,
+    ack: Option<Ack>,
 }
 
 /// A message's text and files, `{"text": "...", "files": [...]}`, each optional, a call's start,
 /// `{"video": ..., "voice": ...}`, a sticker, `{"sticker": "..."}`, a reaction, `{"emoji", "on"}`,
 /// a question's tree, `{"text"?, "first", "nodes"}`, or an answer, `{"question", "answers",
 /// "skipped"?}`. A tree that does not hold together is left out, and so is a reaction whose emoji the
-/// `emojis` crate does not know.
-fn content_of(plaintext: &[u8]) -> Opened {
+/// `emojis` crate does not know. A suggestion's action, `{"text"?, <action>}`, and an ack,
+/// `{"suggestion", "accepted", "created"?, "left"?}`, are read by `content_kind`, and left out when
+/// they do not hold together.
+fn content_of(plaintext: &[u8], content_kind: Option<ContentKind>) -> Opened {
     #[derive(Deserialize)]
     struct Plain {
         #[serde(default)]
@@ -1970,6 +2031,16 @@ fn content_of(plaintext: &[u8]) -> Opened {
                 on,
                 question,
                 answer,
+                suggestion: match content_kind {
+                    Some(ContentKind::Suggestion) => Suggestion::from_plaintext(plaintext),
+                    _ => None,
+                },
+                ack: match content_kind {
+                    Some(ContentKind::Ack) => serde_json::from_slice::<Ack>(plaintext)
+                        .ok()
+                        .filter(|ack| ack.check().is_ok()),
+                    _ => None,
+                },
             }
         }
         Err(_) => Opened::default(),
@@ -2014,6 +2085,8 @@ fn shown(
         on,
         question,
         answer,
+        suggestion,
+        ack,
     } = opened;
     Shown {
         chat: message.chat,
@@ -2036,6 +2109,8 @@ fn shown(
         on,
         question,
         answer,
+        suggestion: suggestion.map(Box::new),
+        ack: ack.map(Box::new),
         problem: None,
     }
 }
@@ -2082,6 +2157,7 @@ impl Client {
             chat_cache: Vec::new(),
             folders: None,
             folders_out: None,
+            acks_waiting: Vec::new(),
             in_app: false,
             kv: Vec::new(),
             kv_version: None,
@@ -2576,64 +2652,7 @@ impl Client {
                 folder_list,
                 default,
             } => {
-                let Some(device) = self.device.as_ref() else {
-                    return;
-                };
-                // A name the same as the one shown keeps its sealed bytes, so the server sees no
-                // rename.
-                let mut shown = HashMap::new();
-                let current = match &self.folders_out {
-                    Some(folders) => Some(folders),
-                    None => self.folders.as_ref(),
-                };
-                if let Some(current) = current {
-                    for folder in &current.folder_list {
-                        if let Some(name) = &folder.name {
-                            shown.insert(folder.id, name.clone());
-                        }
-                    }
-                }
-                let mut sealed_list = Vec::with_capacity(folder_list.len());
-                for folder in folder_list {
-                    let name = match &folder.name {
-                        None => None,
-                        Some(name) => {
-                            let kept = match shown.get(&folder.id) {
-                                Some(sealed) => match device.open_folder_name(folder.id, &sealed.0)
-                                {
-                                    Ok(opened) if opened.as_slice() == name.0.as_bytes() => {
-                                        Some(sealed.clone())
-                                    }
-                                    _ => None,
-                                },
-                                None => None,
-                            };
-                            match kept {
-                                Some(sealed) => Some(sealed),
-                                None => match device.seal_folder_name(folder.id, &name.0) {
-                                    Ok(sealed) => Some(Bytes(sealed)),
-                                    Err(_) => {
-                                        return self
-                                            .error("seal", "A folder name could not be sealed");
-                                    }
-                                },
-                            }
-                        }
-                    };
-                    sealed_list.push(FolderItem {
-                        id: folder.id,
-                        name,
-                        chat_list: folder.chat_list.clone(),
-                        pin_list: folder.pin_list.clone(),
-                    });
-                }
-                self.folders_out = Some(ChatFolders {
-                    folder_list: sealed_list,
-                    default,
-                });
-                self.dirty = true;
-                self.show_folders();
-                self.send_folders();
+                self.arrange(folder_list, default);
             }
             Command::InApp { in_app } => {
                 self.in_app = in_app;
@@ -2801,6 +2820,54 @@ impl Client {
                 question,
                 answer,
             } => self.answer(chat, Some(target), &question, &answer),
+            Command::SendSuggestion {
+                chat,
+                text,
+                suggestion,
+            } => {
+                if let Some(text) = &text
+                    && text.0.chars().count() > crate::protocol::SUGGESTION_TEXT
+                {
+                    return self.error("bad_suggestion", "A suggestion's text is too long");
+                }
+                if let Err(error) = suggestion.check() {
+                    return self.error("bad_suggestion", &error.to_string());
+                }
+                let fields = match serde_json::to_string(&suggestion) {
+                    Ok(fields) => fields,
+                    Err(_) => return self.error("internal", "Could not write the suggestion"),
+                };
+                self.push_content(
+                    chat,
+                    Kind::Content,
+                    None,
+                    Content {
+                        content_kind: Some(ContentKind::Suggestion),
+                        text,
+                        fields: Some(Secret(fields)),
+                        ..Content::default()
+                    },
+                );
+            }
+            Command::AcceptSuggestion {
+                chat,
+                seq,
+                suggestion,
+            } => match suggestion {
+                Suggestion::Folder(folder) => self.accept(chat, seq, folder, None),
+                Suggestion::Unknown => {
+                    self.error("bad_suggestion", "This suggestion needs a newer keryx")
+                }
+            },
+            Command::DeclineSuggestion { chat, seq } => self.send_ack(
+                chat,
+                Ack {
+                    suggestion: seq,
+                    accepted: false,
+                    created: None,
+                    left: None,
+                },
+            ),
             Command::Stickers => self.get("/api/v1/stickers".to_string(), Asked::Stickers),
             Command::StickerImage { sticker } => self.issue(Request {
                 method: "GET".to_string(),
@@ -3270,9 +3337,9 @@ impl Client {
                 .as_ref()?
                 .open(&header, &body, &signature, &known.public)
                 .ok()?;
-            content_of(&plaintext)
+            content_of(&plaintext, message.content_kind)
         } else {
-            content_of(&body)
+            content_of(&body, message.content_kind)
         };
         let mut fields: Vec<&str> = Vec::new();
         if let Some(text) = &opened.text {
@@ -3372,6 +3439,7 @@ impl Client {
             sticker,
             emoji,
             answer,
+            ack,
         } = content;
         let item = Item::Content {
             chat,
@@ -3395,6 +3463,7 @@ impl Client {
             sticker,
             emoji,
             answer,
+            ack,
         });
     }
 
@@ -3633,6 +3702,7 @@ impl Client {
                 sticker: None,
                 emoji: None,
                 answer: None,
+                ack: None,
             },
         );
     }
@@ -4682,6 +4752,7 @@ impl Client {
                             sticker: None,
                             emoji: None,
                             answer: None,
+                            ack: None,
                         };
                         self.send_content(outgoing.id, chat, kind, outgoing.pointer_seq, content);
                     }
@@ -5363,7 +5434,7 @@ impl Client {
             return Ok(None);
         };
         match own.open(&header, &body.0, &signature, &known.public) {
-            Ok(plaintext) => Ok(content_of(&plaintext).text),
+            Ok(plaintext) => Ok(content_of(&plaintext, None).text),
             Err(_) => Ok(None),
         }
     }
@@ -5474,11 +5545,15 @@ impl Client {
             ServerFrame::Marks { chat, mark } => self.event(Event::Marks { chat, mark }),
             ServerFrame::Draft { chat, draft } => self.show_draft(chat, draft),
             ServerFrame::ChatFolders(folders) => self.folders_listed(*folders),
-            ServerFrame::FolderId { reference, folder } => {
-                if let Some(Waiting::FolderId) = self.waiting.remove(&reference) {
-                    self.event(Event::FolderId { folder });
-                }
-            }
+            ServerFrame::FolderId { reference, folder } => match self.waiting.remove(&reference) {
+                Some(Waiting::FolderId) => self.event(Event::FolderId { folder }),
+                Some(Waiting::SuggestionFolder {
+                    chat,
+                    seq,
+                    folder: suggested,
+                }) => self.accept(chat, seq, suggested, Some(folder)),
+                _ => {}
+            },
             ServerFrame::Times {
                 reference,
                 chat,
@@ -5664,10 +5739,19 @@ impl Client {
                 self.send_outs(chat);
             }
             Waiting::Position { chat, which, up_to } => self.position_done(chat, which, up_to),
-            Waiting::Folders { folders } if self.folders_out.as_ref() == Some(&folders) => {
-                self.folders = Some(folders);
-                self.folders_out = None;
-                self.dirty = true;
+            Waiting::Folders { folders } => {
+                let (taken, kept) = std::mem::take(&mut self.acks_waiting)
+                    .into_iter()
+                    .partition::<Vec<_>, _>(|waiting| waiting.folders == folders);
+                self.acks_waiting = kept;
+                if self.folders_out.as_ref() == Some(&folders) {
+                    self.folders = Some(folders);
+                    self.folders_out = None;
+                    self.dirty = true;
+                }
+                for waiting in taken {
+                    self.send_ack(waiting.chat, waiting.ack);
+                }
             }
             _ => {}
         }
@@ -5798,10 +5882,13 @@ impl Client {
                 self.error(code, message);
                 self.position_done(chat, which, up_to);
             }
-            Waiting::FolderId => self.error(code, message),
-            // Refused, it would be refused again, so it goes, and the server's shows instead.
+            Waiting::FolderId | Waiting::SuggestionFolder { .. } => self.error(code, message),
+            // Refused, it would be refused again, so it goes, and the server's shows instead, with
+            // no ack for a suggestion it accepted.
             Waiting::Folders { folders } => {
                 self.error(code, message);
+                self.acks_waiting
+                    .retain(|waiting| waiting.folders != folders);
                 if self.folders_out.as_ref() == Some(&folders) {
                     self.folders_out = None;
                     self.dirty = true;
@@ -6053,6 +6140,192 @@ impl Client {
             }
         }
         self.event(Event::Kv { setting_list });
+    }
+
+    /// Shows and sends this account's whole arrangement, with plain names: only a changed name is
+    /// sealed again. False when it could not be sealed, which is reported.
+    fn arrange(&mut self, folder_list: Vec<Folder>, default: Ulid) -> bool {
+        let Some(device) = self.device.as_ref() else {
+            return false;
+        };
+        // A name the same as the one shown keeps its sealed bytes, so the server sees no
+        // rename.
+        let mut shown = HashMap::new();
+        let current = match &self.folders_out {
+            Some(folders) => Some(folders),
+            None => self.folders.as_ref(),
+        };
+        if let Some(current) = current {
+            for folder in &current.folder_list {
+                if let Some(name) = &folder.name {
+                    shown.insert(folder.id, name.clone());
+                }
+            }
+        }
+        let mut sealed_list = Vec::with_capacity(folder_list.len());
+        for folder in folder_list {
+            let name = match &folder.name {
+                None => None,
+                Some(name) => {
+                    let kept = match shown.get(&folder.id) {
+                        Some(sealed) => match device.open_folder_name(folder.id, &sealed.0) {
+                            Ok(opened) if opened.as_slice() == name.0.as_bytes() => {
+                                Some(sealed.clone())
+                            }
+                            _ => None,
+                        },
+                        None => None,
+                    };
+                    match kept {
+                        Some(sealed) => Some(sealed),
+                        None => match device.seal_folder_name(folder.id, &name.0) {
+                            Ok(sealed) => Some(Bytes(sealed)),
+                            Err(_) => {
+                                self.error("seal", "A folder name could not be sealed");
+                                return false;
+                            }
+                        },
+                    }
+                }
+            };
+            sealed_list.push(FolderItem {
+                id: folder.id,
+                name,
+                chat_list: folder.chat_list.clone(),
+                pin_list: folder.pin_list.clone(),
+            });
+        }
+        let folders = ChatFolders {
+            folder_list: sealed_list,
+            default,
+        };
+        // An ack waiting on the arrangement this one replaces waits on this one, made from
+        // what was shown, its change included.
+        for waiting in &mut self.acks_waiting {
+            if self.folders_out.as_ref() == Some(&waiting.folders) {
+                waiting.folders = folders.clone();
+            }
+        }
+        self.folders_out = Some(folders);
+        self.dirty = true;
+        self.show_folders();
+        self.send_folders();
+        true
+    }
+
+    /// Accepts a folder suggestion: its folder found by its folded name, or `made` once its id has
+    /// come, and the ack sent once the server took the arrangement, or at once when nothing changes.
+    fn accept(&mut self, chat: Ulid, seq: u64, folder: FolderSuggestion, made: Option<Ulid>) {
+        let opened = match (
+            self.device.as_ref(),
+            self.folders_out.as_ref().or(self.folders.as_ref()),
+        ) {
+            (Some(device), Some(shown)) => {
+                let mut folder_list = Vec::with_capacity(shown.folder_list.len() + 1);
+                for item in &shown.folder_list {
+                    let name = item.name.as_ref().map(|sealed| {
+                        match device.open_folder_name(item.id, &sealed.0) {
+                            Ok(opened) => Secret(String::from_utf8_lossy(&opened).into_owned()),
+                            Err(_) => Secret(String::new()),
+                        }
+                    });
+                    folder_list.push(Folder {
+                        id: item.id,
+                        name,
+                        chat_list: item.chat_list.clone(),
+                        pin_list: item.pin_list.clone(),
+                    });
+                }
+                Some((folder_list, shown.default))
+            }
+            _ => None,
+        };
+        let Some((mut folder_list, default)) = opened else {
+            return self.error("offline", "This account's folders have not arrived yet");
+        };
+        let name = folder.name.trim();
+        let wanted = fold_name(name);
+        let found = match made {
+            Some(_) => None,
+            None => folder_list.iter().position(
+                |item| matches!(&item.name, Some(shown) if fold_name(&shown.0) == wanted),
+            ),
+        };
+        let (target, created) = match (found, made) {
+            (Some(target), _) => (target, false),
+            (None, Some(id)) => {
+                folder_list.push(Folder {
+                    id,
+                    name: Some(Secret(name.to_string())),
+                    chat_list: Some(Vec::new()),
+                    pin_list: Vec::new(),
+                });
+                (folder_list.len() - 1, true)
+            }
+            (None, None) => {
+                let reference = reference();
+                let frame = ClientFrame::FolderId { reference };
+                if !self.ask(
+                    frame,
+                    reference,
+                    Waiting::SuggestionFolder { chat, seq, folder },
+                ) {
+                    self.error("offline", "A new folder needs a connection");
+                }
+                return;
+            }
+        };
+        // Pins follow the folders' rules: one in a folder left goes with it, and the target's stays.
+        let mut changed = created;
+        let mut left = 0;
+        for (at, item) in folder_list.iter_mut().enumerate() {
+            let Some(chat_list) = item.chat_list.as_mut() else {
+                continue;
+            };
+            if at == target {
+                if !chat_list.contains(&chat) {
+                    chat_list.push(chat);
+                    changed = true;
+                }
+            } else if folder.r#move && chat_list.contains(&chat) {
+                chat_list.retain(|one| *one != chat);
+                item.pin_list.retain(|one| *one != chat);
+                left += 1;
+                changed = true;
+            }
+        }
+        let ack = Ack {
+            suggestion: seq,
+            accepted: true,
+            created: Some(created),
+            left: Some(left),
+        };
+        if !changed {
+            return self.send_ack(chat, ack);
+        }
+        if self.arrange(folder_list, default)
+            && let Some(folders) = self.folders_out.clone()
+        {
+            self.acks_waiting.push(WaitingAck { folders, chat, ack });
+        }
+    }
+
+    fn send_ack(&mut self, chat: Ulid, ack: Ack) {
+        let fields = match serde_json::to_string(&ack) {
+            Ok(fields) => fields,
+            Err(_) => return self.error("internal", "Could not write the ack"),
+        };
+        self.push_content(
+            chat,
+            Kind::Content,
+            None,
+            Content {
+                content_kind: Some(ContentKind::Ack),
+                fields: Some(Secret(fields)),
+                ack: Some(ack),
+                ..Content::default()
+            },
+        );
     }
 
     /// Sends the arrangement still waiting, if connected. Offline, the next connection sends it.
@@ -6740,14 +7013,14 @@ impl Client {
                 continue;
             }
             let content = if !header.encrypted {
-                content_of(&body)
+                content_of(&body, message.content_kind)
             } else {
                 let Some(own) = self.device.as_ref() else {
                     return;
                 };
                 let current = own.epoch(chat).ok();
                 match own.open(&header, &body, &signature, &known.public) {
-                    Ok(plaintext) => content_of(&plaintext),
+                    Ok(plaintext) => content_of(&plaintext, message.content_kind),
                     Err(_) if wait_key && (restoring || (current.is_none() && joining)) => {
                         self.chat(chat).waiting.push(message);
                         continue;

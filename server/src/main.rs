@@ -174,6 +174,8 @@ fn read_configuration(path: &Path) -> anyhow::Result<Settings> {
         .optional("question", ByteSize::new())
         .optional("answer", ByteSize::new())
         .optional("sticker", ByteSize::new())
+        .optional("suggestion", ByteSize::new())
+        .optional("ack", ByteSize::new())
         .optional("draft", ByteSize::new())
         .optional("folder_name", ByteSize::new())
         .optional("kv_value", ByteSize::new());

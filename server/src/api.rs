@@ -109,6 +109,8 @@ pub const PERMISSION_LIST: &[&str] = &[
     "message.send.question",
     "message.send.answer",
     "message.send.sticker",
+    "message.send.suggestion",
+    "message.send.ack",
     SEND_UNENCRYPTED,
     MESSAGE_COMMIT,
     EDIT_OWN,
@@ -146,6 +148,8 @@ pub fn send_permission(content_kind: ContentKind) -> &'static str {
         ContentKind::Question => "message.send.question",
         ContentKind::Answer => "message.send.answer",
         ContentKind::Sticker => "message.send.sticker",
+        ContentKind::Suggestion => "message.send.suggestion",
+        ContentKind::Ack => "message.send.ack",
     }
 }
 
@@ -359,6 +363,8 @@ pub struct BodyLimits {
     pub question: u64,
     pub answer: u64,
     pub sticker: u64,
+    pub suggestion: u64,
+    pub ack: u64,
     /// An account's sealed draft in one chat, which is not a message.
     pub draft: u64,
     /// One sealed folder name.
@@ -383,6 +389,8 @@ impl Default for BodyLimits {
             question: 64 * 1024,
             answer: 16 * 1024,
             sticker: 1024,
+            suggestion: 4 * 1024,
+            ack: 1024,
             draft: 64 * 1024,
             folder_name: 256,
             kv_value: 4 * 1024,
@@ -406,6 +414,8 @@ impl BodyLimits {
             ContentKind::Question => self.question,
             ContentKind::Answer => self.answer,
             ContentKind::Sticker => self.sticker,
+            ContentKind::Suggestion => self.suggestion,
+            ContentKind::Ack => self.ack,
         }
     }
 }

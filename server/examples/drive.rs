@@ -2,8 +2,8 @@
 //! cannot, such as a question. Not part of the server, and not a test. Reads one command per line on
 //! stdin: `signup` or `login` with a username, password and words, `find <username>`, `say <text>`,
 //! `many <n>`, `seen`, `call`, `question`, `bio <text>`, `link <name> <url>`, `photo <file.jpg>`,
-//! `app <on|off>`, `kv <key> <json>`, `react <seq> <emoji>`, `delete <seq>`, `sticker [n]`, `pump <ms>`
-//! and `quit`.
+//! `app <on|off>`, `kv <key> <json>`, `react <seq> <emoji>`, `delete <seq>`, `sticker [n]`,
+//! `suggest move|copy <folder> [text]`, `pump <ms>` and `quit`.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use keryx_core::client::{
     Auth, Client, Command, Event, Input, Output, Platform, Pointer, Secret, Setting, Thumbnail,
 };
-use keryx_core::protocol::{ChatType, MessageFrame, ProfileLink};
+use keryx_core::protocol::{ChatType, FolderSuggestion, MessageFrame, ProfileLink, Suggestion};
 use keryx_core::ulid::Ulid;
 use serde_json::{Value, json};
 use tungstenite::stream::MaybeTlsStream;
@@ -272,6 +272,19 @@ impl App {
                     if let Event::Started { chat, .. } = &event {
                         self.chat = Some(*chat);
                     }
+                    // An ack to a suggestion this account sent, printed as it arrives.
+                    if let Event::Message { message } = &event
+                        && !message.mine
+                        && let Some(ack) = &message.ack
+                    {
+                        println!(
+                            "ack {} {} created={:?} left={:?}",
+                            ack.suggestion,
+                            if ack.accepted { "accepted" } else { "declined" },
+                            ack.created,
+                            ack.left
+                        );
+                    }
                     self.events.push(event);
                     None
                 }
@@ -490,6 +503,28 @@ fn main() {
                     unreachable!()
                 };
                 println!("asked {seq}");
+            }
+            // A folder suggestion for this chat, printing its sequence id; its ack is printed when it
+            // arrives, during this or a later command such as `pump`.
+            "suggest" => {
+                let chat = app.chat.expect("no chat");
+                let mut words = rest.splitn(3, ' ');
+                let how = words.next().unwrap_or_default();
+                let name = words.next().expect("suggest move|copy <folder> [text]");
+                let text = words.next().map(|text| Secret(text.to_string()));
+                app.command(Command::SendSuggestion {
+                    chat,
+                    text,
+                    suggestion: Suggestion::Folder(FolderSuggestion {
+                        name: name.to_string(),
+                        r#move: how == "move",
+                    }),
+                });
+                let Event::Sent { seq, .. } = app.wait(|event| matches!(event, Event::Sent { .. }))
+                else {
+                    unreachable!()
+                };
+                println!("suggested {seq}");
             }
             "bio" => {
                 app.bio = Some(rest.to_string());
