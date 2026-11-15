@@ -1852,7 +1852,10 @@ about groups and channels stands; this section adds what the author decides as t
     who may see their presence, and an agent's text, its trouble reason, to its owner alone, chosen by
     the author**; others see yellow and "having trouble" only. Everyone sharing a chat with an agent
     holds its profile key, so that the reason reaches the owner alone rests on the server not delivering
-    it, as profiles after leaving do.
+    it, as profiles after leaving do. **That is kept, chosen by the author**, over sealing it to the
+    owner's invite key: one sealing path, and a reason is a code and a detail with no chat content.
+  - **Android shows presence text in a direct chat's header only, in place of "online", chosen by the
+    author.**
 
 ### Settings kept per account (`kv`)
 
@@ -2483,7 +2486,8 @@ and 2026-11-16.** It is MCP's first role, an agent as a participant, and answers
 store their words. How `keryx-agent` itself works is in [agent/AGENTS.md](agent/AGENTS.md).
 
 - **An agent account has an owner and logs in with a token only**, with no password: a long-lived token
-  its owner can renew, which replaces it and ends the old one at once, or revoke. One token per agent.
+  its owner can renew, which replaces it and ends the old one and its device at once, or revoke. One token
+  per agent.
 - **The owner's app makes the agent's words, never the server.** Core makes the words, publishes the
   agent's keys with their stamps, and shows the token and words once, to be put in `agent.toml`. If the
   server made or relayed the words, it and a stolen database could read every chat the agent is in.
@@ -2504,12 +2508,15 @@ store their words. How `keryx-agent` itself works is in [agent/AGENTS.md](agent/
   server for. The account and device stay for old signatures. The owner's app cannot read the agent's
   chats unless the owner is in them, but whoever runs the agent's container holds its `agent.db` and
   reads every chat it is in.
-- **An agent has one device**, which it replaces itself when its container starts with no data: see
-  agent/AGENTS.md. **The server enforces it and tells the owner, chosen by the author:** an agent
-  registers a new device only after its old one is ended, and the server writes a notice into the
-  owner's self chat, such as "Your agent X registered a new device", carrying the device's stamp as the
-  new-device notice does. An agent's own self chat is one its owner never sees, so without this whoever
-  copied `agent.toml` could add a device as the agent and nobody would know.
+- **An agent has one device, and only its owner's token renew or revoke ends it, chosen by the author**
+  over a notice to the owner of each new device. The server refuses a second device, and refuses ending
+  an agent's device with the words, which is what a thief holding a copied `agent.toml` would otherwise
+  do. **A renew always ends the device, chosen by the author:** a token belongs to one device, and the
+  token and the words sit in the same `agent.toml`, so a leaked token means the words leaked too. The
+  old device stops at once on the server; the new `keryx-agent` registers a fresh device and signs the
+  old one's termination with its words, since members remove a device from MLS only on a statement its
+  master key signed, which the owner does not hold. A container that lost its volume waits for its
+  owner's renew.
 - **No agent is run by the keryx server, chosen by the author**, as asked with an `agent.server.create`:
   the server, and a stolen database, could then read every chat it is in. See agent/AGENTS.md.
 - **Anyone may start a direct chat with an agent or add it to a group**, as with any account. The agent's
@@ -2525,7 +2532,10 @@ store their words. How `keryx-agent` itself works is in [agent/AGENTS.md](agent/
   the same account into one expandable list, chosen by the author**; another message or another
   sender between them starts a new one, so an agent working while people talk reads activity, message,
   activity by seq. There is no live, unsaved activity event: the message itself arrives as each step
-  starts.
+  starts. **Its plaintext is `{"text"}`, chosen by the author**, its topic and thread in the signed header
+  as any message's, and **core refuses an empty text or one over 140 characters when sending and when
+  opening, chosen by the author**, as it refuses an unknown emoji, so a modified sender cannot flood the
+  folded list.
 - **The server side, approved as drafted:**
 
   ```
@@ -2672,8 +2682,6 @@ first, as everywhere.
 
 **Accounts**
 
-- The owner's notice of a new agent device: its message kind and body, and who may remove it
-- An `activity` message's plaintext, and how core checks its 140 characters
 - Android's Agents page: its design, drawn first, once the agent has proved itself
 - Rate limits. None in the first build: operators who expose a server turn on `[captcha]`, which
   runs before Argon2, and a server without one can be guessed against at Argon2's speed
@@ -2689,8 +2697,7 @@ first, as everywhere.
 - A call chosen as recorded when neither device can encode H.264: the client should say so
   before it starts
 - Mute
-- Presence text: where Android shows it and sets a person's own; whether an agent's reason is sealed to
-  its owner alone, with HPKE to the owner's invite key, rather than under the agent's profile key
+- Presence text: where Android lets a person set their own
 - The client queue on disk, so unsent messages and unfinished uploads survive a restart: where it is
   kept on each platform and how it is locked
 

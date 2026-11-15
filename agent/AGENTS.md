@@ -87,10 +87,12 @@ agent/tests/            integration tests, the fake LLM, and AGENTS.md with the 
 - **The URL, token and words sit in `agent.toml`, chosen by the author**, since nobody is there to type
   them. Whoever can read that file holds the account, as with the operator token. The words reach the
   owner from their own app when the agent is made: see Agent accounts in the root AGENTS.md.
-- **One device, replaced by itself, chosen by the author.** Starting with no snapshot, keryx-agent signs
-  its old device's termination with its words, then registers a new one, so the old device's keys stop
-  being members. **The server allows an agent one device and tells its owner of each new one, chosen by
-  the author:** see Agent accounts in the root AGENTS.md.
+- **One device, which only its owner's token renew ends, chosen by the author.** The server allows an
+  agent one device and refuses ending it with the words, so whoever copied `agent.toml` cannot replace
+  the running agent with their own. A container that lost its volume needs the owner to renew the token
+  and put the new one in `agent.toml`: the renew ends the old device on the server, and keryx-agent,
+  starting with no snapshot, registers a new one and then signs the old device's termination with its
+  words, so members remove it from MLS. See Agent accounts in the root AGENTS.md.
 - **It keeps its connection and retries forever**, as the author's first sketch said.
 - **Presence only, chosen by the author:** online while connected, offline when it is down, as any
   device. No typing while it works.
@@ -98,7 +100,9 @@ agent/tests/            integration tests, the fake LLM, and AGENTS.md with the 
   failing and backing off, which replaced away; storage full; storage past `storage_warn`, waiting for
   the owner's answer; and a run ended on the tool-call limit or unable to compact, waiting to be told to
   continue. It goes back to green once the cause clears. **The reason is its presence text, sent to its
-  owner alone, chosen by the author.** See Presence in the root AGENTS.md.
+  owner alone, chosen by the author:** a code, `llm_failing`, `storage_full`, `storage_warn` or `stuck`,
+  then a short detail, such as `llm_failing: HTTP 429 since 12m` or `storage_warn: 8.3 of 10 GiB`. Apps
+  translate the code into the owner's language and show the detail as it is. See Presence in the root AGENTS.md.
 - **Whoever runs its container reads everything it sees.** The owner's app cannot open the agent's
   chats, but `agent.db`, the index, the words and the snapshot sit in its volume, so whoever holds the
   volume reads every chat the agent is in. Members of a chat with an agent should take it as that
@@ -337,7 +341,9 @@ agent/tests/            integration tests, the fake LLM, and AGENTS.md with the 
   functions with `chat=`, and searched only as well. **The preamble hints what is there, chosen by the
   author:** for the global memory and each chat whose events are shown, its note count and its
   `[memory] hint_words = 10` most common words from the index's lexicon, 0 turning the words off, so the
-  model knows when to search. **At most `[limits] memory_notes = 10000` of `memory_note = "16KiB"`, chosen by the author**;
+  model knows when to search. **`memory_notes` counts every note together, chosen by the author**, the
+  global memory's and every chat's, so the disk use stays bounded; past it `memory.add` returns
+  `memory_full` in any memory. **At most `[limits] memory_notes = 10000` of `memory_note = "16KiB"`, chosen by the author**;
   past the count, `memory.add` returns `memory_full`.
 - **Files, chosen by the author:** the file functions write and remove only in `tmp/`, and read in
   `tmp/` and in `chats/<chat id>/`, where chat files are kept per conversation. `keryx.send_files` and
@@ -548,6 +554,4 @@ action = "wake"
 
 - The built-in default texts of the compaction prompt, the limit prompt and the preamble, and the
   `starlark` tool's description: written with the code, for the author's approval before they are kept
-- The words of each trouble reason in its presence text
-- Whether `memory_notes` counts all notes together or each memory on its own
 - The Responses API, and calling external MCP servers from scripts, when they come
