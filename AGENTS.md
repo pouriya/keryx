@@ -98,6 +98,8 @@ android/        The Android client, in Kotlin and Jetpack Compose
   ffi/          A workspace crate holding only the hand-written JNI glue around keryx-core
 moq/            A workspace crate, keryx-moq: the native MoQ client for calls, over WebSocket, sealing its frames
   AGENTS.md     keryx-moq's layout, dependencies and checks
+agent/          A workspace crate, keryx-agent: an LLM agent living in keryx as its own account. Planned
+  AGENTS.md     keryx-agent's decisions, what is drafted for the author's approval, and its open questions
 ```
 
 **`server/` and `core/` follow the strict rules.** The file lists are closed, code
@@ -109,6 +111,7 @@ integration tests. **`web/` is loose for now, by the author's choice:** see
 and fmt. The server's integration tests use it as their call client, so it has no tests or coverage
 table of its own. **It is one file with its own Makefile and AGENTS.md, chosen by the author**: see
 [moq/AGENTS.md](moq/AGENTS.md). The server's `make all` runs its `make lint` too, since its tests use it.
+**`agent/` follows core's strict Rust rules too, chosen by the author:** see [agent/AGENTS.md](agent/AGENTS.md).
 
 **`web/wasm/` is its own crate, not a module in `core/`**, so `core/` holds no JavaScript glue and
 its native coverage is not pulled down by code its tests cannot run. **`android/ffi/` is its sibling
@@ -120,7 +123,7 @@ and read the same MLS state. One implementation means one thing to audit.
 
 **The workspace is what keeps crypto versions identical** between the server and
 the WASM build, because there is one `Cargo.lock`. Make targets stay inside
-`server/`, `core/`, `web/`, `android/` and `moq/`.
+`server/`, `core/`, `web/`, `android/`, `moq/` and `agent/`.
 
 ## What has been decided
 
@@ -2460,11 +2463,82 @@ another device still holding the key.
 - **Nothing that reads encrypted content can run on the server.** Searching it, and
   any MCP that reads it, must run on the client, where the keys are.
 
+### Agent accounts
+
+**An agent is a keryx account run by `keryx-agent`, all chosen by the author in the Q/A of 2026-11-15
+and 2026-11-16.** It is MCP's first role, an agent as a participant, and answers how agents get and
+store their words. How `keryx-agent` itself works is in [agent/AGENTS.md](agent/AGENTS.md).
+
+- **An agent account has an owner and logs in with a token only**, with no password: a long-lived token
+  its owner can renew, which replaces it and ends the old one at once, or revoke. One token per agent.
+- **The owner's app makes the agent's words, never the server.** Core makes the words, publishes the
+  agent's keys with their stamps, and shows the token and words once, to be put in `agent.toml`. If the
+  server made or relayed the words, it and a stolen database could read every chat the agent is in.
+- **Making one needs a new server permission, `agent.create`**, held by member, moderator and admin, and
+  an owner may have at most `[limits] agents = 5`.
+- **The owner ticks which of their own server-wide permissions the agent gets**, at creation and later.
+  **It holds the ticked names checked against its owner's current permissions on every operation**, so an
+  agent never exceeds its owner and loses a permission the moment its owner does. **Ticks cover
+  server-wide permissions only**: inside a chat the agent holds what its chat role gives, like anyone.
+- **An admin owner chooses whether the agent is admin.** It is admin only while its owner is. **No agent
+  ever creates agents, admin or not:** `agent.create` cannot be ticked and an admin agent's check refuses
+  it, so nothing can multiply itself through a prompt.
+- **An owner can renew and revoke the token, disable the agent, change its ticks, and edit its display
+  name, photo and bio.** The owner's snapshot keeps only the agent's profile key, to seal its photo and
+  bio, and never its master key, so a stolen owner phone cannot register a device as the agent.
+  **Disabling is done by the server**: the token is revoked, its sessions end, and the agent leaves every
+  group and channel as a leave does, members committing its MLS removal, which clients already trust the
+  server for. The account and device stay for old signatures. The owner cannot read the agent's chats
+  unless they are in them.
+- **An agent has one device**, which it replaces itself when its container starts with no data: see
+  agent/AGENTS.md. **The server enforces it and tells the owner, chosen by the author:** an agent
+  registers a new device only after its old one is ended, and the server writes a notice into the
+  owner's self chat, such as "Your agent X registered a new device", carrying the device's stamp as the
+  new-device notice does. An agent's own self chat is one its owner never sees, so without this whoever
+  copied `agent.toml` could add a device as the agent and nobody would know.
+- **No agent is run by the keryx server, chosen by the author**, as asked with an `agent.server.create`:
+  the server, and a stolen database, could then read every chat it is in. See agent/AGENTS.md.
+- **Anyone may start a direct chat with an agent or add it to a group**, as with any account. The agent's
+  wake rules decide whether it acts.
+- **Others see an agent badge, and its owner only once the owner chooses to show it**, hidden by default.
+- **The server side, approved as drafted:**
+
+  ```
+  account   + owner_id (NULL for people), show_owner (false), disabled_at
+  agent_token      (account_id PK, hash, created_at)  one per agent
+  agent_permission (account_id, permission)  the ticks
+
+  POST /api/v1/agents  agent.create: username, display_name, permission_list (each one the owner holds)
+         -> account, token        at most [limits] agents
+  GET  /api/v1/agents  the owner's -> agent_list{id, username, display_name, show_owner, disabled,
+         permission_list, token_at, last_connected_at}
+  PUT  /api/v1/agents/{id}  owner: display_name?, show_owner?, permission_list?
+  POST /api/v1/agents/{id}/token    owner: renew -> token
+  DEL  /api/v1/agents/{id}/token    owner: revoke
+  POST /api/v1/agents/{id}/disable  owner
+  POST /api/v1/login/agent  token, device?{id, challenge, signature} -> account, device?, token (a
+         session, as /login/token gives, so there is one way in)
+  GET  /api/v1/accounts/{id}  + agent, owner? (when shown)
+  PUT  /api/v1/accounts/{id}/keys  the owner, once, for its agent: what PUT /account/keys takes
+  refusals: not_owner, too_many_agents, not_held (ticking what the owner lacks), agent_disabled
+  ```
+
+  **An admin agent is an optional `admin: true|false` on the create and update bodies, chosen by the
+  author**, refused with `not_held` unless the owner is admin. An agent cannot log in with a password.
+- **Built in this order, chosen by the author:** first the parts of `keryx-agent` that do not touch the
+  server or core (cron, `agent.db`, search, Starlark and the LLM against a fake server), since main's
+  `server/` and `core/` were being reworked in another session; then, once main settles, the server and
+  core, tested by the server's tests driving core; then the rest of `keryx-agent` with its tests, with `server/examples/drive.rs` as the owner through `agent add
+  <username> [--admin] [permission ...]`, which prints the token and words once, `agent list`, `agent
+  perms <username> [permission ...]`, `agent show <username> on|off`, `agent token renew|revoke
+  <username>`, `agent profile <username> [bio] [-- photo.jpg]` and `agent disable <username>`. Android's
+  Agents page waits until the agent proves itself, and is drawn first when it comes.
+
 ### MCP has four roles
 
 | Role | Where it runs | Sees content |
 |------|---------------|--------------|
-| Agents as participants: an agent with its own identity in the chats it was added to | With keys, on the client side | Yes, its own chats |
+| Agents as participants: an agent with its own identity in the chats it was added to, `keryx-agent` | With keys, on the client side | Yes, its own chats |
 | A person's agent acting for them, through their own client | Their client | Yes, as them |
 | Admin and operations: users, rooms, moderation, stats | The server | **Never encrypted content.** Unencrypted content only with a named permission |
 | MCP traffic between agents, tunnelled over chats | Both ends, on the client side | The endpoints only |
@@ -2567,13 +2641,14 @@ first, as everywhere.
 - The safety number's format
 - Changing words: what happens to keys wrapped to the old account key
 - Key wrapping in large channels, where 64 bytes per member adds up
-- Agent identities: how they get and store their words
 - Someone over the limit who lost their words cannot terminate anything: decide this
   together with what changing words does
 - The RBAC permissions for reading another person's devices and logs
 
 **Accounts**
 
+- The owner's notice of a new agent device: its message kind and body, and who may remove it
+- Android's Agents page: its design, drawn first, once the agent has proved itself
 - Rate limits. None in the first build: operators who expose a server turn on `[captcha]`, which
   runs before Argon2, and a server without one can be guessed against at Argon2's speed
 - RBAC: the management UI, and what stops a non-admin who may manage roles from granting themselves
