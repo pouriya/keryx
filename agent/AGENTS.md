@@ -91,8 +91,13 @@ agent/tests/            integration tests, the fake LLM, and AGENTS.md with the 
   being members. **The server allows an agent one device and tells its owner of each new one, chosen by
   the author:** see Agent accounts in the root AGENTS.md.
 - **It keeps its connection and retries forever**, as the author's first sketch said.
-- **Presence only, chosen by the author:** online while connected and its LLM calls succeed, away while
-  they fail and back off, offline when it is down, as any device. No typing while it works.
+- **Presence only, chosen by the author:** online while connected, offline when it is down, as any
+  device. No typing while it works.
+- **Yellow, having trouble, while something needs its owner, chosen by the author:** its LLM calls
+  failing and backing off, which replaced away; storage full; storage past `storage_warn`, waiting for
+  the owner's answer; and a run ended on the tool-call limit or unable to compact, waiting to be told to
+  continue. It goes back to green once the cause clears. **The reason is its presence text, sent to its
+  owner alone, chosen by the author.** See Presence in the root AGENTS.md.
 
 ## Storage
 
@@ -476,4 +481,5 @@ action = "wake"
 
 - The built-in default texts of the compaction prompt, the limit prompt and the preamble, and the
   `starlark` tool's description: written with the code, for the author's approval before they are kept
+- The words of each trouble reason in its presence text
 - The Responses API, and calling external MCP servers from scripts, when they come

@@ -1840,6 +1840,19 @@ about groups and channels stands; this section adds what the author decides as t
     18:05", **the time always shown, in the header too, chosen by the author**, with the profile's line
     called Active, chosen by the author over "seen". **Last connected is not shown when last in the app is
     shown and is the same or later, chosen by the author**, since it then says nothing more.
+  - **A fifth state, yellow "having trouble", chosen by the author in the agent Q/A of 2026-11-16:** wire
+    state `trouble`, which any device may send, and the `presence` frame gains `trouble` and `text`. **Phones
+    do not send it for now**; agents send it on their own, as agent/AGENTS.md says. **It ranks in a call,
+    having trouble, online, away, offline, chosen by the author**, so a problem shows over a healthy
+    device but never hides a call. **Its dot is yellow with a small dark !, chosen by the author**, so it
+    differs from orange by shape and not by colour alone.
+  - **Presence may carry a text, as XMPP's status does, chosen by the author:** at most 140 characters,
+    sealed under the account's profile key, so only people sharing a chat with the account read it and
+    the server, a stolen database and a `presence_of` answer do not. **A person's text goes to everyone
+    who may see their presence, and an agent's text, its trouble reason, to its owner alone, chosen by
+    the author**; others see yellow and "having trouble" only. Everyone sharing a chat with an agent
+    holds its profile key, so that the reason reaches the owner alone rests on the server not delivering
+    it, as profiles after leaving do.
 
 ### Settings kept per account (`kv`)
 
@@ -2663,6 +2676,8 @@ first, as everywhere.
 - A call chosen as recorded when neither device can encode H.264: the client should say so
   before it starts
 - Mute
+- Presence text: where Android shows it and sets a person's own; whether an agent's reason is sealed to
+  its owner alone, with HPKE to the owner's invite key, rather than under the agent's profile key
 - The client queue on disk, so unsent messages and unfinished uploads survive a restart: where it is
   kept on each platform and how it is locked
 
