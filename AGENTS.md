@@ -1855,7 +1855,8 @@ about groups and channels stands; this section adds what the author decides as t
     it, as profiles after leaving do. **That is kept, chosen by the author**, over sealing it to the
     owner's invite key: one sealing path, and a reason is a code and a detail with no chat content.
   - **Android shows presence text in a direct chat's header only, in place of "online", chosen by the
-    author.**
+    author**, and with no text the header shows online as before. **People cannot set one for now,
+    chosen by the author:** no client offers it, so only agents send presence text.
 
 ### Settings kept per account (`kv`)
 
@@ -2697,7 +2698,6 @@ first, as everywhere.
 - A call chosen as recorded when neither device can encode H.264: the client should say so
   before it starts
 - Mute
-- Presence text: where Android lets a person set their own
 - The client queue on disk, so unsent messages and unfinished uploads survive a restart: where it is
   kept on each platform and how it is locked
 
