@@ -59,6 +59,7 @@ agent/AGENTS.md
 agent/Dockerfile
 agent/src/main.rs       CLI, agent.toml, logging, startup
 agent/src/agent.toml    the commented template, include_str!'d
+agent/src/agent.sql     agent.db's schema, include_str!'d by store.rs
 agent/src/connect.rs    the socket, driving core, both queues, presence, snapshot and archive saves
 agent/src/store.rs      agent.db: schema and every query
 agent/src/index.rs      tantivy: messages and memory, search
@@ -98,13 +99,54 @@ agent/tests/            integration tests, the fake LLM, and AGENTS.md with the 
   the owner's answer; and a run ended on the tool-call limit or unable to compact, waiting to be told to
   continue. It goes back to green once the cause clears. **The reason is its presence text, sent to its
   owner alone, chosen by the author.** See Presence in the root AGENTS.md.
+- **Whoever runs its container reads everything it sees.** The owner's app cannot open the agent's
+  chats, but `agent.db`, the index, the words and the snapshot sit in its volume, so whoever holds the
+  volume reads every chat the agent is in. Members of a chat with an agent should take it as that
+  person's.
 
 ## Storage
 
 - **One SQLite file, `agent.db`, with the server's `DELETE` journal, chosen by the author:** both
   snapshot slots, the archive of raw frames as the server sent them, both queues, the run logs,
-  schedules, memory notes, and the search tables when enabled, so one transaction covers a loop step and
-  its queue changes.
+  schedules and memory notes, so one transaction covers a loop step and its queue changes.
+- **Its schema follows the server's rules in `agent/src/agent.sql`, chosen by the author:** ULIDs as
+  `BLOB(16)`, unix milliseconds, enums as integers with their values listed, `WITHOUT ROWID` for small
+  rows, every field naming the feature that needs it, and `PRAGMA user_version`. **The tables, approved
+  by the author:**
+
+  ```
+  snapshot    (slot 0|1 PK, bytes, saved_at)            core's two slots
+  session     (id 0 PK, token)                          the login core hands back, for Loaded
+  message     (chat, seq, kind, content_kind, device, pointer, topic, thread_seq, saved_at, frame)
+              PK (chat, seq)                            the archive of raw frames, as Android's
+  call_row    (chat, call_seq, n, kind, outcome, frame)
+  event       (id PK, kind, chat?, topic?, thread_seq?, seq?, body JSON, received_at,
+               state 0 waiting | 1 taken | 2 deferred, until?, run?, step?)
+              index (state, received_at)
+  outgoing    (id PK, run?, step?, n?, chat, command JSON, client_at,
+               state 0 queued | 1 sent | 2 done | 3 refused, seq?, code?, at)
+  run         (id PK, started_at, ended_at?, state 0 running | 1 done | 2 limit | 3 failed)
+  step        (run, n, phase 1..6, context JSON, intention_list JSON?, answer JSON?, script?,
+               sent_at?, started_at?, ended_at?, cut, tokens_in?, tokens_out?)  PK (run, n)
+  step_output (run, step, n, kind 0 print | 1 action, body, at)  PK (run, step, n)
+  schedule    (id PK, kind 0 at | 1 every | 2 cron, spec, tz, start?, note, chats BLOB(16 each),
+               join, next_at, fired_at?, run?, made_at)  index next_at
+  memory      (id PK, chat?, text, run, step, source_chat?, seq?, made_at, updated_at)
+  ```
+
+- **Events are one table and stay once taken, chosen by the author**, pointing at the run and step that
+  took them, as the run log's record of what woke it, with no copy in the step.
+- **Each print and each action is its own `step_output` row, chosen by the author**, inserted as it
+  happens, so a crash loses at most the one being written.
+- **An `at` schedule's row is removed in the transaction that saves its fire event, chosen by the
+  author**; the event keeps the note, the planned and actual times and why it was late.
+- **`keryx.chat_list` and `keryx.chat` answer from core's state, chosen by the author:** its snapshot
+  and the `chats` list since connecting, so nothing opened reaches the disk unless `[search] plain` is
+  on. Before the first connection they return `offline`.
+- **The search index is a tantivy directory, `index/`, beside `agent.db`, chosen by the author.** Messages
+  are indexed only when `[search] plain` is on; memory notes always are, since `memory.note_list`
+  searches them. `agent.db` is the truth: the index's last commit names the newest row it covers, and a
+  missing or stale index is rebuilt from it at startup.
 - **The plain search database is optional, chosen by the author.** Turning it on means the owner trusts
   the environment to hold plaintext, and gives the LLM rich search. Off, search scans the archive as
   core's search does, which is slow and hard for the LLM.
@@ -118,8 +160,11 @@ agent/tests/            integration tests, the fake LLM, and AGENTS.md with the 
   model proposes what to remove, asks its owner with a keryx question, and removes what was agreed. **At
   the cap**, run logs keep only their action lists, and downloads, `file.write` and `memory.add` return
   `storage_full`. **The archive and both queues always keep writing**, since losing messages is worse
-  than passing the cap. Run logs stay until removed this way, as past runs are the agent's memory of
-  what it did, and deferred events stay until taken, as they were put back on purpose.
+  than passing the cap. Deferred events stay until taken, as they were put back on purpose.
+- **Run logs are kept `[limits] runs_keep = "90d"`, chosen by the author**, and until then removed only
+  by `storage.remove_runs`. Older runs go at startup and once a day, each with its steps, outputs, the
+  events it took and its sent outgoing rows, in one transaction. Unset keeps them until removed. Memory
+  notes keep their source ids when the run is gone.
 
 ## Queues and durability
 
@@ -227,9 +272,20 @@ agent/tests/            integration tests, the fake LLM, and AGENTS.md with the 
 ## Starlark
 
 - **facebook's Starlark as the one tool, chosen by the author.** The LLM sees one tool, `starlark`, with
-  one argument, `script`. Its description holds the `value, err` rule, the naming rules, every built-in's
+  two arguments, `script` and `intention_list`. Its description holds the `value, err` rule, the naming rules, every built-in's
   signature, the globals and the error codes, built from the code so it never drifts. External MCP
   servers come later.
+- **Every step says what it is for, in an `intention_list`, chosen by the author:** `[{"intention":
+  "Posting the new meeting time", "chat_list": [team]}, {"intention": "Telling Sara it is done",
+  "chat_list": [sara]}]`. At least one entry; each intention at most 140 characters; a `chat_list` item is
+  a chat id or `{chat, topic?, thread?}`; a chat in at most one entry, so it never sees two texts for one
+  step; an empty `chat_list` is kept in the log only. Each entry is sent to each of its chats as an
+  `activity` message, a content kind of its own (see Agent accounts in the root AGENTS.md), when the
+  step starts, and the list is saved on the step. **The model writes one text per audience**, since one
+  run can work on a private chat and a group at once and a text written for both would carry one into
+  the other. **`keryx.activity(text, chat_list)` sends more mid-script, chosen by the author.** **Writes are
+  not held to the named chats, chosen by the author:** a chat no entry names simply sees no intention
+  for that step.
 - **A step's output is everything the script printed and the list of actions it took, chosen by the
   author**, appended to the loop's context and saved. **Every side effect is an action, chosen by the
   author:** each keryx write with its result (seq, queued or err), each HTTP call as method, host, path
@@ -277,7 +333,11 @@ agent/tests/            integration tests, the fake LLM, and AGENTS.md with the 
 - **Long-term memory is borhan-like and searched only, chosen by the author**, in the same tantivy index
   as its own kind. Each note records its source, the chat, sender and run, and shows it when read back.
   Nothing is put into a wake on its own, since a note planted through a chat would then steer every
-  wake. **At most `[limits] memory_notes = 10000` of `memory_note = "16KiB"`, chosen by the author**;
+  wake. **Besides the global memory, each chat has its own, chosen by the author**, through the same
+  functions with `chat=`, and searched only as well. **The preamble hints what is there, chosen by the
+  author:** for the global memory and each chat whose events are shown, its note count and its
+  `[memory] hint_words = 10` most common words from the index's lexicon, 0 turning the words off, so the
+  model knows when to search. **At most `[limits] memory_notes = 10000` of `memory_note = "16KiB"`, chosen by the author**;
   past the count, `memory.add` returns `memory_full`.
 - **Files, chosen by the author:** the file functions write and remove only in `tmp/`, and read in
   `tmp/` and in `chats/<chat id>/`, where chat files are kept per conversation. `keryx.send_files` and
@@ -329,6 +389,8 @@ keryx.delete(chat, seq)
 keryx.seen(chat, seq)
 keryx.download(chat, seq, file=None) -> {path, name, type, size}
   under chats/<chat id>/; file is required when the message has several
+keryx.activity(text, chat_list) -> {seqs: {chat: seq}}   one activity message to each chat, as a
+  step's intention_list sends; a chat_list item is a chat id or {chat, topic?, thread?}
 
 # keryx: questions and folder suggestions
 keryx.question(chat, first, nodes, text=None, topic=None, thread=None, reply=None)
@@ -368,10 +430,11 @@ search.message_list(query, chat=None, folder=None, topic=None, thread=None, send
   plain index on: borhan's query syntax and coverage; off: plain text folded as the apps fold, newest first
 log.run_list(query=None, since=None, until=None, limit=20)
   -> {run_list: [{id, started_at, ended_at, outcome, snippet}], more}
-log.run(id) -> {id, started_at, ended_at, outcome, event_list, step_list: [{n, script, output, at}]}
-memory.add(text) -> {id}
-memory.note_list(query=None, limit=20)
-  -> {note_list: [{id, text, source: {chat, sender, run}, at}], more}      query None: the newest
+log.run(id) -> {id, started_at, ended_at, outcome, event_list,
+                step_list: [{n, intention_list, script, output, at}]}
+memory.add(text, chat=None) -> {id}                      chat None: the global memory
+memory.note_list(query=None, chat=None, limit=20)
+  -> {note_list: [{id, chat, text, source: {chat, sender, run}, at}], more}  query None: the newest
 memory.note(id)    memory.replace(id, text)    memory.delete(id)
 skills.read(name, ...)                                   prints each skill
 skills.skill_list() -> {skill_list: [{name, description}], more}
@@ -434,6 +497,9 @@ around = 20                          # nearby messages per event
 [search]
 plain = false
 
+[memory]
+hint_words = 10                      # most common words per memory in the preamble. 0: counts only
+
 # [skills]
 # directory = "/var/lib/keryx-agent/skills"
 # writable = false
@@ -449,6 +515,7 @@ memory_notes = 10000
 memory_note = "16KiB"
 storage = "10GiB"
 storage_warn = 0.8
+runs_keep = "90d"                    # run logs older than this go. Unset: kept until removed
 
 # [http]
 # allow = ["api.github.com"]         # unset: any host. A list, even empty: only those
@@ -482,4 +549,5 @@ action = "wake"
 - The built-in default texts of the compaction prompt, the limit prompt and the preamble, and the
   `starlark` tool's description: written with the code, for the author's approval before they are kept
 - The words of each trouble reason in its presence text
+- Whether `memory_notes` counts all notes together or each memory on its own
 - The Responses API, and calling external MCP servers from scripts, when they come

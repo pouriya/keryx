@@ -216,7 +216,7 @@ the WASM build, because there is one `Cargo.lock`. Make targets stay inside
   is a recorded note, chosen by the author.** It is numbered 4, right after image, and every kind
   from video on moved up one, so the numbers are text 0, voice 1, reaction 2, image 3, music 4,
   video 5, doc 6, file 7, call 8, media_bundle 9, question 10, answer 11, sticker 12, suggestion 13 and
-  ack 14.
+  ack 14 and activity 15.
 - **A reaction is content.** It does not affect the unread count, but it brings the chat up in
   the sorted list and shows as the preview, like "Sara reacted 👍", until the next message.
 - **A recording, when it is built, is saved at the lowest quality for now:**
@@ -2501,8 +2501,9 @@ store their words. How `keryx-agent` itself works is in [agent/AGENTS.md](agent/
   bio, and never its master key, so a stolen owner phone cannot register a device as the agent.
   **Disabling is done by the server**: the token is revoked, its sessions end, and the agent leaves every
   group and channel as a leave does, members committing its MLS removal, which clients already trust the
-  server for. The account and device stay for old signatures. The owner cannot read the agent's chats
-  unless they are in them.
+  server for. The account and device stay for old signatures. The owner's app cannot read the agent's
+  chats unless the owner is in them, but whoever runs the agent's container holds its `agent.db` and
+  reads every chat it is in.
 - **An agent has one device**, which it replaces itself when its container starts with no data: see
   agent/AGENTS.md. **The server enforces it and tells the owner, chosen by the author:** an agent
   registers a new device only after its old one is ended, and the server writes a notice into the
@@ -2514,6 +2515,17 @@ store their words. How `keryx-agent` itself works is in [agent/AGENTS.md](agent/
 - **Anyone may start a direct chat with an agent or add it to a group**, as with any account. The agent's
   wake rules decide whether it acts.
 - **Others see an agent badge, and its owner only once the owner chooses to show it**, hidden by default.
+- **An agent says what it is doing with `activity` messages, content kind 15, chosen by the author:** each
+  step's intention, written for that chat, is one message. **Its rules are a question's, chosen by the
+  author:** encrypted and signed, `message.send.activity` under each chat type's prefix, held by member,
+  moderator and admin, `[limits.body] activity = "1KiB"`, refused for edits with `cannot_edit`, deletable,
+  and clients have no way to send one while nothing refuses one. **It is a stored message, chosen by the
+  author:** it counts as unread, moves the chat up and is the preview, its text. In a channel's main
+  list it needs `channel.message.post`, as any post does. **Clients fold activity messages in a row from
+  the same account into one expandable list, chosen by the author**; another message or another
+  sender between them starts a new one, so an agent working while people talk reads activity, message,
+  activity by seq. There is no live, unsaved activity event: the message itself arrives as each step
+  starts.
 - **The server side, approved as drafted:**
 
   ```
@@ -2661,6 +2673,7 @@ first, as everywhere.
 **Accounts**
 
 - The owner's notice of a new agent device: its message kind and body, and who may remove it
+- An `activity` message's plaintext, and how core checks its 140 characters
 - Android's Agents page: its design, drawn first, once the agent has proved itself
 - Rate limits. None in the first build: operators who expose a server turn on `[captcha]`, which
   runs before Argon2, and a server without one can be guessed against at Argon2's speed
