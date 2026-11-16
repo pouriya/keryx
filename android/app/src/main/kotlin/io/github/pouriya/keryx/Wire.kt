@@ -231,6 +231,12 @@ sealed interface Command {
         val chat: String,
         val text: String,
         val reply: Pointer? = null,
+        /** A group's or channel's topic, none for General. */
+        val topic: String? = null,
+        /** The main-list message whose thread this goes in. */
+        val thread: Long? = null,
+        /** The members the text names as `@username`, kept inside the encryption. */
+        val mentions: List<String> = emptyList(),
     ) : Command
 
     /** Keeps this chat's draft, or clears it with none. Best effort: nothing waits to be sent. */
@@ -254,12 +260,13 @@ sealed interface Command {
         val default: String,
     ) : Command
 
-    /** When each other member received and saw one message, answered as `Event.Times`. */
+    /** When each other member received and saw one message, answered as `Event.Times`, a page at a time. */
     @Serializable
     @SerialName("times")
     data class Times(
         val chat: String,
         val seq: Long,
+        val after: String? = null,
     ) : Command
 
     /** One file, or up to 20 images and videos as a bundle, with an optional caption. */
@@ -269,6 +276,8 @@ sealed interface Command {
         val chat: String,
         val files: List<FileSpec>,
         val text: String? = null,
+        val topic: String? = null,
+        val thread: Long? = null,
     ) : Command
 
     /** Fetches a shown file into `handle`. The ffi puts the file's key back in. */
@@ -300,6 +309,8 @@ sealed interface Command {
     data class Seen(
         val chat: String,
         val up_to_seq: Long,
+        val topic: String? = null,
+        val thread: Long? = null,
     ) : Command
 
     @Serializable
@@ -307,6 +318,8 @@ sealed interface Command {
     data class Typing(
         val chat: String,
         val on: Boolean,
+        val topic: String? = null,
+        val thread: Long? = null,
     ) : Command
 
     @Serializable
@@ -371,6 +384,8 @@ sealed interface Command {
         val chat: String,
         val sticker: String,
         val reply: Pointer? = null,
+        val topic: String? = null,
+        val thread: Long? = null,
     ) : Command
 
     /** One emoji on the message at `on`, refused by core as `bad_emoji` unless the `emojis` crate knows it. */
@@ -494,7 +509,375 @@ sealed interface Command {
         val username: String? = null,
         val password: String? = null,
     ) : Command
+
+    /** A group (2) or channel (3), made with this account as its owner, answered with `started` then `chat_ready`. */
+    @Serializable
+    @SerialName("create_chat")
+    data class CreateChat(
+        val chat_type: Int,
+        val name: String,
+        val bio: String? = null,
+        val link_list: List<ProfileLink> = emptyList(),
+        val account_list: List<String> = emptyList(),
+        val topics: Boolean? = null,
+        val findable: Boolean = false,
+        val options: ChatOptions = ChatOptions(),
+        val photo: PhotoInput? = null,
+        val note: String? = null,
+    ) : Command
+
+    /** A group's or channel's new photo. */
+    @Serializable
+    @SerialName("chat_photo")
+    data class ChatPhoto(
+        val chat: String,
+        @Serializable(with = Octets::class) val jpeg: ByteArray,
+        val thumbnail: Thumbnail,
+    ) : Command
+
+    /** The photo a group's or channel's profile names, opened, answered as `Event.ChatPhoto`. */
+    @Serializable
+    @SerialName("chat_photo_get")
+    data class ChatPhotoGet(
+        val chat: String,
+    ) : Command
+
+    /** Adds people, turning an add someone refused into an invitation carrying `note`. */
+    @Serializable
+    @SerialName("add_members")
+    data class AddMembers(
+        val chat: String,
+        val account_list: List<String>,
+        val note: String? = null,
+    ) : Command
+
+    @Serializable
+    @SerialName("remove_members")
+    data class RemoveMembers(
+        val chat: String,
+        val account_list: List<String>,
+    ) : Command
+
+    /** `owner`, `moderator` or `member`. */
+    @Serializable
+    @SerialName("set_role")
+    data class SetRole(
+        val chat: String,
+        val account: String,
+        val role: String,
+    ) : Command
+
+    @Serializable
+    @SerialName("leave")
+    data class Leave(
+        val chat: String,
+    ) : Command
+
+    /** Removes a whole group or channel for everyone. Owners only. */
+    @Serializable
+    @SerialName("remove_chat")
+    data class RemoveChat(
+        val chat: String,
+    ) : Command
+
+    @Serializable
+    @SerialName("ask_to_join")
+    data class AskToJoin(
+        val chat: String,
+        val note: String? = null,
+    ) : Command
+
+    @Serializable
+    @SerialName("cancel_ask")
+    data class CancelAsk(
+        val chat: String,
+    ) : Command
+
+    @Serializable
+    @SerialName("let_in")
+    data class LetIn(
+        val chat: String,
+        val account: String,
+    ) : Command
+
+    @Serializable
+    @SerialName("decline_ask")
+    data class DeclineAsk(
+        val chat: String,
+        val account: String,
+    ) : Command
+
+    /** The chat's waiting join requests, answered as `Event.Requests`. */
+    @Serializable
+    @SerialName("requests")
+    data class Requests(
+        val chat: String,
+    ) : Command
+
+    @Serializable
+    @SerialName("answer_invite")
+    data class AnswerInvite(
+        val chat: String,
+        val accept: Boolean,
+    ) : Command
+
+    /** A new topic's id, answered as `Event.TopicId`. */
+    @Serializable
+    @SerialName("topic_id")
+    data class TopicId(
+        val chat: String,
+    ) : Command
+
+    /** The members and their roles, answered as `Event.Members`. */
+    @Serializable
+    @SerialName("members")
+    data class Members(
+        val chat: String,
+    ) : Command
+
+    /** Whether topics show, and every topic with its name, General not listed. */
+    @Serializable
+    @SerialName("topics")
+    data class Topics(
+        val chat: String,
+        val on: Boolean,
+        val topic_list: List<TopicName>,
+    ) : Command
+
+    /** A group's or channel's name, bio, links and rules, keeping its photo and topics. */
+    @Serializable
+    @SerialName("chat_profile")
+    data class ChatProfile(
+        val chat: String,
+        val name: String,
+        val bio: String? = null,
+        val link_list: List<ProfileLink> = emptyList(),
+        val rules: String? = null,
+    ) : Command
+
+    /** A topic's bio, links and rules, General's under [GENERAL_TOPIC], keeping its photo. */
+    @Serializable
+    @SerialName("topic_profile")
+    data class TopicProfile(
+        val chat: String,
+        val topic: String,
+        val bio: String? = null,
+        val link_list: List<ProfileLink> = emptyList(),
+        val rules: String? = null,
+    ) : Command
+
+    /** A topic's new photo, which goes up as one of the chat's files. */
+    @Serializable
+    @SerialName("topic_photo")
+    data class TopicPhoto(
+        val chat: String,
+        val topic: String,
+        @Serializable(with = Octets::class) val jpeg: ByteArray,
+        val thumbnail: Thumbnail,
+    ) : Command
+
+    /** The photo a topic's profile names, opened, answered as `Event.TopicPhoto`. */
+    @Serializable
+    @SerialName("topic_photo_get")
+    data class TopicPhotoGet(
+        val chat: String,
+        val topic: String,
+    ) : Command
+
+    /** A topic's own options: what members may send there, slow mode, who writes, closed and hidden. */
+    @Serializable
+    @SerialName("topic_options")
+    data class TopicOptions(
+        val chat: String,
+        val topic: String,
+        val options: TopicOptionsBody,
+    ) : Command
+
+    /** Makes a member a topic's moderator, or a member there again: `moderator` or `member`. Owners only. */
+    @Serializable
+    @SerialName("topic_role")
+    data class TopicRole(
+        val chat: String,
+        val topic: String,
+        val account: String,
+        val role: String,
+    ) : Command
+
+    /** History rows read from the archive, answered as one `Event.ChatEventShown` each with its copies opened. */
+    @Serializable
+    @SerialName("open_history")
+    data class OpenHistory(
+        val chat: String,
+        val event_list: List<ChatEvent>,
+    ) : Command
+
+    @Serializable
+    @SerialName("chat_options")
+    data class SetOptions(
+        val chat: String,
+        val options: ChatOptions,
+    ) : Command
+
+    @Serializable
+    @SerialName("findable")
+    data class Findable(
+        val chat: String,
+        val findable: Boolean,
+        val name: String? = null,
+        val bio: String? = null,
+    ) : Command
 }
+
+@Serializable
+data class PhotoInput(
+    @Serializable(with = Octets::class) val jpeg: ByteArray,
+    val thumbnail: Thumbnail,
+)
+
+/** What a group's or channel's members may do beyond the built-in member role, and slow mode in seconds. */
+@Serializable
+data class ChatOptions(
+    val allow: List<String> = emptyList(),
+    val deny: List<String> = emptyList(),
+    val slow_mode: Long? = null,
+)
+
+/** General's id where its own settings and profile are kept: all zeros. Its messages carry no topic. */
+internal const val GENERAL_TOPIC = "00000000000000000000000000"
+
+/** A topic's own options, starting from the group's: permission names without their prefix, slow mode in
+ * seconds, who writes in its main list (`everyone` or `moderators`), and whether it is closed or hidden. */
+@Serializable
+data class TopicOptionsBody(
+    val allow: List<String> = emptyList(),
+    val deny: List<String> = emptyList(),
+    val slow_mode: Long? = null,
+    val write: String = "everyone",
+    val closed: Boolean = false,
+    val hidden: Boolean = false,
+)
+
+/** A topic's settings as a chats entry lists them, General's under [GENERAL_TOPIC]: its options and moderators. */
+@Serializable
+data class TopicSetting(
+    val topic: String,
+    val allow: List<String> = emptyList(),
+    val deny: List<String> = emptyList(),
+    val slow_mode: Long? = null,
+    val write: String = "everyone",
+    val closed: Boolean = false,
+    val hidden: Boolean = false,
+    val mod_list: List<String> = emptyList(),
+) {
+    val options get() = TopicOptionsBody(allow, deny, slow_mode, write, closed, hidden)
+}
+
+@Serializable
+data class ShownTopicProfile(
+    val bio: String? = null,
+    val link_list: List<ProfileLink> = emptyList(),
+    val rules: String? = null,
+    val photo: ShownChatPhoto? = null,
+    val version: Long = 0,
+)
+
+@Serializable
+data class TopicName(
+    val id: String,
+    val name: String,
+    val place: Long = 0,
+)
+
+/** This account's seen position in a topic or a thread. */
+@Serializable
+data class PlaceSeen(
+    val topic: String? = null,
+    val thread_seq: Long? = null,
+    val seen_seq: Long,
+)
+
+@Serializable
+data class FindableItem(
+    val name: String,
+    val bio: String? = null,
+)
+
+/** A findable group or channel the directory found. */
+@Serializable
+data class FoundChat(
+    val chat: String,
+    val type: Int,
+    val name: String,
+    val bio: String? = null,
+    val member_count: Long,
+)
+
+@Serializable
+data class ShownChatPhoto(
+    val id: String,
+    val blurhash: String,
+)
+
+@Serializable
+data class ShownChatProfile(
+    val name: String,
+    val bio: String? = null,
+    val link_list: List<ProfileLink> = emptyList(),
+    val rules: String? = null,
+    val topic_list: List<TopicName> = emptyList(),
+    val photo: ShownChatPhoto? = null,
+    val version: Long = 0,
+)
+
+/** One member and its role: `owner`, `moderator` or `member`. */
+@Serializable
+data class MemberItem(
+    val account: String,
+    val role: String,
+)
+
+/** A join request. State: `waiting`, `declined`, `gone` or `let_in`. */
+@Serializable
+data class RequestItem(
+    val chat: String,
+    val account: String,
+    val name: String? = null,
+    val note: String? = null,
+    val state: String,
+    val at: Long,
+)
+
+@Serializable
+data class InvitationShown(
+    val type: Int,
+    val inviter: String,
+    val name: String? = null,
+    val blurhash: String? = null,
+    val note: String? = null,
+    val at: Long,
+)
+
+/**
+ * Something the server wrote in a group or channel. Actions: 0 created, 1 added, 2 removed, 3 left,
+ * 4 let in, 5 joined, 6 made owner, 7 made moderator, 8 made member, 9 deleted, 10 topic added,
+ * 11 topic removed, 12 topics on, 13 topics off, 14 invitation declined, 15 chat removed, 16 topic
+ * edited, 17 topic options, 18 made topic moderator, 19 made topic member, 20 edited. Audience:
+ * 0 everyone, live only, 1 owners and moderators, 2 one account. `topic` is the topic whose history
+ * it is in, and `copy_list` a delete's or edit's sealed copies, kept as the server sent them.
+ */
+@Serializable
+data class ChatEvent(
+    val chat: String,
+    val n: Long,
+    val actor: String,
+    val action: Int,
+    val target: String? = null,
+    val seq: Long? = null,
+    val topic: String? = null,
+    val audience: Int,
+    val server_at: Long,
+    val copy_list: List<MessageFrame> = emptyList(),
+)
 
 /** One link on a profile: its name, and an address starting with https:// or http://. */
 @Serializable
@@ -781,6 +1164,7 @@ sealed interface Input {
         val id: Long,
         val message_list: List<MessageFrame>,
         val call_list: List<CallRow>,
+        val chat_event_list: List<ChatEvent> = emptyList(),
     ) : Input
 }
 
@@ -903,6 +1287,7 @@ sealed interface Output {
         val id: Long,
         val message_list: List<MessageFrame>,
         val call_list: List<CallRow>,
+        val chat_event_list: List<ChatEvent> = emptyList(),
     ) : Output
 
     /** Read up to `limit` messages of every chat, newest first, below `before`, and answer with `rows_scanned`. */
@@ -964,6 +1349,8 @@ data class MessageFrame(
     val encrypted: Boolean? = null,
     val epoch: Long? = null,
     val pointer_seq: Long? = null,
+    val topic: String? = null,
+    val thread_seq: Long? = null,
     val client_sent_at: Long? = null,
     val server_saved_at: Long? = null,
     val body: String? = null,
@@ -1011,7 +1398,6 @@ data class CallRow(
 data class ChatItem(
     val chat: String,
     val type: Int,
-    val mode: Int,
     val last_seq: Long? = null,
     val last_kind: Int? = null,
     val last_at: Long? = null,
@@ -1020,6 +1406,20 @@ data class ChatItem(
     val last_content: MessageFrame? = null,
     val mark_list: List<MarkItem> = emptyList(),
     val seen_seq: Long? = null,
+    /** A group's or channel's: this account's role there, `owner`, `moderator` or `member`. */
+    val role: String? = null,
+    val topics_on: Boolean = false,
+    /** Its live topics in order, General not listed. */
+    val topic_list: List<String> = emptyList(),
+    /** Its topics' own settings, General's first; a hidden one left out for those who may not see it. */
+    val topic_setting_list: List<TopicSetting> = emptyList(),
+    /** This account's seen positions in topics and threads it has read in. */
+    val place_seen_list: List<PlaceSeen> = emptyList(),
+    val options: ChatOptions? = null,
+    val findable: FindableItem? = null,
+    val member_count: Long? = null,
+    /** How many join requests wait, set only for an account that may let people in. */
+    val request_count: Long? = null,
 )
 
 /** One folder: `all` is the one with no name and no `chat_list`. Pins are first on top. */
@@ -1057,6 +1457,12 @@ data class Shown(
     /** A reaction's emoji, with the sequence id of the message it is on in `on`. */
     val emoji: String? = null,
     val on: Long? = null,
+    /** A group's or channel's topic, none for General. */
+    val topic: String? = null,
+    /** The main-list message whose thread this is in. */
+    val thread_seq: Long? = null,
+    /** The accounts the text mentions. */
+    val mentions: List<String> = emptyList(),
     val problem: String? = null,
 )
 
@@ -1229,6 +1635,20 @@ sealed interface Event {
         val problem: String? = null,
     ) : Event
 
+    /** A membership line the server wrote in a group: `action` is a word, the actor `account`. */
+    @Serializable
+    @SerialName("line")
+    data class Line(
+        val chat: String,
+        val seq: Long,
+        val device: String,
+        val account: String,
+        val action: String,
+        val account_list: List<String> = emptyList(),
+        val saved_at: Long,
+        val mine: Boolean,
+    ) : Event
+
     @Serializable
     @SerialName("page_loaded")
     data class PageLoaded(
@@ -1252,6 +1672,8 @@ sealed interface Event {
         val emoji: String? = null,
         /** An ack, so its suggestion shows handled at once. */
         val ack: Ack? = null,
+        val topic: String? = null,
+        val thread: Long? = null,
     ) : Event
 
     @Serializable
@@ -1269,6 +1691,8 @@ sealed interface Event {
         val chat: String,
         val local: Long,
         val code: String,
+        /** For `slow_mode`, the seconds left. */
+        val seconds: Long? = null,
     ) : Event
 
     @Serializable
@@ -1284,6 +1708,7 @@ sealed interface Event {
         val chat: String,
         val seq: Long,
         val member_list: List<TimesItem>,
+        val more: Boolean = false,
     ) : Event
 
     /** This chat's draft, from the list or from another device, or none once cleared. */
@@ -1316,6 +1741,8 @@ sealed interface Event {
         val chat: String,
         val account: String,
         val on: Boolean,
+        val topic: String? = null,
+        val thread: Long? = null,
     ) : Event
 
     @Serializable
@@ -1341,6 +1768,7 @@ sealed interface Event {
     @SerialName("search_results")
     data class SearchResults(
         val account_list: List<AccountBrief>,
+        val chat_list: List<FoundChat> = emptyList(),
     ) : Event
 
     /** What one read of the archive found, and how far the search has looked. */
@@ -1469,6 +1897,126 @@ sealed interface Event {
     data class TransferFailed(
         val handle: Long,
         val code: String,
+    ) : Event
+
+    /** A chat event, a delete's or edit's copies opened, oldest first. */
+    @Serializable
+    @SerialName("chat_event")
+    data class ChatEventShown(
+        val event: ChatEvent,
+        val copy_list: List<Shown> = emptyList(),
+    ) : Event
+
+    @Serializable
+    @SerialName("requests")
+    data class Requests(
+        val chat: String,
+        val request_list: List<RequestItem>,
+    ) : Event
+
+    /** Someone asked to join, or took it back, or this account's own request as another device sent it. */
+    @Serializable
+    @SerialName("join_request")
+    data class JoinRequest(
+        val request: RequestItem,
+    ) : Event
+
+    /** This account's own join request: `waiting`, `declined`, `gone` or `let_in`. */
+    @Serializable
+    @SerialName("asked")
+    data class Asked(
+        val chat: String,
+        val name: String? = null,
+        val state: String,
+        val at: Long,
+    ) : Event
+
+    /** An invitation to this account, or none once it is gone. */
+    @Serializable
+    @SerialName("invitation")
+    data class Invitation(
+        val chat: String,
+        val invitation: InvitationShown? = null,
+    ) : Event
+
+    @Serializable
+    @SerialName("members")
+    data class Members(
+        val chat: String,
+        val member_list: List<MemberItem>,
+    ) : Event
+
+    @Serializable
+    @SerialName("topic_id")
+    data class TopicId(
+        val chat: String,
+        val topic: String,
+    ) : Event
+
+    @Serializable
+    @SerialName("topics")
+    data class Topics(
+        val chat: String,
+        val on: Boolean,
+        val topic_list: List<TopicName>,
+    ) : Event
+
+    @Serializable
+    @SerialName("chat_profile")
+    data class ChatProfile(
+        val chat: String,
+        val profile: ShownChatProfile,
+    ) : Event
+
+    /** The opened JPEG of a group's or channel's photo, as base64. */
+    @Serializable
+    @SerialName("chat_photo")
+    data class ChatPhoto(
+        val chat: String,
+        val photo: String,
+        val bytes: String,
+    ) : Event
+
+    /** A topic's own options and moderators; one hidden from this account comes hidden with nothing else. */
+    @Serializable
+    @SerialName("topic_options")
+    data class TopicOptions(
+        val chat: String,
+        val topic: String,
+        val options: TopicOptionsBody,
+        val mod_list: List<String> = emptyList(),
+    ) : Event
+
+    @Serializable
+    @SerialName("topic_profile")
+    data class TopicProfile(
+        val chat: String,
+        val topic: String,
+        val profile: ShownTopicProfile,
+    ) : Event
+
+    /** The opened JPEG of a topic's photo, as base64. */
+    @Serializable
+    @SerialName("topic_photo")
+    data class TopicPhoto(
+        val chat: String,
+        val topic: String,
+        val photo: String,
+        val bytes: String,
+    ) : Event
+
+    @Serializable
+    @SerialName("chat_options")
+    data class ChatOptionsShown(
+        val chat: String,
+        val options: ChatOptions,
+    ) : Event
+
+    @Serializable
+    @SerialName("findable")
+    data class Findable(
+        val chat: String,
+        val findable: FindableItem? = null,
     ) : Event
 
     @Serializable

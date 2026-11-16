@@ -1492,7 +1492,7 @@ private fun SheetOption(
 }
 
 /** A picked picture, turned upright by its EXIF, at most 2048 pixels on its longer side. */
-private fun forCrop(
+internal fun forCrop(
     context: Context,
     uri: Uri,
 ): Bitmap? =
@@ -1512,7 +1512,7 @@ private fun forCrop(
     }
 
 /** The square as a JPEG under the limit, and its pixels small for the BlurHash. */
-private fun encode(square: Bitmap): Pair<ByteArray?, Thumbnail> {
+internal fun encode(square: Bitmap): Pair<ByteArray?, Thumbnail> {
     val thumbnail = thumbnailOf(Bitmap.createScaledBitmap(square, 32, 32, true))
     for (quality in listOf(90, 80, 70, 60)) {
         val out = ByteArrayOutputStream()
@@ -1527,7 +1527,7 @@ private fun encode(square: Bitmap): Pair<ByteArray?, Thumbnail> {
  * cannot be moved or zoomed out past the square's edges. Done hands back the square at 640x640.
  */
 @Composable
-private fun Crop(
+internal fun Crop(
     source: Bitmap,
     onCancel: () -> Unit,
     onDone: (Bitmap) -> Unit,

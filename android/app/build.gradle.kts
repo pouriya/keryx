@@ -42,6 +42,9 @@ android {
     lint {
         warningsAsErrors = true
         abortOnError = true
+        // Newer library versions wait until groups are committed, chosen by the author; the upgrade
+        // is on android/AGENTS.md's Open list.
+        disable += "GradleDependency"
     }
 }
 

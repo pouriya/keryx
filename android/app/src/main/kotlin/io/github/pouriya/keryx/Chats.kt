@@ -41,6 +41,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
@@ -496,6 +497,30 @@ internal class ChatRows {
             )
     }
 
+    /** A membership line: content like text, moving its chat up with its words as the preview. */
+    fun line(
+        event: Event.Line,
+        preview: String,
+    ) {
+        val index = rows.indexOfFirst { it.id == event.chat }
+        if (index < 0) return
+        val row = rows[index]
+        if (row.lastSeq != null && event.seq < row.lastSeq && !row.waiting) return
+        val next =
+            row.copy(
+                lastAt = event.saved_at,
+                lastSeq = event.seq,
+                preview = preview,
+                // A line is the server's, not a message sent, so it shows no marks, as drawn in `tmp/design/groups.html`.
+                mine = false,
+                waiting = false,
+                callVideo = null,
+                suggests = false,
+            )
+        rows.removeAt(index)
+        rows.add(0, next)
+    }
+
     /** A new device's notice as the self chat's preview, while nothing newer is there. */
     fun notice(
         event: Event.Notice,
@@ -577,6 +602,7 @@ private const val CALL = 8
 private const val SELF = 0
 private const val DIRECT = 1
 private const val GROUP = 2
+private const val CHANNEL = 3
 private const val FILTER_AFTER = 300L
 private const val TOAST_FOR = 3000L
 private const val MAX_FOLDERS = 20
@@ -607,10 +633,19 @@ internal fun Chats(
     onProfile: (String) -> Unit,
     onAnswer: (Shown) -> Unit,
     onDecline: (Shown) -> Unit,
+    onNew: () -> Unit = {},
+    newOpen: Boolean = false,
+    onRequests: (String) -> Unit = {},
+    onInvitation: (String) -> Unit = {},
+    onAsked: (String) -> Unit = {},
+    onFound: (FoundChat) -> Unit = {},
 ) {
     val dark = isDark()
     val ink = ink()
     val accentText = if (dark) Color(0xFFC5D4E8) else accent
+    val groups = LocalGroups.current?.state
+    // A chat just made here stays tinted until it is opened or the list is left, chosen by the author.
+    DisposableEffect(groups) { onDispose { groups?.fresh = null } }
     var open by remember { mutableStateOf(false) }
     var query by remember { mutableStateOf("") }
     var applied by remember { mutableStateOf("") }
@@ -777,12 +812,27 @@ internal fun Chats(
                 val ring = if (applied.isNotEmpty() && search.text == applied && !search.done) search.percent else null
                 SearchRow(query, busy, ring, ink, focus, { query = it }, ::closeSearch)
             } else {
-                TitleRow(title, connected, ink, { me?.let(onProfile) }) { open = true }
+                TitleRow(title, connected, newOpen, ink, { me?.let(onProfile) }, onNew) { open = true }
+            }
+            // The tabs sit at the top, under the title row, chosen by the author.
+            if (arrangement != null && !open) {
+                Tabs(
+                    arrangement,
+                    here?.id,
+                    rows,
+                    unread,
+                    ink,
+                    accentText,
+                    dark,
+                    longPress = !selecting,
+                    onTab = { folders.tab = it },
+                    onLong = { folders.openSheet() },
+                )
             }
             ringing?.let { call ->
                 Incoming(call, { onAnswer(call) }, { onDecline(call) })
             }
-            val listInsets = if (arrangement == null) Modifier.windowInsetsPadding(WindowInsets.navigationBars) else Modifier
+            val listInsets = if (selecting) Modifier else Modifier.windowInsetsPadding(WindowInsets.navigationBars)
             if (open) {
                 SearchBody(
                     applied,
@@ -817,10 +867,43 @@ internal fun Chats(
                         closeSearch()
                         onHit(hit)
                     },
+                    onFound = { chat ->
+                        closeSearch()
+                        onFound(chat)
+                    },
                 )
             } else {
                 LazyColumn(Modifier.weight(1f).then(listInsets), state = listState) {
-                    if (shown.isEmpty() && strangers.isEmpty()) {
+                    // Invitations and join requests waiting are rows of their own, in All, chosen by the author.
+                    if (groups != null && !selecting && !filtering && inAll) {
+                        val listed = rows.map { it.id }.toSet()
+                        items(groups.invitations.keys.filter { it !in listed }.toList(), key = { "invite-$it" }) { chat ->
+                            val invitation = groups.invitations[chat]
+                            WaitingRow(
+                                chat,
+                                invitation?.name.orEmpty(),
+                                stringResource(R.string.group_invited_you, personName(invitation?.inviter, people)),
+                                invitation?.blurhash,
+                                invitation?.at,
+                                ink,
+                            ) { onInvitation(chat) }
+                        }
+                        items(groups.asked.keys.filter { it !in listed }.toList(), key = { "asked-$it" }) { chat ->
+                            val asked = groups.asked[chat]
+                            WaitingRow(
+                                chat,
+                                asked?.name.orEmpty(),
+                                stringResource(
+                                    if (asked?.state == "declined") R.string.group_declined_row else R.string.group_request_sent,
+                                ),
+                                null,
+                                asked?.at,
+                                ink,
+                            ) { onAsked(chat) }
+                        }
+                    }
+                    val waiting = groups != null && (groups.invitations.isNotEmpty() || groups.asked.isNotEmpty())
+                    if (shown.isEmpty() && strangers.isEmpty() && !waiting) {
                         item {
                             Text(
                                 stringResource(R.string.no_chats),
@@ -864,6 +947,9 @@ internal fun Chats(
                             me,
                             unread[row.id] ?: 0,
                             row.id in pins,
+                            (groups?.unread?.mentions?.get(row.id) ?: 0) > 0,
+                            groups != null && (groups.info(row.id)?.requestCount ?: 0) > 0 && groups.mayAdd(row.id),
+                            { onRequests(row.id) },
                             ink,
                             accentText,
                             selecting,
@@ -871,6 +957,7 @@ internal fun Chats(
                             handle,
                             place.onSizeChanged { if (dragging || rowHeight == 0) rowHeight = it.height },
                             onProfile,
+                            fresh = groups?.fresh == row.id,
                             onLongClick = {
                                 folders.startEdit()
                                 if (folders.edit != null && row.id !in selected) selected.add(row.id)
@@ -882,6 +969,7 @@ internal fun Chats(
                             } else {
                                 // Back from a chat opened through search lands on the first folder holding it.
                                 if (filtering) arrangement?.holding(row.id)?.let { folders.tab = it }
+                                if (groups?.fresh == row.id) groups.fresh = null
                                 onOpen(row)
                             }
                         }
@@ -911,20 +999,6 @@ internal fun Chats(
                     onMove = { moving = true },
                     onRemove = { act { it.takeOut(here.id, chosen) } },
                     onNew = { newFolder(chosen) },
-                )
-            }
-            if (arrangement != null && !open) {
-                Tabs(
-                    arrangement,
-                    here?.id,
-                    rows,
-                    unread,
-                    ink,
-                    accentText,
-                    dark,
-                    longPress = !selecting,
-                    onTab = { folders.tab = it },
-                    onLong = { folders.openSheet() },
                 )
             }
         }
@@ -1043,8 +1117,10 @@ internal fun statusText(link: Link): String {
 private fun TitleRow(
     title: String,
     connected: Boolean,
+    newOpen: Boolean,
     ink: Ink,
     onMenu: () -> Unit,
+    onNew: () -> Unit,
     onSearch: () -> Unit,
 ) {
     Row(Modifier.fillMaxWidth().height(56.dp).padding(start = 4.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -1058,6 +1134,10 @@ private fun TitleRow(
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
+        // While its menu is open, the + sits on a tinted circle, as drawn in `tmp/design/groups.html`.
+        Box(Modifier.clip(CircleShape).background(if (newOpen) kit().tint else Color.Transparent)) {
+            IconButton(stringResource(R.string.group_new_menu), onNew) { Glyph(Glyphs.plus, ink.text) }
+        }
         IconButton(stringResource(R.string.search), onSearch) { Glass(ink.text) }
     }
 }
@@ -1170,6 +1250,9 @@ private fun Conversation(
     me: String?,
     unread: Int,
     pinned: Boolean,
+    mentioned: Boolean,
+    requests: Boolean,
+    onRequests: () -> Unit,
     ink: Ink,
     accentText: Color,
     selecting: Boolean,
@@ -1177,10 +1260,12 @@ private fun Conversation(
     handle: Modifier?,
     modifier: Modifier,
     onProfile: (String) -> Unit,
+    fresh: Boolean = false,
     onLongClick: () -> Unit,
     onClick: () -> Unit,
 ) {
     val timeColor = if (unread > 0) accentText else ink.muted
+    val tint = kit().tint
     // A direct chat's photo opens that person's profile, not the chat, as root AGENTS.md chose, and
     // Saved messages shows your own photo, which opens your profile.
     val person =
@@ -1192,22 +1277,33 @@ private fun Conversation(
     Row(
         modifier
             .fillMaxWidth()
-            .background(if (selected) accent.copy(alpha = 0.20f) else ink.page)
+            .background(
+                when {
+                    selected -> accent.copy(alpha = 0.20f)
+                    fresh -> tint
+                    else -> ink.page
+                },
+            )
             .combinedClickable(role = Role.Button, onLongClick = onLongClick, onClick = onClick)
             .padding(start = 16.dp, end = if (handle != null) 4.dp else 16.dp, top = 10.dp, bottom = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Box {
-            Avatar(
-                person,
-                name,
-                54.dp,
-                if (person != null) {
-                    Modifier.clip(CircleShape).combinedClickable(role = Role.Button, onLongClick = {}) { onProfile(person) }
-                } else {
-                    Modifier
-                },
-            )
+            val host = LocalGroups.current
+            if ((row.type == GROUP || row.type == CHANNEL) && host != null) {
+                GroupAvatar(row.id, host.state, host.engine, name, 54.dp)
+            } else {
+                Avatar(
+                    person,
+                    name,
+                    54.dp,
+                    if (person != null) {
+                        Modifier.clip(CircleShape).combinedClickable(role = Role.Button, onLongClick = {}) { onProfile(person) }
+                    } else {
+                        Modifier
+                    },
+                )
+            }
             if (row.type == DIRECT && person != null && !(selecting && selected)) {
                 PresenceDot(LocalProfiles.current?.presence?.get(person)?.state, 10.dp, 2.dp, ink.page, Modifier.align(Alignment.BottomEnd))
             }
@@ -1225,6 +1321,10 @@ private fun Conversation(
         }
         Column(Modifier.padding(start = 12.dp).weight(1f)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
+                // A group's or channel's row says which it is before its name, as groups.html draws it.
+                if (row.type == GROUP || row.type == CHANNEL) {
+                    Box(Modifier.padding(end = 4.dp)) { Glyph(if (row.type == GROUP) peopleGlyph else hornGlyph, ink.muted, 16.dp) }
+                }
                 Text(
                     name,
                     Modifier.weight(1f),
@@ -1251,20 +1351,10 @@ private fun Conversation(
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
+                // While join requests wait, those who may let people in see the icon before the count.
+                if (requests && !selecting) RequestsMark(onRequests, 18.dp)
                 if (unread > 0) {
-                    Text(
-                        unread.toString(),
-                        Modifier
-                            .padding(start = 8.dp)
-                            .height(22.dp)
-                            .clip(RoundedCornerShape(11.dp))
-                            .background(accent)
-                            .padding(horizontal = 7.dp),
-                        color = onAccent,
-                        fontSize = 13.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        textAlign = TextAlign.Center,
-                    )
+                    CountPill(unread, mentioned, modifier = Modifier.padding(start = 8.dp))
                 } else if (pinned) {
                     val pinned = stringResource(R.string.chats_pinned)
                     Box(Modifier.padding(start = 8.dp).semantics { contentDescription = pinned }) {
@@ -1295,7 +1385,7 @@ private fun EditBar(
     Row(Modifier.fillMaxWidth().height(56.dp).padding(start = 4.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
         IconButton(stringResource(R.string.chat_cancel), onClose) { Cross(ink.text) }
         Text(
-            stringResource(R.string.chat_selected, count),
+            pluralStringResource(R.plurals.chat_selected, count, count),
             Modifier.weight(1f).padding(start = 6.dp),
             color = ink.text,
             fontSize = 18.sp,
@@ -1338,7 +1428,10 @@ private fun Strip(
     onNew: () -> Unit,
 ) {
     Box(Modifier.fillMaxWidth().height(1.dp).background(ink.line))
-    Row(Modifier.fillMaxWidth().padding(top = 6.dp, bottom = 4.dp), horizontalArrangement = Arrangement.SpaceAround) {
+    Row(
+        Modifier.fillMaxWidth().windowInsetsPadding(WindowInsets.navigationBars).padding(top = 6.dp, bottom = 4.dp),
+        horizontalArrangement = Arrangement.SpaceAround,
+    ) {
         StripButton(
             if (unpin) Glyphs.unpin else Glyphs.pin,
             stringResource(if (unpin) R.string.chats_unpin else R.string.chats_pin),
@@ -1408,72 +1501,73 @@ private fun Tabs(
             right > scroll.value + shownWidth -> scroll.animateScrollTo(right - shownWidth)
         }
     }
-    Column(Modifier.fillMaxWidth().background(ink.page).windowInsetsPadding(WindowInsets.navigationBars)) {
-        Box(Modifier.fillMaxWidth().height(1.dp).background(ink.line))
+
+    @Composable
+    fun FolderTab(folder: Folder) {
+        val chats = folder.chat_list?.toSet()
+        val count = rows.count { (chats == null || it.id in chats) && (unread[it.id] ?: 0) > 0 }
+        val chosen = folder.id == on
         Row(
             Modifier
-                .fillMaxWidth()
-                .onSizeChanged { shownWidth = it.width }
-                .horizontalScroll(scroll)
-                .padding(horizontal = 8.dp, vertical = 6.dp),
-            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                // A short name like All still makes a tab big enough for a thumb, chosen by the author.
+                .widthIn(min = 64.dp)
+                .clip(RoundedCornerShape(10.dp))
+                .background(if (chosen) accent.copy(alpha = if (dark) 0.28f else 0.14f) else Color.Transparent)
+                .combinedClickable(
+                    role = Role.Tab,
+                    onLongClick = if (longPress) onLong else null,
+                ) { onTab(folder.id) }
+                .padding(horizontal = 10.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(5.dp, Alignment.CenterHorizontally),
         ) {
-            for (folder in arrangement.folders) {
-                val chats = folder.chat_list?.toSet()
-                val count = rows.count { (chats == null || it.id in chats) && (unread[it.id] ?: 0) > 0 }
-                val chosen = folder.id == on
+            Text(
+                folder.name ?: allName,
+                Modifier.widthIn(max = 160.dp),
+                color = if (chosen) accentText else ink.muted,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            CountPill(count, false, small = true)
+        }
+    }
+
+    fun unreadIn(folder: Folder): Boolean {
+        val chats = folder.chat_list?.toSet() ?: return false
+        return rows.any { it.id in chats && (unread[it.id] ?: 0) > 0 }
+    }
+    val rest = arrangement.folders.filter { it.name != null }
+    // A tab with unread chats out of sight puts a small blue dot at that edge, chosen by the author.
+    val hiddenStart = rest.any { f -> unreadIn(f) && placed[f.id]?.let { it.last < scroll.value } == true }
+    val hiddenEnd = rest.any { f -> unreadIn(f) && placed[f.id]?.let { it.first > scroll.value + shownWidth } == true }
+    Column(Modifier.fillMaxWidth().background(ink.page)) {
+        Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+            arrangement.all?.let { FolderTab(it) }
+            Box(Modifier.weight(1f).padding(start = 4.dp)) {
                 Row(
                     Modifier
-                        .onPlaced { place ->
-                            val x = place.positionInParent().x.toInt()
-                            val span = x..(x + place.size.width)
-                            if (placed[folder.id] != span) placed[folder.id] = span
-                        }
-                        // A short name like All still makes a tab big enough for a thumb, chosen by the author.
-                        .widthIn(min = 64.dp)
-                        .clip(RoundedCornerShape(10.dp))
-                        .background(if (chosen) accent.copy(alpha = if (dark) 0.28f else 0.14f) else Color.Transparent)
-                        .combinedClickable(
-                            role = Role.Tab,
-                            onLongClick = if (longPress) onLong else null,
-                        ) { onTab(folder.id) }
-                        .padding(horizontal = 10.dp, vertical = 6.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(5.dp, Alignment.CenterHorizontally),
+                        .fillMaxWidth()
+                        .onSizeChanged { shownWidth = it.width }
+                        .horizontalScroll(scroll),
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
-                    Text(
-                        folder.name ?: allName,
-                        Modifier.widthIn(max = 160.dp),
-                        color = if (chosen) accentText else ink.muted,
-                        fontSize = 13.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                    if (count > 0) {
-                        // The circle centres the number: a Text given a height keeps its line at the top.
+                    for (folder in rest) {
                         Box(
-                            Modifier
-                                .height(18.dp)
-                                .widthIn(min = 18.dp)
-                                .clip(RoundedCornerShape(9.dp))
-                                .background(accent)
-                                .padding(horizontal = 5.dp),
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            Text(
-                                if (count > 99) "+99" else count.toString(),
-                                color = onAccent,
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.Bold,
-                                textAlign = TextAlign.Center,
-                                style = badgeText,
-                            )
-                        }
+                            Modifier.onPlaced { place ->
+                                val x = place.positionInParent().x.toInt()
+                                val span = x..(x + place.size.width)
+                                if (placed[folder.id] != span) placed[folder.id] = span
+                            },
+                        ) { FolderTab(folder) }
                     }
                 }
+                if (hiddenStart) EdgeDot(Modifier.align(Alignment.CenterStart))
+                if (hiddenEnd) EdgeDot(Modifier.align(Alignment.CenterEnd))
             }
         }
+        Box(Modifier.fillMaxWidth().height(1.dp).background(ink.line))
     }
 }
 
@@ -1940,7 +2034,7 @@ private fun NameBox(
                 13.sp,
                 FontWeight.Normal,
                 Modifier.padding(bottom = 14.dp),
-                tail = pluralStringResource(R.plurals.folders_go_in, who.size),
+                tail = stringResource(if (who.size == 1) R.string.folders_goes_in else R.string.folders_go_in),
             )
         }
         DialogButtons(
@@ -2057,9 +2151,13 @@ internal fun label(
     saved: String,
 ): String {
     if (row.type == 0) return saved
+    if (row.type == GROUP || row.type == CHANNEL) return groupLabel(row.id).orEmpty()
     val account = row.marks.firstNotNullOfOrNull { people[it.account] } ?: return ""
     return account.display_name?.takeIf { it.isNotBlank() } ?: account.username
 }
+
+/** A group's or channel's name, set by the activity to what its groups' state knows. */
+internal var groupLabel: (String) -> String? = { null }
 
 @Composable
 private fun previewText(row: ChatRow): String {
@@ -2101,7 +2199,9 @@ private fun tick(
             val them = other(row, me)
             if (them == null || them.received_seq < seq) TickKind.One else TickKind.Two
         }
-        GROUP -> TickKind.One
+        // As a direct chat, at the first member's received, chosen by the author.
+        GROUP -> if (row.marks.any { it.account != me && it.received_seq >= seq }) TickKind.Two else TickKind.One
+        CHANNEL -> TickKind.One
         else -> TickKind.None
     }
 }
@@ -2412,9 +2512,12 @@ private fun SearchBody(
     onProfile: (String) -> Unit,
     onOlder: () -> Unit,
     onHit: (Hit) -> Unit,
+    onFound: (FoundChat) -> Unit,
 ) {
     val saved = stringResource(R.string.saved_messages)
     val newTag = stringResource(R.string.search_new)
+    // Findable groups and channels the directory found, beside its people, chosen by the author.
+    val foundChats = LocalGroups.current?.state?.found?.filter { found -> rows.none { it.id == found.chat } }.orEmpty()
     val hits = if (search.text == text) search.hits.toList() else emptyList()
     val scanning = search.text == text && !search.done
     if (text.isEmpty()) {
@@ -2430,7 +2533,7 @@ private fun SearchBody(
         }
         return
     }
-    val nothing = chats.isEmpty() && strangers.isEmpty() && hits.isEmpty() && !asking && !scanning
+    val nothing = chats.isEmpty() && strangers.isEmpty() && foundChats.isEmpty() && hits.isEmpty() && !asking && !scanning
     val accountsShown = part != SearchPart.Messages
     val messagesShown = part != SearchPart.Accounts
     val empty =
@@ -2478,6 +2581,9 @@ private fun SearchBody(
                     me,
                     unread[row.id] ?: 0,
                     false,
+                    false,
+                    false,
+                    {},
                     ink,
                     accentText,
                     false,
@@ -2493,6 +2599,9 @@ private fun SearchBody(
             }
             items(firstStrangers, key = { "person-${it.id}" }) { account ->
                 PersonRow(account, ink, if (all) newTag else null) { onPerson(account) }
+            }
+            items(if (all) foundChats.take(ALL_SHOWS) else foundChats, key = { "found-${it.chat}" }) { found ->
+                WaitingRow(found.chat, found.name, memberCountText(found.type, found.member_count), null, null, ink) { onFound(found) }
             }
             if (!all && asking && strangers.isEmpty()) {
                 item(key = "asking") {
@@ -2595,6 +2704,41 @@ private fun HitRow(
                 Text(chatWhen(hit.saved_at), color = ink.muted, fontSize = 12.sp)
             }
             Text(text, Modifier.padding(top = 1.dp), color = ink.muted, fontSize = 14.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+        }
+    }
+}
+
+/** A row for a chat this account is not in yet: an invitation, a join request, or a findable chat found. */
+@Composable
+private fun WaitingRow(
+    chat: String,
+    name: String,
+    line: String,
+    blurhash: String?,
+    at: Long?,
+    ink: Ink,
+    onClick: () -> Unit,
+) {
+    val host = LocalGroups.current ?: return
+    Row(
+        Modifier.fillMaxWidth().clickable(role = Role.Button, onClick = onClick).padding(horizontal = 16.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        GroupAvatar(chat, host.state, host.engine, name, 54.dp, blurhash = blurhash)
+        Column(Modifier.padding(start = 12.dp).weight(1f)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    name,
+                    Modifier.weight(1f),
+                    color = ink.text,
+                    fontSize = 17.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                if (at != null) Text(chatWhen(at), color = ink.muted, fontSize = 13.sp)
+            }
+            Text(line, Modifier.padding(top = 2.dp), color = ink.muted, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
     }
 }

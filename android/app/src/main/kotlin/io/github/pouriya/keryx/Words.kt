@@ -50,6 +50,7 @@ import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLayoutDirection
+import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.AnnotatedString
@@ -285,7 +286,7 @@ private fun ColumnScope.Check(
     )
     if (places.size == 3) {
         Text(
-            stringResource(R.string.words_check, places[0] + 1, places[1] + 1, places[2] + 1),
+            pluralStringResource(R.plurals.words_check, places.size, places[0] + 1, places[1] + 1, places[2] + 1),
             Modifier.padding(top = 8.dp, bottom = 12.dp).fillMaxWidth(),
             color = ink.muted,
             fontSize = 14.sp,
@@ -497,7 +498,7 @@ private fun Length(
         listOf(12, 24).forEach { value ->
             val on = value == count
             Text(
-                stringResource(R.string.words_count, value),
+                pluralStringResource(R.plurals.words_count, value, value),
                 Modifier.weight(
                     1f,
                 ).clip(

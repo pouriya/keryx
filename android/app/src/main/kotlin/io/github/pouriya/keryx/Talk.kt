@@ -35,14 +35,28 @@ internal data class Bubble(
     val answer: Answer? = null,
     /** A suggestion message's action. Its text is `text`. */
     val suggestion: Suggestion? = null,
+    /** A group's or channel's topic, none for General. */
+    val topic: String? = null,
+    /** The main-list message whose thread this is in. */
+    val thread: Long? = null,
+    /** The accounts its text mentions. */
+    val mentions: List<String> = emptyList(),
+    /** A membership line the server wrote: its action word, and whom it names. */
+    val line: LineInfo? = null,
 ) {
     val key: String get() = if (seq != null) "s$seq" else "l$local"
 
     /** This device holds no key for it: nothing opened, and it is not a call or a file. */
     val locked: Boolean get() =
         text == null && files.isEmpty() && call == null && kind != CONTENT_CALL &&
-            sticker == null && question == null && answer == null && suggestion == null
+            sticker == null && question == null && answer == null && suggestion == null && line == null && notice == null
 }
+
+/** A membership line: "added", "left" and so on, the actor being the bubble's account. */
+internal data class LineInfo(
+    val action: String,
+    val accountList: List<String>,
+)
 
 /** One reaction in the open chat: confirmed (a sequence id) or still waiting (a local id), on a message by either. */
 internal data class Reaction(
@@ -72,9 +86,6 @@ internal data class Chip(
 )
 
 internal const val CONTENT_TEXT = 0
-
-/** A message kind: the server's notice of a new device, in the self chat. */
-internal const val DEVICE_NOTICE = 4
 
 internal const val CONTENT_REACTION = 2
 internal const val CONTENT_CALL = 8
@@ -255,6 +266,9 @@ internal class Talk {
                 question = shown.question,
                 answer = shown.answer,
                 suggestion = shown.suggestion,
+                topic = shown.topic,
+                thread = shown.thread_seq,
+                mentions = shown.mentions,
             )
         val at = bubbles.indexOfFirst { it.seq == shown.seq }
         if (at >= 0) {
@@ -283,6 +297,30 @@ internal class Talk {
                 text = null,
                 at = event.saved_at,
                 notice = text,
+            )
+        val at = bubbles.indexOfFirst { it.seq == event.seq }
+        if (at >= 0) {
+            bubbles[at] = bubble
+            return
+        }
+        var index = bubbles.indexOfFirst { it.seq == null || it.seq > event.seq }
+        if (index < 0) index = bubbles.size
+        bubbles.add(index, bubble)
+    }
+
+    /** A membership line, as a small pill in the chat that acts as a message. */
+    fun line(event: Event.Line) {
+        if (event.chat != chat || gone[event.seq] == true) return
+        val bubble =
+            Bubble(
+                seq = event.seq,
+                local = null,
+                mine = event.mine,
+                account = event.account,
+                kind = null,
+                text = null,
+                at = event.saved_at,
+                line = LineInfo(event.action, event.account_list),
             )
         val at = bubbles.indexOfFirst { it.seq == event.seq }
         if (at >= 0) {
@@ -344,6 +382,8 @@ internal class Talk {
                 at = System.currentTimeMillis(),
                 sticker = event.sticker,
                 answer = event.answer,
+                topic = event.topic,
+                thread = event.thread,
             ),
         )
     }
@@ -452,18 +492,32 @@ private const val KIND_CONTENT = 0
 private const val KIND_EDIT = 1
 private const val KIND_DELETE = 2
 
-/** A link, or a run of 5 digits or more, inside a message's text. */
+/** A link, a run of 5 digits or more, or a mention, inside a message's text. A link opens, a number copies and a
+ * mention, whose `account` is set, opens that person's profile, chosen by the author. */
 internal data class Copyable(
     val start: Int,
     val end: Int,
+    val link: Boolean = false,
+    val account: String? = null,
 )
 
 private val LINK = Regex("""https?://[^\s]+""", RegexOption.IGNORE_CASE)
 private val NUMBER = Regex("""\d{5,}""")
 
-internal fun copyables(text: String): List<Copyable> {
+private val MENTION = Regex("""@([a-z_][a-z0-9_]*)""")
+
+/** `mentioned` is each mentioned account by its username: only those are drawn as mentions. */
+internal fun copyables(
+    text: String,
+    mentioned: Map<String, String> = emptyMap(),
+): List<Copyable> {
     val found = ArrayList<Copyable>()
-    for (match in LINK.findAll(text)) found.add(Copyable(match.range.first, match.range.last + 1))
+    for (match in LINK.findAll(text)) found.add(Copyable(match.range.first, match.range.last + 1, link = true))
+    for (match in MENTION.findAll(text)) {
+        val start = match.range.first
+        val account = mentioned[match.groupValues[1]] ?: continue
+        if (found.none { start >= it.start && start < it.end }) found.add(Copyable(start, match.range.last + 1, account = account))
+    }
     for (match in NUMBER.findAll(text)) {
         val start = match.range.first
         if (found.none { start >= it.start && start < it.end }) found.add(Copyable(start, match.range.last + 1))

@@ -22,17 +22,24 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
@@ -51,7 +58,10 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
@@ -159,6 +169,28 @@ class MainActivity : ComponentActivity() {
     private var lookingFor: String? = null
     private lateinit var engine: Engine
     private lateinit var profiles: Profiles
+
+    /** This account's groups and channels, kept from core's events. */
+    private val groups = GroupState()
+    private lateinit var groupHost: GroupHost
+
+    /** The + menu, the create sheet's chat type, and the group page, invitation or findable chat open over the list. */
+    private val newMenu = mutableStateOf(false)
+    private val creatingType = mutableStateOf<Int?>(null)
+    private val groupOpen = mutableStateOf<Pair<String, GroupSub>?>(null)
+    private val invitationOpen = mutableStateOf<String?>(null)
+    private val foundOpen = mutableStateOf<FoundChat?>(null)
+
+    /** The thread open as a sheet over the chat, by its first message's seq. */
+    private val threadOpen = mutableStateOf<Long?>(null)
+    private val topicsSheet = mutableStateOf(false)
+
+    /** A topic's page open over the chat, by chat and topic, General's as empty; and the new-topic page by chat. */
+    private val topicPage = mutableStateOf<Pair<String, String>?>(null)
+    private val newTopic = mutableStateOf<String?>(null)
+
+    /** Rules shown once this run, so a sheet just closed does not come back before its mark is read. */
+    private val rulesSeen = androidx.compose.runtime.mutableStateListOf<String>()
 
     /** Whose profile is open over the list or the chat, if anyone's. */
     private val profileOf = mutableStateOf<String?>(null)
@@ -281,8 +313,9 @@ class MainActivity : ComponentActivity() {
                 { output -> runOnUiThread { call(output) } },
                 { counts ->
                     runOnUiThread {
+                        groups.unread = counts
                         unreadCounts.clear()
-                        for ((chat, count) in counts) {
+                        for ((chat, count) in counts.chats) {
                             if (count > 0) unreadCounts[chat] = count
                         }
                     }
@@ -296,6 +329,8 @@ class MainActivity : ComponentActivity() {
                 { runOnUiThread { blink() } },
             )
         profiles = Profiles(engine)
+        groupHost = GroupHost(groups, engine) { me.value }
+        groupLabel = { chat -> groups.name(chat) }
         netUp = connectivity.activeNetwork != null
         runCatching {
             connectivity.registerDefaultNetworkCallback(netCallback)
@@ -333,7 +368,7 @@ class MainActivity : ComponentActivity() {
                 LocalTrying provides trying.value,
             ) {
                 MaterialTheme(colorScheme = if (isDark()) darkColorScheme() else lightColorScheme()) {
-                    CompositionLocalProvider(LocalProfiles provides profiles) { Screen(joined) }
+                    CompositionLocalProvider(LocalProfiles provides profiles, LocalGroups provides groupHost) { Screen(joined) }
                 }
             }
         }
@@ -453,8 +488,18 @@ class MainActivity : ComponentActivity() {
                                     engine.send(Command.DeclineCall(call.chat, call.seq))
                                     ringing.value = null
                                 },
+                                onNew = { newMenu.value = true },
+                                newOpen = newMenu.value,
+                                onRequests = { chat -> groupOpen.value = chat to GroupSub.Requests },
+                                onInvitation = { invitationOpen.value = it },
+                                onAsked = { chat ->
+                                    val asked = groups.asked[chat]
+                                    foundOpen.value = FoundChat(chat, TYPE_GROUP, asked?.name.orEmpty(), null, 0)
+                                },
+                                onFound = { foundOpen.value = it },
                             )
                         }
+                        GroupLayers()
                         profileOf.value?.let { account ->
                             ProfileScreen(
                                 account = account,
@@ -479,6 +524,127 @@ class MainActivity : ComponentActivity() {
                 Place.Test -> Surface(Modifier.fillMaxSize()) { Bare() }
             }
         }
+    }
+
+    /** What groups and channels draw over the list or the chat: the + menu, making one, a group's page, an invitation, a findable chat. */
+    @Composable
+    private fun GroupLayers() {
+        val known = list.rows.flatMap { row -> row.marks.map { it.account } }.distinct()
+        if (newMenu.value) {
+            NewMenu(onClose = { newMenu.value = false }) { type ->
+                newMenu.value = false
+                creatingType.value = type
+            }
+        }
+        creatingType.value?.let { type ->
+            CreateSheet(
+                type = type,
+                topicsDefault = false,
+                me = me.value,
+                people = people,
+                known = known,
+                found = found,
+                onSearch = ::searchPeople,
+                onClose = { creatingType.value = null },
+            ) { made, picked -> create(made, picked) }
+        }
+        groupOpen.value?.let { (chat, start) ->
+            GroupPage(
+                chat = chat,
+                start = start,
+                people = people,
+                known = known,
+                found = found,
+                onSearch = ::searchPeople,
+                onBack = { groupOpen.value = null },
+                onProfile = { profileOf.value = it },
+                onMessage = { account ->
+                    groupOpen.value = null
+                    actionsOf(account).onMessage?.invoke()
+                },
+            )
+        }
+        invitationOpen.value?.let { chat -> InvitationPage(chat, people) { invitationOpen.value = null } }
+        foundOpen.value?.let { chat ->
+            FoundPage(
+                chat.chat,
+                chat.type,
+                groups.name(chat.chat) ?: chat.name,
+                chat.bio,
+            ) { foundOpen.value = null }
+        }
+    }
+
+    /**
+     * Makes a group or channel: the photo encoded first, then core does the rest. The list shows the
+     * new chat on top with nothing opened, chosen by the author.
+     */
+    private fun create(
+        made: NewChat,
+        picked: List<String>,
+    ) {
+        creatingType.value = null
+        groups.creating = made.name.trim()
+        val photo =
+            made.photo?.let { square ->
+                val (jpeg, thumbnail) = encode(square)
+                jpeg?.let { PhotoInput(it, thumbnail) }
+            }
+        engine.send(
+            Command.CreateChat(
+                chat_type = made.type,
+                name = made.name.trim(),
+                bio = made.bio.trim().ifEmpty { null },
+                link_list = usable(made.links),
+                account_list = picked,
+                topics = made.topics,
+                findable = made.findable,
+                options = made.switches.options(made.type),
+                photo = photo,
+            ),
+        )
+    }
+
+    /** The accounts a text names as `@username` among the chat's members, kept inside the encryption. */
+    private fun mentionsIn(
+        chat: String,
+        text: String,
+    ): List<String> {
+        val members = groups.members[chat] ?: return emptyList()
+        val names = Regex("@([a-z0-9_]+)").findAll(text.lowercase()).map { it.groupValues[1] }.toSet()
+        if (names.isEmpty()) return emptyList()
+        return members.map { it.account }.filter { people[it]?.username in names }
+    }
+
+    /** A group's preview names its sender first, as drawn: "Sara: Draft is ready". A channel's posts do not. */
+    private fun senderFirst(
+        chat: String,
+        mine: Boolean,
+        account: String?,
+        kind: Int?,
+        preview: String,
+    ): String {
+        if (groups.info(chat)?.type != TYPE_GROUP || kind == CONTENT_REACTION) return preview
+        val who = if (mine) getString(R.string.chat_you) else personName(account, people)
+        return if (who.isEmpty()) preview else "$who: $preview"
+    }
+
+    /** A preview walked back to an older message, drawn as a live one is: a group's topic and sender first. */
+    private fun walkedPreview(bubble: Bubble): String {
+        val chat = talk.chat ?: return previewOfBubble(bubble)
+        return groupPreview(chat, bubble.topic, senderFirst(chat, bubble.mine, bubble.account, bubble.kind, previewOfBubble(bubble)))
+    }
+
+    /** A group's preview with its topic's name before it while topics are on, chosen by the author. */
+    private fun groupPreview(
+        chat: String,
+        topic: String?,
+        preview: String,
+    ): String {
+        val info = groups.info(chat) ?: return preview
+        if (!info.topicsOn) return preview
+        val name = topic?.let { groups.topicNames[chat]?.get(it) } ?: getString(R.string.topic_general)
+        return "$name: $preview"
     }
 
     /** English until FA is chosen. Kept as a plain note, and the activity is built again so the screen mirrors. */
@@ -680,6 +846,7 @@ class MainActivity : ComponentActivity() {
 
     private fun previewOfBubble(bubble: Bubble): String {
         val text = bubble.text?.takeIf { it.isNotBlank() }
+        bubble.line?.let { return lineWords(this, it.action, bubble.account.orEmpty(), it.accountList, me.value, people) }
         return when (bubble.kind) {
             1 -> getString(R.string.kind_voice)
             2 -> text?.let { getString(R.string.kind_reacted, it) } ?: getString(R.string.kind_reacted, "").trim()
@@ -1114,6 +1281,7 @@ class MainActivity : ComponentActivity() {
         }
         profiles.apply(event)
         folders.apply(event)
+        groups.apply(event, me.value)
         happened.add(0, event::class.simpleName ?: "?")
         if (happened.size > 40) {
             happened.removeAt(happened.lastIndex)
@@ -1195,7 +1363,14 @@ class MainActivity : ComponentActivity() {
             is Event.Message -> {
                 val message = event.message
                 val known = list.rows.any { it.id == message.chat }
-                list.message(message, previewOf(message))
+                list.message(
+                    message,
+                    groupPreview(
+                        message.chat,
+                        message.topic,
+                        senderFirst(message.chat, message.mine, message.account, message.content_kind, previewOf(message)),
+                    ),
+                )
                 talk.message(message)
                 if (!known) engine.send(Command.ChatList)
                 if (message.chat == chosen.value) messages.add(message)
@@ -1223,6 +1398,25 @@ class MainActivity : ComponentActivity() {
                     list.pending(event.chat, getString(R.string.kind_reacted, event.emoji))
                 }
             }
+            // A group joined by Welcome may bring only lines, so a chat not listed yet asks for the list.
+            is Event.ChatReady -> if (list.rows.none { it.id == event.chat }) engine.send(Command.ChatList)
+            is Event.Line -> {
+                if (list.rows.none { it.id == event.chat }) engine.send(Command.ChatList)
+                list.line(
+                    event,
+                    groupPreview(event.chat, null, lineWords(this, event.action, event.account, event.account_list, me.value, people)),
+                )
+                talk.line(event)
+            }
+            is Event.ChatLeft -> {
+                if (talk.chat == event.chat) {
+                    threadOpen.value = null
+                    topicsSheet.value = false
+                    talk.close()
+                }
+                if (groupOpen.value?.first == event.chat) groupOpen.value = null
+                engine.send(Command.ChatList)
+            }
             is Event.Stickers -> stickerPacks.value = event.pack_list
             is Event.Emoji -> emojiGroups.value = event.group_list
             is Event.StickerImage -> stickersKept[event.sticker] = true
@@ -1235,7 +1429,7 @@ class MainActivity : ComponentActivity() {
                     engine.send(Command.JoinCall(event.chat, event.seq))
                 }
                 if (event.chat == chosen.value && place.value == Place.Test) choose(event.chat)
-                list.walkBack(event.chat, talk, ::previewOfBubble)
+                list.walkBack(event.chat, talk, ::walkedPreview)
             }
             is Event.Marks -> list.marks(event.chat, event.mark)
             is Event.Edited -> talk.edited(event)
@@ -1244,19 +1438,32 @@ class MainActivity : ComponentActivity() {
                 // far, for a chat that is not open too.
                 val last = list.rows.any { it.id == event.chat && it.lastSeq == event.target_seq }
                 talk.deleted(event.chat, event.target_seq)
-                talk.chat?.let { list.walkBack(it, talk, ::previewOfBubble) }
+                talk.chat?.let { list.walkBack(it, talk, ::walkedPreview) }
                 if (last) engine.send(Command.ChatList)
             }
             is Event.Removed -> {
+                // A removed topic's rows come only as these, so a chat not open asks for the list,
+                // whose preview the server already walked back.
+                val last = list.rows.any { it.id == event.chat && it.lastSeq == event.seq }
                 talk.deleted(event.chat, event.seq)
-                talk.chat?.let { list.walkBack(it, talk, ::previewOfBubble) }
+                talk.chat?.let { list.walkBack(it, talk, ::walkedPreview) }
+                if (last && talk.chat != event.chat) engine.send(Command.ChatList)
             }
             is Event.PageLoaded -> {
                 if (event.chat == talk.chat) talk.page(event.has_older)
                 loadingOlder = false
             }
             is Event.Draft -> talk.drafted(event)
-            is Event.Times -> timesAnswer.value = TimesAnswer(event.seq, event.member_list)
+            is Event.Times -> {
+                // A next page is added under the ones shown; anything else starts the list again.
+                val shown = timesAnswer.value
+                timesAnswer.value =
+                    if (shown != null && shown.seq == event.seq && shown.asking) {
+                        TimesAnswer(event.seq, shown.member_list.orEmpty() + event.member_list, event.more)
+                    } else {
+                        TimesAnswer(event.seq, event.member_list, event.more)
+                    }
+            }
             is Event.Failed -> {
                 talk.failed(event)
                 happened[0] = "Failed: ${event.code}"
@@ -1293,13 +1500,25 @@ class MainActivity : ComponentActivity() {
                 }
             }
             is Event.Started -> {
-                if (place.value == Place.Chats) openChat(event.chat) else choose(event.chat)
+                // A group or channel made here shows on top of the list with nothing opened, chosen by the author.
+                if (groups.creating != null) {
+                    groups.creating = null
+                    groups.fresh = event.chat
+                } else if (place.value == Place.Chats) {
+                    openChat(event.chat)
+                } else {
+                    choose(event.chat)
+                }
                 engine.send(Command.ChatList)
             }
             is Event.Error -> {
                 happened[0] = "Error: ${event.code}"
                 talk.refused(event.code)
-                timesAnswer.value?.let { if (it.member_list == null) timesAnswer.value = it.copy(member_list = emptyList()) }
+                timesAnswer.value?.let {
+                    if (it.member_list == null) timesAnswer.value = it.copy(member_list = emptyList())
+                    // A next page that failed is not asked again on its own.
+                    if (it.asking) timesAnswer.value = it.copy(more = false, asking = false)
+                }
                 busy.value = false
                 if (place.value == Place.Chats && searches > 0) searchAnswered(emptyList())
                 val shown = accountMessage(event.code, event.message)
@@ -1317,6 +1536,13 @@ class MainActivity : ComponentActivity() {
             }
             is Event.LoggedOut -> {
                 profileOf.value = null
+                newMenu.value = false
+                creatingType.value = null
+                groupOpen.value = null
+                invitationOpen.value = null
+                foundOpen.value = null
+                threadOpen.value = null
+                topicsSheet.value = false
                 chats.clear()
                 list.clear()
                 folders.clear()
@@ -1557,8 +1783,16 @@ class MainActivity : ComponentActivity() {
     private fun openChat(chat: String) {
         timesAnswer.value = null
         loadingOlder = false
+        threadOpen.value = null
+        topicsSheet.value = false
+        topicPage.value = null
+        newTopic.value = null
+        // A chat with topics opens on its topic list, as the author chose.
+        groups.topicOpen.remove(chat)
         talk.open(chat)
         engine.send(Command.OpenChat(chat))
+        // A group's members, for names in its lines and its @ suggestions.
+        if (groups.isGroupish(chat) && groups.members[chat] == null) engine.send(Command.Members(chat))
     }
 
     private fun pointer(bubble: Bubble) = Pointer(seq = bubble.seq, local = bubble.local)
@@ -1566,8 +1800,190 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun OpenedChat() {
         val chat = talk.chat ?: return
+        if (groups.info(chat)?.topicsOn == true && groups.topicOpen[chat] == null) TopicListView(chat) else ChatView(chat, null)
+        val thread = threadOpen.value
+        if (thread != null && groups.isGroupish(chat)) {
+            // A thread opens as a sheet over the chat, covering most of the screen, chosen by the author.
+            val dark = isDark()
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .background(androidx.compose.ui.graphics.Color(0x66000000))
+                    .clickable(
+                        remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
+                        null,
+                    ) { threadOpen.value = null },
+            ) {
+                // Drag its head up for the whole screen, and down to close, as the design draws it.
+                val fullState = remember(thread) { mutableStateOf(false) }
+                val pullState = remember(thread) { mutableStateOf(0f) }
+                val full = fullState.value
+                val far = with(androidx.compose.ui.platform.LocalDensity.current) { 120.dp.toPx() }
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        .windowInsetsPadding(WindowInsets.statusBars)
+                        .padding(top = if (full) 0.dp else 70.dp)
+                        .graphicsLayer { translationY = pullState.value.coerceAtLeast(0f) }
+                        .clip(RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp))
+                        .background(ink().page)
+                        .clickable(remember { androidx.compose.foundation.interaction.MutableInteractionSource() }, null) {}
+                        .pointerInput(thread) {
+                            detectVerticalDragGestures(
+                                onDragEnd = {
+                                    val pull = pullState.value
+                                    when {
+                                        pull > far && !fullState.value -> threadOpen.value = null
+                                        pull > far / 2 && fullState.value -> fullState.value = false
+                                        pull < -far / 2 -> fullState.value = true
+                                    }
+                                    pullState.value = 0f
+                                },
+                                onDragCancel = { pullState.value = 0f },
+                            ) { change, amount ->
+                                change.consume()
+                                pullState.value += amount
+                            }
+                        },
+                ) {
+                    androidx.compose.runtime.key(thread, dark) { ChatView(chat, thread) }
+                }
+            }
+        }
+        if (topicsSheet.value) TopicsSheet(chat, ink(), { newTopic.value = chat }) { topicsSheet.value = false }
+        newTopic.value?.takeIf { it == chat }?.let {
+            NewTopicPage(chat, { newTopic.value = null }) { id ->
+                newTopic.value = null
+                topicsSheet.value = false
+                groups.topicOpen[chat] = id
+            }
+        }
+        topicPage.value?.takeIf { it.first == chat }?.let { (_, topic) ->
+            TopicPage(
+                chat,
+                topic,
+                people,
+                onBack = { topicPage.value = null },
+                onRemoved = {
+                    topicPage.value = null
+                    groups.topicOpen.remove(chat)
+                },
+                onProfile = { profileOf.value = it },
+            )
+        }
+        RulesOnce(chat)
+    }
+
+    /**
+     * Rules shown once on this device, in a sheet with OK: the group's when it first opens, then the open
+     * topic's when it first opens, General's too.
+     */
+    @Composable
+    private fun RulesOnce(chat: String) {
+        if (!groups.isGroupish(chat)) return
+        val context = androidx.compose.ui.platform.LocalContext.current
+        val account = me.value
+        val groupRules = groups.profiles[chat]?.rules?.takeIf { it.isNotBlank() }
+        val open = groups.topicOpen[chat]
+        val topicRules = open?.let { groups.topicProfile(chat, it)?.rules?.takeIf { rules -> rules.isNotBlank() } }
+        val (key, rules) =
+            when {
+                groupRules != null && "$chat " !in rulesSeen && !rulesShown(context, account, chat, null) -> "$chat " to groupRules
+                topicRules != null && "$chat $open" !in rulesSeen && !rulesShown(context, account, chat, open) ->
+                    "$chat $open" to topicRules
+                else -> return
+            }
+        val topic = key.substringAfter(' ').takeIf { key != "$chat " }
+        val name = if (topic == null) groups.name(chat).orEmpty() else topicName(groups, chat, topic)
+        RulesSheet(getString(R.string.topic_rules_of, name), rules) {
+            rulesSeen.add(key)
+            markRulesShown(context, account, chat, topic)
+        }
+    }
+
+    /**
+     * A group's or channel's topics as a list, its header the group's: tapping it opens the group's page,
+     * and a pencil for those who manage topics opens the Topics sheet. A search hit opens its topic.
+     */
+    @Composable
+    private fun TopicListView(chat: String) {
         val row = list.rows.firstOrNull { it.id == chat }
         val saved = getString(R.string.saved_messages)
+        val title = row?.let { label(it, people, saved) }.orEmpty()
+        val info = groups.info(chat)
+        val ink = ink()
+        val link = linkState.value
+        BackHandler { talk.close() }
+        Bars(ink.page, isDark())
+        val seeking = talk.seeking
+        androidx.compose.runtime.LaunchedEffect(seeking, talk.bubbles.size, talk.paged) {
+            if (seeking == null || !talk.paged) return@LaunchedEffect
+            val found = talk.bySeq(seeking)
+            if (found != null) {
+                groups.topicOpen[chat] = (found.thread?.let { talk.bySeq(it) } ?: found).topic.orEmpty()
+            } else if (talk.hasOlder && !loadingOlder) {
+                loadingOlder = true
+                engine.send(Command.LoadOlder(chat))
+            } else if (!talk.hasOlder) {
+                talk.seeking = null
+            }
+        }
+        Column(
+            Modifier
+                .fillMaxSize()
+                .background(ink.page)
+                .windowInsetsPadding(WindowInsets.statusBars)
+                .windowInsetsPadding(WindowInsets.navigationBars),
+        ) {
+            GroupBar(
+                title,
+                chat,
+                if (link != Link.Connected) statusText(link) else info?.memberCount?.let { memberCountText(info.type, it) },
+                false,
+                (info?.requestCount ?: 0) > 0 && groups.mayAdd(chat),
+                ink,
+                { talk.close() },
+                { groupOpen.value = chat to GroupSub.Requests },
+                { groupOpen.value = chat to GroupSub.Page },
+                end =
+                    if (groups.managing(chat)) {
+                        {
+                            IconButton(
+                                getString(R.string.group_topics_title),
+                                { topicsSheet.value = true },
+                                44.dp,
+                            ) { Glyph(GroupGlyphs.pencil, ink.text) }
+                        }
+                    } else {
+                        null
+                    },
+            )
+            TopicRows(chat, talk.bubbles.toList(), me.value, people, ::previewOfBubble, ink, Modifier.weight(1f)) { topic ->
+                groups.topicOpen[chat] = topic
+            }
+        }
+    }
+
+    /** Where a send goes: a thread's message's topic, or the open topic while topics are on. */
+    private fun placeTopic(
+        chat: String,
+        thread: Long?,
+    ): String? =
+        when {
+            thread != null -> talk.bySeq(thread)?.topic
+            groups.info(chat)?.topicsOn == true -> groups.topicOpen[chat]?.ifEmpty { null }
+            else -> null
+        }
+
+    /** The open chat's main list, or one of its threads. */
+    @Composable
+    private fun ChatView(
+        chat: String,
+        thread: Long?,
+    ) {
+        val row = list.rows.firstOrNull { it.id == chat }
+        val saved = getString(R.string.saved_messages)
+        val info = groups.info(chat)
         ChatScreen(
             talk = talk,
             title = row?.let { label(it, people, saved) }.orEmpty(),
@@ -1577,8 +1993,26 @@ class MainActivity : ComponentActivity() {
             people = people,
             marks = row?.marks ?: emptyList(),
             times = timesAnswer.value,
-            onBack = { talk.close() },
-            onSend = { text, reply -> engine.send(Command.SendText(chat, text, reply?.let(::pointer))) },
+            onBack = {
+                when {
+                    thread != null -> threadOpen.value = null
+                    // Back from a topic goes to the topics.
+                    info?.topicsOn == true -> groups.topicOpen.remove(chat)
+                    else -> talk.close()
+                }
+            },
+            onSend = { text, reply ->
+                engine.send(
+                    Command.SendText(
+                        chat,
+                        text,
+                        reply?.let(::pointer),
+                        topic = placeTopic(chat, thread),
+                        thread = thread,
+                        mentions = mentionsIn(chat, text),
+                    ),
+                )
+            },
             onEdit = { bubble, text -> engine.send(Command.Edit(chat, pointer(bubble), text)) },
             onDelete = { list ->
                 for (bubble in list) engine.send(Command.Delete(chat, pointer(bubble), bubble.files.map { it.id }))
@@ -1587,13 +2021,22 @@ class MainActivity : ComponentActivity() {
                 timesAnswer.value = TimesAnswer(seq, null)
                 engine.send(Command.Times(chat, seq))
             },
+            onMoreTimes = {
+                timesAnswer.value?.let { shown ->
+                    val last = shown.member_list?.lastOrNull()?.account
+                    if (last != null && shown.more && !shown.asking) {
+                        timesAnswer.value = shown.copy(asking = true)
+                        engine.send(Command.Times(chat, shown.seq, last))
+                    }
+                }
+            },
             onOlder = {
                 if (!loadingOlder) {
                     loadingOlder = true
                     engine.send(Command.LoadOlder(chat))
                 }
             },
-            onSeen = { seq -> engine.send(Command.Seen(chat, seq)) },
+            onSeen = { seq -> engine.send(Command.Seen(chat, seq, if (thread != null) null else placeTopic(chat, null), thread)) },
             onDraft = { text ->
                 talk.keep(chat, text)
                 engine.send(Command.Draft(chat, text))
@@ -1630,7 +2073,7 @@ class MainActivity : ComponentActivity() {
                 engine.send(Command.Delete(chat, Pointer(seq = reaction.seq, local = reaction.local)))
             },
             onSticker = { id, reply ->
-                engine.send(Command.SendSticker(chat, id, reply?.let(::pointer)))
+                engine.send(Command.SendSticker(chat, id, reply?.let(::pointer), placeTopic(chat, thread), thread))
                 recentSticker(id)
             },
             onAnswer = { question, answer, editing ->
@@ -1666,6 +2109,20 @@ class MainActivity : ComponentActivity() {
                 }
             },
             onProfile = { profileOf.value = it },
+            group =
+                info?.let {
+                    GroupView(
+                        chat = chat,
+                        type = it.type,
+                        thread = thread,
+                        onPage = { groupOpen.value = chat to GroupSub.Page },
+                        onRequests = { groupOpen.value = chat to GroupSub.Requests },
+                        onThread = { seq -> threadOpen.value = seq },
+                        onTyping = { on -> engine.send(Command.Typing(chat, on, placeTopic(chat, thread), thread)) },
+                        onTopics = { topicsSheet.value = true },
+                        onTopicPage = { topicPage.value = chat to (groups.topicOpen[chat] ?: "") },
+                    )
+                },
         )
     }
 

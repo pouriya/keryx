@@ -145,7 +145,7 @@ class Engine(
     private val platform: Platform,
     private val show: (Event) -> Unit,
     private val calls: (Output) -> Unit,
-    private val unread: (Map<String, Int>) -> Unit,
+    private val unread: (Unread) -> Unit,
     private val callEnded: (String, Long, Int) -> Unit,
     private val trying: () -> Unit,
 ) {
@@ -243,6 +243,48 @@ class Engine(
         if (photoFile(id).exists() || (photosAsked[id] ?: 0L) > now - STICKER_RETRY_MS) return@execute
         photosAsked[id] = now
         handle(Command.Photo(account))
+    }
+
+    /** Fetches and opens the photo a group's or channel's profile names, unless it is kept or was just asked for. */
+    fun chatPhoto(
+        chat: String,
+        id: String,
+    ) = thread.execute {
+        val now = System.currentTimeMillis()
+        if (photoFile(id).exists() || (photosAsked[id] ?: 0L) > now - STICKER_RETRY_MS) return@execute
+        photosAsked[id] = now
+        handle(Command.ChatPhotoGet(chat))
+    }
+
+    /** Fetches and opens the photo a topic's profile names, unless it is kept or was just asked for. */
+    fun topicPhoto(
+        chat: String,
+        topic: String,
+        id: String,
+    ) = thread.execute {
+        val now = System.currentTimeMillis()
+        if (photoFile(id).exists() || (photosAsked[id] ?: 0L) > now - STICKER_RETRY_MS) return@execute
+        photosAsked[id] = now
+        handle(Command.TopicPhotoGet(chat, topic))
+    }
+
+    /**
+     * A group's or channel's kept history, newest first, handed back on the main thread's side by `then`.
+     * The rows holding a delete's or edit's copies go to core too, which opens them and shows each again.
+     */
+    fun history(
+        chat: String,
+        then: (List<ChatEvent>) -> Unit,
+    ) = thread.execute {
+        val events =
+            try {
+                archive?.history(chat) ?: emptyList()
+            } catch (_: android.database.SQLException) {
+                emptyList()
+            }
+        then(events)
+        val copied = events.filter { it.copy_list.isNotEmpty() }
+        if (copied.isNotEmpty()) handle(Command.OpenHistory(chat, copied))
     }
 
     /** Keeps bytes as a file, written whole or not at all. */
@@ -663,7 +705,7 @@ class Engine(
         // The server sends no list back for this device's own seen, so the count drops here.
         if (command is Command.Seen) {
             try {
-                archive?.seenUpTo(command.chat, command.up_to_seq)
+                archive?.seenUpTo(command.chat, command.up_to_seq, command.topic, command.thread)
             } catch (_: android.database.SQLException) {
                 return
             }
@@ -886,7 +928,6 @@ class Engine(
             is Output.Show -> {
                 val showing = rememberedCall(output.event)
                 ownProfile(showing)
-                var after = emptyList<Event>()
                 when (val event = showing) {
                     is Event.SignedIn -> {
                         bound = event.account
@@ -896,11 +937,48 @@ class Engine(
                     is Event.Chats -> {
                         archive?.seen(event.chat_list)
                         reportUnread()
-                        after = notices(event.chat_list)
                     }
                     is Event.OwnDevices -> {
                         archive?.devices(event.device_list)
                         reportUnread()
+                    }
+                    // Mentions are inside the encryption, so the archive learns of one as core opens it.
+                    is Event.Message ->
+                        if (account != null && account in event.message.mentions) {
+                            try {
+                                archive?.mentioned(event.message.chat, event.message.seq)
+                            } catch (_: android.database.SQLException) {
+                                Unit
+                            }
+                            reportUnread()
+                        }
+                    is Event.Topics -> {
+                        try {
+                            archive?.topicsOn(event.chat, event.on)
+                        } catch (_: android.database.SQLException) {
+                            Unit
+                        }
+                        reportUnread()
+                    }
+                    is Event.TopicPhoto -> {
+                        photosAsked.remove(event.photo)
+                        val opened =
+                            try {
+                                java.util.Base64.getDecoder().decode(event.bytes)
+                            } catch (_: IllegalArgumentException) {
+                                return
+                            }
+                        if (!keep(photoFile(event.photo), opened)) return
+                    }
+                    is Event.ChatPhoto -> {
+                        photosAsked.remove(event.photo)
+                        val opened =
+                            try {
+                                java.util.Base64.getDecoder().decode(event.bytes)
+                            } catch (_: IllegalArgumentException) {
+                                return
+                            }
+                        if (!keep(photoFile(event.photo), opened)) return
                     }
                     is Event.Token ->
                         bound?.let { account ->
@@ -928,7 +1006,6 @@ class Engine(
                     else -> Unit
                 }
                 show(showing)
-                after.forEach { show(it) }
             }
         }
     }
@@ -952,15 +1029,15 @@ class Engine(
     private fun closeArchive() {
         archive?.close()
         archive = null
-        unread(emptyMap())
+        unread(Unread())
     }
 
     private fun reportUnread() {
         val counts =
             try {
-                archive?.unread() ?: emptyMap()
+                archive?.unread() ?: Unread()
             } catch (_: android.database.SQLException) {
-                emptyMap()
+                Unread()
             }
         unread(counts)
     }
@@ -972,7 +1049,7 @@ class Engine(
             return
         }
         try {
-            kept.save(asked.message_list, asked.call_list)
+            kept.save(asked.message_list, asked.call_list, asked.chat_event_list)
         } catch (_: android.database.SQLException) {
             feed(Input.RowsSaveFailed(asked.id))
             return
@@ -1015,8 +1092,8 @@ class Engine(
             } catch (_: android.database.SQLException) {
                 null
             }
-        val (messages, calls) = read ?: (emptyList<MessageFrame>() to emptyList())
-        feed(Input.RowsRead(asked.id, messages, calls))
+        val (messages, calls, events) = read ?: Triple(emptyList(), emptyList(), emptyList())
+        feed(Input.RowsRead(asked.id, messages, calls, events))
     }
 
     private fun scanRows(asked: Output.ScanRows) {
@@ -1029,23 +1106,6 @@ class Engine(
         val (messages, total) = read ?: (emptyList<MessageFrame>() to 0L)
         feed(Input.RowsScanned(asked.id, messages, total))
     }
-
-    /**
-     * A chat whose newest row is a device notice, which the server's list never names as its last content,
-     * shown again from the archive so the list can preview it after a restart.
-     */
-    private fun notices(list: List<ChatItem>): List<Event> =
-        list.mapNotNull { item ->
-            val seq = item.last_seq?.takeIf { item.last_kind == DEVICE_NOTICE } ?: return@mapNotNull null
-            val frame =
-                try {
-                    archive?.frame(item.chat, seq)
-                } catch (_: android.database.SQLException) {
-                    null
-                }
-            val device = frame?.device?.takeIf { frame.kind == DEVICE_NOTICE } ?: return@mapNotNull null
-            Event.Notice(item.chat, seq, device, frame.server_saved_at ?: 0)
-        }
 
     private fun request(
         base: String,
