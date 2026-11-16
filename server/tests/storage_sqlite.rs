@@ -333,9 +333,9 @@ fn foreign_keys_hold_and_a_chat_takes_its_rows_with_it() {
 }
 
 #[test]
-fn a_challenge_has_only_the_four_purposes() {
+fn a_challenge_has_only_the_five_purposes() {
     let connection = world();
-    for purpose in [0, 1, 2, 3] {
+    for purpose in [0, 1, 2, 3, 4] {
         connection
             .execute(
                 "INSERT INTO challenge (value, account_id, purpose, expires_at) VALUES (?1, ?2, ?3, 1)",
@@ -346,7 +346,7 @@ fn a_challenge_has_only_the_four_purposes() {
     assert!(
         connection
             .execute(
-                "INSERT INTO challenge (value, account_id, purpose, expires_at) VALUES (x'09', ?1, 4, 1)",
+                "INSERT INTO challenge (value, account_id, purpose, expires_at) VALUES (x'09', ?1, 5, 1)",
                 params![id(1)],
             )
             .is_err()
@@ -363,7 +363,7 @@ async fn one_file_with_the_classic_journal_and_opening_twice_keeps_everything() 
         id: role_id,
         scope: 0,
         name: "member",
-        permission_list: vec!["directory.search"],
+        permission_list: vec!["directory.search".to_string()],
     };
     storage.seed_roles(vec![role()]).await.unwrap();
     // A second seed leaves it as it is, and does not fail.
@@ -555,4 +555,162 @@ async fn calls_still_open_at_startup_end_and_keep_an_answer() {
         vec![(1, CallEventKind::End, 7, Some(CallOutcome::Missed))]
     );
     assert!(rows(4).is_empty());
+}
+
+#[tokio::test]
+async fn times_come_in_pages_seen_then_received_then_neither_and_hidden_times_do_not_order() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("keryx.db");
+    let storage = Sqlite::open(&path).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .unwrap();
+    // Account 1 sends; 2 to 7 are the other members, each with a device 12 to 17.
+    for byte in 1..=7 {
+        account(&connection, byte, &format!("member_{byte}"));
+        device(&connection, 10 + byte, byte);
+    }
+    let topic = id(90);
+    connection
+        .execute(
+            "INSERT INTO conversation (id, type, topics_on, created_at) VALUES (?1, 2, 1, 1)",
+            params![id(40)],
+        )
+        .unwrap();
+    for byte in 1..=7 {
+        connection
+            .execute(
+                "INSERT INTO member (conversation_id, account_id, joined_seq) VALUES (?1, ?2, 0)",
+                params![id(40), id(byte)],
+            )
+            .unwrap();
+    }
+    // 1 in General, 2 in the topic, 3 in the thread under 1.
+    for (seq, topic_id, thread_seq) in [(1, None, None), (2, Some(topic), None), (3, None, Some(1))]
+    {
+        connection
+            .execute(
+                "INSERT INTO message (conversation_id, seq, device_id, kind, content_kind,
+                 encrypted, epoch, client_sent_at, server_saved_at, signature, body, topic_id,
+                 thread_seq)
+                 VALUES (?1, ?2, ?3, 0, 0, 1, 1, 1, 1, x'00', x'00', ?4, ?5)",
+                params![id(40), seq, id(11), topic_id, thread_seq],
+            )
+            .unwrap();
+    }
+    let received = |byte: u8, at: i64| {
+        connection
+            .execute(
+                "INSERT INTO received (conversation_id, account_id, kind, place, up_to_seq,
+                 device_id, client_received_at, server_received_at)
+                 VALUES (?1, ?2, 0, x'', 3, ?3, ?4, ?4)",
+                params![id(40), id(byte), id(10 + byte), at],
+            )
+            .unwrap();
+    };
+    received(2, 100);
+    received(3, 200);
+    received(4, 150);
+    received(5, 120);
+    let seen = |byte: u8, kind: i64, place: Vec<u8>, at: i64| {
+        connection
+            .execute(
+                "INSERT INTO seen (conversation_id, account_id, kind, place, up_to_seq, device_id,
+                 client_seen_at, server_seen_at)
+                 VALUES (?1, ?2, ?3, ?4, 3, ?5, ?6, ?6)",
+                params![id(40), id(byte), kind, place, id(10 + byte), at],
+            )
+            .unwrap();
+    };
+    seen(3, 1, topic.to_vec(), 300);
+    seen(4, 1, topic.to_vec(), 250);
+    // General read past the topic's message, which says nothing of it while topics are on.
+    seen(2, 0, Vec::new(), 400);
+    seen(7, 2, 1u64.to_be_bytes().to_vec(), 500);
+
+    let chat = Ulid::from_bytes(id(40));
+    let both = keryx::storage::TimesShown {
+        received: true,
+        seen: true,
+    };
+    let page = |seq: u64, after: Option<u8>, shown: keryx::storage::TimesShown, limit: usize| {
+        let storage = &storage;
+        async move {
+            let (list, more) = storage
+                .message_times(
+                    chat,
+                    seq,
+                    after.map(|byte| Ulid::from_bytes(id(byte))),
+                    shown,
+                    limit,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            let order: Vec<u8> = list.iter().map(|item| item.account.bytes()[0]).collect();
+            (order, more, list)
+        }
+    };
+
+    // Seen newest first, then received only newest first, then neither by account, in pages.
+    let (order, more, list) = page(2, None, both, 2).await;
+    assert_eq!((order, more), (vec![3, 4], true));
+    assert_eq!(
+        (list[0].received_at, list[0].seen_at),
+        (Some(200), Some(300))
+    );
+    let (order, more, _) = page(2, Some(4), both, 2).await;
+    assert_eq!((order, more), (vec![5, 2], true));
+    let (order, more, list) = page(2, Some(2), both, 2).await;
+    assert_eq!((order, more), (vec![6, 7], false));
+    assert_eq!((list[0].received_at, list[0].seen_at), (None, None));
+    let (order, more, _) = page(2, None, both, 50).await;
+    assert_eq!((order, more), (vec![3, 4, 5, 2, 6, 7], false));
+
+    // Seen hidden: ordered by received alone, so the order does not tell who saw it.
+    let received_only = keryx::storage::TimesShown {
+        received: true,
+        seen: false,
+    };
+    let (order, _, list) = page(2, None, received_only, 50).await;
+    assert_eq!(order, vec![3, 4, 5, 2, 6, 7]);
+    assert!(list.iter().all(|item| item.seen_at.is_none()));
+    let (order, _, _) = page(2, Some(4), received_only, 2).await;
+    assert_eq!(order, vec![5, 2]);
+
+    // A thread's message is seen in its thread only.
+    let (order, _, _) = page(3, None, both, 50).await;
+    assert_eq!(order, vec![7, 3, 4, 5, 2, 6]);
+
+    // With topics off the one list counts too, so General's reading covers the topic's message.
+    connection
+        .execute(
+            "UPDATE conversation SET topics_on = 0 WHERE id = ?1",
+            params![id(40)],
+        )
+        .unwrap();
+    let (order, _, _) = page(2, None, both, 50).await;
+    assert_eq!(order, vec![2, 3, 4, 5, 6, 7]);
+
+    // Someone who left between pages still marks where the next page starts.
+    connection
+        .execute(
+            "DELETE FROM member WHERE conversation_id = ?1 AND account_id = ?2",
+            params![id(40), id(4)],
+        )
+        .unwrap();
+    let (order, more, _) = page(2, Some(4), both, 50).await;
+    assert_eq!((order, more), (vec![5, 6, 7], false));
+
+    // The sender is never listed, and an unknown message is none.
+    let (order, _, _) = page(1, None, both, 50).await;
+    assert!(!order.contains(&1));
+    assert!(
+        storage
+            .message_times(chat, 99, None, both, 50)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }

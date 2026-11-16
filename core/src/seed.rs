@@ -5,6 +5,9 @@
 //! master  = HKDF-SHA256(seed, "keryx v1 master key")          32 bytes, an Ed25519 key
 //! account = HKDF-SHA256(seed, "keryx v1 account key")         32 bytes,
 //!           through HPKE's DeriveKeyPair, an X25519 key
+//! profile = HKDF-SHA256(seed, "keryx v1 profile key")         16 bytes, an AES-128 key
+//! invite  = HKDF-SHA256(seed, "keryx v1 invite key")          32 bytes,
+//!           through HPKE's DeriveKeyPair, an X25519 key
 //! ```
 //!
 //! **This can never change once accounts exist:** a derivation that differs by one byte
@@ -24,6 +27,7 @@ use zeroize::Zeroizing;
 const MASTER_LABEL: &[u8] = b"keryx v1 master key";
 const ACCOUNT_LABEL: &[u8] = b"keryx v1 account key";
 const PROFILE_LABEL: &[u8] = b"keryx v1 profile key";
+const INVITE_LABEL: &[u8] = b"keryx v1 invite key";
 
 #[derive(Debug, thiserror::Error)]
 pub enum SeedError {
@@ -46,7 +50,7 @@ pub enum SeedError {
     #[error("Could not derive a key from the seed")]
     Derive,
 
-    #[error("Could not derive the account key")]
+    #[error("Could not derive the account or invite key")]
     AccountKey {
         #[source]
         source: openmls::prelude::CryptoError,
@@ -61,6 +65,8 @@ pub struct AccountKeys {
     account_private: Zeroizing<[u8; 32]>,
     account_public: [u8; 32],
     profile: Zeroizing<[u8; 16]>,
+    invite_private: Zeroizing<[u8; 32]>,
+    invite_public: [u8; 32],
 }
 
 impl AccountKeys {
@@ -84,6 +90,16 @@ impl AccountKeys {
     /// running device keeps it, since it is shared with everyone in the account's chats anyway.
     pub fn profile(&self) -> &[u8; 16] {
         &self.profile
+    }
+
+    /// The X25519 key invitations are sealed to. A running device keeps it too, so a stolen phone
+    /// can open invitations only, never history.
+    pub fn invite_private(&self) -> &[u8; 32] {
+        &self.invite_private
+    }
+
+    pub fn invite_public(&self) -> &[u8; 32] {
+        &self.invite_public
     }
 }
 
@@ -122,34 +138,14 @@ pub fn derive(words: &str) -> Result<AccountKeys, SeedError> {
         .verifying_key()
         .to_bytes();
 
-    let mut account_material = Zeroizing::new([0u8; 32]);
-    if hkdf
-        .expand(ACCOUNT_LABEL, account_material.as_mut())
-        .is_err()
-    {
-        return Err(SeedError::Derive);
-    }
-    let config = HpkeConfig(
-        HpkeKemType::DhKem25519,
-        HpkeKdfType::HkdfSha256,
-        HpkeAeadType::AesGcm128,
-    );
-    let pair = match RustCrypto::default().derive_hpke_keypair(config, account_material.as_ref()) {
-        Ok(pair) => pair,
-        Err(source) => return Err(SeedError::AccountKey { source }),
-    };
-    let mut account_private = Zeroizing::new([0u8; 32]);
-    let mut account_public = [0u8; 32];
-    if pair.private.as_ref().len() != 32 || pair.public.len() != 32 {
-        return Err(SeedError::Derive);
-    }
-    account_private.copy_from_slice(pair.private.as_ref());
-    account_public.copy_from_slice(&pair.public);
+    let (account_private, account_public) = x25519_pair(&hkdf, ACCOUNT_LABEL)?;
 
     let mut profile = Zeroizing::new([0u8; 16]);
     if hkdf.expand(PROFILE_LABEL, profile.as_mut()).is_err() {
         return Err(SeedError::Derive);
     }
+
+    let (invite_private, invite_public) = x25519_pair(&hkdf, INVITE_LABEL)?;
 
     Ok(AccountKeys {
         master_private,
@@ -157,5 +153,35 @@ pub fn derive(words: &str) -> Result<AccountKeys, SeedError> {
         account_private,
         account_public,
         profile,
+        invite_private,
+        invite_public,
     })
+}
+
+/// An X25519 key pair from one HKDF label, through HPKE's DeriveKeyPair.
+fn x25519_pair(
+    hkdf: &Hkdf<Sha256>,
+    label: &[u8],
+) -> Result<(Zeroizing<[u8; 32]>, [u8; 32]), SeedError> {
+    let mut material = Zeroizing::new([0u8; 32]);
+    if hkdf.expand(label, material.as_mut()).is_err() {
+        return Err(SeedError::Derive);
+    }
+    let config = HpkeConfig(
+        HpkeKemType::DhKem25519,
+        HpkeKdfType::HkdfSha256,
+        HpkeAeadType::AesGcm128,
+    );
+    let pair = match RustCrypto::default().derive_hpke_keypair(config, material.as_ref()) {
+        Ok(pair) => pair,
+        Err(source) => return Err(SeedError::AccountKey { source }),
+    };
+    if pair.private.as_ref().len() != 32 || pair.public.len() != 32 {
+        return Err(SeedError::Derive);
+    }
+    let mut private = Zeroizing::new([0u8; 32]);
+    let mut public = [0u8; 32];
+    private.copy_from_slice(pair.private.as_ref());
+    public.copy_from_slice(&pair.public);
+    Ok((private, public))
 }

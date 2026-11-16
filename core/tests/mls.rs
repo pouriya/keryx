@@ -1,8 +1,8 @@
 use keryx_core::mls::{
-    AccountKey, AccountWrap, Commit, Device, MlsError, ROTATION_MS, StateError, stamp_account_key,
-    verify_message,
+    AccountKey, AccountWrap, Commit, Device, Leaf, MlsError, ROTATION_MS, StateError,
+    public_group_commit, public_group_start, stamp_account_key, verify_message,
 };
-use keryx_core::protocol::{ContentKind, Header, Kind};
+use keryx_core::protocol::{Bytes, ContentKind, Header, InviteStatement, Kind};
 use keryx_core::seed::{AccountKeys, derive};
 use keryx_core::ulid::Ulid;
 
@@ -40,6 +40,8 @@ fn chat() -> Ulid {
 
 fn header(sender: &Device, epoch: u64) -> Header {
     Header {
+        thread_seq: None,
+        topic: None,
         chat: chat(),
         device: sender.record().device,
         kind: Kind::Content,
@@ -110,7 +112,7 @@ fn a_new_device_reads_everything_with_only_the_words() {
     let group_info = sara_device.group_info(chat()).unwrap();
     let accounts = [sara.key.clone(), babak.key.clone()];
     let join = new_device
-        .join_external(chat(), &group_info, NOW, &accounts)
+        .join_external(chat(), &group_info, NOW, &accounts, None)
         .unwrap();
     new_device.commit_accepted(chat(), NOW).unwrap();
     assert_eq!(join.epoch, first_commit.epoch + 1);
@@ -162,7 +164,7 @@ fn a_new_device_reads_everything_with_only_the_words() {
         .unwrap();
     let mut third_device = device(&babak);
     let join = third_device
-        .join_external(chat(), &rotation.group_info, NOW, &accounts)
+        .join_external(chat(), &rotation.group_info, NOW, &accounts, None)
         .unwrap();
     assert_eq!(join.epoch, rotation.epoch + 1);
     third_device.commit_accepted(chat(), NOW).unwrap();
@@ -450,10 +452,10 @@ fn a_join_that_loses_its_race_leaves_nothing_behind() {
     let accounts = [sara.key.clone(), babak.key.clone()];
     let mut joining = device(&babak);
     joining
-        .join_external(chat(), &info, NOW, &accounts)
+        .join_external(chat(), &info, NOW, &accounts, None)
         .unwrap();
     assert!(matches!(
-        joining.join_external(chat(), &info, NOW, &accounts),
+        joining.join_external(chat(), &info, NOW, &accounts, None),
         Err(MlsError::CommitPending { .. })
     ));
     joining.commit_rejected(chat()).unwrap();
@@ -462,7 +464,7 @@ fn a_join_that_loses_its_race_leaves_nothing_behind() {
         Err(MlsError::UnknownChat { .. })
     ));
     joining
-        .join_external(chat(), &info, NOW, &accounts)
+        .join_external(chat(), &info, NOW, &accounts, None)
         .unwrap();
 }
 
@@ -497,12 +499,102 @@ fn someone_from_outside_cannot_join_by_themselves() {
     let mut stranger_device = device(&stranger);
     let accounts = [sara.key.clone(), babak.key.clone(), stranger.key.clone()];
     let join = stranger_device
-        .join_external(chat(), &info, NOW, &accounts)
+        .join_external(chat(), &info, NOW, &accounts, None)
         .unwrap();
     assert!(matches!(
         sara_device.process_commit(chat(), &join.commit, NOW),
         Err(MlsError::JoinRefused { .. })
     ));
+}
+
+const STRANGER_WORDS: &str =
+    "letter advice cage absurd amount doctor acoustic avoid letter advice cage above";
+const OUTSIDER_WORDS: &str = "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong";
+
+/// The stranger's external join into Sara and Babak's chat, carrying this invitation.
+fn join_with(sara: &Person, babak: &Person, info: &[u8], invite: &InviteStatement) -> Commit {
+    let stranger = person(STRANGER_WORDS, 3);
+    let mut stranger_device = device(&stranger);
+    let accounts = [sara.key.clone(), babak.key.clone(), stranger.key.clone()];
+    stranger_device
+        .join_external(chat(), info, NOW, &accounts, Some(invite))
+        .unwrap()
+}
+
+#[test]
+fn an_invitation_signed_by_a_member_device_lets_its_account_join_by_itself() {
+    let (sara, babak, mut sara_device, mut babak_device, _) = direct_chat();
+    let info = sara_device.group_info(chat()).unwrap();
+    let stranger = Ulid::from_bytes([3; 16]);
+    let invite = InviteStatement {
+        account: stranger,
+        device: sara_device.record().device,
+        signature: Bytes(
+            sara_device
+                .sign_invite(&chat(), &stranger)
+                .unwrap()
+                .to_vec(),
+        ),
+    };
+    let join = join_with(&sara, &babak, &info, &invite);
+    sara_device
+        .process_commit(chat(), &join.commit, NOW)
+        .unwrap();
+    babak_device
+        .process_commit(chat(), &join.commit, NOW)
+        .unwrap();
+}
+
+#[test]
+fn an_invitation_that_does_not_hold_is_refused() {
+    let (sara, babak, mut sara_device, _, _) = direct_chat();
+    let info = sara_device.group_info(chat()).unwrap();
+    let stranger = Ulid::from_bytes([3; 16]);
+    let sara_id = sara_device.record().device;
+
+    // Signed by a device that is not in the group.
+    let outsider = device(&person(OUTSIDER_WORDS, 4));
+    let not_member = InviteStatement {
+        account: stranger,
+        device: outsider.record().device,
+        signature: Bytes(outsider.sign_invite(&chat(), &stranger).unwrap().to_vec()),
+    };
+    // Naming the outsider's device as a member's.
+    let wrong_device = InviteStatement {
+        device: sara_id,
+        ..not_member.clone()
+    };
+    // For another account.
+    let other = Ulid::from_bytes([9; 16]);
+    let other_account = InviteStatement {
+        account: other,
+        device: sara_id,
+        signature: Bytes(sara_device.sign_invite(&chat(), &other).unwrap().to_vec()),
+    };
+    // For another chat.
+    let other_chat = InviteStatement {
+        account: stranger,
+        device: sara_id,
+        signature: Bytes(
+            sara_device
+                .sign_invite(&Ulid::from_bytes([51; 16]), &stranger)
+                .unwrap()
+                .to_vec(),
+        ),
+    };
+    // Not a signature at all.
+    let short = InviteStatement {
+        account: stranger,
+        device: sara_id,
+        signature: Bytes(vec![1; 10]),
+    };
+    for invite in [not_member, wrong_device, other_account, other_chat, short] {
+        let join = join_with(&sara, &babak, &info, &invite);
+        assert!(matches!(
+            sara_device.process_commit(chat(), &join.commit, NOW),
+            Err(MlsError::NotAllowed { .. })
+        ));
+    }
 }
 
 #[test]
@@ -531,7 +623,7 @@ fn the_wrong_bytes_are_refused_clearly() {
         })
     ));
     assert!(matches!(
-        babak_device.join_external(other, b"garbage", NOW, &accounts),
+        babak_device.join_external(other, b"garbage", NOW, &accounts, None),
         Err(MlsError::WrongMessage { .. })
     ));
     assert!(matches!(
@@ -735,4 +827,88 @@ fn statements_verify_only_for_what_they_say() {
     )
     .unwrap();
     verify_account_key(&master, &other, sara.keys.account_public(), &sara.key.stamp).unwrap_err();
+}
+
+#[test]
+fn the_server_reads_each_commit_from_a_public_group_it_moves_on() {
+    let sara = person(SARA_WORDS, 1);
+    let babak = person(BABAK_WORDS, 2);
+    let mut sara_device = device(&sara);
+    let babak_device = device(&babak);
+    let created = sara_device
+        .create_chat(chat(), NOW, std::slice::from_ref(&sara.key))
+        .unwrap();
+
+    // Only the chat's own group info starts it.
+    let other = Ulid::from_bytes([51; 16]);
+    assert!(matches!(
+        public_group_start(other, &created.group_info),
+        Err(MlsError::WrongGroup { .. })
+    ));
+    assert!(matches!(
+        public_group_start(chat(), b"junk"),
+        Err(MlsError::WrongMessage { .. })
+    ));
+    let state = public_group_start(chat(), &created.group_info).unwrap();
+
+    // An add names the device it brings in, and the group moves past its epoch.
+    let babak_leaf = Leaf {
+        account: babak.id,
+        device: babak_device.record().device,
+    };
+    let accounts = [sara.key.clone(), babak.key.clone()];
+    let package = babak_device.key_package().unwrap();
+    let add = sara_device
+        .add_devices(chat(), &[package], &accounts)
+        .unwrap();
+    let read = public_group_commit(chat(), &state, &add.commit).unwrap();
+    assert_eq!(read.added, vec![babak_leaf]);
+    assert!(read.removed.is_empty());
+    assert_eq!(read.joined, None);
+    sara_device.commit_accepted(chat(), NOW).unwrap();
+    assert!(matches!(
+        public_group_commit(chat(), &read.state, &add.commit),
+        Err(MlsError::StaleCommit { .. })
+    ));
+    let state = read.state;
+
+    // A removal names the device it takes out.
+    let remove = sara_device
+        .remove_devices(
+            chat(),
+            &[babak_leaf.device],
+            std::slice::from_ref(&sara.key),
+        )
+        .unwrap();
+    let read = public_group_commit(chat(), &state, &remove.commit).unwrap();
+    assert_eq!(read.removed, vec![babak_leaf]);
+    assert!(read.added.is_empty());
+    sara_device.commit_rejected(chat()).unwrap();
+
+    // A device joining by itself is named as the one joining.
+    let mut second = device(&sara);
+    let group_info = sara_device.group_info(chat()).unwrap();
+    let join = second
+        .join_external(chat(), &group_info, NOW, &accounts, None)
+        .unwrap();
+    let read = public_group_commit(chat(), &state, &join.commit).unwrap();
+    assert_eq!(
+        read.joined,
+        Some(Leaf {
+            account: sara.id,
+            device: second.record().device,
+        })
+    );
+
+    // Bytes that are no commit, and a kept group that is not one, are refused.
+    assert!(matches!(
+        public_group_commit(chat(), &state, b"junk"),
+        Err(MlsError::WrongMessage { .. })
+    ));
+    for broken in [&[][..], &[0, 0, 0, 9][..], &[0, 0, 0, 0][..]] {
+        assert!(matches!(
+            public_group_commit(chat(), broken, &join.commit),
+            Err(MlsError::PublicState { .. })
+        ));
+    }
 }

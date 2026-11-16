@@ -85,6 +85,7 @@ numbered!(
         Delete = 2,
         Commit = 3,
         DeviceNotice = 4,
+        Line = 5,
     }
 );
 
@@ -145,15 +146,6 @@ numbered!(
     }
 );
 
-numbered!(
-    /// The numbers are the `conversation.mode` column's.
-    ChatMode {
-        Private = 0,
-        Mixed = 1,
-        Open = 2,
-    }
-);
-
 /// Everything about a message that its device vouches for, apart from its body. The server
 /// assigns the sequence id afterwards, so it cannot be here.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,6 +158,10 @@ pub struct Header {
     pub epoch: Option<u64>,
     pub pointer_seq: Option<u64>,
     pub call_seq: Option<u64>,
+    /// The topic a group's or channel's message is in. None for General.
+    pub topic: Option<Ulid>,
+    /// The main-list message whose thread this is in.
+    pub thread_seq: Option<u64>,
     pub client_sent_at: i64,
 }
 
@@ -193,6 +189,20 @@ impl Header {
                 }
                 None => bytes.extend_from_slice(&[0; 9]),
             }
+        }
+        match self.topic {
+            Some(topic) => {
+                bytes.push(1);
+                bytes.extend_from_slice(topic.bytes());
+            }
+            None => bytes.extend_from_slice(&[0; 17]),
+        }
+        match self.thread_seq {
+            Some(value) => {
+                bytes.push(1);
+                bytes.extend_from_slice(&value.to_be_bytes());
+            }
+            None => bytes.extend_from_slice(&[0; 9]),
         }
         bytes.extend_from_slice(&self.client_sent_at.to_be_bytes());
         bytes
@@ -228,6 +238,12 @@ pub struct SendFrame {
     pub epoch: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pointer_seq: Option<u64>,
+    /// A content message's topic in a group or channel, signed in its header. None for General.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<Ulid>,
+    /// A content message's thread: the main-list message it answers under, signed in its header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_seq: Option<u64>,
     pub client_sent_at: i64,
     pub body: Bytes,
     pub signature: Bytes,
@@ -247,6 +263,44 @@ pub struct SendFrame {
     /// A commit's: every member's profile key it knows, sealed at the epoch it moves to.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub profile_key_list: Vec<ProfileKeyShare>,
+    /// A group's or channel's commit that changes who is in it or their role, which the server
+    /// checks and applies in the same step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<CommitAction>,
+    /// An add commit's, or the commit of a device joining by invitation: the group's or channel's
+    /// profile key sealed at the epoch it moves to, which everyone it leaves in the chat holds.
+    /// Saved in the same step, replacing the one kept, and pushed after the commit with the profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_key: Option<Bytes>,
+}
+
+/// What a commit does to a group's or channel's people, readable so the server checks it.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitAction {
+    pub kind: ActionKind,
+    pub account_list: Vec<Ulid>,
+}
+
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionKind {
+    /// New accounts, by someone who may add, or let in by request.
+    Add,
+    /// Accounts taken out by someone who may remove them. Finishing in MLS what a leave or an ended
+    /// device already did carries no action.
+    Remove,
+}
+
+/// A group's or channel's built-in roles.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatRole {
+    Owner,
+    Moderator,
+    Member,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -259,6 +313,11 @@ pub enum ClientFrame {
         chat: Ulid,
         up_to_seq: u64,
         client_seen_at: i64,
+        /// Where it was read: a topic, a thread, or neither for the main list.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        topic: Option<Ulid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread_seq: Option<u64>,
     },
     /// "Received up to N": this device now holds those messages. Kept like `seen`, and answered
     /// with `done`.
@@ -268,6 +327,10 @@ pub enum ClientFrame {
         chat: Ulid,
         up_to_seq: u64,
         client_received_at: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        topic: Option<Ulid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread_seq: Option<u64>,
     },
     /// Keeps this account's draft in a chat, or clears it with none. Answered with `done`, and the
     /// account's other online devices get it as `draft`.
@@ -291,17 +354,25 @@ pub enum ClientFrame {
         #[serde(flatten)]
         folders: ChatFolders,
     },
-    /// When each other member's device received and saw one message, answered with `times`.
+    /// When each other member's device received and saw one message, answered with `times` in
+    /// pages: `after` is the last account of the page before.
     Times {
         #[serde(rename = "ref")]
         reference: Ulid,
         chat: Ulid,
         seq: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<Ulid>,
     },
-    /// Not saved and not answered, so it has no `ref` and no sequence id.
+    /// Not saved and not answered, so it has no `ref` and no sequence id. In a channel it goes out
+    /// only inside a thread.
     Typing {
         chat: Ulid,
         on: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        topic: Option<Ulid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread_seq: Option<u64>,
     },
     /// The chats list, and the messages and call rows saved after a time, in pages. The server
     /// works out which chats, and the client never sends a list. `since` is the server time of the
@@ -324,6 +395,16 @@ pub enum ClientFrame {
         chat: Ulid,
         epoch: u64,
         body: Bytes,
+        /// A new group's or channel's first profile, sealed under its profile key, saved in the
+        /// same step.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chat_profile: Option<Box<ChatProfileBody>>,
+        /// That profile key, sealed at epoch 0, which goes with the first profile.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chat_key: Option<Bytes>,
+        /// A new group's or channel's first options, saved in the same step.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chat_options: Option<Box<ChatOptions>>,
     },
     /// Asks whether the server is alive, for a browser, which cannot send a WebSocket ping. Answered
     /// with `done`.
@@ -385,6 +466,146 @@ pub enum ClientFrame {
         reference: Ulid,
         #[serde(flatten)]
         change: KvChange,
+    },
+    /// An owner removes a whole group or channel, for everyone. Answered with `done`.
+    ChatRemove {
+        #[serde(rename = "ref")]
+        reference: Ulid,
+        chat: Ulid,
+    },
+    /// Leaves a group or channel, at once on the server, and the next member online commits the
+    /// removal. Answered with `done`.
+    Leave {
+        #[serde(rename = "ref")]
+        reference: Ulid,
+        chat: Ulid,
+    },
+    /// Makes a member of a group or channel an owner, a moderator or a plain member, on the server
+    /// alone, which clients trust for roles. Answered with `done`.
+    ChatRole {
+        #[serde(rename = "ref")]
+        reference: Ulid,
+        chat: Ulid,
+        account: Ulid,
+        role: ChatRole,
+    },
+    /// Asks to join a findable group or channel, with a note the server can read. Answered with
+    /// `done`.
+    JoinRequest {
+        #[serde(rename = "ref")]
+        reference: Ulid,
+        chat: Ulid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
+    /// Takes back this account's request. Answered with `done`.
+    JoinCancel {
+        #[serde(rename = "ref")]
+        reference: Ulid,
+        chat: Ulid,
+    },
+    /// Declines someone's request, by one who may add people. Answered with `done`.
+    JoinDecline {
+        #[serde(rename = "ref")]
+        reference: Ulid,
+        chat: Ulid,
+        account: Ulid,
+    },
+    /// Invites someone whose switch turns every add into an invitation. `sealed` holds the inviter
+    /// and the chat's name and photo, sealed to the invited account, and `signature` is this
+    /// device's over `keryx v1 invite`, the chat and that account. Answered with `done`.
+    Invite {
+        #[serde(rename = "ref")]
+        reference: Ulid,
+        chat: Ulid,
+        account: Ulid,
+        sealed: Bytes,
+        signature: Bytes,
+    },
+    /// Accepts or declines this account's invitation. Accepting makes it a member at once, and its
+    /// device then joins by external commit. Answered with `done`.
+    InviteAnswer {
+        #[serde(rename = "ref")]
+        reference: Ulid,
+        chat: Ulid,
+        accept: bool,
+    },
+    /// Asks for a new topic's id, so its name can be sealed with it. Answered with `topic_id`.
+    TopicId {
+        #[serde(rename = "ref")]
+        reference: Ulid,
+        chat: Ulid,
+    },
+    /// Asks for a group's or channel's members and their roles, by any member. Answered with
+    /// `members`.
+    Members {
+        #[serde(rename = "ref")]
+        reference: Ulid,
+        chat: Ulid,
+    },
+    /// Whether topics show, and the live topics, in order. A topic left out is removed with every
+    /// message in it. Answered with `done`.
+    Topics {
+        #[serde(rename = "ref")]
+        reference: Ulid,
+        chat: Ulid,
+        #[serde(flatten)]
+        topics: TopicsBody,
+    },
+    /// A group's or channel's sealed profile, with its topics' names. Answered with `done`.
+    ChatProfile {
+        #[serde(rename = "ref")]
+        reference: Ulid,
+        chat: Ulid,
+        #[serde(flatten)]
+        profile: ChatProfileBody,
+    },
+    /// What a group's or channel's members may do, by owners. Answered with `done`.
+    ChatOptions {
+        #[serde(rename = "ref")]
+        reference: Ulid,
+        chat: Ulid,
+        #[serde(flatten)]
+        options: ChatOptions,
+    },
+    /// Whether the directory lists this group or channel, with the name and bio it shows, which
+    /// the server reads. Answered with `done`.
+    Findable {
+        #[serde(rename = "ref")]
+        reference: Ulid,
+        chat: Ulid,
+        #[serde(flatten)]
+        findable: FindableBody,
+    },
+    /// A topic's sealed profile, General's under the all-zero id, by its moderators and the group's
+    /// owners and moderators. Answered with `done`.
+    TopicProfile {
+        #[serde(rename = "ref")]
+        reference: Ulid,
+        chat: Ulid,
+        topic: Ulid,
+        #[serde(flatten)]
+        profile: Box<ChatProfileBody>,
+    },
+    /// A topic's own options, by its moderators and the group's owners and moderators. Answered
+    /// with `done`.
+    TopicOptions {
+        #[serde(rename = "ref")]
+        reference: Ulid,
+        chat: Ulid,
+        topic: Ulid,
+        #[serde(flatten)]
+        options: Box<TopicOptionsBody>,
+    },
+    /// Makes a member a topic's moderator, or a plain member there again, by the group's owners.
+    /// Answered with `done`.
+    TopicRole {
+        #[serde(rename = "ref")]
+        reference: Ulid,
+        chat: Ulid,
+        topic: Ulid,
+        account: Ulid,
+        role: ChatRole,
     },
 }
 
@@ -509,6 +730,8 @@ pub fn call_text_header(
         epoch: Some(epoch),
         pointer_seq: None,
         call_seq: Some(call_seq),
+        topic: None,
+        thread_seq: None,
         client_sent_at: client_at,
     }
 }
@@ -1201,6 +1424,10 @@ pub struct MessageFrame {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pointer_seq: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<Ulid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_sent_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_saved_at: Option<i64>,
@@ -1223,6 +1450,8 @@ impl MessageFrame {
             epoch: self.epoch,
             pointer_seq: self.pointer_seq,
             call_seq: None,
+            topic: self.topic,
+            thread_seq: self.thread_seq,
             client_sent_at: self.client_sent_at?,
         })
     }
@@ -1235,7 +1464,6 @@ pub struct ChatItem {
     pub chat: Ulid,
     #[serde(rename = "type")]
     pub chat_type: ChatType,
-    pub mode: ChatMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seq: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1265,6 +1493,427 @@ pub struct ChatItem {
     /// Every member's profile version and sealed profile key, this account's too.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub profile_key_list: Vec<ProfileKeyItem>,
+    /// A group's or channel's: this account's role there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<ChatRole>,
+    /// Whether its messages show in topics.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub topics_on: bool,
+    /// Its live topics, in order. General is not listed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub topic_list: Vec<Ulid>,
+    /// Its topics' own settings, moderators and profiles, General's too under the all-zero id. A
+    /// hidden topic is left out for those who may not see it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub topic_setting_list: Vec<TopicItem>,
+    /// This account's seen positions in topics and threads it has read in. The main list's is
+    /// `seen_seq`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub place_seen_list: Vec<PlaceSeen>,
+    /// Its sealed profile, with its topics' names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<ChatProfileItem>,
+    /// What its members may do, when it differs from the built-in member role.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<ChatOptions>,
+    /// The name and bio the directory shows, while it is findable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub findable: Option<FindableItem>,
+    /// How many accounts are in it, for a channel's subscribers, who do not see the list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_count: Option<u64>,
+    /// How many join requests wait, set only for an account that may let people in, 0 included, so
+    /// a device back from being away knows whether any wait.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_count: Option<u64>,
+}
+
+/// One topic's or thread's seen position for this account.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlaceSeen {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<Ulid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_seq: Option<u64>,
+    pub seen_seq: u64,
+}
+
+numbered!(
+    /// The numbers are the `chat_event.action` column's. `ChatRemoved` is sent live only, since the
+    /// chat's rows go with it, and a device back later finds the chat missing from its list.
+    ChatAction {
+        Created = 0,
+        Added = 1,
+        Removed = 2,
+        Left = 3,
+        LetIn = 4,
+        Joined = 5,
+        MadeOwner = 6,
+        MadeModerator = 7,
+        MadeMember = 8,
+        Deleted = 9,
+        TopicAdded = 10,
+        TopicRemoved = 11,
+        TopicsOn = 12,
+        TopicsOff = 13,
+        InvitationDeclined = 14,
+        ChatRemoved = 15,
+        TopicEdited = 16,
+        TopicOptions = 17,
+        MadeTopicModerator = 18,
+        MadeTopicMember = 19,
+        Edited = 20,
+    }
+);
+
+/// What a membership line says happened, as a word in its readable body.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LineAction {
+    Created,
+    Added,
+    LetIn,
+    Joined,
+    Removed,
+    Left,
+    MadeOwner,
+    MadeModerator,
+    MadeMember,
+}
+
+/// A membership line's body, readable JSON the server writes. The actor is its device's account,
+/// and `account_list` the people acted on, empty when the actor is the one it is about.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LineBody {
+    pub action: LineAction,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub account_list: Vec<Ulid>,
+}
+
+numbered!(
+    /// Who sees a chat event: the numbers are the `chat_event.audience` column's, except
+    /// `Everyone`, which is only ever sent live and never saved: a whole chat removed, and each
+    /// membership change, so every device keeps its member list current.
+    Audience {
+        Everyone = 0,
+        Moderators = 1,
+        One = 2,
+    }
+);
+
+/// What the server wrote happened in a group or channel: a membership line every member sees, or
+/// history for its owners and moderators, or a line for one account.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatEvent {
+    pub chat: Ulid,
+    pub n: u64,
+    pub actor: Ulid,
+    pub action: ChatAction,
+    /// The account acted on, or the topic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<Ulid>,
+    /// The message a delete removed or an edit changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
+    /// The topic a topic moderator's row is about, its account being the target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<Ulid>,
+    pub audience: Audience,
+    pub server_at: i64,
+    /// A delete's or edit's copy of the message and its edits as they were, ciphertext, header and
+    /// signature, kept for the history's readers to open.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub copy_list: Vec<MessageFrame>,
+}
+
+/// A commit's authenticated data, as JSON. Only an external join by an account not yet in the chat
+/// carries anything: the invitation that lets it in.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitData {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invite: Option<InviteStatement>,
+}
+
+/// An invitation's signature, `keryx v1 invite`, the chat and the invited account, by a device in the
+/// chat. Members accept an outsider's external join only with one from a device already in the group.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InviteStatement {
+    /// The invited account.
+    pub account: Ulid,
+    /// The inviting device.
+    pub device: Ulid,
+    pub signature: Bytes,
+}
+
+/// A join request, as its asker and those who may let it in see it.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestItem {
+    pub chat: Ulid,
+    pub account: Ulid,
+    /// The chat's findable name, for the asker's row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    pub state: RequestState,
+    pub at: i64,
+}
+
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestState {
+    Waiting,
+    Declined,
+    /// Taken back by its asker, or expired.
+    Gone,
+    /// Let in: the chat follows.
+    LetIn,
+}
+
+/// An invitation's sealed part, HPKE-sealed to the invited account's invite key, so the server sees
+/// none of it: the group's name and its photo's BlurHash, shown before joining, and the chat's
+/// profile key, which opens its whole profile once joined. The photo itself shows once they join.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InvitationPlain {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blurhash: Option<String>,
+    pub key: Bytes,
+    /// The inviter's note, at most 500 characters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// An invitation as core shows it, its sealed part opened. `name` is `None` when it does not open.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InvitationShown {
+    #[serde(rename = "type")]
+    pub chat_type: ChatType,
+    pub inviter: Ulid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blurhash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    pub at: i64,
+}
+
+/// An invitation, as the invited account sees it.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InvitationItem {
+    pub chat: Ulid,
+    #[serde(rename = "type")]
+    pub chat_type: ChatType,
+    pub inviter: Ulid,
+    pub device: Ulid,
+    pub sealed: Bytes,
+    pub signature: Bytes,
+    pub at: i64,
+}
+
+/// Whether topics show, and the live topics in order. Also the body of `PUT
+/// /api/v1/chats/{id}/topics`.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopicsBody {
+    pub on: bool,
+    pub topic_list: Vec<Ulid>,
+}
+
+/// A group's or channel's sealed profile, as a device sends it. Also the body of `PUT
+/// /api/v1/chats/{id}/profile`. `photo` is the chat file it names, kept from now on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatProfileBody {
+    pub sealed: Bytes,
+    pub signature: Bytes,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub photo: Option<Ulid>,
+}
+
+/// What a group's or channel's sealed profile holds, as JSON: its name, bio, links and photo, and its
+/// topics' names. Sealed under the chat's own profile key, which never changes, so anyone given the
+/// key reads it, and every later change.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatProfilePlain {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bio: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub link_list: Vec<ProfileLink>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub photo: Option<ProfilePhoto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub topic_list: Vec<TopicName>,
+    /// At most 2,000 characters, counted as Unicode characters, checked by core.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rules: Option<String>,
+}
+
+/// One topic's name, inside the chat's sealed profile. `place` is its order among the topics.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopicName {
+    pub id: Ulid,
+    pub name: String,
+    #[serde(default)]
+    pub place: u64,
+}
+
+/// What a group's or channel's text message holds besides its text: the accounts it mentions, which
+/// the server never sees.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Mentions {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<Ulid>,
+}
+
+/// A group's or channel's sealed profile, as the server keeps it, with the profile key it is sealed
+/// under, itself sealed at `key_epoch`: the newest epoch the key was shared at, which everyone in the
+/// chat holds.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatProfileItem {
+    pub sealed: Bytes,
+    pub signature: Bytes,
+    pub device: Ulid,
+    pub version: u64,
+    pub key_epoch: u64,
+    pub key: Bytes,
+}
+
+/// What a chat's members may do beyond or short of the built-in member role: permission names
+/// without their prefix, and slow mode in seconds. Also the body of `PUT
+/// /api/v1/chats/{id}/options`.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatOptions {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slow_mode: Option<u64>,
+}
+
+/// Who may write in a topic's main list. Members still react and reply in threads either way.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TopicWrite {
+    #[default]
+    Everyone,
+    Moderators,
+}
+
+impl TopicWrite {
+    pub fn is_everyone(&self) -> bool {
+        *self == TopicWrite::Everyone
+    }
+}
+
+/// A topic's own options, starting from the group's: permission names without their prefix, from
+/// the reaction, sticker and file kinds and the four times permissions, slow mode in seconds (none
+/// follows the group's, 0 is off), who may write, and whether it is closed or hidden. Also the body of `PUT
+/// /api/v1/chats/{id}/topics/{topic}/options`.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopicOptionsBody {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slow_mode: Option<u64>,
+    #[serde(default, skip_serializing_if = "TopicWrite::is_everyone")]
+    pub write: TopicWrite,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub closed: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hidden: bool,
+}
+
+/// A topic's sealed profile, as the server keeps it. Sealed under the group's own profile key.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopicProfileItem {
+    pub sealed: Bytes,
+    pub signature: Bytes,
+    pub device: Ulid,
+    pub version: u64,
+}
+
+/// What a topic's sealed profile holds, as JSON: its bio, links, photo and rules. Its name stays in
+/// the group's topic list.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopicProfilePlain {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bio: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub link_list: Vec<ProfileLink>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub photo: Option<ProfilePhoto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rules: Option<String>,
+}
+
+/// One topic's own settings, moderators and sealed profile, General's under the all-zero id.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopicItem {
+    pub topic: Ulid,
+    #[serde(flatten)]
+    pub options: TopicOptionsBody,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mod_list: Vec<Ulid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<TopicProfileItem>,
+}
+
+/// General's id where a topic's own settings are kept: all zeros. Its messages carry no topic.
+pub const GENERAL_TOPIC: Ulid = Ulid::ZERO;
+
+/// Whether a group or channel is findable, with the name and bio the directory shows. Also the
+/// body of `PUT /api/v1/chats/{id}/findable`.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FindableBody {
+    pub findable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bio: Option<String>,
+}
+
+/// A findable group's or channel's readable name and bio.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FindableItem {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bio: Option<String>,
+}
+
+/// A findable group or channel, as the directory lists it.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FoundChat {
+    pub chat: Ulid,
+    #[serde(rename = "type")]
+    pub chat_type: ChatType,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bio: Option<String>,
+    pub member_count: u64,
 }
 
 /// One folder of an account. `all` is the one with no name and no `chat_list`, and holds every chat.
@@ -1321,7 +1970,7 @@ pub struct DraftRequest {
 }
 
 /// When one member's devices first received and first saw a message, by the server's clock. Each is
-/// missing until it has happened, and `seen_at` is also missing for a member with receipts off.
+/// missing until it has happened, or when the asker may not see it.
 #[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimesItem {
@@ -1332,17 +1981,18 @@ pub struct TimesItem {
     pub seen_at: Option<i64>,
 }
 
-/// `GET /api/v1/chats/{id}/messages/{seq}/times`: the same list `times` answers with, for every
+/// `GET /api/v1/chats/{id}/messages/{seq}/times`: the same page `times` answers with, of every
 /// member but the message's sender.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimesReply {
     pub chat: Ulid,
     pub seq: u64,
     pub member_list: Vec<TimesItem>,
+    /// Another page follows: ask again with `after` at this one's last account.
+    pub more: bool,
 }
 
-/// How far one member's devices have received and seen a chat. No `seen_seq` for someone with
-/// receipts off.
+/// How far one member's devices have received and seen a chat.
 #[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MarkItem {
@@ -1388,15 +2038,22 @@ pub enum ServerFrame {
         version: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         kv_list: Option<Vec<KvItem>>,
+        /// Only for `slow_mode`: how many seconds until this member may write there again.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seconds: Option<u64>,
+        /// Only for `invite_needed`: the accounts added by invitation only, whom the client invites.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account_list: Option<Vec<Ulid>>,
     },
     Message(Box<MessageFrame>),
-    /// A `times` request's answer: who got and saw the message, and when.
+    /// A `times` request's answer: who got and saw the message, and when, one page of them.
     Times {
         #[serde(rename = "ref")]
         reference: Ulid,
         chat: Ulid,
         seq: u64,
         member_list: Vec<TimesItem>,
+        more: bool,
     },
     /// A `sync`'s answer: the chats list on its first page only, then up to `[limits] history_page`
     /// messages and call rows, ordered by server time, chat, sequence id and `n`, where a message's
@@ -1407,10 +2064,20 @@ pub enum ServerFrame {
         chat_list: Vec<ChatItem>,
         message_list: Vec<MessageFrame>,
         call_list: Vec<CallEvent>,
+        /// Groups' and channels' events this account may see, ordered with the rest, at sequence
+        /// id 0 and their own `n`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        chat_event_list: Vec<ChatEvent>,
         more: bool,
         /// This account's folders, on the first page only.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         chat_folders: Option<ChatFolders>,
+        /// This account's own join requests, waiting or declined, on the first page only.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        asked_list: Vec<RequestItem>,
+        /// This account's invitations, on the first page only.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        invitation_list: Vec<InvitationItem>,
     },
     Welcome {
         chat: Ulid,
@@ -1420,6 +2087,10 @@ pub enum ServerFrame {
         chat: Ulid,
         account: Ulid,
         on: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        topic: Option<Ulid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread_seq: Option<u64>,
     },
     /// This account's draft changed on another of its devices. None means it was cleared.
     Draft {
@@ -1443,6 +2114,59 @@ pub enum ServerFrame {
     },
     /// Something happened inside a call, sent to the chat's online devices.
     CallEvent(Box<CallEvent>),
+    /// Something happened in a group or channel, sent to the online devices of those it is for.
+    ChatEvent(Box<ChatEvent>),
+    /// A new topic's id, answering `topic_id`.
+    TopicId {
+        #[serde(rename = "ref")]
+        reference: Ulid,
+        chat: Ulid,
+        topic: Ulid,
+    },
+    /// A group's or channel's members and their roles, answering `members`.
+    Members {
+        #[serde(rename = "ref")]
+        reference: Ulid,
+        chat: Ulid,
+        member_list: Vec<MemberItem>,
+    },
+    /// A group's or channel's topics changed.
+    Topics {
+        chat: Ulid,
+        #[serde(flatten)]
+        topics: TopicsBody,
+    },
+    /// A group's or channel's sealed profile changed.
+    ChatProfile {
+        chat: Ulid,
+        profile: ChatProfileItem,
+    },
+    /// What a group's or channel's members may do changed.
+    ChatOptions {
+        chat: Ulid,
+        #[serde(flatten)]
+        options: ChatOptions,
+    },
+    /// Whether the directory lists a group or channel changed, with the name and bio it shows.
+    Findable {
+        chat: Ulid,
+        #[serde(flatten)]
+        findable: FindableBody,
+    },
+    /// A topic's settings, moderators or profile changed: the whole item, to those who may see it.
+    Topic {
+        chat: Ulid,
+        #[serde(flatten)]
+        item: Box<TopicItem>,
+    },
+    /// A join request changed: to the asker's devices, its own, and to those who may let it in.
+    JoinRequest(Box<RequestItem>),
+    /// An invitation arrived, or with none, went: answered on another device, or expired.
+    Invitation {
+        chat: Ulid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        invitation: Option<InvitationItem>,
+    },
     /// A device of someone sharing a chat ended. `statement` is its signed revocation or logout,
     /// which a client verifies before removing the device from each chat.
     Revoked {
@@ -1637,6 +2361,9 @@ pub struct AccountKeysBody {
     pub master_public: Bytes,
     pub account_public: Bytes,
     pub account_stamp: Bytes,
+    /// The X25519 key invitations are sealed to, and the master key's stamp on it.
+    pub invite_public: Bytes,
+    pub invite_stamp: Bytes,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1644,7 +2371,7 @@ pub struct SelfChatReply {
     pub self_chat: Ulid,
 }
 
-/// An account, with its three keys once its words are set up.
+/// An account, with its keys once its words are set up.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountInfo {
     pub id: Ulid,
@@ -1657,6 +2384,10 @@ pub struct AccountInfo {
     pub account_public: Option<Bytes>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_stamp: Option<Bytes>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invite_public: Option<Bytes>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invite_stamp: Option<Bytes>,
 }
 
 /// What anyone logged in can see of an account.
@@ -1672,6 +2403,62 @@ pub struct AccountBrief {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountListReply {
     pub account_list: Vec<AccountBrief>,
+    /// Findable groups and channels whose name holds the search.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chat_list: Vec<FoundChat>,
+}
+
+/// `POST /api/v1/chats/{id}/requests`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestBody {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// `GET /api/v1/chats/{id}/requests`: the waiting ones.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestListReply {
+    pub request_list: Vec<RequestItem>,
+}
+
+/// `POST /api/v1/chats/{id}/invitations`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InviteBody {
+    pub account: Ulid,
+    pub sealed: Bytes,
+    pub signature: Bytes,
+}
+
+/// `POST /api/v1/chats/{id}/invitation`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InviteAnswerBody {
+    pub accept: bool,
+}
+
+/// `PUT /api/v1/chats/{id}/members/{account}/role`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleBody {
+    pub role: ChatRole,
+}
+
+/// One member of a group or channel, with its role.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberItem {
+    pub account: Ulid,
+    pub role: ChatRole,
+}
+
+/// `GET /api/v1/chats/{id}/members`: every member, channel subscribers too, with its role.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberListReply {
+    pub member_list: Vec<MemberItem>,
+}
+
+/// `POST /api/v1/chats/{id}/topics/id`: a new topic's id, kept for this account for 5 minutes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopicReply {
+    pub topic: Ulid,
 }
 
 #[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
@@ -1778,6 +2565,15 @@ pub struct KeyPackageItem {
     pub body: Bytes,
 }
 
+/// The body of `POST /api/v1/accounts/{id}/key_packages/claim`. Claiming to add someone to a group
+/// or channel names it, so an account added by invitation only is refused before any of its
+/// one-use packages is handed out. An empty body names none.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimBody {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat: Option<Ulid>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyPackageListReply {
     pub key_package_list: Vec<KeyPackageItem>,
@@ -1785,7 +2581,18 @@ pub struct KeyPackageListReply {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateChatBody {
-    pub account: Ulid,
+    /// A direct chat's other person, or your own account for your self chat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<Ulid>,
+    /// A group or channel, with this account its owner, alone in it until it adds people.
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub chat_type: Option<ChatType>,
+    /// Whether it starts with topics on. Unset takes the server's `[chat] topics`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topics: Option<bool>,
+    /// Listed in the directory from the start, under this name and bio.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub findable: Option<FindableItem>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1801,6 +2608,10 @@ pub struct CreateFileBody {
     pub kind: ContentKind,
     pub size: u64,
     pub chunks: u64,
+    /// False for an unencrypted message's file, which needs the permission to send one. Unset
+    /// means encrypted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encrypted: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

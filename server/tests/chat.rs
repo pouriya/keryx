@@ -8,15 +8,18 @@ use std::time::Duration;
 
 use common::{OPERATOR_TOKEN, Server};
 use keryx_core::client::{
-    Command, Draft, Event, FileSpec, Folder, Hit, Pointer, Secret, Setting, ShownProfile, Thumbnail,
+    Command, Draft, Event, FileSpec, Folder, Hit, PhotoInput, Pointer, Secret, Setting,
+    ShownChatProfile, ShownProfile, Thumbnail,
 };
 use keryx_core::file;
 use keryx_core::mls::{AccountWrap, Commit, Device};
 use keryx_core::protocol::{
-    Ack, Answer, Bytes, CallEvent, CallEventKind, CallOutcome, ChatFolders, ChatType, ClientFrame,
-    ContentKind, FolderItem, FolderSuggestion, Header, Kind, KvChange, KvItem, MessageFrame,
-    PresenceItem, PresenceState, ProfileKeyShare, ProfileLink, Question, SendFrame, ServerFrame,
-    Suggestion, SyncPosition, WelcomeItem, WrapItem,
+    Ack, Answer, Audience, Bytes, CallEvent, CallEventKind, CallOutcome, ChatAction, ChatEvent,
+    ChatFolders, ChatOptions, ChatRole, ChatType, ClientFrame, ContentKind, FolderItem,
+    FolderSuggestion, GENERAL_TOPIC, Header, InvitationItem, InvitationShown, Kind, KvChange,
+    KvItem, LineAction, MessageFrame, PresenceItem, PresenceState, ProfileKeyShare, ProfileLink,
+    Question, RequestItem, RequestState, SendFrame, ServerFrame, Suggestion, SyncPosition,
+    TimesItem, TopicName, TopicOptionsBody, TopicWrite, WelcomeItem, WrapItem,
 };
 use keryx_core::ulid::Ulid;
 use person::{
@@ -222,6 +225,8 @@ fn sealed_as(
         pointer_seq,
         call_seq: None,
         client_sent_at,
+        topic: None,
+        thread_seq: None,
     };
     let (body, signature) = person.device.seal(&header, text).unwrap();
     SendFrame {
@@ -241,6 +246,10 @@ fn sealed_as(
         persist: Vec::new(),
         remove: Vec::new(),
         profile_key_list: Vec::new(),
+        topic: None,
+        thread_seq: None,
+        action: None,
+        chat_key: None,
     }
 }
 
@@ -266,6 +275,8 @@ fn commit_frame(
         pointer_seq: None,
         call_seq: None,
         client_sent_at,
+        topic: None,
+        thread_seq: None,
     };
     let signature = device.sign(&header, &commit.commit).unwrap();
     SendFrame {
@@ -292,6 +303,10 @@ fn commit_frame(
                 sealed: Bytes(sealed.clone()),
             })
             .collect(),
+        topic: None,
+        thread_seq: None,
+        action: None,
+        chat_key: None,
     }
 }
 
@@ -303,6 +318,9 @@ fn upload_group_info(socket: &mut Socket, chat: Ulid, epoch: u64, body: Vec<u8>)
             chat,
             epoch,
             body: Bytes(body),
+            chat_profile: None,
+            chat_key: None,
+            chat_options: None,
         },
         wanted,
     )
@@ -498,6 +516,9 @@ fn two_people_exchange_encrypted_text_the_server_cannot_read() {
     sara.command(
         &server,
         Command::SendText {
+            mentions: Vec::new(),
+            thread: None,
+            topic: None,
             chat,
             text: Secret("سلام".to_string()),
             reply: None,
@@ -529,6 +550,9 @@ fn two_people_exchange_encrypted_text_the_server_cannot_read() {
     babak.command(
         &server,
         Command::SendText {
+            mentions: Vec::new(),
+            thread: None,
+            topic: None,
             chat,
             text: Secret("hello".to_string()),
             reply: None,
@@ -606,6 +630,9 @@ fn a_new_device_gets_everything_with_only_the_words() {
     babak.command(
         &server,
         Command::SendText {
+            mentions: Vec::new(),
+            thread: None,
+            topic: None,
             chat,
             text: Secret("before".to_string()),
             reply: None,
@@ -682,6 +709,9 @@ fn a_new_device_gets_everything_with_only_the_words() {
     new.command(
         &server,
         Command::SendText {
+            mentions: Vec::new(),
+            thread: None,
+            topic: None,
             chat,
             text: Secret("from the new one".to_string()),
             reply: None,
@@ -706,8 +736,16 @@ fn a_new_device_cannot_remove_its_notice_but_an_older_one_can() {
     let mut new_socket = connect(&pair.server, &token);
     let page = chat_messages(&mut new_socket, self_chat, 0, 200);
     assert_eq!(page.len(), 2, "one notice per device so far");
+    let first_seq = page[0].seq;
     let notice_seq = page[1].seq;
     assert_eq!(page[1].device, Some(new_device.record().device));
+    // The notice is the self chat's last content, so a later commit cannot hide the preview.
+    let item = chat_item(&mut new_socket, self_chat);
+    assert_eq!(item.last_content_seq, Some(notice_seq));
+    assert_eq!(
+        item.last_content.map(|message| (message.seq, message.kind)),
+        Some((notice_seq, Some(Kind::DeviceNotice)))
+    );
 
     let delete = |device: &Device| {
         let client_sent_at = Ulid::now();
@@ -721,6 +759,8 @@ fn a_new_device_cannot_remove_its_notice_but_an_older_one_can() {
             pointer_seq: Some(notice_seq),
             call_seq: None,
             client_sent_at,
+            topic: None,
+            thread_seq: None,
         };
         let signature = device.sign(&header, b"").unwrap();
         SendFrame {
@@ -740,6 +780,10 @@ fn a_new_device_cannot_remove_its_notice_but_an_older_one_can() {
             persist: Vec::new(),
             remove: Vec::new(),
             profile_key_list: Vec::new(),
+            topic: None,
+            thread_seq: None,
+            action: None,
+            chat_key: None,
         }
     };
 
@@ -752,11 +796,11 @@ fn a_new_device_cannot_remove_its_notice_but_an_older_one_can() {
     assert_eq!(page[0].kind, None, "it is wiped to its sequence id");
     assert_eq!(page[1].seq, seq);
 
-    // Walks the preview's time back to the notice before it, as the list is not moved by a delete.
+    // Walks the preview back to the notice before it, as the list is not moved by a delete.
     let item = chat_item(&mut pair.sara_socket, self_chat);
     assert_eq!(item.chat_type, ChatType::SelfChat);
     assert_eq!(item.last_kind, Some(Kind::Delete));
-    assert_eq!(item.last_content_seq, None);
+    assert_eq!(item.last_content_seq, Some(first_seq));
     assert!(item.last_at.is_some());
 }
 
@@ -940,23 +984,103 @@ fn the_first_commit_for_each_epoch_wins_and_group_info_follows_the_rules() {
     lost.wrap_list.clear();
     assert_refused(post(&mut pair.sara_socket, lost), "commit_lost");
 
+    // Epoch 0 must be the chat's own group info, which starts the public group commits are read
+    // against.
+    assert_refused(
+        upload_group_info(&mut pair.sara_socket, unstarted, 0, vec![1]),
+        "bad_message",
+    );
+    let accounts = [pair.sara.key.clone(), third.key.clone()];
+    let started = pair
+        .sara
+        .device
+        .create_chat(unstarted, Ulid::now(), &accounts)
+        .unwrap();
+    assert_refused(
+        upload_group_info(
+            &mut pair.sara_socket,
+            unstarted,
+            0,
+            sara_commit.group_info.clone(),
+        ),
+        "bad_message",
+    );
+
     // The same epoch 0 again is a resend whose answer was lost, and anything else lost the start.
     done(upload_group_info(
         &mut pair.sara_socket,
         unstarted,
         0,
-        vec![1],
+        started.group_info.clone(),
     ));
     done(upload_group_info(
         &mut pair.sara_socket,
         unstarted,
         0,
-        vec![1],
+        started.group_info,
     ));
     assert_refused(
         upload_group_info(&mut pair.sara_socket, unstarted, 0, vec![2]),
         "chat_started",
     );
+}
+
+#[test]
+fn a_commit_is_read_by_the_server_and_changes_only_what_it_allowed() {
+    let mut pair = pair();
+    let chat = pair.chat;
+    let accounts = [pair.sara.key.clone(), pair.babak.key.clone()];
+
+    // Taking out a device that is not ended, of an account still in, is refused.
+    let babak_device = pair.babak.device.record().device;
+    let commit = pair
+        .sara
+        .device
+        .remove_devices(chat, &[babak_device], &accounts)
+        .unwrap();
+    let frame = commit_frame(&pair.sara.device, chat, &commit, Vec::new());
+    assert_refused(post(&mut pair.sara_socket, frame), "bad_commit");
+    pair.sara.device.commit_rejected(chat).unwrap();
+
+    // So is bringing in a device of an account the chat does not hold.
+    let third = sign_up(&pair.server, "third_x", MINA_WORDS);
+    let package = third.device.key_package().unwrap();
+    let with_third = [
+        pair.sara.key.clone(),
+        pair.babak.key.clone(),
+        third.key.clone(),
+    ];
+    let commit = pair
+        .sara
+        .device
+        .add_devices(chat, &[package], &with_third)
+        .unwrap();
+    // Its wrap for the stranger would be refused first, so only the MLS add is left to name them.
+    let mut frame = commit_frame(&pair.sara.device, chat, &commit, Vec::new());
+    frame.wrap_list.retain(|wrap| wrap.account != third.id);
+    frame
+        .profile_key_list
+        .retain(|share| share.account != third.id);
+    assert_refused(post(&mut pair.sara_socket, frame), "bad_commit");
+    pair.sara.device.commit_rejected(chat).unwrap();
+
+    // A device joins by itself only as itself: Babak's new device's join, sent by Sara, is refused.
+    let token = log_in(&pair.server, "babak_x");
+    let mut fresh = add_device(&pair.server, pair.babak.id, &pair.babak.keys, &token);
+    let group_info = pair.sara.device.group_info(chat).unwrap();
+    let join = fresh
+        .join_external(chat, &group_info, Ulid::now(), &accounts, None)
+        .unwrap();
+    let frame = commit_frame(&fresh, chat, &join, Vec::new());
+    assert_refused(post(&mut pair.sara_socket, frame), "bad_commit");
+
+    // Bytes that are no commit are refused too, and the real one goes in after them.
+    let commit = pair.sara.device.rotate(chat, &accounts).unwrap();
+    let mut frame = commit_frame(&pair.sara.device, chat, &commit, Vec::new());
+    frame.body = Bytes(vec![0, 1, 2]);
+    assert_refused(post(&mut pair.sara_socket, frame), "bad_commit");
+    let frame = commit_frame(&pair.sara.device, chat, &commit, Vec::new());
+    seq_of(post(&mut pair.sara_socket, frame));
 }
 
 #[test]
@@ -1032,7 +1156,7 @@ fn frames_that_break_the_rules_are_refused_with_their_reference() {
             Box::new(|frame: &mut SendFrame| {
                 frame.encrypted = false;
             }),
-            "unencrypted_refused",
+            "no_permission",
         ),
         (
             Box::new(|frame: &mut SendFrame| {
@@ -1127,6 +1251,8 @@ fn a_stranger_gets_nothing_from_a_chat() {
                     chat,
                     up_to_seq: 1,
                     client_seen_at: 1,
+                    topic: None,
+                    thread_seq: None,
                 },
                 wanted,
             )
@@ -1153,7 +1279,12 @@ fn a_stranger_gets_nothing_from_a_chat() {
         "not_member",
     );
     // Typing into someone else's chat reaches nobody, and takes no answer.
-    socket.send(&ClientFrame::Typing { chat, on: true });
+    socket.send(&ClientFrame::Typing {
+        chat,
+        on: true,
+        topic: None,
+        thread_seq: None,
+    });
 
     // An admin passes every permission and is still no member.
     let (status, reply) = pair.server.call(
@@ -1178,6 +1309,8 @@ fn a_stranger_gets_nothing_from_a_chat() {
         "master_public": Bytes(keys.master_public().to_vec()),
         "account_public": Bytes(keys.account_public().to_vec()),
         "account_stamp": Bytes(keryx_core::mls::stamp_account_key(&keys, &boss_id).to_vec()),
+        "invite_public": Bytes(keys.invite_public().to_vec()),
+        "invite_stamp": Bytes(keryx_core::mls::stamp_invite_key(&keys, &boss_id).to_vec()),
     });
     assert_eq!(
         pair.server
@@ -1258,6 +1391,8 @@ fn seen_and_received_keep_the_highest_and_tell_the_sender_and_typing_is_not_save
                 chat,
                 up_to_seq,
                 client_seen_at: Ulid::now(),
+                topic: None,
+                thread_seq: None,
             },
             wanted,
         )
@@ -1270,6 +1405,8 @@ fn seen_and_received_keep_the_highest_and_tell_the_sender_and_typing_is_not_save
                 chat,
                 up_to_seq,
                 client_received_at: Ulid::now(),
+                topic: None,
+                thread_seq: None,
             },
             wanted,
         )
@@ -1311,8 +1448,12 @@ fn seen_and_received_keep_the_highest_and_tell_the_sender_and_typing_is_not_save
     assert_eq!(item.mark_list[0].account, pair.sara.id);
     assert_eq!(item.mark_list[0].received_seq, 0);
 
-    pair.sara_socket
-        .send(&ClientFrame::Typing { chat, on: true });
+    pair.sara_socket.send(&ClientFrame::Typing {
+        chat,
+        on: true,
+        topic: None,
+        thread_seq: None,
+    });
     let typing = pair
         .babak_socket
         .next_where(|frame| matches!(frame, ServerFrame::Typing { .. }));
@@ -1828,6 +1969,9 @@ fn a_welcome_waits_for_an_offline_device() {
     sara.command(
         &server,
         Command::SendText {
+            mentions: Vec::new(),
+            thread: None,
+            topic: None,
             chat,
             text: Secret("you are back".to_string()),
             reply: None,
@@ -1848,6 +1992,9 @@ fn marks_reach_the_sender_and_typing_reaches_the_other() {
     sara.command(
         &server,
         Command::SendText {
+            mentions: Vec::new(),
+            thread: None,
+            topic: None,
             chat,
             text: Secret("x".to_string()),
             reply: None,
@@ -1872,6 +2019,8 @@ fn marks_reach_the_sender_and_typing_reaches_the_other() {
     babak.command(
         &server,
         Command::Seen {
+            thread: None,
+            topic: None,
             chat,
             up_to_seq: seq,
         },
@@ -1902,7 +2051,15 @@ fn marks_reach_the_sender_and_typing_reaches_the_other() {
     }
     assert!(found);
 
-    sara.command(&server, Command::Typing { chat, on: true });
+    sara.command(
+        &server,
+        Command::Typing {
+            thread: None,
+            topic: None,
+            chat,
+            on: true,
+        },
+    );
     let Event::Typing { account, on, .. } =
         babak.wait(&server, |event| matches!(event, Event::Typing { .. }))
     else {
@@ -1919,6 +2076,9 @@ fn a_reply_is_a_message_with_a_target_inside_its_encryption_and_times_show_each_
     sara.command(
         &server,
         Command::SendText {
+            mentions: Vec::new(),
+            thread: None,
+            topic: None,
             chat,
             text: Secret("first".to_string()),
             reply: None,
@@ -1933,6 +2093,9 @@ fn a_reply_is_a_message_with_a_target_inside_its_encryption_and_times_show_each_
     sara.command(
         &server,
         Command::SendText {
+            mentions: Vec::new(),
+            thread: None,
+            topic: None,
             chat,
             text: Secret("second".to_string()),
             reply: Some(Pointer::Local(local)),
@@ -1968,6 +2131,9 @@ fn a_reply_is_a_message_with_a_target_inside_its_encryption_and_times_show_each_
     babak.command(
         &server,
         Command::SendText {
+            mentions: Vec::new(),
+            thread: None,
+            topic: None,
             chat,
             text: Secret("third".to_string()),
             reply: Some(Pointer::Seq(first)),
@@ -1982,7 +2148,14 @@ fn a_reply_is_a_message_with_a_target_inside_its_encryption_and_times_show_each_
     assert_eq!(message.reply, Some(first));
 
     // Times: nobody but the sender's counterpart is listed, and "seen" stays empty until it is.
-    sara.command(&server, Command::Times { chat, seq: first });
+    sara.command(
+        &server,
+        Command::Times {
+            chat,
+            seq: first,
+            after: None,
+        },
+    );
     let Event::Times { member_list, .. } =
         sara.wait(&server, |event| matches!(event, Event::Times { .. }))
     else {
@@ -1995,6 +2168,8 @@ fn a_reply_is_a_message_with_a_target_inside_its_encryption_and_times_show_each_
     babak.command(
         &server,
         Command::Seen {
+            thread: None,
+            topic: None,
             chat,
             up_to_seq: third,
         },
@@ -2324,7 +2499,7 @@ fn folders_are_saved_whole_checked_against_what_is_kept_and_pushed_to_the_other_
     assert_eq!(status, 200, "{reply}");
     let home = ulid_of(&reply["data"]["folder"]);
     let by_rest = ChatFolders {
-        folder_list: vec![named(home, vec![own], Vec::new()), all_with(vec![chat])],
+        folder_list: vec![all_with(vec![chat]), named(home, vec![own], Vec::new())],
         default: home,
     };
     let (status, reply) = pair.server.call(
@@ -2587,6 +2762,9 @@ fn a_chat_opens_on_its_newest_page_and_older_pages_load_upwards() {
         sara.command(
             &server,
             Command::SendText {
+                mentions: Vec::new(),
+                thread: None,
+                topic: None,
                 chat,
                 text: Secret(format!("{number}")),
                 reply: None,
@@ -2653,6 +2831,9 @@ fn an_edit_or_delete_can_point_at_a_message_still_waiting() {
     sara.command(
         &server,
         Command::SendText {
+            mentions: Vec::new(),
+            thread: None,
+            topic: None,
             chat,
             text: Secret("frist".to_string()),
             reply: None,
@@ -2742,6 +2923,9 @@ fn a_device_comes_back_from_its_saved_state_and_logging_out_wipes_it() {
     back.command(
         &server,
         Command::SendText {
+            mentions: Vec::new(),
+            thread: None,
+            topic: None,
             chat,
             text: Secret("still me".to_string()),
             reply: None,
@@ -2768,6 +2952,9 @@ fn a_device_shows_its_chats_with_no_network() {
     babak.command(
         &server,
         Command::SendText {
+            mentions: Vec::new(),
+            thread: None,
+            topic: None,
             chat,
             text: Secret("kept for later".to_string()),
             reply: None,
@@ -2890,6 +3077,8 @@ fn the_websocket_works_over_tls_and_the_certificate_is_checked() {
         "master_public": Bytes(keys.master_public().to_vec()),
         "account_public": Bytes(keys.account_public().to_vec()),
         "account_stamp": Bytes(keryx_core::mls::stamp_account_key(&keys, &id).to_vec()),
+        "invite_public": Bytes(keys.invite_public().to_vec()),
+        "invite_stamp": Bytes(keryx_core::mls::stamp_invite_key(&keys, &id).to_vec()),
     });
     let (_, reply) = server.call("PUT", "/api/v1/account/keys", Some(&token), Some(&body));
     let self_chat = ulid_of(&reply["data"]["self_chat"]);
@@ -3470,6 +3659,8 @@ fn a_file_and_a_bundle_go_up_encrypted_and_come_down_whole() {
     sara.command(
         &server,
         Command::SendFiles {
+            thread: None,
+            topic: None,
             chat,
             files: vec![spec(1, ContentKind::Video, video.len())],
             text: Some(Secret("watch this".to_string())),
@@ -3547,6 +3738,8 @@ fn a_file_and_a_bundle_go_up_encrypted_and_come_down_whole() {
     sara.command(
         &server,
         Command::SendFiles {
+            thread: None,
+            topic: None,
             chat,
             files: vec![first, second],
             text: None,
@@ -3604,6 +3797,8 @@ fn a_file_and_a_bundle_go_up_encrypted_and_come_down_whole() {
     sara.command(
         &server,
         Command::SendFiles {
+            thread: None,
+            topic: None,
             chat,
             files: vec![spec(4, ContentKind::Doc, 1), spec(5, ContentKind::Image, 1)],
             text: None,
@@ -3617,6 +3812,8 @@ fn a_file_and_a_bundle_go_up_encrypted_and_come_down_whole() {
     sara.command(
         &server,
         Command::SendFiles {
+            thread: None,
+            topic: None,
             chat,
             files: vec![spec(6, ContentKind::Image, 21 * 1024 * 1024)],
             text: None,
@@ -4199,6 +4396,8 @@ fn a_sticker_names_a_server_sticker_inside_its_encryption_and_cannot_be_edited()
     sara.command(
         &server,
         Command::SendSticker {
+            thread: None,
+            topic: None,
             chat,
             sticker,
             reply: None,
@@ -4261,6 +4460,9 @@ fn reactions_go_through_core_with_their_target_inside_the_encryption_and_several
     sara.command(
         &server,
         Command::SendText {
+            mentions: Vec::new(),
+            thread: None,
+            topic: None,
             chat,
             text: Secret("lunch?".to_string()),
             reply: None,
@@ -4281,6 +4483,8 @@ fn reactions_go_through_core_with_their_target_inside_the_encryption_and_several
                 chat,
                 emoji: emoji.to_string(),
                 on: Pointer::Seq(on),
+                topic: None,
+                thread: None,
             },
         );
         let Event::Sent { seq, .. } =
@@ -5597,6 +5801,9 @@ fn say_to(server: &Server, from: &mut App, to: &mut App, chat: Ulid, text: &str)
     from.command(
         server,
         Command::SendText {
+            mentions: Vec::new(),
+            thread: None,
+            topic: None,
             chat,
             text: Secret(text.to_string()),
             reply: None,
@@ -5721,6 +5928,8 @@ fn a_search_opens_the_archive_newest_first_by_newest_text_a_page_at_a_time() {
     sara.command(
         &server,
         Command::SendFiles {
+            thread: None,
+            topic: None,
             chat,
             files: vec![spec(1, ContentKind::Doc, 10)],
             text: None,
@@ -5730,6 +5939,8 @@ fn a_search_opens_the_archive_newest_first_by_newest_text_a_page_at_a_time() {
     sara.command(
         &server,
         Command::SendFiles {
+            thread: None,
+            topic: None,
             chat,
             files: vec![spec(2, ContentKind::Voice, 10)],
             text: None,
@@ -5810,4 +6021,2461 @@ fn a_search_opens_the_archive_newest_first_by_newest_text_a_page_at_a_time() {
     let (found, more, ..) = hits_of(&server, &mut babak);
     assert!(found.is_empty());
     assert!(!more);
+}
+
+// -------------------------------------------------------------------------------------------------
+// Groups and channels
+// -------------------------------------------------------------------------------------------------
+
+const MINA_WORDS: &str = "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong";
+
+/// Waits for a chat other than the self chat to be ready.
+fn ready_chat(app: &mut App, server: &Server) -> Ulid {
+    let self_chat = app.self_chat;
+    let Event::ChatReady { chat } = app.wait(
+        server,
+        |event| matches!(event, Event::ChatReady { chat } if Some(*chat) != self_chat),
+    ) else {
+        unreachable!();
+    };
+    chat
+}
+
+fn ready_in(app: &mut App, server: &Server, chat: Ulid) {
+    app.wait(
+        server,
+        |event| matches!(event, Event::ChatReady { chat: ready } if *ready == chat),
+    );
+}
+
+/// Sara makes a group of this type with these people in it.
+fn make_group(
+    sara: &mut App,
+    server: &Server,
+    chat_type: ChatType,
+    account_list: Vec<Ulid>,
+) -> Ulid {
+    sara.command(
+        server,
+        Command::CreateChat {
+            chat_type,
+            name: "  Apollo  ".to_string(),
+            bio: Some("The moon team".to_string()),
+            link_list: Vec::new(),
+            account_list: account_list.clone(),
+            topics: None,
+            findable: false,
+            options: ChatOptions::default(),
+            photo: None,
+            note: None,
+        },
+    );
+    let chat = ready_chat(sara, server);
+    if !account_list.is_empty() {
+        // The add commit carries the profile sealed for the new people, and a text's `sent` comes
+        // after the commit's on the same socket, so the add has landed.
+        send_text(sara, server, chat, "made");
+    }
+    chat
+}
+
+/// Sends a text and waits until the server stored it, reading whatever came before its answer.
+fn send_text(app: &mut App, server: &Server, chat: Ulid, text: &str) {
+    app.command(
+        server,
+        Command::SendText {
+            chat,
+            text: Secret(text.to_string()),
+            reply: None,
+            topic: None,
+            thread: None,
+            mentions: Vec::new(),
+        },
+    );
+    app.wait(
+        server,
+        |event| matches!(event, Event::Sent { chat: sent, .. } if *sent == chat),
+    );
+}
+
+/// Waits for a message with this text in this chat.
+fn read_text(app: &mut App, server: &Server, chat: Ulid, text: &str) -> keryx_core::client::Shown {
+    shown(app.wait(server, |event| {
+        matches!(event, Event::Message { message }
+            if message.chat == chat && text_of(message) == Some(text))
+    }))
+}
+
+fn chat_event_seen(app: &mut App, server: &Server, chat: Ulid, action: ChatAction) -> ChatEvent {
+    let Event::ChatEvent { event, .. } = app.wait(
+        server,
+        |event| matches!(event, Event::ChatEvent { event, .. } if event.chat == chat && event.action == action),
+    ) else {
+        unreachable!();
+    };
+    event
+}
+
+#[test]
+fn a_group_is_made_with_its_people_who_read_its_profile_and_each_other() {
+    let server = open_server();
+    let mut sara = App::sign_up(&server, "sara_x", SARA_WORDS);
+    let mut babak = App::sign_up(&server, "babak_x", BABAK_WORDS);
+    let mut mina = App::sign_up(&server, "mina_x", MINA_WORDS);
+    let chat = make_group(
+        &mut sara,
+        &server,
+        ChatType::Group,
+        vec![babak.id(), mina.id()],
+    );
+    ready_in(&mut babak, &server, chat);
+    ready_in(&mut mina, &server, chat);
+
+    // The profile opens for the new members with its key, which the add shared at its epoch.
+    let Event::ChatProfile { profile, .. } = mina.wait(
+        &server,
+        |event| matches!(event, Event::ChatProfile { chat: shown, .. } if *shown == chat),
+    ) else {
+        unreachable!();
+    };
+    assert_eq!(profile.name, "Apollo");
+    assert_eq!(profile.bio.as_deref(), Some("The moon team"));
+
+    send_text(&mut sara, &server, chat, "hello all");
+    read_text(&mut babak, &server, chat, "hello all");
+    read_text(&mut mina, &server, chat, "hello all");
+    send_text(&mut mina, &server, chat, "hi from mina");
+    read_text(&mut babak, &server, chat, "hi from mina");
+    read_text(&mut sara, &server, chat, "hi from mina");
+    let added = chat_event_seen(&mut babak, &server, chat, ChatAction::Added);
+    assert_eq!(added.actor, sara.id());
+
+    // A mention names members only, and travels inside the encryption.
+    sara.command(
+        &server,
+        Command::SendText {
+            chat,
+            text: Secret("@mina_x look".to_string()),
+            reply: None,
+            topic: None,
+            thread: None,
+            mentions: vec![mina.id()],
+        },
+    );
+    let message = read_text(&mut mina, &server, chat, "@mina_x look");
+    assert_eq!(message.mentions, vec![mina.id()]);
+    let stranger = Ulid::from_bytes([7; 16]);
+    sara.command(
+        &server,
+        Command::SendText {
+            chat,
+            text: Secret("@nobody".to_string()),
+            reply: None,
+            topic: None,
+            thread: None,
+            mentions: vec![stranger],
+        },
+    );
+    sara.wait(
+        &server,
+        |event| matches!(event, Event::Error { code, .. } if code == "not_member"),
+    );
+}
+
+#[test]
+fn leaving_is_at_once_and_a_member_takes_the_leaver_out_of_the_group() {
+    let server = open_server();
+    let mut sara = App::sign_up(&server, "sara_x", SARA_WORDS);
+    let mut babak = App::sign_up(&server, "babak_x", BABAK_WORDS);
+    let mut mina = App::sign_up(&server, "mina_x", MINA_WORDS);
+    let chat = make_group(
+        &mut sara,
+        &server,
+        ChatType::Group,
+        vec![babak.id(), mina.id()],
+    );
+    ready_in(&mut babak, &server, chat);
+    ready_in(&mut mina, &server, chat);
+
+    mina.command(&server, Command::Leave { chat });
+    mina.wait(
+        &server,
+        |event| matches!(event, Event::ChatLeft { chat: left } if *left == chat),
+    );
+    let left = chat_event_seen(&mut sara, &server, chat, ChatAction::Left);
+    assert_eq!(left.target, Some(mina.id()));
+    chat_event_seen(&mut babak, &server, chat, ChatAction::Left);
+
+    // The group goes on without her: what is sent after reaches the others, on a key she lacks.
+    send_text(&mut sara, &server, chat, "after mina");
+    read_text(&mut babak, &server, chat, "after mina");
+
+    // Removing someone is a commit by an owner, and the removed account drops the chat.
+    sara.command(
+        &server,
+        Command::RemoveMembers {
+            chat,
+            account_list: vec![babak.id()],
+        },
+    );
+    babak.wait(
+        &server,
+        |event| matches!(event, Event::ChatLeft { chat: left } if *left == chat),
+    );
+    let removed = chat_event_seen(&mut sara, &server, chat, ChatAction::Removed);
+    assert_eq!(removed.target, Some(babak.id()));
+
+    // The last owner leaving removes the whole chat.
+    sara.command(&server, Command::Leave { chat });
+    sara.wait(
+        &server,
+        |event| matches!(event, Event::ChatLeft { chat: left } if *left == chat),
+    );
+}
+
+#[test]
+fn roles_live_on_the_server_and_only_owners_change_them() {
+    let server = open_server();
+    let mut sara = App::sign_up(&server, "sara_x", SARA_WORDS);
+    let mut babak = App::sign_up(&server, "babak_x", BABAK_WORDS);
+    let chat = make_group(&mut sara, &server, ChatType::Group, vec![babak.id()]);
+    ready_in(&mut babak, &server, chat);
+
+    sara.command(
+        &server,
+        Command::SetRole {
+            chat,
+            account: babak.id(),
+            role: ChatRole::Moderator,
+        },
+    );
+    let made = chat_event_seen(&mut babak, &server, chat, ChatAction::MadeModerator);
+    assert_eq!(made.target, Some(babak.id()));
+
+    // A moderator may not change roles, and the last owner may not step down.
+    babak.command(
+        &server,
+        Command::SetRole {
+            chat,
+            account: sara.id(),
+            role: ChatRole::Member,
+        },
+    );
+    babak.wait(
+        &server,
+        |event| matches!(event, Event::Error { code, .. } if code == "no_permission"),
+    );
+    sara.command(
+        &server,
+        Command::SetRole {
+            chat,
+            account: sara.id(),
+            role: ChatRole::Member,
+        },
+    );
+    sara.wait(
+        &server,
+        |event| matches!(event, Event::Error { code, .. } if code == "last_owner"),
+    );
+
+    // Over REST too, with the same answers.
+    let token = sara.token.clone().unwrap();
+    let route = format!("/api/v1/chats/{chat}/members/{}/role", babak.id());
+    let (status, _) = raw(&server, "PUT", &route, &token, Some(br#"{"role":"owner"}"#));
+    assert_eq!(status, 200);
+    chat_event_seen(&mut babak, &server, chat, ChatAction::MadeOwner);
+    let route = format!(
+        "/api/v1/chats/{chat}/members/{}/role",
+        Ulid::from_bytes([7; 16])
+    );
+    let (status, _) = raw(&server, "PUT", &route, &token, Some(br#"{"role":"owner"}"#));
+    assert_eq!(status, 404);
+}
+
+/// Waits until `app` is told that `them` reached `seq` in this chat, received or seen. Their client
+/// sends one position at a time, the next once the last is answered, so their socket is read too.
+fn marked(app: &mut App, them: &mut App, server: &Server, chat: Ulid, seq: u64, seen: bool) {
+    let account = them.id();
+    let wanted = |event: &Event| {
+        matches!(event, Event::Marks { chat: marked, mark } if *marked == chat
+            && mark.account == account
+            && if seen { mark.seen_seq >= Some(seq) } else { mark.received_seq >= seq })
+    };
+    let started = std::time::Instant::now();
+    while !app.events.iter().any(wanted) {
+        assert!(started.elapsed() < Duration::from_secs(20), "No mark came");
+        them.read_once(server);
+        app.read_once(server);
+    }
+    app.wait(server, wanted);
+}
+
+/// A message's times as this app may see them, by account.
+fn times_of(app: &mut App, server: &Server, chat: Ulid, seq: u64) -> Vec<TimesItem> {
+    app.command(
+        server,
+        Command::Times {
+            chat,
+            seq,
+            after: None,
+        },
+    );
+    let Event::Times { member_list, .. } = app.wait(
+        server,
+        |event| matches!(event, Event::Times { chat: asked, seq: of, .. } if *asked == chat && *of == seq),
+    ) else {
+        unreachable!();
+    };
+    member_list
+}
+
+fn times_for(member_list: &[TimesItem], account: Ulid) -> (bool, bool) {
+    let Some(item) = member_list.iter().find(|item| item.account == account) else {
+        panic!("{account} is not listed");
+    };
+    (item.received_at.is_some(), item.seen_at.is_some())
+}
+
+/// Sets the chat's options as `sara`, and waits until `other` is told.
+fn options_set(sara: &mut App, other: &mut App, server: &Server, chat: Ulid, options: ChatOptions) {
+    sara.command(
+        server,
+        Command::ChatOptions {
+            chat,
+            options: options.clone(),
+        },
+    );
+    other.wait(
+        server,
+        |event| matches!(event, Event::ChatOptions { chat: set, options: got } if *set == chat && *got == options),
+    );
+}
+
+#[test]
+fn times_show_only_what_the_asker_may_see_on_their_own_messages_and_others() {
+    let server = open_server();
+    let mut sara = App::sign_up(&server, "sara_x", SARA_WORDS);
+    let mut babak = App::sign_up(&server, "babak_x", BABAK_WORDS);
+    let mut mina = App::sign_up(&server, "mina_x", MINA_WORDS);
+    let chat = make_group(
+        &mut sara,
+        &server,
+        ChatType::Group,
+        vec![babak.id(), mina.id()],
+    );
+    ready_in(&mut babak, &server, chat);
+    ready_in(&mut mina, &server, chat);
+    let first = say_to(&server, &mut sara, &mut babak, chat, "from sara");
+    read_text(&mut mina, &server, chat, "from sara");
+    let second = say_to(&server, &mut babak, &mut sara, chat, "from babak");
+    read_text(&mut mina, &server, chat, "from babak");
+    mina.command(
+        &server,
+        Command::Seen {
+            chat,
+            up_to_seq: second,
+            topic: None,
+            thread: None,
+        },
+    );
+    marked(&mut babak, &mut mina, &server, chat, second, true);
+    marked(&mut babak, &mut mina, &server, chat, second, false);
+    marked(&mut babak, &mut sara, &server, chat, second, false);
+
+    // A plain member sees both times on their own message, and nothing on someone else's.
+    let member_list = times_of(&mut babak, &server, chat, second);
+    assert_eq!(member_list.len(), 2);
+    assert_eq!(times_for(&member_list, mina.id()), (true, true));
+    assert_eq!(times_for(&member_list, sara.id()), (true, false));
+    assert_eq!(
+        refusal(
+            &mut babak,
+            &server,
+            Command::Times {
+                chat,
+                seq: first,
+                after: None
+            }
+        ),
+        "no_permission"
+    );
+
+    // An owner sees everyone's, and so does a moderator.
+    let member_list = times_of(&mut sara, &server, chat, second);
+    assert_eq!(times_for(&member_list, mina.id()), (true, true));
+    sara.command(
+        &server,
+        Command::SetRole {
+            chat,
+            account: babak.id(),
+            role: ChatRole::Moderator,
+        },
+    );
+    chat_event_seen(&mut babak, &server, chat, ChatAction::MadeModerator);
+    let member_list = times_of(&mut babak, &server, chat, first);
+    assert_eq!(times_for(&member_list, mina.id()), (true, true));
+
+    // Options take a member's own times away one by one, and can hand them others' too.
+    let third = say_to(&server, &mut mina, &mut sara, chat, "from mina");
+    sara.command(
+        &server,
+        Command::Seen {
+            chat,
+            up_to_seq: third,
+            topic: None,
+            thread: None,
+        },
+    );
+    marked(&mut mina, &mut sara, &server, chat, third, true);
+    marked(&mut mina, &mut sara, &server, chat, third, false);
+    options_set(
+        &mut sara,
+        &mut mina,
+        &server,
+        chat,
+        ChatOptions {
+            deny: vec!["message.view_seen.own".to_string()],
+            ..ChatOptions::default()
+        },
+    );
+    let member_list = times_of(&mut mina, &server, chat, third);
+    assert_eq!(times_for(&member_list, sara.id()), (true, false));
+    options_set(
+        &mut sara,
+        &mut mina,
+        &server,
+        chat,
+        ChatOptions {
+            deny: vec![
+                "message.view_seen.own".to_string(),
+                "message.view_received.own".to_string(),
+            ],
+            ..ChatOptions::default()
+        },
+    );
+    assert_eq!(
+        refusal(
+            &mut mina,
+            &server,
+            Command::Times {
+                chat,
+                seq: third,
+                after: None
+            }
+        ),
+        "no_permission"
+    );
+    options_set(
+        &mut sara,
+        &mut mina,
+        &server,
+        chat,
+        ChatOptions {
+            allow: vec!["message.view_seen.others".to_string()],
+            ..ChatOptions::default()
+        },
+    );
+    let member_list = times_of(&mut mina, &server, chat, first);
+    assert_eq!(times_for(&member_list, mina.id()), (false, true));
+}
+
+/// How the server answered this app's next send or delete in this chat: its seq, or the refusal.
+fn answered(app: &mut App, server: &Server, chat: Ulid) -> Result<u64, String> {
+    match app.wait(server, |event| {
+        matches!(event, Event::Sent { chat: of, .. } | Event::Failed { chat: of, .. } if *of == chat)
+    }) {
+        Event::Sent { seq, .. } => Ok(seq),
+        Event::Failed { code, .. } => Err(code),
+        _ => unreachable!(),
+    }
+}
+
+/// Sends a text, in a thread or not, and says how the server answered.
+fn try_text(
+    app: &mut App,
+    server: &Server,
+    chat: Ulid,
+    text: &str,
+    thread: Option<u64>,
+) -> Result<u64, String> {
+    app.command(
+        server,
+        Command::SendText {
+            chat,
+            text: Secret(text.to_string()),
+            reply: None,
+            topic: None,
+            thread,
+            mentions: Vec::new(),
+        },
+    );
+    answered(app, server, chat)
+}
+
+fn try_delete(app: &mut App, server: &Server, chat: Ulid, seq: u64) -> Result<u64, String> {
+    app.command(
+        server,
+        Command::Delete {
+            chat,
+            target: Pointer::Seq(seq),
+            remove: Vec::new(),
+        },
+    );
+    answered(app, server, chat)
+}
+
+fn try_react(app: &mut App, server: &Server, chat: Ulid, on: u64) -> Result<u64, String> {
+    app.command(
+        server,
+        Command::SendReaction {
+            chat,
+            emoji: "👍".to_string(),
+            on: Pointer::Seq(on),
+            topic: None,
+            thread: None,
+        },
+    );
+    answered(app, server, chat)
+}
+
+fn make_moderator(sara: &mut App, them: &mut App, server: &Server, chat: Ulid) {
+    sara.command(
+        server,
+        Command::SetRole {
+            chat,
+            account: them.id(),
+            role: ChatRole::Moderator,
+        },
+    );
+    chat_event_seen(them, server, chat, ChatAction::MadeModerator);
+}
+
+#[test]
+fn slow_mode_spaces_a_members_messages_and_moderators_delete_others_but_an_owners() {
+    let server = open_server();
+    let mut sara = App::sign_up(&server, "sara_x", SARA_WORDS);
+    let mut babak = App::sign_up(&server, "babak_x", BABAK_WORDS);
+    let mut mina = App::sign_up(&server, "mina_x", MINA_WORDS);
+    let chat = make_group(
+        &mut sara,
+        &server,
+        ChatType::Group,
+        vec![babak.id(), mina.id()],
+    );
+    ready_in(&mut babak, &server, chat);
+    ready_in(&mut mina, &server, chat);
+
+    // Only the slow modes on the list are taken.
+    sara.command(
+        &server,
+        Command::ChatOptions {
+            chat,
+            options: ChatOptions {
+                slow_mode: Some(20),
+                ..ChatOptions::default()
+            },
+        },
+    );
+    sara.wait(
+        &server,
+        |event| matches!(event, Event::Error { code, .. } if code == "bad_body"),
+    );
+    options_set(
+        &mut sara,
+        &mut babak,
+        &server,
+        chat,
+        ChatOptions {
+            slow_mode: Some(30),
+            ..ChatOptions::default()
+        },
+    );
+    let first = try_text(&mut babak, &server, chat, "one", None).unwrap();
+    babak.command(
+        &server,
+        Command::SendText {
+            chat,
+            text: Secret("two".to_string()),
+            reply: None,
+            topic: None,
+            thread: None,
+            mentions: Vec::new(),
+        },
+    );
+    let Event::Failed { code, seconds, .. } =
+        babak.wait(&server, |event| matches!(event, Event::Failed { .. }))
+    else {
+        unreachable!();
+    };
+    assert_eq!(code, "slow_mode");
+    assert!(seconds.is_some_and(|seconds| (1..=30).contains(&seconds)));
+    // Threads, reactions and owners are not slowed.
+    try_text(&mut babak, &server, chat, "in a thread", Some(first)).unwrap();
+    try_react(&mut babak, &server, chat, first).unwrap();
+    try_text(&mut sara, &server, chat, "a", None).unwrap();
+    try_text(&mut sara, &server, chat, "b", None).unwrap();
+    options_set(&mut sara, &mut babak, &server, chat, ChatOptions::default());
+    try_text(&mut babak, &server, chat, "three", None).unwrap();
+
+    // A plain member deletes only their own; a moderator deletes others', but never an owner's.
+    let from_sara = try_text(&mut sara, &server, chat, "the owner's", None).unwrap();
+    let from_mina = try_text(&mut mina, &server, chat, "mina's", None).unwrap();
+    assert_eq!(
+        try_delete(&mut babak, &server, chat, from_mina),
+        Err("no_permission".to_string())
+    );
+    make_moderator(&mut sara, &mut babak, &server, chat);
+    assert_eq!(
+        try_delete(&mut babak, &server, chat, from_sara),
+        Err("no_permission".to_string())
+    );
+    try_delete(&mut babak, &server, chat, from_mina).unwrap();
+    mina.wait(
+        &server,
+        |event| matches!(event, Event::Deleted { target_seq, .. } if *target_seq == from_mina),
+    );
+    // An owner deletes anyone's.
+    let from_babak = try_text(&mut babak, &server, chat, "babak's", None).unwrap();
+    try_delete(&mut sara, &server, chat, from_babak).unwrap();
+
+    // The history names who deleted what, for owners and moderators alone.
+    let deleted = chat_event_seen(&mut sara, &server, chat, ChatAction::Deleted);
+    assert_eq!(
+        (deleted.actor, deleted.target, deleted.seq, deleted.audience),
+        (
+            babak.id(),
+            Some(mina.id()),
+            Some(from_mina),
+            Audience::Moderators
+        )
+    );
+    send_text(&mut sara, &server, chat, "after");
+    read_text(&mut mina, &server, chat, "after");
+    assert!(!mina.events.iter().any(|event| matches!(event,
+        Event::ChatEvent { event, .. } if event.action == ChatAction::Deleted)));
+}
+
+#[test]
+fn slow_mode_counts_each_topic_on_its_own_and_a_topics_zero_is_off() {
+    let server = open_server();
+    let mut sara = App::sign_up(&server, "sara_x", SARA_WORDS);
+    let mut babak = App::sign_up(&server, "babak_x", BABAK_WORDS);
+    let chat = make_group(&mut sara, &server, ChatType::Group, vec![babak.id()]);
+    ready_in(&mut babak, &server, chat);
+    let topic = topic_made(&mut sara, &server, chat, "Launch");
+    options_set(
+        &mut sara,
+        &mut babak,
+        &server,
+        chat,
+        ChatOptions {
+            slow_mode: Some(30),
+            ..ChatOptions::default()
+        },
+    );
+
+    // A message in General does not slow the topic, and the topic's own then slows it.
+    try_text(&mut babak, &server, chat, "in general", None).unwrap();
+    try_topic_text(&mut babak, &server, chat, topic, "in launch", None).unwrap();
+    assert_eq!(
+        try_topic_text(&mut babak, &server, chat, topic, "again", None),
+        Err("slow_mode".to_string())
+    );
+
+    // A topic's 0 is off while the group keeps its own.
+    topic_options_set(
+        &mut sara,
+        &mut babak,
+        &server,
+        chat,
+        topic,
+        TopicOptionsBody {
+            slow_mode: Some(0),
+            ..TopicOptionsBody::default()
+        },
+    );
+    try_topic_text(&mut babak, &server, chat, topic, "free", None).unwrap();
+    try_topic_text(&mut babak, &server, chat, topic, "still free", None).unwrap();
+    assert_eq!(
+        try_text(&mut babak, &server, chat, "general again", None),
+        Err("slow_mode".to_string())
+    );
+}
+
+#[test]
+fn a_channel_is_written_by_its_posters_and_talked_about_in_one_level_threads() {
+    let server = open_server();
+    let mut sara = App::sign_up(&server, "sara_x", SARA_WORDS);
+    let mut babak = App::sign_up(&server, "babak_x", BABAK_WORDS);
+    let mut mina = App::sign_up(&server, "mina_x", MINA_WORDS);
+    let chat = make_group(
+        &mut sara,
+        &server,
+        ChatType::Channel,
+        vec![babak.id(), mina.id()],
+    );
+    ready_in(&mut babak, &server, chat);
+    ready_in(&mut mina, &server, chat);
+
+    // A subscriber writes in threads, and only reacts in the main list.
+    assert_eq!(
+        try_text(&mut babak, &server, chat, "main", None),
+        Err("no_permission".to_string())
+    );
+    let post = try_text(&mut sara, &server, chat, "a post", None).unwrap();
+    try_react(&mut babak, &server, chat, post).unwrap();
+    let comment = try_text(&mut babak, &server, chat, "a comment", Some(post)).unwrap();
+    let shown = read_text(&mut mina, &server, chat, "a comment");
+    assert_eq!(shown.thread_seq, Some(post));
+    assert_eq!(
+        try_text(&mut babak, &server, chat, "deeper", Some(comment)),
+        Err("bad_message".to_string())
+    );
+    assert_eq!(
+        try_text(&mut babak, &server, chat, "nowhere", Some(999)),
+        Err("no_such_message".to_string())
+    );
+
+    // Typing shows only inside a thread.
+    for thread in [None, Some(post)] {
+        mina.command(
+            &server,
+            Command::Typing {
+                chat,
+                on: true,
+                topic: None,
+                thread,
+            },
+        );
+    }
+    let Event::Typing {
+        account, thread, ..
+    } = sara.wait(&server, |event| matches!(event, Event::Typing { .. }))
+    else {
+        unreachable!();
+    };
+    assert_eq!((account, thread), (mina.id(), Some(post)));
+
+    // A moderator posts in the main list.
+    make_moderator(&mut sara, &mut babak, &server, chat);
+    try_text(&mut babak, &server, chat, "a moderator's post", None).unwrap();
+}
+
+/// Waits for this account's own join request to show in this state.
+fn asked_seen(app: &mut App, server: &Server, chat: Ulid, wanted: RequestState) -> Option<String> {
+    let Event::Asked { name, .. } = app.wait(
+        server,
+        |event| matches!(event, Event::Asked { chat: of, state, .. } if *of == chat && *state == wanted),
+    ) else {
+        unreachable!();
+    };
+    name
+}
+
+fn found_chats(app: &mut App, server: &Server, text: &str) -> Vec<Ulid> {
+    app.command(
+        server,
+        Command::Search {
+            text: text.to_string(),
+        },
+    );
+    let Event::SearchResults { chat_list, .. } =
+        app.wait(server, |event| matches!(event, Event::SearchResults { .. }))
+    else {
+        unreachable!();
+    };
+    chat_list.into_iter().map(|found| found.chat).collect()
+}
+
+#[test]
+fn a_join_request_is_declined_or_taken_back_and_its_asker_is_told_on_every_device() {
+    let server = open_server();
+    let mut sara = App::sign_up(&server, "sara_x", SARA_WORDS);
+    let mut babak = App::sign_up(&server, "babak_x", BABAK_WORDS);
+    let mut mina = App::sign_up(&server, "mina_x", MINA_WORDS);
+    let chat = make_group(&mut sara, &server, ChatType::Group, vec![babak.id()]);
+    ready_in(&mut babak, &server, chat);
+
+    // Hidden, it is neither listed nor asked into.
+    assert!(found_chats(&mut mina, &server, "apol").is_empty());
+    assert_eq!(
+        refusal(&mut mina, &server, Command::AskToJoin { chat, note: None }),
+        "not_findable"
+    );
+    let findable = || Command::Findable {
+        chat,
+        findable: true,
+        name: Some("Apollo".to_string()),
+        bio: None,
+    };
+    assert_eq!(refusal(&mut babak, &server, findable()), "no_permission");
+    sara.command(&server, findable());
+    // The socket answers in order, so the text's `sent` comes after the findable's `done`.
+    send_text(&mut sara, &server, chat, "findable now");
+    assert_eq!(found_chats(&mut mina, &server, "apol"), vec![chat]);
+
+    // The asking device is told too, with the chat's findable name.
+    mina.command(
+        &server,
+        Command::AskToJoin {
+            chat,
+            note: Some("hi".to_string()),
+        },
+    );
+    let name = asked_seen(&mut mina, &server, chat, RequestState::Waiting);
+    assert_eq!(name.as_deref(), Some("Apollo"));
+    sara.wait(
+        &server,
+        |event| matches!(event, Event::JoinRequest { request } if request.state == RequestState::Waiting),
+    );
+    assert_eq!(
+        refusal(
+            &mut babak,
+            &server,
+            Command::DeclineAsk {
+                chat,
+                account: mina.id()
+            }
+        ),
+        "no_permission"
+    );
+    assert_eq!(
+        refusal(&mut babak, &server, Command::Requests { chat }),
+        "no_permission"
+    );
+
+    // Taken back, it goes from both sides, and cannot then be declined.
+    mina.command(&server, Command::CancelAsk { chat });
+    asked_seen(&mut mina, &server, chat, RequestState::Gone);
+    sara.wait(
+        &server,
+        |event| matches!(event, Event::JoinRequest { request } if request.state == RequestState::Gone),
+    );
+    assert_eq!(
+        refusal(
+            &mut sara,
+            &server,
+            Command::DeclineAsk {
+                chat,
+                account: mina.id()
+            }
+        ),
+        "no_request"
+    );
+    assert_eq!(
+        refusal(&mut mina, &server, Command::CancelAsk { chat }),
+        "no_request"
+    );
+
+    // Declined, the asker is told and may ask again.
+    mina.command(&server, Command::AskToJoin { chat, note: None });
+    asked_seen(&mut mina, &server, chat, RequestState::Waiting);
+    sara.wait(
+        &server,
+        |event| matches!(event, Event::JoinRequest { request } if request.state == RequestState::Waiting),
+    );
+    sara.command(
+        &server,
+        Command::DeclineAsk {
+            chat,
+            account: mina.id(),
+        },
+    );
+    asked_seen(&mut mina, &server, chat, RequestState::Declined);
+    mina.command(&server, Command::AskToJoin { chat, note: None });
+    asked_seen(&mut mina, &server, chat, RequestState::Waiting);
+
+    // Every member reads the member list with roles.
+    babak.command(&server, Command::Members { chat });
+    let Event::Members { member_list, .. } =
+        babak.wait(&server, |event| matches!(event, Event::Members { .. }))
+    else {
+        unreachable!();
+    };
+    let mut roles: Vec<_> = member_list
+        .iter()
+        .map(|member| (member.account, member.role))
+        .collect();
+    roles.sort_by_key(|(account, _)| *account);
+    let mut wanted = vec![(sara.id(), ChatRole::Owner), (babak.id(), ChatRole::Member)];
+    wanted.sort_by_key(|(account, _)| *account);
+    assert_eq!(roles, wanted);
+    assert_eq!(
+        refusal(&mut mina, &server, Command::Members { chat }),
+        "not_member"
+    );
+
+    // Hidden again, it leaves the directory.
+    sara.command(
+        &server,
+        Command::Findable {
+            chat,
+            findable: false,
+            name: None,
+            bio: None,
+        },
+    );
+    send_text(&mut sara, &server, chat, "hidden now");
+    assert!(found_chats(&mut mina, &server, "apol").is_empty());
+
+    // Only an owner removes the whole chat, and it goes for everyone.
+    assert_eq!(
+        refusal(&mut babak, &server, Command::RemoveChat { chat }),
+        "no_permission"
+    );
+    sara.command(&server, Command::RemoveChat { chat });
+    for app in [&mut sara, &mut babak] {
+        app.wait(
+            &server,
+            |event| matches!(event, Event::ChatLeft { chat: left } if *left == chat),
+        );
+    }
+    assert_eq!(
+        refusal(&mut babak, &server, Command::Members { chat }),
+        "not_member"
+    );
+}
+
+/// This account lets nobody add it to a group straight in, so being added becomes an invitation.
+fn invitation_only(app: &mut App, server: &Server) {
+    app.command(
+        server,
+        Command::Kv {
+            set: vec![setting("privacy.add.group", json!("nobody"))],
+            remove: Vec::new(),
+        },
+    );
+    settings_shown(app, server, |list| {
+        list.iter().any(|item| item.key == "privacy.add.group")
+    });
+}
+
+/// Waits for this account's invitation to the chat.
+fn invited(app: &mut App, server: &Server, chat: Ulid) -> InvitationShown {
+    let Event::Invitation { invitation, .. } = app.wait(
+        server,
+        |event| matches!(event, Event::Invitation { chat: invited, invitation: Some(_) } if *invited == chat),
+    ) else {
+        unreachable!();
+    };
+    invitation.unwrap()
+}
+
+#[test]
+fn someone_added_by_invitation_only_is_invited_and_joins_by_itself() {
+    let server = open_server();
+    let mut sara = App::sign_up(&server, "sara_x", SARA_WORDS);
+    let mut babak = App::sign_up(&server, "babak_x", BABAK_WORDS);
+    let mut mina = App::sign_up(&server, "mina_x", MINA_WORDS);
+    invitation_only(&mut mina, &server);
+
+    // Babak goes straight in, and Mina is invited instead.
+    let chat = make_group(
+        &mut sara,
+        &server,
+        ChatType::Group,
+        vec![babak.id(), mina.id()],
+    );
+    ready_in(&mut babak, &server, chat);
+    let Event::Invitation { invitation, .. } = mina.wait(
+        &server,
+        |event| matches!(event, Event::Invitation { chat: invited, invitation: Some(_) } if *invited == chat),
+    ) else {
+        unreachable!();
+    };
+    // The group's name was sealed to Mina's invite key, so she reads it before joining.
+    let invitation = invitation.unwrap();
+    assert_eq!(invitation.inviter, sara.id());
+    assert_eq!(invitation.chat_type, ChatType::Group);
+    assert_eq!(invitation.name.as_deref(), Some("Apollo"));
+    assert_eq!(invitation.blurhash, None);
+    assert_eq!(invitation.note, None);
+
+    // Accepting joins by external commit, carrying the inviter's signature, which members check.
+    mina.command(&server, Command::AnswerInvite { chat, accept: true });
+    ready_in(&mut mina, &server, chat);
+    // With nobody else running, the profile opens with the key the invitation carried.
+    let Event::ChatProfile { profile, .. } = mina.wait(
+        &server,
+        |event| matches!(event, Event::ChatProfile { chat: shown, .. } if *shown == chat),
+    ) else {
+        unreachable!();
+    };
+    assert_eq!(profile.name, "Apollo");
+    assert_eq!(profile.bio.as_deref(), Some("The moon team"));
+    // Reading Mina's text takes her join first, so Sara's answer is sealed under a key she holds.
+    send_text(&mut mina, &server, chat, "thanks");
+    read_text(&mut babak, &server, chat, "thanks");
+    read_text(&mut sara, &server, chat, "thanks");
+    send_text(&mut sara, &server, chat, "welcome mina");
+    read_text(&mut mina, &server, chat, "welcome mina");
+
+    // A change after her join reaches her too.
+    sara.command(
+        &server,
+        Command::ChatProfile {
+            chat,
+            name: "Artemis".to_string(),
+            bio: None,
+            link_list: Vec::new(),
+            rules: None,
+        },
+    );
+    let Event::ChatProfile { profile, .. } = mina.wait(
+        &server,
+        |event| matches!(event, Event::ChatProfile { profile, .. } if profile.name == "Artemis"),
+    ) else {
+        unreachable!();
+    };
+    assert_eq!(profile.bio, None);
+    // The device that saved it gets the server's copy too, with its new version.
+    let own = chat_profile_seen(&mut sara, &server, chat, |profile| {
+        profile.name == "Artemis"
+    });
+    assert_eq!(own.version, profile.version);
+}
+
+/// A group's photo of `size` bytes, which core seals without decoding, with a flat thumbnail.
+fn group_photo(size: usize, seed: u8) -> PhotoInput {
+    PhotoInput {
+        jpeg: pattern(size, seed),
+        thumbnail: Thumbnail {
+            width: 2,
+            height: 2,
+            rgba: vec![seed; 16],
+        },
+    }
+}
+
+/// Sara makes a group with Babak in it, with this photo.
+fn group_with_photo(sara: &mut App, server: &Server, babak: Ulid, photo: PhotoInput) {
+    sara.command(
+        server,
+        Command::CreateChat {
+            chat_type: ChatType::Group,
+            name: "Apollo".to_string(),
+            bio: None,
+            link_list: Vec::new(),
+            account_list: vec![babak],
+            topics: None,
+            findable: false,
+            options: ChatOptions::default(),
+            photo: Some(photo),
+            note: None,
+        },
+    );
+}
+
+fn chat_profile_seen(
+    app: &mut App,
+    server: &Server,
+    chat: Ulid,
+    wanted: impl Fn(&ShownChatProfile) -> bool,
+) -> ShownChatProfile {
+    let Event::ChatProfile { profile, .. } = app.wait(
+        server,
+        |event| matches!(event, Event::ChatProfile { chat: shown, profile } if *shown == chat && wanted(profile)),
+    ) else {
+        unreachable!();
+    };
+    profile
+}
+
+fn chat_photo_bytes(app: &mut App, server: &Server, chat: Ulid) -> (Ulid, Vec<u8>) {
+    app.command(server, Command::ChatPhotoGet { chat });
+    let Event::ChatPhoto { photo, bytes, .. } = app.wait(
+        server,
+        |event| matches!(event, Event::ChatPhoto { chat: shown, .. } if *shown == chat),
+    ) else {
+        unreachable!();
+    };
+    (photo, bytes.0)
+}
+
+#[test]
+fn a_group_photo_goes_up_before_its_people_and_a_failed_one_leaves_the_group_without_it() {
+    let server = open_server();
+    let mut sara = App::sign_up(&server, "sara_x", SARA_WORDS);
+    let mut babak = App::sign_up(&server, "babak_x", BABAK_WORDS);
+
+    // The photo went up before Babak was added, so the first profile he opens names it.
+    let first = group_photo(3000, 1);
+    group_with_photo(&mut sara, &server, babak.id(), first.clone());
+    let chat = ready_chat(&mut sara, &server);
+    ready_in(&mut babak, &server, chat);
+    let profile = chat_profile_seen(&mut babak, &server, chat, |profile| profile.photo.is_some());
+    let shown = profile.photo.unwrap();
+    assert!(!shown.blurhash.is_empty());
+    let (photo, bytes) = chat_photo_bytes(&mut babak, &server, chat);
+    assert_eq!(photo, shown.id);
+    assert_eq!(bytes, first.jpeg);
+
+    // A new one replaces it for everyone, and the old one's bytes go.
+    let second = group_photo(5000, 2);
+    sara.command(
+        &server,
+        Command::ChatPhoto {
+            chat,
+            jpeg: second.jpeg.clone(),
+            thumbnail: second.thumbnail,
+        },
+    );
+    let profile = chat_profile_seen(&mut babak, &server, chat, |profile| {
+        profile
+            .photo
+            .as_ref()
+            .is_some_and(|photo| photo.id != shown.id)
+    });
+    assert_eq!(profile.name, "Apollo");
+    let (_, bytes) = chat_photo_bytes(&mut babak, &server, chat);
+    assert_eq!(bytes, second.jpeg);
+    let token = babak.token.clone().unwrap();
+    let route = format!("/api/v1/files/{}/chunks/0", shown.id);
+    let (status, reply) = raw(&server, "GET", &route, &token, None);
+    assert_eq!((status, code_of(&reply).as_str()), (404, "no_such_file"));
+
+    // Larger than one chunk is refused by core, and the server refuses a sealed photo over
+    // `[limits.upload] photo`, which a whole chunk is once sealed.
+    let chunk = usize::try_from(file::CHUNK).unwrap();
+    let too_large = group_photo(chunk + 1, 3);
+    let refused = refusal(
+        &mut sara,
+        &server,
+        Command::ChatPhoto {
+            chat,
+            jpeg: too_large.jpeg,
+            thumbnail: too_large.thumbnail,
+        },
+    );
+    assert_eq!(refused, "bad_files");
+    let over_limit = group_photo(chunk, 4);
+    let refused = refusal(
+        &mut sara,
+        &server,
+        Command::ChatPhoto {
+            chat,
+            jpeg: over_limit.jpeg,
+            thumbnail: over_limit.thumbnail,
+        },
+    );
+    assert_eq!(refused, "no_such_file");
+
+    // A photo that fails while a group is made, in core or on the server, is only reported: the
+    // group is still made, and its people read a profile without one.
+    let self_chat = sara.self_chat;
+    let mut made_list = vec![chat];
+    for (size, seed) in [(chunk + 1, 5), (chunk, 6)] {
+        group_with_photo(&mut sara, &server, babak.id(), group_photo(size, seed));
+        sara.wait(
+            &server,
+            |event| matches!(event, Event::Error { code, .. } if code == "photo_failed"),
+        );
+        let Event::ChatReady { chat: made } = sara.wait(
+            &server,
+            |event| matches!(event, Event::ChatReady { chat } if !made_list.contains(chat) && Some(*chat) != self_chat),
+        ) else {
+            unreachable!();
+        };
+        made_list.push(made);
+        ready_in(&mut babak, &server, made);
+        let profile = chat_profile_seen(&mut babak, &server, made, |_| true);
+        assert_eq!(profile.name, "Apollo");
+        assert_eq!(profile.photo, None);
+    }
+}
+
+#[test]
+fn a_findable_group_is_asked_to_join_and_its_asker_let_in() {
+    let server = open_server();
+    let mut sara = App::sign_up(&server, "sara_x", SARA_WORDS);
+    let mut mina = App::sign_up(&server, "mina_x", MINA_WORDS);
+    sara.command(
+        &server,
+        Command::CreateChat {
+            chat_type: ChatType::Channel,
+            name: "News".to_string(),
+            bio: None,
+            link_list: Vec::new(),
+            account_list: Vec::new(),
+            topics: None,
+            findable: true,
+            options: ChatOptions::default(),
+            photo: None,
+            note: None,
+        },
+    );
+    let chat = ready_chat(&mut sara, &server);
+
+    // Findable, its name is in the directory beside accounts.
+    mina.command(
+        &server,
+        Command::Search {
+            text: "new".to_string(),
+        },
+    );
+    let Event::SearchResults { chat_list, .. } = mina.wait(&server, |event| {
+        matches!(event, Event::SearchResults { .. })
+    }) else {
+        unreachable!();
+    };
+    assert_eq!(chat_list.len(), 1);
+    assert_eq!(chat_list[0].chat, chat);
+    assert_eq!(chat_list[0].name, "News");
+    assert_eq!(chat_list[0].chat_type, ChatType::Channel);
+
+    mina.command(
+        &server,
+        Command::AskToJoin {
+            chat,
+            note: Some("Let me read".to_string()),
+        },
+    );
+    let Event::JoinRequest { request } = sara.wait(
+        &server,
+        |event| matches!(event, Event::JoinRequest { request } if request.chat == chat),
+    ) else {
+        unreachable!();
+    };
+    assert_eq!(request.account, mina.id());
+    assert_eq!(request.note.as_deref(), Some("Let me read"));
+    sara.command(&server, Command::Requests { chat });
+    let Event::Requests { request_list, .. } =
+        sara.wait(&server, |event| matches!(event, Event::Requests { .. }))
+    else {
+        unreachable!();
+    };
+    assert_eq!(request_list.len(), 1);
+
+    sara.command(
+        &server,
+        Command::LetIn {
+            chat,
+            account: mina.id(),
+        },
+    );
+    ready_in(&mut mina, &server, chat);
+    let let_in = chat_event_seen(&mut sara, &server, chat, ChatAction::LetIn);
+    assert_eq!(let_in.target, Some(mina.id()));
+    send_text(&mut sara, &server, chat, "first post");
+    read_text(&mut mina, &server, chat, "first post");
+
+    // Hiding it, and listing it again under another name, reach its members live.
+    for (findable, name) in [(false, None), (true, Some("Moon news"))] {
+        sara.command(
+            &server,
+            Command::Findable {
+                chat,
+                findable,
+                name: name.map(str::to_string),
+                bio: None,
+            },
+        );
+        let Event::Findable {
+            findable: shown, ..
+        } = mina.wait(
+            &server,
+            |event| matches!(event, Event::Findable { chat: of, .. } if *of == chat),
+        )
+        else {
+            unreachable!();
+        };
+        assert_eq!(shown.map(|item| item.name).as_deref(), name);
+    }
+}
+
+/// This account's waiting join requests and invitations, from the first page of its chats list.
+fn asked_and_invited(server: &Server, token: &str) -> (Vec<RequestItem>, Vec<InvitationItem>) {
+    let mut socket = connect(server, token);
+    let wanted = reference();
+    let ServerFrame::Chats {
+        asked_list,
+        invitation_list,
+        ..
+    } = socket.request(&sync_frame(wanted), wanted)
+    else {
+        panic!("Wanted the chats");
+    };
+    (asked_list, invitation_list)
+}
+
+#[test]
+fn removing_a_chat_takes_its_join_requests_and_invitations_from_those_waiting() {
+    let server = open_server();
+    let mut sara = App::sign_up(&server, "sara_x", SARA_WORDS);
+    let mut babak = App::sign_up(&server, "babak_x", BABAK_WORDS);
+    let mut mina = App::sign_up(&server, "mina_x", MINA_WORDS);
+    invitation_only(&mut mina, &server);
+    sara.command(
+        &server,
+        Command::CreateChat {
+            chat_type: ChatType::Group,
+            name: "Apollo".to_string(),
+            bio: None,
+            link_list: Vec::new(),
+            account_list: vec![mina.id()],
+            topics: None,
+            findable: true,
+            options: ChatOptions::default(),
+            photo: None,
+            note: None,
+        },
+    );
+    let chat = ready_chat(&mut sara, &server);
+    mina.wait(
+        &server,
+        |event| matches!(event, Event::Invitation { chat: invited, invitation: Some(_) } if *invited == chat),
+    );
+    babak.command(&server, Command::AskToJoin { chat, note: None });
+    sara.wait(
+        &server,
+        |event| matches!(event, Event::JoinRequest { request } if request.chat == chat),
+    );
+
+    // Removing the chat tells the one asking and the one invited live, and their lists lose them.
+    sara.command(&server, Command::RemoveChat { chat });
+    babak.wait(
+        &server,
+        |event| matches!(event, Event::Asked { chat: of, state: RequestState::Gone, .. } if *of == chat),
+    );
+    mina.wait(
+        &server,
+        |event| matches!(event, Event::Invitation { chat: of, invitation: None } if *of == chat),
+    );
+    // A socket of their own replaces each app's, so the lists are read only once the pushes came.
+    assert!(
+        asked_and_invited(&server, &babak.token.clone().unwrap())
+            .0
+            .is_empty()
+    );
+    assert!(
+        asked_and_invited(&server, &mina.token.clone().unwrap())
+            .1
+            .is_empty()
+    );
+}
+
+#[test]
+fn declining_an_invitation_tells_the_inviter_alone_and_keeps_the_chat_closed() {
+    let server = open_server();
+    let mut sara = App::sign_up(&server, "sara_x", SARA_WORDS);
+    let mut babak = App::sign_up(&server, "babak_x", BABAK_WORDS);
+    let mut mina = App::sign_up(&server, "mina_x", MINA_WORDS);
+    invitation_only(&mut mina, &server);
+    let chat = make_group(
+        &mut sara,
+        &server,
+        ChatType::Group,
+        vec![babak.id(), mina.id()],
+    );
+    ready_in(&mut babak, &server, chat);
+    invited(&mut mina, &server, chat);
+
+    // The declining device drops it, and the inviter alone gets a line.
+    mina.command(
+        &server,
+        Command::AnswerInvite {
+            chat,
+            accept: false,
+        },
+    );
+    mina.wait(
+        &server,
+        |event| matches!(event, Event::Invitation { chat: of, invitation: None } if *of == chat),
+    );
+    let line = chat_event_seen(&mut sara, &server, chat, ChatAction::InvitationDeclined);
+    assert_eq!(
+        (line.actor, line.target, line.audience),
+        (mina.id(), Some(mina.id()), Audience::One)
+    );
+    send_text(&mut sara, &server, chat, "after");
+    read_text(&mut babak, &server, chat, "after");
+    let declined = |event: &ChatEvent| event.action == ChatAction::InvitationDeclined;
+    assert!(!babak.archive_events.values().any(declined));
+    assert!(!babak.events.iter().any(|event| matches!(event,
+        Event::ChatEvent { event, .. } if declined(event))));
+
+    // Declined, it is gone: it cannot be accepted after all, and Mina is not in.
+    assert_eq!(
+        refusal(
+            &mut mina,
+            &server,
+            Command::AnswerInvite { chat, accept: true }
+        ),
+        "no_invitation"
+    );
+    assert_eq!(
+        refusal(&mut mina, &server, Command::Members { chat }),
+        "not_member"
+    );
+
+    // She can be invited again.
+    sara.command(
+        &server,
+        Command::AddMembers {
+            chat,
+            account_list: vec![mina.id()],
+            note: None,
+        },
+    );
+    invited(&mut mina, &server, chat);
+}
+
+#[test]
+fn an_invitation_and_a_join_request_expire_from_both_sides_and_can_come_again() {
+    let server = Server::start(
+        "",
+        "[registration]\nallow = true\n[limits]\ninvitation_lifetime = \"2s\"\n",
+    );
+    let lifetime = Duration::from_millis(2500);
+    let mut sara = App::sign_up(&server, "sara_x", SARA_WORDS);
+    let mut babak = App::sign_up(&server, "babak_x", BABAK_WORDS);
+    let mut mina = App::sign_up(&server, "mina_x", MINA_WORDS);
+    invitation_only(&mut mina, &server);
+    sara.command(
+        &server,
+        Command::CreateChat {
+            chat_type: ChatType::Group,
+            name: "Apollo".to_string(),
+            bio: None,
+            link_list: Vec::new(),
+            account_list: vec![mina.id()],
+            topics: None,
+            findable: true,
+            options: ChatOptions::default(),
+            photo: None,
+            note: None,
+        },
+    );
+    let chat = ready_chat(&mut sara, &server);
+    invited(&mut mina, &server, chat);
+    babak.command(&server, Command::AskToJoin { chat, note: None });
+    asked_seen(&mut babak, &server, chat, RequestState::Waiting);
+    sara.wait(
+        &server,
+        |event| matches!(event, Event::JoinRequest { request } if request.chat == chat),
+    );
+    let requests = |sara: &mut App| {
+        sara.command(&server, Command::Requests { chat });
+        let Event::Requests { request_list, .. } =
+            sara.wait(&server, |event| matches!(event, Event::Requests { .. }))
+        else {
+            unreachable!();
+        };
+        request_list
+    };
+
+    // Past its lifetime, the chat no longer lists the request, and the invitation is not there to
+    // accept or in the invited account's list.
+    std::thread::sleep(lifetime);
+    assert!(requests(&mut sara).is_empty());
+    assert_eq!(
+        refusal(
+            &mut sara,
+            &server,
+            Command::DeclineAsk {
+                chat,
+                account: babak.id()
+            }
+        ),
+        "no_request"
+    );
+    assert_eq!(
+        refusal(
+            &mut mina,
+            &server,
+            Command::AnswerInvite { chat, accept: true }
+        ),
+        "no_invitation"
+    );
+    // A socket of its own replaces the app's, which reconnects, and core shows the invitation gone,
+    // as the new list leaves it out.
+    assert!(
+        asked_and_invited(&server, &mina.token.clone().unwrap())
+            .1
+            .is_empty()
+    );
+    mina.wait(
+        &server,
+        |event| matches!(event, Event::Invitation { chat: of, invitation: None } if *of == chat),
+    );
+
+    // Invited again, it is as new and can be accepted.
+    sara.command(
+        &server,
+        Command::AddMembers {
+            chat,
+            account_list: vec![mina.id()],
+            note: None,
+        },
+    );
+    invited(&mut mina, &server, chat);
+    mina.command(&server, Command::AnswerInvite { chat, accept: true });
+    ready_in(&mut mina, &server, chat);
+
+    // Asked again, it waits as new, then goes from the asker's own list once it expires too.
+    babak.command(&server, Command::AskToJoin { chat, note: None });
+    asked_seen(&mut babak, &server, chat, RequestState::Waiting);
+    assert_eq!(requests(&mut sara).len(), 1);
+    std::thread::sleep(lifetime);
+    assert!(requests(&mut sara).is_empty());
+    assert!(
+        asked_and_invited(&server, &babak.token.clone().unwrap())
+            .0
+            .is_empty()
+    );
+    asked_seen(&mut babak, &server, chat, RequestState::Gone);
+}
+
+#[test]
+fn topics_are_named_in_the_sealed_profile_and_a_message_carries_its_topic() {
+    let server = open_server();
+    let mut sara = App::sign_up(&server, "sara_x", SARA_WORDS);
+    let mut babak = App::sign_up(&server, "babak_x", BABAK_WORDS);
+    let chat = make_group(&mut sara, &server, ChatType::Group, vec![babak.id()]);
+    ready_in(&mut babak, &server, chat);
+
+    sara.command(&server, Command::TopicId { chat });
+    let Event::TopicId { topic, .. } =
+        sara.wait(&server, |event| matches!(event, Event::TopicId { .. }))
+    else {
+        unreachable!();
+    };
+    sara.command(
+        &server,
+        Command::Topics {
+            chat,
+            on: true,
+            topic_list: vec![TopicName {
+                id: topic,
+                name: " Launch ".to_string(),
+                place: 0,
+            }],
+        },
+    );
+    let Event::ChatProfile { profile, .. } = babak.wait(
+        &server,
+        |event| matches!(event, Event::ChatProfile { profile, .. } if !profile.topic_list.is_empty()),
+    ) else {
+        unreachable!();
+    };
+    assert_eq!(profile.topic_list[0].name, "Launch");
+
+    sara.command(
+        &server,
+        Command::SendText {
+            chat,
+            text: Secret("in launch".to_string()),
+            reply: None,
+            topic: Some(topic),
+            thread: None,
+            mentions: Vec::new(),
+        },
+    );
+    let message = read_text(&mut babak, &server, chat, "in launch");
+    assert_eq!(message.topic, Some(topic));
+
+    // A thread under that message, and seen positions in the topic and the thread.
+    babak.command(
+        &server,
+        Command::SendText {
+            chat,
+            text: Secret("a reply in the thread".to_string()),
+            reply: None,
+            topic: Some(topic),
+            thread: Some(message.seq),
+            mentions: Vec::new(),
+        },
+    );
+    let reply = read_text(&mut sara, &server, chat, "a reply in the thread");
+    assert_eq!(reply.thread_seq, Some(message.seq));
+    sara.command(
+        &server,
+        Command::Seen {
+            chat,
+            up_to_seq: reply.seq,
+            topic: Some(topic),
+            thread: Some(message.seq),
+        },
+    );
+    send_text(&mut sara, &server, chat, "in general");
+    read_text(&mut babak, &server, chat, "in general");
+}
+
+/// A topic of this chat, named, with topics on.
+fn topic_made(sara: &mut App, server: &Server, chat: Ulid, name: &str) -> Ulid {
+    sara.command(server, Command::TopicId { chat });
+    let Event::TopicId { topic, .. } =
+        sara.wait(server, |event| matches!(event, Event::TopicId { .. }))
+    else {
+        unreachable!();
+    };
+    sara.command(
+        server,
+        Command::Topics {
+            chat,
+            on: true,
+            topic_list: vec![TopicName {
+                id: topic,
+                name: name.to_string(),
+                place: 0,
+            }],
+        },
+    );
+    chat_event_seen(sara, server, chat, ChatAction::TopicAdded);
+    topic
+}
+
+#[test]
+fn removing_a_topic_wipes_its_messages_and_threads_and_later_sends_into_it_are_refused() {
+    let server = open_server();
+    let mut sara = App::sign_up(&server, "sara_x", SARA_WORDS);
+    let mut babak = App::sign_up(&server, "babak_x", BABAK_WORDS);
+    let chat = make_group(&mut sara, &server, ChatType::Group, vec![babak.id()]);
+    ready_in(&mut babak, &server, chat);
+    let topic = topic_made(&mut sara, &server, chat, "Launch");
+
+    sara.command(
+        &server,
+        Command::SendText {
+            chat,
+            text: Secret("in launch".to_string()),
+            reply: None,
+            topic: Some(topic),
+            thread: None,
+            mentions: Vec::new(),
+        },
+    );
+    let post = read_text(&mut babak, &server, chat, "in launch");
+    babak.command(
+        &server,
+        Command::SendText {
+            chat,
+            text: Secret("under it".to_string()),
+            reply: None,
+            topic: Some(topic),
+            thread: Some(post.seq),
+            mentions: Vec::new(),
+        },
+    );
+    let comment = read_text(&mut sara, &server, chat, "under it");
+    send_text(&mut sara, &server, chat, "in general");
+    read_text(&mut babak, &server, chat, "in general");
+
+    // A plain member may not change topics, and an id the server never issued is refused.
+    let route = format!("/api/v1/chats/{chat}/topics");
+    let body = json!({"on": true, "topic_list": []}).to_string();
+    let babak_token = babak.token.clone().unwrap();
+    let (status, reply) = raw(&server, "PUT", &route, &babak_token, Some(body.as_bytes()));
+    assert_eq!((status, code_of(&reply).as_str()), (403, "no_permission"));
+    let sara_token = sara.token.clone().unwrap();
+    let body = json!({"on": true, "topic_list": [topic, Ulid::from_bytes([7; 16])]}).to_string();
+    let (status, reply) = raw(&server, "PUT", &route, &sara_token, Some(body.as_bytes()));
+    assert_eq!((status, code_of(&reply).as_str()), (404, "unknown_topic"));
+
+    // Leaving it out removes it for everyone, and the history says so to owners and moderators.
+    sara.command(
+        &server,
+        Command::Topics {
+            chat,
+            on: true,
+            topic_list: Vec::new(),
+        },
+    );
+    babak.wait(
+        &server,
+        |event| matches!(event, Event::Topics { chat: of, on: true, topic_list } if *of == chat && topic_list.is_empty()),
+    );
+    let removed = chat_event_seen(&mut sara, &server, chat, ChatAction::TopicRemoved);
+    assert_eq!(removed.target, Some(topic));
+    assert_eq!(removed.audience, Audience::Moderators);
+
+    // No delete is sent for them, so both online devices sync and drop them from their archives at
+    // once: Babak's on the pushed list, and Sara's, which made the change, once it was taken.
+    for app in [&mut babak, &mut sara] {
+        archive_wiped(app, &server, chat, post.seq);
+        archive_wiped(app, &server, chat, comment.seq);
+    }
+    // A topic's events name the topic as their target, which is no account to ask about.
+    for app in [&mut babak, &mut sara] {
+        app.read_once(&server);
+        assert!(
+            !app.events.iter().any(
+                |event| matches!(event, Event::Error { code, .. } if code == "no_such_account")
+            ),
+            "A topic was asked for as an account"
+        );
+    }
+
+    // Sending into it now is refused, in the main list and in a thread. His thread comment's `sent`
+    // was never waited for, so it goes first.
+    babak.events.clear();
+    babak.command(
+        &server,
+        Command::SendText {
+            chat,
+            text: Secret("too late".to_string()),
+            reply: None,
+            topic: Some(topic),
+            thread: None,
+            mentions: Vec::new(),
+        },
+    );
+    assert_eq!(
+        answered(&mut babak, &server, chat),
+        Err("topic_gone".to_string())
+    );
+    babak.command(
+        &server,
+        Command::SendText {
+            chat,
+            text: Secret("too late here too".to_string()),
+            reply: None,
+            topic: Some(topic),
+            thread: Some(post.seq),
+            mentions: Vec::new(),
+        },
+    );
+    // Its post was wiped with it, so a thread under it has nothing to hang from.
+    assert_eq!(
+        answered(&mut babak, &server, chat),
+        Err("no_such_message".to_string())
+    );
+    send_text(&mut babak, &server, chat, "general still works");
+    read_text(&mut sara, &server, chat, "general still works");
+
+    // Its post and the thread under it keep only their seq, and General keeps its text.
+    let mut socket = connect(&server, &sara_token);
+    let (message_list, _) = sync_chat(&mut socket, chat);
+    let wiped = |seq: u64| {
+        let message = message_list
+            .iter()
+            .find(|message| message.seq == seq)
+            .unwrap();
+        message.body.is_none() && message.signature.is_none() && message.topic.is_none()
+    };
+    assert!(wiped(post.seq));
+    assert!(wiped(comment.seq));
+    assert!(
+        message_list
+            .iter()
+            .any(|message| message.body.is_some() && message.topic.is_none())
+    );
+}
+
+/// Reads until this app's archive holds the message at `seq` wiped to its seq.
+fn archive_wiped(app: &mut App, server: &Server, chat: Ulid, seq: u64) {
+    let started = std::time::Instant::now();
+    while app
+        .archive
+        .get(&(chat, seq))
+        .is_none_or(|message| message.body.is_some())
+    {
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "The archive still holds {seq}"
+        );
+        app.read_once(server);
+    }
+}
+
+/// Another device of this account, from the words alone.
+fn second_device(server: &Server, username: &str, words: &str) -> App {
+    let mut second = App::new();
+    second.command(
+        server,
+        Command::LogIn {
+            username: username.to_string(),
+            password: Secret(PASSWORD.to_string()),
+            captcha: None,
+        },
+    );
+    second.wait(server, |event| {
+        matches!(event, Event::NeedWords { restore: true })
+    });
+    second.command(
+        server,
+        Command::Restore {
+            words: Secret(words.to_string()),
+        },
+    );
+    second
+}
+
+/// The chat's events this app's archive holds, by action.
+fn archived_actions(app: &App, chat: Ulid) -> Vec<ChatAction> {
+    app.archive_events
+        .range((chat, 0)..=(chat, u64::MAX))
+        .map(|(_, event)| event.action)
+        .collect()
+}
+
+#[test]
+fn a_new_device_reads_the_chat_events_its_account_may_see_through_sync() {
+    let server = open_server();
+    let mut sara = App::sign_up(&server, "sara_x", SARA_WORDS);
+    let mut babak = App::sign_up(&server, "babak_x", BABAK_WORDS);
+    let mut mina = App::sign_up(&server, "mina_x", MINA_WORDS);
+    let chat = make_group(
+        &mut sara,
+        &server,
+        ChatType::Group,
+        vec![babak.id(), mina.id()],
+    );
+    ready_in(&mut babak, &server, chat);
+    ready_in(&mut mina, &server, chat);
+    make_moderator(&mut sara, &mut babak, &server, chat);
+    let doomed = try_text(&mut mina, &server, chat, "remove me", None).unwrap();
+    read_text(&mut babak, &server, chat, "remove me");
+    assert!(try_delete(&mut babak, &server, chat, doomed).is_ok());
+    let deleted = chat_event_seen(&mut sara, &server, chat, ChatAction::Deleted);
+    assert_eq!(deleted.seq, Some(doomed));
+    send_text(&mut sara, &server, chat, "last");
+    read_text(&mut mina, &server, chat, "last");
+
+    // An owner's new device gets the membership lines and the history, in order.
+    let mut owner = second_device(&server, "sara_x", SARA_WORDS);
+    ready_in(&mut owner, &server, chat);
+    owner.command(&server, Command::OpenChat { chat });
+    read_text(&mut owner, &server, chat, "last");
+    let owner_actions = archived_actions(&owner, chat);
+    assert!(owner_actions.contains(&ChatAction::Added));
+    assert!(owner_actions.contains(&ChatAction::MadeModerator));
+    assert!(owner_actions.contains(&ChatAction::Deleted));
+    let mut n_list: Vec<u64> = owner
+        .archive_events
+        .range((chat, 0)..=(chat, u64::MAX))
+        .map(|((_, n), _)| *n)
+        .collect();
+    let in_order = n_list.clone();
+    n_list.sort_unstable();
+    assert_eq!(n_list, in_order);
+    // Opening the chat shows them as lines, from the archive.
+    let line = chat_event_seen(&mut owner, &server, chat, ChatAction::Deleted);
+    assert_eq!(line.actor, babak.id());
+
+    // A plain member's new device gets the membership lines, which are messages, and no history.
+    let mut member = second_device(&server, "mina_x", MINA_WORDS);
+    ready_in(&mut member, &server, chat);
+    member.command(&server, Command::OpenChat { chat });
+    read_text(&mut member, &server, chat, "last");
+    assert!(archived_actions(&member, chat).is_empty());
+    member.wait(&server, |event| {
+        matches!(event, Event::Line { chat: of, action: LineAction::MadeModerator, .. } if *of == chat)
+    });
+}
+
+#[test]
+fn content_sealed_under_an_older_key_is_refused_and_core_seals_it_again() {
+    let server = open_server();
+    let mut sara = App::sign_up(&server, "sara_x", SARA_WORDS);
+    let mut babak = App::sign_up(&server, "babak_x", BABAK_WORDS);
+    let mut mina = App::sign_up(&server, "mina_x", MINA_WORDS);
+    let chat = make_group(&mut sara, &server, ChatType::Group, vec![babak.id()]);
+    ready_in(&mut babak, &server, chat);
+    send_text(&mut sara, &server, chat, "before mina");
+    read_text(&mut babak, &server, chat, "before mina");
+
+    // Mina is added while Babak reads nothing, so the add commit waits unread on his socket.
+    sara.command(
+        &server,
+        Command::AddMembers {
+            chat,
+            account_list: vec![mina.id()],
+            note: None,
+        },
+    );
+    ready_in(&mut mina, &server, chat);
+    chat_event_seen(&mut sara, &server, chat, ChatAction::Added);
+
+    // Babak's text is sealed under the old key at once and refused with `stale_epoch`. Core applies
+    // the commit and seals it again, so Mina, who holds only the new key, reads it.
+    let seq = try_text(&mut babak, &server, chat, "sealed again", None).unwrap();
+    let message = read_text(&mut mina, &server, chat, "sealed again");
+    assert_eq!(message.seq, seq);
+    read_text(&mut sara, &server, chat, "sealed again");
+}
+
+/// How many key packages this device keeps on the server.
+fn key_packages_kept(server: &Server, token: &str) -> u64 {
+    let (status, reply) = raw(
+        server,
+        "POST",
+        "/api/v1/key_packages",
+        token,
+        Some(br#"{"body_list":[]}"#),
+    );
+    assert_eq!(status, 200);
+    let reply: Value = serde_json::from_slice(&reply).unwrap();
+    reply["data"]["count"].as_u64().unwrap()
+}
+
+#[test]
+fn claiming_for_an_add_refuses_someone_added_by_invitation_only_before_any_package_goes() {
+    let server = open_server();
+    let mut sara = App::sign_up(&server, "sara_x", SARA_WORDS);
+    let mut babak = App::sign_up(&server, "babak_x", BABAK_WORDS);
+    let mut mina = App::sign_up(&server, "mina_x", MINA_WORDS);
+    invitation_only(&mut mina, &server);
+    let chat = make_group(&mut sara, &server, ChatType::Group, vec![babak.id()]);
+    ready_in(&mut babak, &server, chat);
+    let mina_token = mina.token.clone().unwrap();
+    let kept = key_packages_kept(&server, &mina_token);
+    assert!(kept > 0);
+
+    let route = format!("/api/v1/accounts/{}/key_packages/claim", mina.id());
+    let body = json!({ "chat": chat }).to_string();
+    let sara_token = sara.token.clone().unwrap();
+    let (status, reply) = raw(&server, "POST", &route, &sara_token, Some(body.as_bytes()));
+    assert_eq!((status, code_of(&reply).as_str()), (403, "invite_needed"));
+    let reply: Value = serde_json::from_slice(&reply).unwrap();
+    assert_eq!(reply["account_list"], json!([mina.id()]));
+    // A member who may not add people is refused before that, and so is a stranger.
+    let babak_token = babak.token.clone().unwrap();
+    let (status, reply) = raw(&server, "POST", &route, &babak_token, Some(body.as_bytes()));
+    assert_eq!((status, code_of(&reply).as_str()), (403, "no_permission"));
+    let (status, reply) = raw(&server, "POST", &route, &mina_token, Some(body.as_bytes()));
+    assert_eq!((status, code_of(&reply).as_str()), (404, "not_member"));
+    assert_eq!(key_packages_kept(&server, &mina_token), kept);
+
+    // A note over 500 characters is refused before anything is asked.
+    let code = refusal(
+        &mut sara,
+        &server,
+        Command::AddMembers {
+            chat,
+            account_list: vec![mina.id()],
+            note: Some("a".repeat(501)),
+        },
+    );
+    assert_eq!(code, "bad_note");
+
+    // Core's add turns into an invitation carrying the note sealed, and still none of her packages
+    // went.
+    sara.command(
+        &server,
+        Command::AddMembers {
+            chat,
+            account_list: vec![mina.id()],
+            note: Some("  Come and see the moon  ".to_string()),
+        },
+    );
+    let Event::Invitation { invitation, .. } = mina.wait(
+        &server,
+        |event| matches!(event, Event::Invitation { chat: invited, invitation: Some(_) } if *invited == chat),
+    ) else {
+        unreachable!();
+    };
+    assert_eq!(
+        invitation.unwrap().note.as_deref(),
+        Some("Come and see the moon")
+    );
+    assert_eq!(key_packages_kept(&server, &mina_token), kept);
+}
+
+#[test]
+fn a_new_device_of_someone_who_joined_by_invitation_reads_the_profile_from_the_words() {
+    let server = open_server();
+    let mut sara = App::sign_up(&server, "sara_x", SARA_WORDS);
+    let mut mina = App::sign_up(&server, "mina_x", MINA_WORDS);
+    invitation_only(&mut mina, &server);
+    sara.command(
+        &server,
+        Command::CreateChat {
+            chat_type: ChatType::Group,
+            name: "Apollo".to_string(),
+            bio: Some("The moon team".to_string()),
+            link_list: Vec::new(),
+            account_list: vec![mina.id()],
+            topics: None,
+            findable: false,
+            options: ChatOptions::default(),
+            photo: None,
+            note: None,
+        },
+    );
+    let chat = ready_chat(&mut sara, &server);
+    mina.wait(
+        &server,
+        |event| matches!(event, Event::Invitation { chat: invited, invitation: Some(_) } if *invited == chat),
+    );
+    mina.command(&server, Command::AnswerInvite { chat, accept: true });
+    ready_in(&mut mina, &server, chat);
+    send_text(&mut mina, &server, chat, "joined");
+    read_text(&mut sara, &server, chat, "joined");
+
+    // Sara is gone, and Mina's first device too: the new one has only the words, and the share
+    // Mina's join carried is what opens the profile.
+    drop(sara);
+    drop(mina);
+    let mut second = second_device(&server, "mina_x", MINA_WORDS);
+    ready_in(&mut second, &server, chat);
+    let profile = chat_profile_seen(&mut second, &server, chat, |_| true);
+    assert_eq!(profile.name, "Apollo");
+    assert_eq!(profile.bio.as_deref(), Some("The moon team"));
+    second.command(&server, Command::OpenChat { chat });
+    read_text(&mut second, &server, chat, "joined");
+}
+
+/// Sends a text into a topic, in its main list or a thread, and says how the server answered.
+fn try_topic_text(
+    app: &mut App,
+    server: &Server,
+    chat: Ulid,
+    topic: Ulid,
+    text: &str,
+    thread: Option<u64>,
+) -> Result<u64, String> {
+    app.command(
+        server,
+        Command::SendText {
+            chat,
+            text: Secret(text.to_string()),
+            reply: None,
+            topic: Some(topic),
+            thread,
+            mentions: Vec::new(),
+        },
+    );
+    answered(app, server, chat)
+}
+
+fn try_topic_react(
+    app: &mut App,
+    server: &Server,
+    chat: Ulid,
+    topic: Ulid,
+    on: u64,
+) -> Result<u64, String> {
+    app.command(
+        server,
+        Command::SendReaction {
+            chat,
+            emoji: "👍".to_string(),
+            on: Pointer::Seq(on),
+            topic: Some(topic),
+            thread: None,
+        },
+    );
+    answered(app, server, chat)
+}
+
+/// Sets a topic's options and waits until another member's device has them.
+fn topic_options_set(
+    app: &mut App,
+    other: &mut App,
+    server: &Server,
+    chat: Ulid,
+    topic: Ulid,
+    options: TopicOptionsBody,
+) {
+    app.command(
+        server,
+        Command::TopicOptions {
+            chat,
+            topic,
+            options: options.clone(),
+        },
+    );
+    let hidden = options.hidden;
+    other.wait(server, |event| {
+        matches!(event, Event::TopicOptions { topic: of, options: got, .. }
+            if *of == topic && got.hidden == hidden && (hidden || *got == options))
+    });
+    // The device that changed them is shown the server's copy too.
+    app.wait(server, |event| {
+        matches!(event, Event::TopicOptions { topic: of, options: got, .. }
+            if *of == topic && *got == options)
+    });
+}
+
+#[test]
+fn a_topic_has_its_own_options_moderators_and_profile_and_a_hidden_one_is_withheld() {
+    let server = open_server();
+    let mut sara = App::sign_up(&server, "sara_x", SARA_WORDS);
+    let mut babak = App::sign_up(&server, "babak_x", BABAK_WORDS);
+    let mut mina = App::sign_up(&server, "mina_x", MINA_WORDS);
+    let chat = make_group(
+        &mut sara,
+        &server,
+        ChatType::Group,
+        vec![babak.id(), mina.id()],
+    );
+    ready_in(&mut babak, &server, chat);
+    ready_in(&mut mina, &server, chat);
+    let topic = topic_made(&mut sara, &server, chat, "Launch");
+    let first = try_topic_text(&mut mina, &server, chat, topic, "hello", None).unwrap();
+
+    // Closed: only moderators write or react there.
+    topic_options_set(
+        &mut sara,
+        &mut mina,
+        &server,
+        chat,
+        topic,
+        TopicOptionsBody {
+            closed: true,
+            ..TopicOptionsBody::default()
+        },
+    );
+    assert_eq!(
+        try_topic_text(&mut babak, &server, chat, topic, "no", None),
+        Err("topic_closed".to_string())
+    );
+    assert_eq!(
+        try_topic_react(&mut mina, &server, chat, topic, first),
+        Err("topic_closed".to_string())
+    );
+    try_topic_text(&mut sara, &server, chat, topic, "the owner writes", None).unwrap();
+
+    // A topic's own moderator writes when it is closed and changes its settings; a member cannot.
+    sara.command(
+        &server,
+        Command::TopicRole {
+            chat,
+            topic,
+            account: babak.id(),
+            role: ChatRole::Moderator,
+        },
+    );
+    mina.wait(&server, |event| {
+        matches!(event, Event::TopicOptions { mod_list, .. } if mod_list.contains(&babak.id()))
+    });
+    sara.wait(&server, |event| {
+        matches!(event, Event::TopicOptions { mod_list, .. } if mod_list.contains(&babak.id()))
+    });
+    try_topic_text(
+        &mut babak,
+        &server,
+        chat,
+        topic,
+        "the topic's moderator",
+        None,
+    )
+    .unwrap();
+    mina.command(
+        &server,
+        Command::TopicOptions {
+            chat,
+            topic,
+            options: TopicOptionsBody::default(),
+        },
+    );
+    mina.wait(
+        &server,
+        |event| matches!(event, Event::Error { code, .. } if code == "no_permission"),
+    );
+
+    // Moderators only in the main list: members still react and talk in threads.
+    topic_options_set(
+        &mut babak,
+        &mut mina,
+        &server,
+        chat,
+        topic,
+        TopicOptionsBody {
+            write: TopicWrite::Moderators,
+            ..TopicOptionsBody::default()
+        },
+    );
+    assert_eq!(
+        try_topic_text(&mut mina, &server, chat, topic, "main", None),
+        Err("moderators_only".to_string())
+    );
+    try_topic_text(&mut mina, &server, chat, topic, "in a thread", Some(first)).unwrap();
+    try_topic_react(&mut mina, &server, chat, topic, first).unwrap();
+
+    // Its own permissions: reactions refused there, still allowed in General.
+    topic_options_set(
+        &mut babak,
+        &mut mina,
+        &server,
+        chat,
+        topic,
+        TopicOptionsBody {
+            deny: vec!["message.send.reaction".to_string()],
+            ..TopicOptionsBody::default()
+        },
+    );
+    assert_eq!(
+        try_topic_react(&mut mina, &server, chat, topic, first),
+        Err("no_permission".to_string())
+    );
+    let general = try_text(&mut mina, &server, chat, "in general", None).unwrap();
+    try_react(&mut mina, &server, chat, general).unwrap();
+
+    // Its own profile, with rules, opened by every member.
+    babak.command(
+        &server,
+        Command::TopicProfile {
+            chat,
+            topic,
+            bio: Some(" About the launch ".to_string()),
+            link_list: Vec::new(),
+            rules: Some("Be kind".to_string()),
+        },
+    );
+    let Event::TopicProfile { profile, .. } = mina.wait(
+        &server,
+        |event| matches!(event, Event::TopicProfile { topic: of, .. } if *of == topic),
+    ) else {
+        unreachable!();
+    };
+    assert_eq!(
+        (profile.bio.as_deref(), profile.rules.as_deref()),
+        (Some("About the launch"), Some("Be kind"))
+    );
+    babak.command(
+        &server,
+        Command::TopicProfile {
+            chat,
+            topic,
+            bio: None,
+            link_list: Vec::new(),
+            rules: Some("x".repeat(2001)),
+        },
+    );
+    babak.wait(
+        &server,
+        |event| matches!(event, Event::Error { code, .. } if code == "bad_profile"),
+    );
+
+    // General cannot be hidden.
+    sara.command(
+        &server,
+        Command::TopicOptions {
+            chat,
+            topic: GENERAL_TOPIC,
+            options: TopicOptionsBody {
+                hidden: true,
+                ..TopicOptionsBody::default()
+            },
+        },
+    );
+    sara.wait(
+        &server,
+        |event| matches!(event, Event::Error { code, .. } if code == "bad_body"),
+    );
+
+    // Hidden: a member is told only that, cannot write there, and its messages are withheld.
+    topic_options_set(
+        &mut babak,
+        &mut mina,
+        &server,
+        chat,
+        topic,
+        TopicOptionsBody {
+            hidden: true,
+            ..TopicOptionsBody::default()
+        },
+    );
+    assert_eq!(
+        try_topic_text(&mut mina, &server, chat, topic, "nobody hears", None),
+        Err("topic_gone".to_string())
+    );
+    try_topic_text(&mut sara, &server, chat, topic, "a secret", None).unwrap();
+    read_text(&mut babak, &server, chat, "a secret");
+    send_text(&mut sara, &server, chat, "after");
+    read_text(&mut mina, &server, chat, "after");
+    assert!(!mina.events.iter().any(|event| matches!(event,
+        Event::Message { message } if text_of(message) == Some("a secret"))));
+
+    // Shown again, the member's device syncs the chat and reads what was withheld.
+    topic_options_set(
+        &mut babak,
+        &mut mina,
+        &server,
+        chat,
+        topic,
+        TopicOptionsBody::default(),
+    );
+    read_text(&mut mina, &server, chat, "a secret");
+
+    // Each change is in the topic's history, which its moderator and the owners read.
+    let edited = chat_event_seen(&mut babak, &server, chat, ChatAction::TopicEdited);
+    assert_eq!((edited.actor, edited.topic), (babak.id(), Some(topic)));
+    let made = chat_event_seen(&mut babak, &server, chat, ChatAction::MadeTopicModerator);
+    assert_eq!(
+        (made.actor, made.target, made.topic),
+        (sara.id(), Some(babak.id()), Some(topic))
+    );
+    chat_event_seen(&mut sara, &server, chat, ChatAction::TopicOptions);
+    assert!(!mina.events.iter().any(|event| matches!(event,
+        Event::ChatEvent { event, .. } if event.topic == Some(topic))));
+
+    // A topic's first profile, set by whoever added it, is part of creating it: no "edited" row.
+    // A later one is. Gamma goes beside Launch, since the list sent is the whole list.
+    sara.command(&server, Command::TopicId { chat });
+    let Event::TopicId { topic: gamma, .. } =
+        sara.wait(&server, |event| matches!(event, Event::TopicId { .. }))
+    else {
+        unreachable!();
+    };
+    sara.command(
+        &server,
+        Command::Topics {
+            chat,
+            on: true,
+            topic_list: vec![
+                TopicName {
+                    id: topic,
+                    name: "Launch".to_string(),
+                    place: 0,
+                },
+                TopicName {
+                    id: gamma,
+                    name: "Gamma".to_string(),
+                    place: 1,
+                },
+            ],
+        },
+    );
+    let Event::ChatEvent { event: added, .. } = sara.wait(&server, |event| {
+        matches!(event, Event::ChatEvent { event, .. }
+            if event.action == ChatAction::TopicAdded && event.target == Some(gamma))
+    }) else {
+        unreachable!();
+    };
+    assert_eq!(added.actor, sara.id());
+    let profile_set = |sara: &mut App, mina: &mut App, bio: &str| {
+        sara.command(
+            &server,
+            Command::TopicProfile {
+                chat,
+                topic: gamma,
+                bio: Some(bio.to_string()),
+                link_list: Vec::new(),
+                rules: None,
+            },
+        );
+        mina.wait(&server, |event| {
+            matches!(event, Event::TopicProfile { topic: of, profile, .. }
+                if *of == gamma && profile.bio.as_deref() == Some(bio))
+        });
+    };
+    profile_set(&mut sara, &mut mina, "first");
+    // Sara's own copy of a later change comes after any row the first one wrote.
+    topic_options_set(
+        &mut sara,
+        &mut mina,
+        &server,
+        chat,
+        gamma,
+        TopicOptionsBody::default(),
+    );
+    assert!(!sara.events.iter().any(|event| matches!(event,
+        Event::ChatEvent { event, .. } if event.action == ChatAction::TopicEdited
+            && event.topic == Some(gamma))));
+    profile_set(&mut sara, &mut mina, "second");
+    let Event::ChatEvent { event: edited, .. } = sara.wait(&server, |event| {
+        matches!(event, Event::ChatEvent { event, .. }
+            if event.action == ChatAction::TopicEdited && event.topic == Some(gamma))
+    }) else {
+        unreachable!();
+    };
+    assert_eq!(edited.actor, sara.id());
+}
+
+#[test]
+fn every_delete_and_edit_in_a_group_keeps_what_it_changed_for_owners_and_moderators() {
+    let server = open_server();
+    let mut sara = App::sign_up(&server, "sara_x", SARA_WORDS);
+    let mut babak = App::sign_up(&server, "babak_x", BABAK_WORDS);
+    let mut mina = App::sign_up(&server, "mina_x", MINA_WORDS);
+    let chat = make_group(
+        &mut sara,
+        &server,
+        ChatType::Group,
+        vec![babak.id(), mina.id()],
+    );
+    ready_in(&mut babak, &server, chat);
+    ready_in(&mut mina, &server, chat);
+
+    // Mina edits her own message, then deletes it: owners see both, with the texts as they were.
+    let seq = try_text(&mut mina, &server, chat, "first", None).unwrap();
+    mina.command(
+        &server,
+        Command::Edit {
+            chat,
+            target: Pointer::Seq(seq),
+            text: Secret("second".to_string()),
+            files: Vec::new(),
+            remove: Vec::new(),
+        },
+    );
+    answered(&mut mina, &server, chat).unwrap();
+    try_delete(&mut mina, &server, chat, seq).unwrap();
+    let texts = |event: &Event| match event {
+        Event::ChatEvent { copy_list, .. } => copy_list
+            .iter()
+            .map(|copy| text_of(copy).unwrap_or("").to_string())
+            .collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
+    let edited = sara.wait(&server, |event| {
+        matches!(event, Event::ChatEvent { event, .. } if event.action == ChatAction::Edited)
+    });
+    assert_eq!(texts(&edited), ["first", "second"]);
+    let deleted = sara.wait(&server, |event| {
+        matches!(event, Event::ChatEvent { event, .. } if event.action == ChatAction::Deleted)
+    });
+    assert_eq!(texts(&deleted), ["first", "second"]);
+    let Event::ChatEvent { event, .. } = deleted else {
+        unreachable!();
+    };
+    assert_eq!(
+        (event.actor, event.target, event.seq),
+        (mina.id(), Some(mina.id()), Some(seq))
+    );
+    // The archive keeps the copies sealed, and a History page read from it has core open them.
+    let kept: Vec<ChatEvent> = sara
+        .archive_events
+        .values()
+        .filter(|kept| kept.chat == chat && !kept.copy_list.is_empty())
+        .cloned()
+        .collect();
+    assert_eq!(kept.len(), 2);
+    sara.events.clear();
+    sara.command(
+        &server,
+        Command::OpenHistory {
+            chat,
+            event_list: kept,
+        },
+    );
+    let opened: Vec<Vec<String>> = sara
+        .events
+        .iter()
+        .filter(|event| matches!(event, Event::ChatEvent { .. }))
+        .map(texts)
+        .collect();
+    assert_eq!(opened, [["first", "second"], ["first", "second"]]);
+    // A plain member reads no history.
+    send_text(&mut sara, &server, chat, "after");
+    read_text(&mut mina, &server, chat, "after");
+    assert!(!mina.events.iter().any(|event| matches!(event,
+        Event::ChatEvent { event, .. }
+            if matches!(event.action, ChatAction::Edited | ChatAction::Deleted))));
+
+    // In a topic, its own moderator deletes a member's message and reads that topic's history.
+    let topic = topic_made(&mut sara, &server, chat, "Launch");
+    sara.command(
+        &server,
+        Command::TopicRole {
+            chat,
+            topic,
+            account: babak.id(),
+            role: ChatRole::Moderator,
+        },
+    );
+    let babak_id = babak.id();
+    babak.wait(&server, |event| {
+        matches!(event, Event::TopicOptions { mod_list, .. } if mod_list.contains(&babak_id))
+    });
+    let in_topic = try_topic_text(&mut mina, &server, chat, topic, "in launch", None).unwrap();
+    try_delete(&mut babak, &server, chat, in_topic).unwrap();
+    let deleted = babak.wait(&server, |event| {
+        matches!(event, Event::ChatEvent { event, .. }
+            if event.action == ChatAction::Deleted && event.topic == Some(topic))
+    });
+    assert_eq!(texts(&deleted), ["in launch"]);
 }

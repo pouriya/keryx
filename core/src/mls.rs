@@ -10,7 +10,7 @@
 //! commit is never sent.
 
 use crate::call::{self, CallIndex, CallKey};
-use crate::protocol::{Bytes, Header};
+use crate::protocol::{Bytes, CommitData, Header, InviteStatement};
 use crate::seed::AccountKeys;
 use crate::ulid::Ulid;
 use crate::wrap::{self, WRAP_SIZE, WrapError};
@@ -33,11 +33,14 @@ use zeroize::Zeroizing;
 pub const ROTATION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
 const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+
 const MESSAGE_KEY_LABEL: &str = "keryx v1 message key";
 const DEVICE_STAMP_LABEL: &[u8] = b"keryx v1 device stamp";
 const ACCOUNT_STAMP_LABEL: &[u8] = b"keryx v1 account key";
 const REVOKE_LABEL: &[u8] = b"keryx v1 revoke device";
 const LOGOUT_LABEL: &[u8] = b"keryx v1 logout";
+const INVITE_LABEL: &[u8] = b"keryx v1 invite";
+const INVITE_KEY_LABEL: &[u8] = b"keryx v1 invite key";
 const PASSWORD_RESET_LABEL: &[u8] = b"keryx v1 password reset";
 const DEVICE_LOGIN_LABEL: &[u8] = b"keryx v1 device login";
 const DRAFT_LABEL: &[u8] = b"keryx v1 draft";
@@ -45,6 +48,9 @@ const PROFILE_KEY_LABEL: &[u8] = b"keryx v1 profile key";
 const PROFILE_LABEL: &[u8] = b"keryx v1 profile";
 const FOLDER_NAME_LABEL: &[u8] = b"keryx v1 folder name";
 const KV_LABEL: &[u8] = b"keryx v1 kv";
+const CHAT_PROFILE_LABEL: &[u8] = b"keryx v1 chat profile";
+const CHAT_KEY_LABEL: &[u8] = b"keryx v1 chat profile key";
+const TOPIC_PROFILE_LABEL: &[u8] = b"keryx v1 topic profile";
 const BODY_VERSION: u8 = 1;
 /// The account id, device id, master public key and stamp.
 const CREDENTIAL_SIZE: usize = 128;
@@ -82,6 +88,9 @@ pub enum MlsError {
 
     #[error("A device of account {account} joined by itself, and that account is not in the chat")]
     JoinRefused { account: Ulid },
+    /// An invitation in a commit's authenticated data that does not hold.
+    #[error("A commit in chat {chat} carries an invitation that does not hold")]
+    NotAllowed { chat: Ulid },
 
     #[error("This is not the group it was meant to be for chat {chat}")]
     WrongGroup { chat: Ulid },
@@ -126,11 +135,21 @@ pub enum MlsError {
     #[error("A message does not open with its epoch's key")]
     Decrypt,
 
+    #[error("This device has no profile key for chat {chat}")]
+    NoChatKey { chat: Ulid },
+
     #[error("This device has no profile key for account {account}")]
     NoProfileKey { account: Ulid },
 
     #[error("Could not wrap or unwrap a key")]
     Wrap(#[from] WrapError),
+
+    /// A commit for an epoch the chat's public group has already left, or not reached.
+    #[error("A commit in chat {chat} is not for its current epoch")]
+    StaleCommit { chat: Ulid },
+
+    #[error("The public group of chat {chat} could not be read")]
+    PublicState { chat: Ulid },
 }
 
 /// Each failure on load has its own error, so a client can say what happened.
@@ -189,6 +208,16 @@ pub struct AccountKey {
     pub stamp: [u8; 64],
 }
 
+/// An account's invite key, which an invitation's name and BlurHash are sealed to, and the master
+/// key's stamp on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InviteKey {
+    pub account: Ulid,
+    pub invite_public: [u8; 32],
+    pub master_public: [u8; 32],
+    pub stamp: [u8; 64],
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountWrap {
     pub account: Ulid,
@@ -216,6 +245,10 @@ pub struct Commit {
     /// Every member's profile key this device holds, sealed at the new epoch, so a member it adds
     /// sees everyone's photo at once.
     pub profile_key_list: Vec<(Ulid, Vec<u8>)>,
+    /// The chat's profile key sealed at the new epoch, when this device holds one, so the people an
+    /// add brings in, or a device joining by invitation, leave it where everyone in the chat can
+    /// open it.
+    pub chat_key: Option<Vec<u8>>,
 }
 
 /// Someone else's commit, applied.
@@ -260,6 +293,12 @@ pub struct Device {
     epoch_keys: HashMap<(Ulid, u64), Zeroizing<[u8; 16]>>,
     /// Profile keys by account, this account's own from the words and others' opened from chats.
     profile_keys: HashMap<Ulid, Zeroizing<[u8; 16]>>,
+    /// The private half of the account's invite key, from the words, kept so this device can open
+    /// invitations after it dropped the words' other keys.
+    invite_private: Zeroizing<[u8; 32]>,
+    /// Each group's or channel's profile key, which its profile is sealed under. Random, made by
+    /// its creator, and never changed.
+    chat_keys: HashMap<Ulid, Zeroizing<[u8; 16]>>,
     chats: HashMap<Ulid, Chat>,
     /// The server time of the last row the platform saved, where the next `sync` starts. Kept here
     /// so it never runs ahead of the commits this state has applied.
@@ -271,7 +310,7 @@ pub struct Device {
 
 /// The master key's stamp on this account's public key, published once when the words are set up.
 pub fn stamp_account_key(keys: &AccountKeys, account: &Ulid) -> [u8; 64] {
-    let bytes = account_stamp_bytes(account, keys.account_public());
+    let bytes = key_stamp_bytes(ACCOUNT_STAMP_LABEL, account, keys.account_public());
     SigningKey::from_bytes(keys.master_private())
         .sign(&bytes)
         .to_bytes()
@@ -302,7 +341,31 @@ pub fn verify_account_key(
 ) -> Result<(), MlsError> {
     verify(
         master_public,
-        &account_stamp_bytes(account, account_public),
+        &key_stamp_bytes(ACCOUNT_STAMP_LABEL, account, account_public),
+        stamp,
+        MlsError::BadStamp { account: *account },
+    )
+}
+
+/// The master key's stamp on this account's invite key, published with its account key.
+pub fn stamp_invite_key(keys: &AccountKeys, account: &Ulid) -> [u8; 64] {
+    let bytes = key_stamp_bytes(INVITE_KEY_LABEL, account, keys.invite_public());
+    SigningKey::from_bytes(keys.master_private())
+        .sign(&bytes)
+        .to_bytes()
+}
+
+/// Check an invite key's stamp with public keys only: the server when words are set up, and an
+/// inviter against the pinned master key before sealing anything to it.
+pub fn verify_invite_key(
+    master_public: &[u8; 32],
+    account: &Ulid,
+    invite_public: &[u8; 32],
+    stamp: &[u8; 64],
+) -> Result<(), MlsError> {
+    verify(
+        master_public,
+        &key_stamp_bytes(INVITE_KEY_LABEL, account, invite_public),
         stamp,
         MlsError::BadStamp { account: *account },
     )
@@ -338,6 +401,22 @@ pub fn verify_logout(
     verify(
         device_public,
         &device_statement_bytes(LOGOUT_LABEL, account, device),
+        signature,
+        MlsError::Signature,
+    )
+}
+
+/// A device inviting an account into a group or channel: `keryx v1 invite`, the chat and the invited
+/// account. The joiner puts it in its external commit's authenticated data.
+pub fn verify_invite(
+    device_public: &[u8; 32],
+    chat: &Ulid,
+    account: &Ulid,
+    signature: &[u8; 64],
+) -> Result<(), MlsError> {
+    verify(
+        device_public,
+        &device_statement_bytes(INVITE_LABEL, chat, account),
         signature,
         MlsError::Signature,
     )
@@ -383,6 +462,19 @@ pub fn verify_device_login(
     verify(device_public, &bytes, signature, MlsError::Signature)
 }
 
+/// A group's or channel's sealed profile, or one topic's, signed by the device that sealed it.
+pub fn verify_chat_profile(
+    device_public: &[u8; 32],
+    chat: &Ulid,
+    topic: Option<Ulid>,
+    sealed: &[u8],
+    signature: &[u8; 64],
+) -> Result<(), MlsError> {
+    let mut signed = chat_profile_data(*chat, topic);
+    signed.extend_from_slice(sealed);
+    verify(device_public, &signed, signature, MlsError::Signature)
+}
+
 /// Check a signature on a message, with public keys only, before decrypting anything.
 pub fn verify_message(
     header: &Header,
@@ -416,6 +508,33 @@ fn verify(
 fn draft_data(chat: Ulid, epoch: u64) -> Vec<u8> {
     let mut data = Vec::with_capacity(DRAFT_LABEL.len() + 24);
     data.extend_from_slice(DRAFT_LABEL);
+    data.extend_from_slice(chat.bytes());
+    data.extend_from_slice(&epoch.to_be_bytes());
+    data
+}
+
+/// **Permanent:** a group's or channel's sealed profile's associated data, and with its body what
+/// the device signs. A topic's has its own label and its id after the chat's.
+fn chat_profile_data(chat: Ulid, topic: Option<Ulid>) -> Vec<u8> {
+    let mut data = Vec::with_capacity(TOPIC_PROFILE_LABEL.len() + 32);
+    match topic {
+        Some(topic) => {
+            data.extend_from_slice(TOPIC_PROFILE_LABEL);
+            data.extend_from_slice(chat.bytes());
+            data.extend_from_slice(topic.bytes());
+        }
+        None => {
+            data.extend_from_slice(CHAT_PROFILE_LABEL);
+            data.extend_from_slice(chat.bytes());
+        }
+    }
+    data
+}
+
+/// **Permanent:** a chat's profile key shared at an epoch, as associated data.
+fn chat_key_data(chat: Ulid, epoch: u64) -> Vec<u8> {
+    let mut data = Vec::with_capacity(CHAT_KEY_LABEL.len() + 24);
+    data.extend_from_slice(CHAT_KEY_LABEL);
     data.extend_from_slice(chat.bytes());
     data.extend_from_slice(&epoch.to_be_bytes());
     data
@@ -533,12 +652,31 @@ fn device_stamp_bytes(account: &Ulid, device: &Ulid, device_public: &[u8; 32]) -
     bytes
 }
 
-fn account_stamp_bytes(account: &Ulid, account_public: &[u8; 32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(ACCOUNT_STAMP_LABEL.len() + 48);
-    bytes.extend_from_slice(ACCOUNT_STAMP_LABEL);
+/// What the master key stamps on one of the account's keys: the key's label, the account and the key.
+fn key_stamp_bytes(label: &[u8], account: &Ulid, key: &[u8; 32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(label.len() + 48);
+    bytes.extend_from_slice(label);
     bytes.extend_from_slice(account.bytes());
-    bytes.extend_from_slice(account_public);
+    bytes.extend_from_slice(key);
     bytes
+}
+
+/// The invite key's HPKE suite, the same one its key pair was derived for.
+const INVITE_HPKE: HpkeConfig = HpkeConfig(
+    HpkeKemType::DhKem25519,
+    HpkeKdfType::HkdfSha256,
+    HpkeAeadType::AesGcm128,
+);
+
+/// The size of X25519's KEM output, at the front of a sealed invitation.
+const INVITE_KEM_SIZE: usize = 32;
+
+fn invitation_info(chat: Ulid, account: Ulid) -> Vec<u8> {
+    let mut info = Vec::with_capacity(INVITE_KEY_LABEL.len() + 32);
+    info.extend_from_slice(INVITE_KEY_LABEL);
+    info.extend_from_slice(chat.bytes());
+    info.extend_from_slice(account.bytes());
+    info
 }
 
 fn group_error<E: StdError + Send + Sync + 'static>(
@@ -632,6 +770,179 @@ fn wire_in(expected: &'static str, mut bytes: &[u8]) -> Result<MlsMessageIn, Mls
     }
 }
 
+/// A device in a chat's group, as its credential names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Leaf {
+    pub account: Ulid,
+    pub device: Ulid,
+}
+
+/// What a commit changes, read by the server from the chat's public group.
+#[derive(Debug, Default)]
+pub struct CommitRead {
+    /// The device a join by external commit brings in.
+    pub joined: Option<Leaf>,
+    pub added: Vec<Leaf>,
+    pub removed: Vec<Leaf>,
+    /// The public group after the commit, kept in place of the one before.
+    pub state: Vec<u8>,
+}
+
+fn leaf_of(leaf: &LeafNode) -> Result<Leaf, MlsError> {
+    let record = read_leaf(leaf.credential(), leaf.signature_key().as_slice())?;
+    Ok(Leaf {
+        account: record.account,
+        device: record.device,
+    })
+}
+
+/// openmls's storage of a public group, as count, then each key and value with its length.
+fn public_state(chat: Ulid, provider: &OpenMlsRustCrypto) -> Result<Vec<u8>, MlsError> {
+    let Ok(values) = provider.storage().values.read() else {
+        return Err(MlsError::PublicState { chat });
+    };
+    let mut out = Vec::new();
+    out.extend_from_slice(&(values.len() as u32).to_be_bytes());
+    for (key, value) in values.iter() {
+        out.extend_from_slice(&(key.len() as u32).to_be_bytes());
+        out.extend_from_slice(key);
+        out.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        out.extend_from_slice(value);
+    }
+    Ok(out)
+}
+
+/// Starts the public group the server keeps for a chat, from epoch 0's group info, when every key
+/// in it is fresh. It is moved on by each accepted commit and never rebuilt from group info, since
+/// openmls checks every member's key lifetime when it builds one, and a member who has been quiet
+/// for 12 weeks would fail that.
+pub fn public_group_start(chat: Ulid, group_info: &[u8]) -> Result<Vec<u8>, MlsError> {
+    let verifiable = match wire_in("group info", group_info)?.extract() {
+        MlsMessageBodyIn::GroupInfo(verifiable) => verifiable,
+        _ => {
+            return Err(MlsError::WrongMessage {
+                expected: "group info",
+            });
+        }
+    };
+    if verifiable.group_id().as_slice() != chat.bytes() {
+        return Err(MlsError::WrongGroup { chat });
+    }
+    let Some(tree) = verifiable.extensions().ratchet_tree() else {
+        return Err(MlsError::WrongMessage {
+            expected: "group info with its tree",
+        });
+    };
+    let tree = tree.ratchet_tree().clone();
+    let provider = OpenMlsRustCrypto::default();
+    if let Err(source) = PublicGroup::from_external(
+        provider.crypto(),
+        provider.storage(),
+        tree,
+        verifiable,
+        ProposalStore::new(),
+    ) {
+        return Err(group_error("start a public group", source));
+    }
+    public_state(chat, &provider)
+}
+
+/// Reads a commit against the chat's public group, which checks its signature and shape, and
+/// moves the group on: the device joining by itself, and the devices it adds and removes.
+pub fn public_group_commit(
+    chat: Ulid,
+    state: &[u8],
+    commit: &[u8],
+) -> Result<CommitRead, MlsError> {
+    let provider = OpenMlsRustCrypto::default();
+    {
+        let Ok(mut values) = provider.storage().values.write() else {
+            return Err(MlsError::PublicState { chat });
+        };
+        let mut reader = state;
+        let Ok(count) = read_array(&mut reader).map(u32::from_be_bytes) else {
+            return Err(MlsError::PublicState { chat });
+        };
+        for _ in 0..count {
+            let (Ok(key), Ok(value)) = (read_slice(&mut reader), read_slice(&mut reader)) else {
+                return Err(MlsError::PublicState { chat });
+            };
+            values.insert(key.to_vec(), value.to_vec());
+        }
+    }
+    let group = PublicGroup::load(provider.storage(), &GroupId::from_slice(chat.bytes()));
+    let Ok(Some(mut group)) = group else {
+        return Err(MlsError::PublicState { chat });
+    };
+    let message = match wire_in("commit", commit)?.try_into_protocol_message() {
+        Ok(message) => message,
+        Err(_) => return Err(MlsError::WrongMessage { expected: "commit" }),
+    };
+    if !matches!(message, ProtocolMessage::PublicMessage(_)) {
+        return Err(MlsError::WrongMessage {
+            expected: "public commit",
+        });
+    }
+    if message.epoch() != group.group_context().epoch() {
+        return Err(MlsError::StaleCommit { chat });
+    }
+    let processed = match group.process_message(provider.crypto(), message) {
+        Ok(processed) => processed,
+        Err(source) => return Err(group_error("read a commit", source)),
+    };
+    let external = matches!(processed.sender(), Sender::NewMemberCommit);
+    let staged = match processed.into_content() {
+        ProcessedMessageContent::StagedCommitMessage(staged) => *staged,
+        _ => return Err(MlsError::WrongMessage { expected: "commit" }),
+    };
+    let mut read = CommitRead::default();
+    for add in staged.add_proposals() {
+        read.added
+            .push(leaf_of(add.add_proposal().key_package().leaf_node())?);
+    }
+    for remove in staged.remove_proposals() {
+        let Some(leaf) = group.leaf(remove.remove_proposal().removed()) else {
+            return Err(MlsError::WrongMessage {
+                expected: "removal of a member",
+            });
+        };
+        read.removed.push(leaf_of(leaf)?);
+    }
+    if external {
+        let Some(leaf) = staged.update_path_leaf_node() else {
+            return Err(MlsError::WrongMessage {
+                expected: "join with its leaf",
+            });
+        };
+        read.joined = Some(leaf_of(leaf)?);
+    }
+    if let Err(source) = group.merge_commit(provider.storage(), staged) {
+        return Err(group_error("move a public group on", source));
+    }
+    read.state = public_state(chat, &provider)?;
+    Ok(read)
+}
+
+/// The authenticated data of an external join, carrying the invitation that lets an account not
+/// yet in the chat in.
+fn commit_data(invite: Option<&InviteStatement>) -> Vec<u8> {
+    let Some(invite) = invite else {
+        return Vec::new();
+    };
+    let data = CommitData {
+        invite: Some(invite.clone()),
+    };
+    // A struct of ids and bytes always encodes.
+    serde_json::to_vec(&data).unwrap_or_default()
+}
+
+/// What one commit changes: devices in and out.
+#[derive(Debug, Clone, Default)]
+pub struct Change {
+    pub key_package_list: Vec<Vec<u8>>,
+    pub device_list: Vec<Ulid>,
+}
+
 impl Device {
     /// A new device with a random key, stamped by the master key. This is the only moment a
     /// device touches the words' keys, apart from unwrapping history.
@@ -672,6 +983,8 @@ impl Device {
             pins,
             epoch_keys: HashMap::new(),
             profile_keys,
+            invite_private: Zeroizing::new(*keys.invite_private()),
+            chat_keys: HashMap::new(),
             chats: HashMap::new(),
             since: None,
             shelf: Vec::new(),
@@ -737,9 +1050,11 @@ impl Device {
         now: i64,
         account_list: &[AccountKey],
     ) -> Result<Created, MlsError> {
+        // Commits go as public messages, so the server can read what each adds and removes.
         let config = MlsGroupCreateConfig::builder()
             .ciphersuite(CIPHERSUITE)
             .use_ratchet_tree_extension(true)
+            .wire_format_policy(PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
             .build();
         let group = match MlsGroup::new_with_group_id(
             &self.provider,
@@ -787,8 +1102,38 @@ impl Device {
         key_package_list: &[Vec<u8>],
         account_list: &[AccountKey],
     ) -> Result<Commit, MlsError> {
-        let mut packages = Vec::with_capacity(key_package_list.len());
-        for bytes in key_package_list {
+        let change = Change {
+            key_package_list: key_package_list.to_vec(),
+            ..Change::default()
+        };
+        self.change(chat, &change, account_list)
+    }
+
+    /// Remove devices, such as after a signed revocation. `account_list` is every account in the
+    /// chat afterwards.
+    pub fn remove_devices(
+        &mut self,
+        chat: Ulid,
+        device_list: &[Ulid],
+        account_list: &[AccountKey],
+    ) -> Result<Commit, MlsError> {
+        let change = Change {
+            device_list: device_list.to_vec(),
+            ..Change::default()
+        };
+        self.change(chat, &change, account_list)
+    }
+
+    /// One commit adding and removing devices. `account_list` is every account in the chat
+    /// afterwards.
+    pub fn change(
+        &mut self,
+        chat: Ulid,
+        change: &Change,
+        account_list: &[AccountKey],
+    ) -> Result<Commit, MlsError> {
+        let mut packages = Vec::with_capacity(change.key_package_list.len());
+        for bytes in &change.key_package_list {
             let mut reader = bytes.as_slice();
             let package = match KeyPackageIn::tls_deserialize(&mut reader) {
                 Ok(package) => package,
@@ -813,45 +1158,45 @@ impl Device {
         let Some(state) = self.chats.get_mut(&chat) else {
             return Err(MlsError::UnknownChat { chat });
         };
-        let (commit, welcome, group_info) =
-            match state.group.add_members(provider, signer, &packages) {
-                Ok(built) => built,
-                Err(source) => return Err(group_error("add a device", source)),
-            };
-        let commit = wire_out("encode a commit", &commit)?;
-        let welcome = wire_out("encode a welcome", &welcome)?;
-        let group_info = next_group_info(group_info)?;
-        self.pending_commit(chat, commit, Some(welcome), group_info, account_list)
-    }
-
-    /// Remove devices, such as after a signed revocation. `account_list` is every account in the
-    /// chat afterwards.
-    pub fn remove_devices(
-        &mut self,
-        chat: Ulid,
-        device_list: &[Ulid],
-        account_list: &[AccountKey],
-    ) -> Result<Commit, MlsError> {
-        self.refuse_second_commit(chat)?;
-        let provider = &self.provider;
-        let signer = &self.signer;
-        let Some(state) = self.chats.get_mut(&chat) else {
-            return Err(MlsError::UnknownChat { chat });
-        };
-        let mut leaves = Vec::with_capacity(device_list.len());
+        let mut leaves = Vec::with_capacity(change.device_list.len());
         for member in state.group.members() {
             let record = read_leaf(&member.credential, &member.signature_key)?;
-            if device_list.contains(&record.device) {
+            if change.device_list.contains(&record.device) {
                 leaves.push(member.index);
             }
         }
-        let (commit, _, group_info) = match state.group.remove_members(provider, signer, &leaves) {
-            Ok(built) => built,
-            Err(source) => return Err(group_error("remove a device", source)),
+        let builder = state
+            .group
+            .commit_builder()
+            .propose_removals(leaves)
+            .propose_adds(packages);
+        let builder = match builder.load_psks(provider.storage()) {
+            Ok(builder) => builder,
+            Err(source) => return Err(group_error("load keys to commit", source)),
         };
+        let builder = match builder.build(provider.rand(), provider.crypto(), signer, |_| true) {
+            Ok(builder) => builder,
+            Err(source) => return Err(group_error("build a commit", source)),
+        };
+        let bundle = match builder.stage_commit(provider) {
+            Ok(bundle) => bundle,
+            Err(source) => return Err(group_error("stage a commit", source)),
+        };
+        let (commit, welcome, group_info) = bundle.into_messages();
         let commit = wire_out("encode a commit", &commit)?;
-        let group_info = next_group_info(group_info)?;
-        self.pending_commit(chat, commit, None, group_info, account_list)
+        let welcome = match welcome {
+            Some(welcome) => Some(wire_out("encode a welcome", &welcome)?),
+            None => None,
+        };
+        let group_info = match group_info {
+            Some(group_info) => wire_out("encode group info", &group_info)?,
+            None => {
+                return Err(MlsError::WrongMessage {
+                    expected: "group info",
+                });
+            }
+        };
+        self.pending_commit(chat, commit, welcome, group_info, account_list)
     }
 
     /// Whether this chat's key is too old to send under.
@@ -882,14 +1227,17 @@ impl Device {
     }
 
     /// Join a chat without anyone's help, from its public group info. This is what lets someone
-    /// who lost every device come back with only the words.
+    /// who lost every device come back with only the words. An account not yet in the chat joins
+    /// with the invitation a device in it signed.
     pub fn join_external(
         &mut self,
         chat: Ulid,
         group_info: &[u8],
         now: i64,
         account_list: &[AccountKey],
+        invite: Option<&InviteStatement>,
     ) -> Result<Commit, MlsError> {
+        let data = commit_data(invite);
         if self.chats.contains_key(&chat) {
             return Err(MlsError::CommitPending { chat });
         }
@@ -906,9 +1254,11 @@ impl Device {
         // Its later commits carry the ratchet tree in their group info, as every group's do.
         let config = MlsGroupJoinConfig::builder()
             .use_ratchet_tree_extension(true)
+            .wire_format_policy(PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
             .build();
         let stage = match MlsGroup::external_commit_builder()
             .with_config(config)
+            .with_aad(data)
             .skip_lifetime_validation()
             .build_group(&self.provider, verifiable, self.credential())
         {
@@ -1047,6 +1397,7 @@ impl Device {
             Err(source) => return Err(group_error("read a commit", source)),
         };
         let external = matches!(processed.sender(), Sender::NewMemberCommit);
+        let data = processed.aad().to_vec();
         let staged = match processed.into_content() {
             ProcessedMessageContent::StagedCommitMessage(staged) => *staged,
             _ => return Err(MlsError::WrongMessage { expected: "commit" }),
@@ -1060,18 +1411,50 @@ impl Device {
         if let Some(leaf) = staged.update_path_leaf_node() {
             let record = read_leaf(leaf.credential(), leaf.signature_key().as_slice())?;
             check_record(&mut self.pins, &record)?;
+            // A device joining by itself belongs to an account already in the chat, or carries an
+            // invitation for its account signed by a device already in the group.
             if external {
                 let mut account_is_in_chat = false;
+                let mut before_list = Vec::new();
                 for member in state.group.members() {
                     let existing = read_leaf(&member.credential, &member.signature_key)?;
                     if existing.account == record.account {
                         account_is_in_chat = true;
                     }
+                    before_list.push(existing);
                 }
                 if !account_is_in_chat {
-                    return Err(MlsError::JoinRefused {
-                        account: record.account,
-                    });
+                    let invite = match serde_json::from_slice::<CommitData>(&data) {
+                        Ok(CommitData {
+                            invite: Some(invite),
+                        }) => invite,
+                        _ => {
+                            return Err(MlsError::JoinRefused {
+                                account: record.account,
+                            });
+                        }
+                    };
+                    let Ok(signature) = <[u8; 64]>::try_from(invite.signature.0.as_slice()) else {
+                        return Err(MlsError::NotAllowed { chat });
+                    };
+                    let mut holds = false;
+                    for inviter in &before_list {
+                        if inviter.device == invite.device
+                            && invite.account == record.account
+                            && verify_invite(
+                                &inviter.device_public,
+                                &chat,
+                                &invite.account,
+                                &signature,
+                            )
+                            .is_ok()
+                        {
+                            holds = true;
+                        }
+                    }
+                    if !holds {
+                        return Err(MlsError::NotAllowed { chat });
+                    }
                 }
             }
         }
@@ -1114,6 +1497,7 @@ impl Device {
         };
         let config = MlsGroupJoinConfig::builder()
             .use_ratchet_tree_extension(true)
+            .wire_format_policy(PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
             .build();
         let builder = match StagedWelcome::build_from_welcome(&self.provider, &config, welcome) {
             Ok(builder) => builder,
@@ -1282,15 +1666,122 @@ impl Device {
     /// chat and the epoch, so a draft cannot pass for a message.
     pub fn seal_draft(&self, chat: Ulid, plaintext: &[u8]) -> Result<(u64, Vec<u8>), MlsError> {
         let epoch = self.epoch(chat)?;
+        let body = self.seal_at(chat, epoch, &draft_data(chat, epoch), plaintext)?;
+        Ok((epoch, body))
+    }
+
+    /// Open a draft sealed at `epoch`, which needs that epoch's key.
+    pub fn open_draft(
+        &self,
+        chat: Ulid,
+        epoch: u64,
+        body: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>, MlsError> {
+        self.open_at(chat, epoch, &draft_data(chat, epoch), body)
+    }
+
+    /// A group's or channel's profile, with its topics' names, or one topic's own, sealed under the
+    /// chat's profile key and signed by this device over its associated data and the sealed bytes.
+    pub fn seal_chat_profile(
+        &self,
+        chat: Ulid,
+        topic: Option<Ulid>,
+        plaintext: &[u8],
+    ) -> Result<(Vec<u8>, [u8; 64]), MlsError> {
+        let Some(key) = self.chat_keys.get(&chat) else {
+            return Err(MlsError::NoChatKey { chat });
+        };
+        let data = chat_profile_data(chat, topic);
+        let sealed = seal_under(key, &data, plaintext)?;
+        let mut signed = data;
+        signed.extend_from_slice(&sealed);
+        let signature = self.sign_bytes(&signed)?;
+        Ok((sealed, signature))
+    }
+
+    /// Open a group's or channel's profile with its profile key. Its signature is checked apart,
+    /// with [`verify_chat_profile`].
+    pub fn open_chat_profile(
+        &self,
+        chat: Ulid,
+        topic: Option<Ulid>,
+        sealed: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>, MlsError> {
+        let Some(key) = self.chat_keys.get(&chat) else {
+            return Err(MlsError::NoChatKey { chat });
+        };
+        open_under(key, &chat_profile_data(chat, topic), sealed)
+    }
+
+    /// A new group's or channel's profile key, made by its creator.
+    pub fn new_chat_key(&mut self, chat: Ulid) -> Result<(), MlsError> {
+        let mut key = Zeroizing::new([0u8; 16]);
+        if let Err(source) = getrandom::fill(key.as_mut()) {
+            return Err(MlsError::Random { source });
+        }
+        self.chat_keys.insert(chat, key);
+        Ok(())
+    }
+
+    pub fn has_chat_key(&self, chat: Ulid) -> bool {
+        self.chat_keys.contains_key(&chat)
+    }
+
+    /// The chat's profile key itself, for an invitation sealed to the invited account.
+    pub fn chat_key(&self, chat: Ulid) -> Result<Zeroizing<[u8; 16]>, MlsError> {
+        match self.chat_keys.get(&chat) {
+            Some(key) => Ok(key.clone()),
+            None => Err(MlsError::NoChatKey { chat }),
+        }
+    }
+
+    /// Keeps a chat's profile key from an invitation, before this device has joined.
+    pub fn set_chat_key(&mut self, chat: Ulid, key: [u8; 16]) {
+        self.chat_keys.insert(chat, Zeroizing::new(key));
+    }
+
+    /// The chat's profile key sealed under its current epoch's key, for a new group's epoch 0.
+    pub fn share_chat_key(&self, chat: Ulid) -> Result<(u64, Vec<u8>), MlsError> {
+        let Some(chat_key) = self.chat_keys.get(&chat) else {
+            return Err(MlsError::NoChatKey { chat });
+        };
+        let epoch = self.epoch(chat)?;
+        let key = self.current_key(chat, epoch)?;
+        Ok((
+            epoch,
+            seal_under(&key, &chat_key_data(chat, epoch), chat_key.as_ref())?,
+        ))
+    }
+
+    /// Opens a chat's profile key shared at `epoch`, and keeps it.
+    pub fn take_chat_key(&mut self, chat: Ulid, epoch: u64, sealed: &[u8]) -> Result<(), MlsError> {
+        let key = self.current_key(chat, epoch)?;
+        let opened = open_under(&key, &chat_key_data(chat, epoch), sealed)?;
+        if opened.len() != 16 {
+            return Err(MlsError::Decrypt);
+        }
+        let mut chat_key = Zeroizing::new([0u8; 16]);
+        chat_key.copy_from_slice(&opened);
+        self.chat_keys.insert(chat, chat_key);
+        Ok(())
+    }
+
+    /// The version byte, a random nonce, then AES-128-GCM under the chat's key at `epoch`.
+    fn seal_at(
+        &self,
+        chat: Ulid,
+        epoch: u64,
+        data: &[u8],
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, MlsError> {
         let cipher = self.message_cipher(chat, epoch)?;
         let mut nonce = [0u8; 12];
         if let Err(source) = getrandom::fill(&mut nonce) {
             return Err(MlsError::Random { source });
         }
-        let data = draft_data(chat, epoch);
         let payload = Payload {
             msg: plaintext,
-            aad: &data,
+            aad: data,
         };
         let sealed = match cipher.encrypt(Nonce::from_slice(&nonce), payload) {
             Ok(sealed) => sealed,
@@ -1300,14 +1791,14 @@ impl Device {
         body.push(BODY_VERSION);
         body.extend_from_slice(&nonce);
         body.extend_from_slice(&sealed);
-        Ok((epoch, body))
+        Ok(body)
     }
 
-    /// Open a draft sealed at `epoch`, which needs that epoch's key.
-    pub fn open_draft(
+    fn open_at(
         &self,
         chat: Ulid,
         epoch: u64,
+        data: &[u8],
         body: &[u8],
     ) -> Result<Zeroizing<Vec<u8>>, MlsError> {
         if body.is_empty() {
@@ -1320,10 +1811,9 @@ impl Device {
             return Err(MlsError::BodyShort);
         }
         let cipher = self.message_cipher(chat, epoch)?;
-        let data = draft_data(chat, epoch);
         let payload = Payload {
             msg: &body[13..],
-            aad: &data,
+            aad: data,
         };
         match cipher.decrypt(Nonce::from_slice(&body[1..13]), payload) {
             Ok(plaintext) => Ok(Zeroizing::new(plaintext)),
@@ -1480,6 +1970,71 @@ impl Device {
         ))
     }
 
+    /// This device inviting an account into a group or channel.
+    pub fn sign_invite(&self, chat: &Ulid, account: &Ulid) -> Result<[u8; 64], MlsError> {
+        self.sign_bytes(&device_statement_bytes(INVITE_LABEL, chat, account))
+    }
+
+    /// An invitation's sealed part, for the invited account only. The invite key's stamp is checked
+    /// against the account's master key, which is pinned here, then the plaintext is HPKE-sealed to it
+    /// with the label, the chat and the account as its info, laid out as the KEM output then the
+    /// ciphertext.
+    pub fn seal_invitation(
+        &mut self,
+        chat: Ulid,
+        invitee: &InviteKey,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, MlsError> {
+        verify_invite_key(
+            &invitee.master_public,
+            &invitee.account,
+            &invitee.invite_public,
+            &invitee.stamp,
+        )?;
+        pin(&mut self.pins, invitee.account, &invitee.master_public)?;
+        let info = invitation_info(chat, invitee.account);
+        let sealed = match self.provider.crypto().hpke_seal(
+            INVITE_HPKE,
+            &invitee.invite_public,
+            &info,
+            &[],
+            plaintext,
+        ) {
+            Ok(sealed) => sealed,
+            Err(_) => return Err(MlsError::Encrypt),
+        };
+        let mut out = sealed.kem_output.as_slice().to_vec();
+        out.extend_from_slice(sealed.ciphertext.as_slice());
+        Ok(out)
+    }
+
+    /// An invitation's sealed part, opened with the invite key this device kept from the words.
+    pub fn open_invitation(
+        &self,
+        chat: Ulid,
+        sealed: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>, MlsError> {
+        if sealed.len() <= INVITE_KEM_SIZE {
+            return Err(MlsError::BodyShort);
+        }
+        let (kem_output, ciphertext) = sealed.split_at(INVITE_KEM_SIZE);
+        let input = openmls_traits::types::HpkeCiphertext {
+            kem_output: kem_output.to_vec().into(),
+            ciphertext: ciphertext.to_vec().into(),
+        };
+        let info = invitation_info(chat, self.record.account);
+        match self.provider.crypto().hpke_open(
+            INVITE_HPKE,
+            &input,
+            self.invite_private.as_ref(),
+            &info,
+            &[],
+        ) {
+            Ok(opened) => Ok(Zeroizing::new(opened)),
+            Err(_) => Err(MlsError::Decrypt),
+        }
+    }
+
     /// This device proving which one it is, when its session has expired.
     pub fn sign_device_login(&self, challenge: &[u8; 32]) -> Result<[u8; 64], MlsError> {
         let mut bytes = device_statement_bytes(
@@ -1552,6 +2107,7 @@ impl Device {
         out.extend_from_slice(&self.record.device_public);
         out.extend_from_slice(&self.record.master_public);
         out.extend_from_slice(&self.record.stamp);
+        out.extend_from_slice(self.invite_private.as_ref());
         match self.since {
             Some(since) => {
                 out.push(1);
@@ -1580,6 +2136,11 @@ impl Device {
         out.extend_from_slice(&(self.profile_keys.len() as u32).to_be_bytes());
         for (account, key) in &self.profile_keys {
             out.extend_from_slice(account.bytes());
+            out.extend_from_slice(key.as_ref());
+        }
+        out.extend_from_slice(&(self.chat_keys.len() as u32).to_be_bytes());
+        for (chat, key) in &self.chat_keys {
+            out.extend_from_slice(chat.bytes());
             out.extend_from_slice(key.as_ref());
         }
         let values = match self.provider.storage().values.read() {
@@ -1668,6 +2229,7 @@ impl Device {
         let device_public: [u8; 32] = read_array(&mut reader)?;
         let master_public: [u8; 32] = read_array(&mut reader)?;
         let stamp: [u8; 64] = read_array(&mut reader)?;
+        let invite_private = Zeroizing::new(read_array::<32>(&mut reader)?);
         let [has_since]: [u8; 1] = read_array(&mut reader)?;
         let since = match has_since {
             1 => Some(i64::from_be_bytes(read_array(&mut reader)?)),
@@ -1702,6 +2264,13 @@ impl Device {
             let account = Ulid::from_bytes(read_array(&mut reader)?);
             let key: [u8; 16] = read_array(&mut reader)?;
             profile_keys.insert(account, Zeroizing::new(key));
+        }
+        let mut chat_keys = HashMap::new();
+        let count = u32::from_be_bytes(read_array(&mut reader)?);
+        for _ in 0..count {
+            let chat = Ulid::from_bytes(read_array(&mut reader)?);
+            let key: [u8; 16] = read_array(&mut reader)?;
+            chat_keys.insert(chat, Zeroizing::new(key));
         }
 
         let provider = OpenMlsRustCrypto::default();
@@ -1766,6 +2335,8 @@ impl Device {
             pins,
             epoch_keys,
             profile_keys,
+            invite_private,
+            chat_keys,
             chats,
             since,
             shelf,
@@ -1896,6 +2467,14 @@ impl Device {
                 profile_key_list.push((account.account, sealed));
             }
         }
+        let chat_key = match self.chat_keys.get(&chat) {
+            Some(chat_key) => Some(seal_under(
+                &key_bytes,
+                &chat_key_data(chat, epoch),
+                chat_key.as_ref(),
+            )?),
+            None => None,
+        };
         Ok(Commit {
             epoch,
             commit,
@@ -1903,6 +2482,7 @@ impl Device {
             wrap_list,
             group_info,
             profile_key_list,
+            chat_key,
         })
     }
 
@@ -1918,7 +2498,11 @@ impl Device {
         secret_bytes.copy_from_slice(secret);
         let mut list = Vec::with_capacity(account_list.len());
         for account in account_list {
-            let bytes = account_stamp_bytes(&account.account, &account.account_public);
+            let bytes = key_stamp_bytes(
+                ACCOUNT_STAMP_LABEL,
+                &account.account,
+                &account.account_public,
+            );
             let bad = MlsError::BadStamp {
                 account: account.account,
             };

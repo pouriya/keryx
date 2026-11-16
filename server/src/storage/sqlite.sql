@@ -44,10 +44,13 @@ CREATE TABLE account (
     -- [Key wrapping] the master key's signature over account_public_key, so a server cannot
     -- swap in its own key and be sent every chat's keys. NULL until the words are set up.
     account_key_stamp   BLOB,
+    -- [Invitations] what an invitation's name and BlurHash are sealed to, with the master key's
+    -- stamp over it, so a server cannot read an invitation by swapping in its own key. NULL until
+    -- the words are set up.
+    invite_public_key   BLOB,
+    invite_key_stamp    BLOB,
     -- [Words setup] when setup finished, so the client knows whether to ask for it.
     words_set_at        INTEGER,
-    -- [Seen times] a person may turn receipts off. Their times are still stored.
-    receipts_enabled    INTEGER NOT NULL DEFAULT 1 CHECK (receipts_enabled IN (0, 1)),
     -- [Account profile] moves on every change of the names, photo, bio or links, so a client that
     -- was offline knows to fetch the profile again.
     profile_version     INTEGER NOT NULL DEFAULT 0 CHECK (profile_version >= 0),
@@ -135,15 +138,17 @@ CREATE INDEX login_session_expiry ON login_session (expires_at);
 -- [Password reset, Returning device, Device ids] what the server handed out to be used once: a
 -- challenge to sign, or a new device's id, so a client can never choose its own.
 CREATE TABLE challenge (
-    -- [Password reset, Returning device, Device ids, Folders] 32 random bytes, or a device's or
-    -- folder's ULID.
+    -- [Password reset, Returning device, Device ids, Folders, Topics] 32 random bytes, or a
+    -- device's, folder's or topic's ULID.
     value       BLOB PRIMARY KEY,
-    -- [Password reset, Returning device, Device ids, Folders] which account it is for.
+    -- [Password reset, Returning device, Device ids, Folders, Topics] which account it is for.
     account_id  BLOB NOT NULL REFERENCES account (id) ON DELETE CASCADE,
-    -- [Password reset, Returning device, Device ids, Folders] 0 password reset, 1 returning
-    -- device, 2 device id, 3 folder id: so one cannot be used as another.
-    purpose     INTEGER NOT NULL CHECK (purpose IN (0, 1, 2, 3)),
-    -- [Password reset, Returning device, Device ids, Folders] five minutes after it was made.
+    -- [Password reset, Returning device, Device ids, Folders, Topics] 0 password reset, 1 returning
+    -- device, 2 device id, 3 folder id, 4 topic id: so one cannot be used as another.
+    purpose     INTEGER NOT NULL CHECK (purpose IN (0, 1, 2, 3, 4)),
+    -- [Topics] the chat a topic id was issued for. NULL for every other purpose.
+    conversation_id  BLOB REFERENCES conversation (id) ON DELETE CASCADE,
+    -- [Password reset, Returning device, Device ids, Folders, Topics] five minutes after it was made.
     expires_at  INTEGER NOT NULL
 ) WITHOUT ROWID, STRICT;
 
@@ -246,7 +251,8 @@ CREATE TABLE role (
     conversation_id  BLOB REFERENCES conversation (id) ON DELETE CASCADE,
     -- [RBAC] shown when managing roles.
     name             TEXT NOT NULL,
-    -- [RBAC] admin, moderator and member, which cannot be deleted.
+    -- [RBAC] the server's admin, moderator and member, and a chat's owner, moderator and member,
+    -- which cannot be deleted.
     built_in         INTEGER NOT NULL DEFAULT 0 CHECK (built_in IN (0, 1)),
     -- [Device limit] overrides `max_devices` in server.toml. The highest of a person's
     -- roles applies. NULL means this role does not change the limit.
@@ -293,12 +299,17 @@ CREATE TABLE conversation (
     direct_low        BLOB REFERENCES account (id),
     -- [Direct chats, Self chat] the higher of the two accounts.
     direct_high       BLOB REFERENCES account (id),
-    -- [Unencrypted switching] 0 private: everything encrypted, and unencrypted is refused.
-    -- 1 mixed: encrypted, but permitted people may send unencrypted messages. 2 open: everything
-    -- unencrypted. New chats start as 0.
-    -- A copy of what is signed inside MLS: the server uses it to refuse, clients check the
-    -- signed one.
-    mode              INTEGER NOT NULL DEFAULT 0 CHECK (mode IN (0, 1, 2)),
+    -- [Topics] whether a group's or channel's messages show in named topics. Off shows one list,
+    -- and every message keeps its topic.
+    topics_on         INTEGER NOT NULL DEFAULT 0 CHECK (topics_on IN (0, 1)),
+    -- [Findable chats] a group or channel the directory lists, whose name and bio the server reads.
+    findable          INTEGER NOT NULL DEFAULT 0 CHECK (findable IN (0, 1)),
+    -- [Findable chats] its readable name, set only while findable.
+    find_name         TEXT,
+    -- [Findable chats] its readable bio.
+    find_bio          TEXT,
+    -- [Slow mode] seconds between one member's messages in the main list or a topic. NULL is off.
+    slow_mode         INTEGER CHECK (slow_mode IN (10, 30, 60, 300, 900, 3600)),
     -- [Retention] the chat's own limit. NULL falls back to server.toml, and the shortest wins.
     retention_ms      INTEGER,
     -- [Chat list, Sending, Fetch pages] the newest seq. Also what a chat's task resumes from
@@ -309,7 +320,8 @@ CREATE TABLE conversation (
     -- [Chat list] sorts the list by activity. A reaction moves this, so it brings the chat up. An
     -- ack does not.
     last_at           INTEGER,
-    -- [Chat list] the preview. A reaction moves it, showing "Sara reacted" until the next message.
+    -- [Chat list] the preview. A reaction moves it, showing "Sara reacted" until the next message,
+    -- and so does a membership line.
     -- Commits, acks and a call's own messages do not, and removing or editing the last message does.
     last_content_seq  INTEGER,
     -- [Chat list] sorts a chat with no messages yet.
@@ -317,59 +329,44 @@ CREATE TABLE conversation (
     CHECK ((type IN (0, 1)) = (direct_low IS NOT NULL)),
     CHECK ((type IN (0, 1)) = (direct_high IS NOT NULL)),
     CHECK (direct_low <= direct_high),
-    CHECK ((type = 0) = (direct_low IS NOT NULL AND direct_low = direct_high))
+    CHECK ((type = 0) = (direct_low IS NOT NULL AND direct_low = direct_high)),
+    CHECK (type IN (2, 3) OR (topics_on = 0 AND findable = 0 AND slow_mode IS NULL)),
+    CHECK ((findable = 1) = (find_name IS NOT NULL)),
+    CHECK (findable = 1 OR find_bio IS NULL)
 ) WITHOUT ROWID, STRICT;
+
+-- [Findable chats] the directory's search.
+CREATE INDEX conversation_findable ON conversation (find_name) WHERE findable = 1;
 
 -- [Direct chats, Self chat] one pair cannot get two chats, and a person gets one self chat.
 CREATE UNIQUE INDEX conversation_direct ON conversation (direct_low, direct_high)
     WHERE direct_low IS NOT NULL;
 
 -- [Group and channel profile] one row per group or channel, never for direct or self chats.
--- Kept off `conversation` because that row changes on every message. In an encrypted chat the
--- server holds only the sealed blob. In an unencrypted one it can read the fields.
+-- Kept off `conversation` because that row changes on every message. The server holds only the
+-- sealed blob.
 CREATE TABLE conversation_profile (
     -- [Group and channel profile] which chat.
     conversation_id  BLOB PRIMARY KEY REFERENCES conversation (id) ON DELETE CASCADE,
-    -- [Group and channel profile, Unencrypted switching] 1 uses sealed and epoch, 0 uses the
-    -- readable fields. Switching a chat's mode rewrites this row.
-    encrypted        INTEGER NOT NULL CHECK (encrypted IN (0, 1)),
-    -- [Encrypted profile] name, bio, links, and image info with its file key, encrypted under
-    -- the chat key of `epoch`.
-    sealed           BLOB,
-    -- [Encrypted profile] the chat key that opens it. Whoever adds a member re-encrypts this
-    -- under the new key, because a new member only has the current one.
-    epoch            INTEGER,
-    -- [Unencrypted profile, Chat list] what the chat is called.
-    name             TEXT,
-    -- [Unencrypted profile] free text about the chat.
-    bio              TEXT,
-    -- [Unencrypted profile] the image's file.
-    image_file_id    BLOB REFERENCES file (id),
-    -- [Unencrypted profile] the image's media type, so it can be served correctly.
-    image_type       TEXT,
+    -- [Group and channel profile, Topics] name, bio, links, the photo with its file key, and the
+    -- topics' names, encrypted under the chat's own profile key, which never changes.
+    sealed           BLOB NOT NULL,
+    -- [Group and channel profile, Invitations] that profile key, encrypted under the chat key of
+    -- `key_epoch`. Its creator, an add and a device joining by invitation share it again at their
+    -- epoch, so every member holds the key of the newest.
+    key              BLOB NOT NULL,
+    -- [Group and channel profile, Invitations] the epoch whose chat key opens `key`.
+    key_epoch        INTEGER NOT NULL,
+    -- [Group and channel profile] the photo the blob names, a chat file. NULL with no photo.
+    photo_id         BLOB REFERENCES file (id) ON DELETE SET NULL,
     -- [Signatures] by updated_by, so a server cannot forge a chat's profile.
     signature        BLOB NOT NULL,
     -- [Signatures, RBAC] which device changed it, to check it held the permission.
     updated_by       BLOB NOT NULL REFERENCES device (id),
-    -- [Group and channel profile] lets a client skip fetching what it already has.
-    updated_at       INTEGER NOT NULL,
-    CHECK ((encrypted = 1) = (sealed IS NOT NULL)),
-    CHECK ((encrypted = 1) = (epoch IS NOT NULL)),
-    CHECK ((encrypted = 0) = (name IS NOT NULL)),
-    CHECK (encrypted = 0 OR (bio IS NULL AND image_file_id IS NULL AND image_type IS NULL)),
-    CHECK ((image_file_id IS NULL) = (image_type IS NULL))
-) WITHOUT ROWID, STRICT;
-
--- [Unencrypted profile] an unencrypted group's or channel's links, as key and value. In an
--- encrypted chat, links are inside the sealed blob and this table has no rows.
-CREATE TABLE conversation_link (
-    -- [Unencrypted profile] which chat.
-    conversation_id  BLOB NOT NULL REFERENCES conversation (id) ON DELETE CASCADE,
-    -- [Unencrypted profile] the label, unique per chat.
-    key              TEXT NOT NULL,
-    -- [Unencrypted profile] the link itself.
-    value            TEXT NOT NULL,
-    PRIMARY KEY (conversation_id, key)
+    -- [Group and channel profile] moves on every change, so a device fetches only a newer one.
+    version          INTEGER NOT NULL CHECK (version >= 1),
+    -- [Group and channel profile] when it last changed.
+    updated_at       INTEGER NOT NULL
 ) WITHOUT ROWID, STRICT;
 
 -- [Chat list, Read state] who is in a chat, and how far they have read. An account's rows
@@ -387,7 +384,7 @@ CREATE TABLE member (
     -- [Read state, Marks] the highest "received up to N": a device of this member holds those
     -- messages. Drives the second mark in a direct chat.
     received_seq     INTEGER NOT NULL DEFAULT 0,
-    -- [Owners, Unencrypted switching, RBAC] groups and channels can have several owners, and
+    -- [Owners, RBAC] groups and channels can have several owners, and
     -- ownership can be transferred. Recorded inside MLS too, which is what clients trust, so a
     -- server cannot make someone an owner. When the last owner leaves, the chat is removed.
     is_owner         INTEGER NOT NULL DEFAULT 0 CHECK (is_owner IN (0, 1)),
@@ -455,7 +452,8 @@ CREATE TABLE kv (
     PRIMARY KEY (account_id, key)
 ) WITHOUT ROWID, STRICT;
 
--- [RBAC] chat-scope roles held by a member.
+-- [RBAC] chat-scope roles held by a member: a moderator's row. Owners are `member.is_owner`, and
+-- every member holds the built-in member role without a row.
 CREATE TABLE member_role (
     -- [RBAC] which chat.
     conversation_id  BLOB NOT NULL,
@@ -467,6 +465,137 @@ CREATE TABLE member_role (
     FOREIGN KEY (conversation_id, account_id)
         REFERENCES member (conversation_id, account_id) ON DELETE CASCADE
 ) WITHOUT ROWID, STRICT;
+
+-- [Chat options] a chat's changes to the built-in member role: reactions, stickers, files and media,
+-- and whether members may add people. A row adds the permission to its members or takes it away.
+CREATE TABLE chat_permission (
+    -- [Chat options] which chat.
+    conversation_id  BLOB NOT NULL REFERENCES conversation (id) ON DELETE CASCADE,
+    -- [Chat options] the permission's name, with the chat type's prefix.
+    permission       TEXT NOT NULL,
+    -- [Chat options] 1 added to the member role, 0 taken from it.
+    allowed          INTEGER NOT NULL CHECK (allowed IN (0, 1)),
+    PRIMARY KEY (conversation_id, permission)
+) WITHOUT ROWID, STRICT;
+
+-- [Topics] a group's or channel's topics, their names inside the sealed profile. General's own
+-- settings sit in a row under the all-zero id, made with the chat, while its messages carry no topic.
+CREATE TABLE topic (
+    -- [Topics] which chat.
+    conversation_id  BLOB NOT NULL REFERENCES conversation (id) ON DELETE CASCADE,
+    -- [Topics] issued by the server first, so the sealed name can name it. All zeros for General.
+    id               BLOB NOT NULL,
+    -- [Topics] when its id was issued.
+    issued_at        INTEGER NOT NULL,
+    -- [Topics] set once removed: its messages are wiped and nothing new goes in. The row stays, so a
+    -- removed id is never live again.
+    removed          INTEGER NOT NULL DEFAULT 0 CHECK (removed IN (0, 1)),
+    -- [Topic settings] nobody but moderators writes, reacts or replies in it.
+    closed           INTEGER NOT NULL DEFAULT 0 CHECK (closed IN (0, 1)),
+    -- [Topic settings] only moderators see it, and its messages go to nobody else.
+    hidden           INTEGER NOT NULL DEFAULT 0 CHECK (hidden IN (0, 1)),
+    -- [Topic settings] who writes in its main list: 0 everyone, 1 moderators.
+    write            INTEGER NOT NULL DEFAULT 0 CHECK (write IN (0, 1)),
+    -- [Topic settings] seconds between one member's messages in it. NULL follows the chat's, 0 is off.
+    slow_mode        INTEGER CHECK (slow_mode IN (0, 10, 30, 60, 300, 900, 3600)),
+    -- [Topic settings] its bio, links, photo and rules, sealed under the chat's profile key.
+    sealed           BLOB,
+    -- [Topic settings] the sealing device's signature over it.
+    signature        BLOB,
+    -- [Topic settings] the chat file its photo is, kept while named.
+    photo_id         BLOB,
+    -- [Topic settings] the device that sealed it.
+    updated_by       BLOB,
+    -- [Topic settings] 1, 2, 3 as it changes.
+    version          INTEGER NOT NULL DEFAULT 0,
+    -- [Topic settings] when its profile last changed.
+    updated_at       INTEGER,
+    PRIMARY KEY (conversation_id, id),
+    CHECK ((sealed IS NULL) = (signature IS NULL))
+) WITHOUT ROWID, STRICT;
+
+-- [Slow mode] when each member last wrote in each topic's main list, General under the all-zero id,
+-- so a topic's slow mode counts only messages in that topic.
+CREATE TABLE slow_sent (
+    -- [Slow mode] which chat.
+    conversation_id  BLOB NOT NULL REFERENCES conversation (id) ON DELETE CASCADE,
+    -- [Slow mode] who wrote.
+    account_id       BLOB NOT NULL,
+    -- [Slow mode] the topic written in. All zeros for General.
+    topic_id         BLOB NOT NULL,
+    -- [Slow mode] the server time of that member's last message there.
+    at               INTEGER NOT NULL,
+    PRIMARY KEY (conversation_id, topic_id, account_id)
+) WITHOUT ROWID, STRICT;
+
+-- [Topic settings] a topic's own override of the member role, on top of the chat's: the reaction,
+-- sticker and file kinds and the four times permissions.
+CREATE TABLE topic_permission (
+    -- [Topic settings] which chat.
+    conversation_id  BLOB NOT NULL REFERENCES conversation (id) ON DELETE CASCADE,
+    -- [Topic settings] which topic, all zeros for General.
+    topic_id         BLOB NOT NULL,
+    -- [Topic settings] the permission's name, with the chat type's prefix.
+    permission       TEXT NOT NULL,
+    -- [Topic settings] 1 added to the member role there, 0 taken from it.
+    allowed          INTEGER NOT NULL CHECK (allowed IN (0, 1)),
+    PRIMARY KEY (conversation_id, topic_id, permission)
+) WITHOUT ROWID, STRICT;
+
+-- [Topic settings] a topic's own moderators, made by the chat's owners. The chat's owners and
+-- moderators moderate every topic anyway.
+CREATE TABLE topic_moderator (
+    -- [Topic settings] which chat.
+    conversation_id  BLOB NOT NULL,
+    -- [Topic settings] which topic, all zeros for General.
+    topic_id         BLOB NOT NULL,
+    -- [Topic settings] who.
+    account_id       BLOB NOT NULL,
+    PRIMARY KEY (conversation_id, topic_id, account_id),
+    FOREIGN KEY (conversation_id, account_id)
+        REFERENCES member (conversation_id, account_id) ON DELETE CASCADE
+) WITHOUT ROWID, STRICT;
+
+-- [Join requests] someone asking to join a findable group or channel. Let in by an add commit, which
+-- deletes the row. Expires after `[limits] invitation_lifetime`.
+CREATE TABLE join_request (
+    -- [Join requests] which chat.
+    conversation_id  BLOB NOT NULL REFERENCES conversation (id) ON DELETE CASCADE,
+    -- [Join requests] who asks.
+    account_id       BLOB NOT NULL REFERENCES account (id) ON DELETE CASCADE,
+    -- [Join requests] plain text the server reads, at most 140 characters.
+    note             TEXT,
+    -- [Join requests] 0 waiting, 1 declined: the asker is told, and may ask again.
+    state            INTEGER NOT NULL CHECK (state IN (0, 1)),
+    -- [Join requests, Expiry] when asked or declined.
+    at               INTEGER NOT NULL,
+    PRIMARY KEY (conversation_id, account_id)
+) WITHOUT ROWID, STRICT;
+
+-- [Invitations] an add turned into an invitation, as the invited person's switch says. Deleted when
+-- answered or expired.
+CREATE TABLE invitation (
+    -- [Invitations] which chat.
+    conversation_id  BLOB NOT NULL REFERENCES conversation (id) ON DELETE CASCADE,
+    -- [Invitations] who is invited.
+    account_id       BLOB NOT NULL REFERENCES account (id) ON DELETE CASCADE,
+    -- [Invitations] which device invited, which gives the inviter and the key its signature checks.
+    inviter          BLOB NOT NULL REFERENCES device (id),
+    -- [Invitations] the chat's name, its photo's BlurHash, its profile key and the inviter's note,
+    -- sealed to the invited account.
+    sealed           BLOB NOT NULL,
+    -- [Invitations] the inviter's device over `keryx v1 invite`, the chat and the invited account,
+    -- which the joiner hands to the chat's members.
+    signature        BLOB NOT NULL,
+    -- [Invitations, Expiry] when invited.
+    at               INTEGER NOT NULL,
+    PRIMARY KEY (conversation_id, account_id)
+) WITHOUT ROWID, STRICT;
+
+-- [Invitations] an account's own invitations, for its chat list.
+CREATE INDEX invitation_account ON invitation (account_id);
+-- [Join requests] an account's own requests, for its chat list.
+CREATE INDEX join_request_account ON join_request (account_id);
 
 
 -- ---------------------------------------------------------------------------
@@ -486,10 +615,12 @@ CREATE TABLE message (
     -- refuses a removal from it or any device newer than it.
     device_id          BLOB REFERENCES device (id),
     -- [RBAC, Chat list, Actions] always readable, because RBAC needs it:
-    -- 0 content, 1 edit, 2 delete, 3 commit, 4 device_notice.
+    -- 0 content, 1 edit, 2 delete, 3 commit, 4 device_notice, 5 line.
     -- A reply is not a kind: it is a content message with a pointer.
     -- A device_notice is written by the server, in the person's self chat only.
-    kind               INTEGER CHECK (kind BETWEEN 0 AND 4),
+    -- A line is written by the server in a group, in the same step as a membership change: its
+    -- body is readable JSON, its device the actor's, and it has no signature.
+    kind               INTEGER CHECK (kind BETWEEN 0 AND 5),
     -- [RBAC, Chat list, Calls] what a content message is, and NULL for every other kind. Readable
     -- by the server even in an encrypted chat, so roles can allow or refuse each one:
     -- 0 text, 1 voice, 2 reaction, 3 image, 4 music (an MP3), 5 video, 6 doc, 7 file,
@@ -505,6 +636,11 @@ CREATE TABLE message (
     -- [Restore, Commit order] the key this was encrypted under, and for a commit, the step it
     -- claims. NULL for an unencrypted message that is not a commit.
     epoch              INTEGER,
+    -- [Topics] the topic a content message is in. NULL for General, and in every direct chat.
+    topic_id           BLOB,
+    -- [Threads] the seq of the main-list message whose thread this is in. Readable, so the server
+    -- enforces a channel's rule, counts replies and syncs one thread.
+    thread_seq         INTEGER,
     -- [Actions, Replies] the target's seq. In an encrypted chat only delete and edit fill it,
     -- because the server acts on those. Reply and reaction pointers stay inside the ciphertext.
     pointer_seq        INTEGER,
@@ -534,8 +670,10 @@ CREATE TABLE message (
     CHECK ((kind IS NULL) = (device_id IS NULL)),
     CHECK ((kind IS NULL) = (encrypted IS NULL)),
     CHECK ((kind IS NULL) = (client_sent_at IS NULL)),
-    CHECK ((kind IS NULL) = (signature IS NULL)),
+    -- A line is the server's own and carries no signature.
+    CHECK ((kind IS NULL OR kind = 5) = (signature IS NULL)),
     CHECK ((kind IS NULL) = (body IS NULL)),
+    CHECK (kind = 0 OR (topic_id IS NULL AND thread_seq IS NULL)),
     CHECK (kind IS NOT NULL OR (epoch IS NULL AND pointer_seq IS NULL AND expires_at IS NULL))
 ) STRICT;
 
@@ -548,6 +686,10 @@ CREATE UNIQUE INDEX message_commit ON message (conversation_id, epoch) WHERE kin
 CREATE INDEX message_edit ON message (conversation_id, pointer_seq) WHERE kind = 1;
 -- [Calls] the calls, to end those still open at startup, since nobody can be in them after a restart.
 CREATE INDEX message_call ON message (conversation_id, seq) WHERE content_kind = 8;
+-- [Topics] removing a topic wipes its messages.
+CREATE INDEX message_topic ON message (conversation_id, topic_id) WHERE topic_id IS NOT NULL;
+-- [Threads] a thread's replies, counted under the message that opened it.
+CREATE INDEX message_thread ON message (conversation_id, thread_seq) WHERE thread_seq IS NOT NULL;
 -- [Sync] what was saved or removed after a time, in one chat or several.
 CREATE INDEX message_sync ON message (conversation_id, server_saved_at);
 -- [Retention] the sweep.
@@ -593,6 +735,46 @@ CREATE TABLE call (
 -- [Sync] call rows saved after a time, in one chat or several.
 CREATE INDEX call_sync ON call (conversation_id, server_at);
 
+-- [Chat history, Membership lines] what happened in a group or channel, written by the server so a
+-- modified client cannot leave one out: adds, removals, leaving, role changes, deletes of others'
+-- messages, topic changes and a declined invitation. Kept under the chat's retention.
+CREATE TABLE chat_event (
+    -- [Chat history] which chat.
+    conversation_id  BLOB NOT NULL REFERENCES conversation (id) ON DELETE CASCADE,
+    -- [Chat history] 1, 2, 3 in the chat, in the order the server wrote them.
+    n                INTEGER NOT NULL CHECK (n >= 1),
+    -- [Chat history] who did it.
+    actor            BLOB NOT NULL REFERENCES account (id),
+    -- [Chat history] 0 created, 1 added, 2 removed, 3 left, 4 let in, 5 joined by invitation, 6 made
+    -- owner, 7 made moderator, 8 made member, 9 deleted a message, 10 topic added, 11 topic removed,
+    -- 12 topics on, 13 topics off, 14 invitation declined, 16 a topic's profile edited, 17 a topic's
+    -- options changed, 18 made a topic's moderator, 19 made a member there again, 20 edited a message.
+    action           INTEGER NOT NULL CHECK (action BETWEEN 0 AND 20 AND action != 15),
+    -- [Chat history] the account acted on: the member, or a deleted or edited message's author.
+    target           BLOB,
+    -- [Chat history] the message a delete removed or an edit changed.
+    seq              INTEGER,
+    -- [Topic settings] the topic whose history the row is in, NULL for the group's own.
+    topic_id         BLOB,
+    -- [Chat history] a delete's or edit's copy of the message and its edits as they were, as the
+    -- JSON list of message frames the wire carries: ciphertext, header and signature, which the
+    -- history's readers open and check. NULL for every other row.
+    copy             BLOB,
+    -- [Chat history] who sees it: 1 owners and moderators, 2 the
+    -- account in `viewer` alone.
+    audience         INTEGER NOT NULL CHECK (audience IN (1, 2)),
+    -- [Invitations] the one account an audience 2 row is for.
+    viewer           BLOB REFERENCES account (id),
+    -- [Chat history, Sync] the server's clock, which never goes back.
+    server_at        INTEGER NOT NULL,
+    PRIMARY KEY (conversation_id, n),
+    CHECK ((audience = 2) = (viewer IS NOT NULL))
+) WITHOUT ROWID, STRICT;
+
+-- [Sync] chat events saved after a time, in one chat or several.
+CREATE INDEX chat_event_sync ON chat_event (conversation_id, server_at);
+
+
 -- [Seen times] one row per `seen`, with one time for many messages. A member saw message N
 -- at the time on their first row reaching N. Deleted once the messages it covers expire.
 -- Not tied to `member`: a member who leaves keeps their seen times, so the code checks
@@ -602,6 +784,11 @@ CREATE TABLE seen (
     conversation_id  BLOB NOT NULL REFERENCES conversation (id) ON DELETE CASCADE,
     -- [Seen times] who.
     account_id       BLOB NOT NULL REFERENCES account (id),
+    -- [Topics, Threads] where it was read: 0 the main list or General, 1 a topic, 2 a thread.
+    kind             INTEGER NOT NULL DEFAULT 0 CHECK (kind IN (0, 1, 2)),
+    -- [Topics, Threads] empty for the main list, the topic's id, or the thread's seq as 8 bytes
+    -- big-endian. A place nobody read in has no rows.
+    place            BLOB NOT NULL DEFAULT x'',
     -- [Seen times, Read state] the "seen up to N" the client sent.
     up_to_seq        INTEGER NOT NULL,
     -- [Devices] which device reported it.
@@ -611,7 +798,7 @@ CREATE TABLE seen (
     client_seen_at   INTEGER NOT NULL,
     -- [Seen times] catches a client lying about its time.
     server_seen_at   INTEGER NOT NULL,
-    PRIMARY KEY (conversation_id, account_id, up_to_seq)
+    PRIMARY KEY (conversation_id, account_id, kind, place, up_to_seq)
 ) WITHOUT ROWID, STRICT;
 
 -- [Received times] one row per `received`, like `seen`: a member's device got message N at the time
@@ -622,6 +809,10 @@ CREATE TABLE received (
     conversation_id     BLOB NOT NULL REFERENCES conversation (id) ON DELETE CASCADE,
     -- [Received times] who.
     account_id          BLOB NOT NULL REFERENCES account (id),
+    -- [Topics, Threads] as `seen`'s: 0 the main list, 1 a topic, 2 a thread.
+    kind                INTEGER NOT NULL DEFAULT 0 CHECK (kind IN (0, 1, 2)),
+    -- [Topics, Threads] as `seen`'s.
+    place               BLOB NOT NULL DEFAULT x'',
     -- [Received times, Read state] the "received up to N" the client sent.
     up_to_seq           INTEGER NOT NULL,
     -- [Devices] which device reported it.
@@ -630,7 +821,7 @@ CREATE TABLE received (
     client_received_at  INTEGER NOT NULL,
     -- [Received times] catches a client lying about its time.
     server_received_at  INTEGER NOT NULL,
-    PRIMARY KEY (conversation_id, account_id, up_to_seq)
+    PRIMARY KEY (conversation_id, account_id, kind, place, up_to_seq)
 ) WITHOUT ROWID, STRICT;
 
 
@@ -650,7 +841,7 @@ CREATE TABLE file (
     -- [Profile images] the account it belongs to, its bytes under `accounts/<account id>`. NULL for a
     -- chat's file. A photo is one chunk, of kind 3, and used_at is set once the profile names it.
     account_id       BLOB REFERENCES account (id) ON DELETE CASCADE,
-    -- [Unencrypted messages] 0 only for files in an unencrypted chat.
+    -- [Unencrypted messages] 0 only for an unencrypted message's files, as its uploader declared.
     encrypted        INTEGER NOT NULL CHECK (encrypted IN (0, 1)),
     -- [Upload limits] the type its uploader declared, which picks the limit: 1 voice, 3 image,
     -- 4 music, 5 video, 6 doc, 7 file, as message.content_kind. The real type is encrypted.
@@ -727,7 +918,7 @@ CREATE INDEX sticker_in_pack ON sticker (pack_id, created_at);
 -- MLS and keys
 -- ---------------------------------------------------------------------------
 
--- [External join, Commit order] every chat has one, even while unencrypted. Kept off
+-- [External join, Commit order] every chat has one. Kept off
 -- `conversation` because group info can be large and that row changes on every message.
 CREATE TABLE mls_group (
     -- [External join] which chat.
@@ -736,6 +927,9 @@ CREATE TABLE mls_group (
     epoch            INTEGER NOT NULL,
     -- [External join] public, and what a new device joins the chat with by itself.
     group_info       BLOB NOT NULL,
+    -- [Commit check] openmls's public group, started from epoch 0's group info and moved on by
+    -- each accepted commit, which the server reads to check what a commit adds and removes.
+    public_group     BLOB NOT NULL,
     -- [External join] lets a client skip fetching group info it already has.
     updated_at       INTEGER NOT NULL
 ) STRICT;

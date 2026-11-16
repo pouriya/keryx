@@ -12,7 +12,9 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// **If this fails, nobody's words give their keys any more.** These values were computed from the
-/// spec by a separate implementation, on Node and OpenSSL. Never update them to make the test pass.
+/// spec by a separate implementation, on Node and OpenSSL, and the invite key's by another in plain
+/// Python from RFC 5869, 7748 and 9180, which gave the account key's pins too. Never update them to
+/// make the test pass.
 #[test]
 fn derivation_is_pinned() {
     let keys = derive(WORDS).unwrap();
@@ -31,6 +33,14 @@ fn derivation_is_pinned() {
     assert_eq!(
         hex(keys.account_public()),
         "a8b4afab143861e81ee0eb9a14f1ed610f06a9f947685928a5a992553f9c7a0e"
+    );
+    assert_eq!(
+        hex(keys.invite_private()),
+        "fde8551b1e74a6d9723bea500ab29ff8fb5c7cd8c21283c0052ea5d58b0b7ba3"
+    );
+    assert_eq!(
+        hex(keys.invite_public()),
+        "a2b90cf1b3e8258951f79634caa69a0839b712d77aa07d0945c0528811780023"
     );
 }
 

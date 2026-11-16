@@ -123,6 +123,9 @@ impl Ulid {
     /// in the future or a run of zeros is a value, not a parse error, and the
     /// length is the caller's problem because that is where the useful context
     /// about *which* row is malformed lives.
+    /// The all-zero id, which no ULID made by `new` can be.
+    pub const ZERO: Self = Self([0; 16]);
+
     pub fn from_bytes(bytes: [u8; 16]) -> Self {
         Self(bytes)
     }

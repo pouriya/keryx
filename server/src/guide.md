@@ -38,9 +38,10 @@ Registering and the one-time link do not log you in.
 
     GET  /sessions               -> session_list
     DEL  /sessions/{id}
-    PUT  /account/keys           master_public, account_public, account_stamp -> self_chat
+    PUT  /account/keys           master_public, account_public, account_stamp, invite_public,
+                                 invite_stamp -> self_chat
     GET  /accounts/{id}          -> id, username, display_name?, master_public?, account_public?,
-                                    account_stamp?
+                                    account_stamp?, invite_public?, invite_stamp?
     GET  /devices                -> device_list
     POST /devices/id             -> device
     POST /devices                device, public_key, stamp, platform, os, os_version,
@@ -75,12 +76,13 @@ good.
 
     POST /key_packages                    body_list -> count
     POST /accounts/{id}/key_packages/claim   -> key_package_list{device, body}
-    POST /chats                           account -> chat, created
+    POST /chats                           account -> chat, created; or type (group | channel),
+                                          topics?, findable?{name, bio?} -> chat
     GET  /chats/{id}/group_info           -> epoch, group_info
     GET  /chats/{id}/devices              -> device_list{account, device, public_key, stamp,
                                              master_public, statement?}
     GET  /chats/{id}/wraps                -> wrap_list{epoch, account, wrapped}
-    GET  /chats/{id}/messages/{seq}/times -> member_list{account, received_at?, seen_at?}
+    GET  /chats/{id}/messages/{seq}/times?after= -> member_list{account, received_at?, seen_at?}, more
     PUT  /chats/{id}/draft                {draft?: {epoch, body}}: keeps your sealed draft, or clears it
     POST /chat_folders/id                 -> folder: a new folder's id, yours for 5 minutes
     PUT  /chat_folders                    {folder_list, default}: your whole arrangement of folders
@@ -143,11 +145,14 @@ Every frame is JSON with a `type`. A request's `ref` is a ULID you make, which c
 
 You send: `send`, `seen`, `received`, `typing`, `sync`, `group_info`, `wraps`, `profile_keys`,
 `call_event`, `times`, `draft`, `folder_id`, `chat_folders`, `presence`, `presence_of`, `kv`,
-`kv_set`, `ping`.
+`kv_set`, `ping`, and for groups and channels `chat_remove`, `leave`, `chat_role`, `join_request`,
+`join_cancel`, `join_decline`, `invite`, `invite_answer`, `topic_id`, `topics`, `chat_profile`,
+`chat_options`, `topic_profile`, `topic_options`, `topic_role` and `findable`.
 
 The server sends: `features`, `sent`, `done`, `refused`, `message`, `chats`, `welcome`, `typing`,
 `marks`, `revoked`, `call_event`, `times`, `draft`, `folder_id`, `chat_folders`, `profile`,
-`profile_keys`, `presence`, `presence_of`, `kv`.
+`profile_keys`, `presence`, `presence_of`, `kv`, `chat_event`, `topic_id`, `topics`, `chat_profile`,
+`chat_options`, `topic`, `findable`, `join_request`, `invitation`.
 
 `profile` carries an `account` sharing a chat with you, or your own, with its `version`, `username` and
 `display_name`, whenever its names, photo, bio or links change. Each `chats` entry carries every
@@ -168,8 +173,8 @@ to your other online devices. Each `chats` entry carries yours in `draft`, with 
 `folder_id` asks for a new folder's id and is answered with `folder_id` and `folder`, kept for you for
 5 minutes, so your client can seal the folder's name with it. `chat_folders` carries your whole
 arrangement at once: `folder_list` in tab order, each `{id, name?, chat_list?, pin_list}`, and
-`default`, the folder a device opens on. `all` is the one folder with no `name` or `chat_list`, and
-holds every chat. A name is sealed by your client and never read; send an unchanged one back as the
+`default`, the folder a device opens on. `all` is the one folder with no `name` or `chat_list`,
+always first, and holds every chat. A name is sealed by your client and never read; send an unchanged one back as the
 same bytes. It is answered with `done`, and your other online devices get it as `chat_folders`. The
 first page of `chats` carries yours in `chat_folders`. A change you may not make is `no_permission`,
 more than `folders` folders `too_many_folders`, an id neither yours nor issued to you
@@ -188,8 +193,15 @@ One based on an older version is refused with `kv_stale`, carrying `version` and
 online devices get `kv` with `from`, `version`, `set` and `remove`. A name is 1 to 64 of a-z, 0-9, _ and
 ., and a value is bytes the server never reads, at most `kv_value`; more than `kv_keys` names is
 `too_many_keys`.
-`times` carries `chat` and `seq` and is answered with `times`: `member_list` of each member but the
-sender, with the server's time for `received_at` and `seen_at`.
+`times` carries `chat`, `seq` and an optional `after` and is answered with `times`: a page of 50 of the
+members but the sender in `member_list`, with the server's time for `received_at` and `seen_at`, each
+left out when you may not see it, and `more` when another page follows. Those who saw it come first,
+then those who only received it, then the rest, the newest first and then by account; ask the next
+page with `after` set to the last account listed. A thread's message counts reading in its thread, and
+a topic's reading in its topic while topics are on.
+`message.view_received.own` and `message.view_seen.own` cover your own messages, and
+`message.view_received.others` and `message.view_seen.others` everyone else's, under the chat type's
+prefix. With neither on that message, it is refused with `no_permission`.
 
 `sync` answers with `chats`: your chats in `chat_list`, then every message in `message_list` and call
 row in `call_list` saved since `since`, the server time in milliseconds of the newest row you hold,
@@ -205,6 +217,105 @@ chat's group info at that epoch, which is saved with it. The first commit for ea
 loser gets `refused` with the code `commit_lost`. A chat's group starts when someone sends `group_info`
 for epoch 0, and if two people start it at once the second gets `chat_started` and waits for its
 Welcome. The same epoch 0 bytes sent again are accepted, as a resend whose answer was lost.
+
+Commits are MLS public messages, and the server reads each one, in every kind of chat. A device
+joining by itself must be the device sending the commit. An add may bring in only devices of the
+accounts its action names, or of accounts already in the chat. A removal may take out only the
+accounts its action names, ended devices, or accounts no longer in the chat. A commit that breaks
+these rules, or cannot be read, is refused with `bad_commit`. Epoch 0's `group_info` must be the
+chat's own, or it is refused with `bad_message`.
+
+## Groups and channels
+
+`POST /chats` with `type` makes one, with you its owner. Your device then starts its group as a direct
+chat's start does, and adds its people with one commit. A group has at most `group_members` accounts
+and a channel `channel_members`. Each frame below is answered with `done` unless noted, and has the REST
+route beside it:
+
+    chat_remove {ref, chat}                     DEL  /chats/{id}                        owners
+    leave {ref, chat}                           POST /chats/{id}/leave
+    chat_role {ref, chat, account, role}        PUT  /chats/{id}/members/{account}/role  owners: {role}
+    join_request {ref, chat, note?}             POST /chats/{id}/requests              {note?}
+    join_cancel {ref, chat}                     DEL  /chats/{id}/requests
+    join_decline {ref, chat, account}           POST /chats/{id}/requests/{account}/decline
+                                                GET  /chats/{id}/requests   member.add -> request_list
+    invite {ref, chat, account, sealed, signature}   POST /chats/{id}/invitations
+    invite_answer {ref, chat, accept}           POST /chats/{id}/invitation            {accept}
+    topic_id {ref, chat} -> topic_id {ref, chat, topic}   POST /chats/{id}/topics/id -> topic
+    topics {ref, chat, on, topic_list}          PUT  /chats/{id}/topics                topic.manage
+    chat_profile {ref, chat, sealed, signature, photo?}   PUT /chats/{id}/profile   profile.edit
+    chat_options {ref, chat, allow, deny, slow_mode?}   PUT /chats/{id}/options       owners
+    findable {ref, chat, findable, name?, bio?} PUT  /chats/{id}/findable              owners
+    topic_profile {ref, chat, topic, sealed, signature, photo?}
+                                  PUT /chats/{id}/topics/{topic}/profile       topic.edit
+    topic_options {ref, chat, topic, allow?, deny?, slow_mode?, write?, closed?, hidden?}
+                                  PUT /chats/{id}/topics/{topic}/options       topic.edit
+    topic_role {ref, chat, topic, account, role}
+                                  PUT /chats/{id}/topics/{topic}/members/{account}/role  owners
+
+`role` is `owner`, `moderator` or `member`; the last owner cannot step down, `last_owner`, and the last
+owner leaving removes the chat for everyone. Leaving takes effect at once: the chat goes from your list
+and folders, and the next member online commits your devices' removal in MLS. A commit that adds or
+removes people carries `action`, `{kind: add | remove, account_list}`, which the server checks against
+the permissions and saves with the commit; letting a request in is an add. An add naming someone who
+accepts only invitations is refused with `invite_needed` and its `account_list`, and an `invite` goes
+instead: `signature` is the inviting device's over `keryx v1 invite`, the chat and the account, and
+the invited device joins by external commit with `{"invite": {account, device, signature}}` as its
+authenticated data. `sealed` is HPKE-sealed to the invited account's `invite_public`, whose
+`invite_stamp` is its master key's over `keryx v1 invite key`, the account and the key; the inviter's
+note, if any, is inside it. A join request's note is plain text the server reads, at most 140
+characters. Invitations and requests expire after `invitation_lifetime`.
+
+A group's or channel's profile is sealed under its own profile key, which never changes. The key goes
+sealed at an epoch: in `group_info` at epoch 0 as `chat_key`, beside the first `chat_profile` and
+`chat_options`, and in a commit's `chat_key` when it adds people or joins by invitation. The server
+keeps the newest, and the profile comes as `{sealed, signature, device, version, key_epoch, key}`.
+
+Each topic, and General under the all-zero id, has its own settings: `write` `everyone` or
+`moderators` (who write in its main list; members still react and talk in threads), `closed` (only
+moderators write, react or reply there: `topic_closed`), `hidden` (only the chat's owners and
+moderators and the topic's own see it; to the rest it does not exist, and its messages are withheld),
+its own `slow_mode` (none follows the chat's, 0 is off, and each topic counts its own messages), and
+`allow` and `deny` over the reaction, sticker and file kinds and the four times
+permissions. A main-list send in a moderators-only topic is refused with `moderators_only`. A topic's
+own moderators, appointed by owners with `topic_role` (`moderator` or `member`), hold `topic.edit`,
+deleting others' messages, writing when closed, the slow-mode exemption and everyone's times there.
+General cannot be hidden. A topic's profile is sealed under the chat's profile key with `keryx v1 topic
+profile`, the chat and the topic, holding its bio, links, photo and rules. A change reaches the chat's
+online devices as `topic` `{chat, topic, ...settings, mod_list, profile?}`; a hidden topic reaches the
+rest as `{chat, topic, hidden: true}` alone. A reaction carries its message's `topic` and `thread_seq`.
+
+Each `chats` entry of a group or channel carries `role`, `topics_on`, `topic_list`, `topic_setting_list`
+(every topic you may see, General's first), `place_seen_list`,
+`profile`, `options`, `findable` and `member_count`, and `request_count`, the join requests waiting,
+for whoever may let people in. The first page carries `asked_list`, your own requests, and
+`invitation_list`. A message in a topic or thread carries `topic` or `thread_seq` in its header.
+
+In a group, each change to its people is a line: a message of `kind` 5 the server writes as the chat's
+next seq, unencrypted and unsigned, its device the actor's, its body readable JSON `{"action",
+"account_list"?}`, the action one of `created`, `added`, `let_in`, `joined`, `removed`, `left`,
+`made_owner`, `made_moderator` and `made_member`. It is replied to, reacted to and opened as a thread
+like any message, and removed by those holding `message.delete.others`. A client sending one is refused
+with `server_only`. Channels get no lines.
+
+The history comes as `chat_event` and through `sync` in `chat_event_list`: `{chat, n, actor, action,
+target?, seq?, topic?, audience, server_at, copy_list?}`, with `action` 0 created, 1 added, 2 removed,
+3 left, 4 let in, 5 joined, 6 made owner, 7 made moderator, 8 made member, 9 deleted, 10 topic added, 11
+topic removed, 12 topics on, 13 topics off, 14 invitation declined, 15 chat removed, 16 a topic's
+profile edited, 17 a topic's options changed, 18 made a topic's moderator, 19 made a member there
+again and 20 edited. Every delete and edit in a group or channel writes one, `target` the message's
+author and `copy_list` the message and its edits as they were, ciphertext, header and signature, which
+the readers open and check. A row with a `topic` is that topic's history, which its own moderators read
+too. `audience` 1 is owners and
+moderators, 2 one account, and 0 everyone, which is live only and never saved: a removed chat, and each
+change to its people, so every device keeps its member list. `topics`,
+`chat_profile`, `chat_options`, `findable` `{chat, findable, name?, bio?}`, `join_request` and
+`invitation` reach the devices they concern once saved; your own `join_request` and its taking back
+reach every device of yours, the asking one too, and so does an edited `chat_profile`, the saving
+device included, so it shows the server's copy. A removed topic's messages are wiped with no delete,
+so a client syncs the chat to drop them. Removing a chat sends `join_request` gone and `invitation`
+with none to those who asked to join it or were invited. `GET /accounts?search=` also lists findable chats in `chat_list`. Calls are refused in groups and
+channels with `call_not_allowed`.
 
 ## Calls
 

@@ -10,9 +10,9 @@ use keryx_core::client::{
 use keryx_core::file::{self, FileInfo};
 use keryx_core::mls::{AccountKey, Device, sign_revocation, stamp_account_key};
 use keryx_core::protocol::{
-    AccountKeysBody, Bytes, CallBody, CallEvent, CallEventKind, CaptchaAnswer, ChatItem, ChatMode,
-    ChatType, ClientFrame, ContentKind, DraftItem, Kind, MarkItem, MessageFrame, SendFrame,
-    ServerFrame, SyncPosition, WrapEntry,
+    AccountKeysBody, Bytes, CallBody, CallEvent, CallEventKind, CaptchaAnswer, ChatItem, ChatType,
+    ClientFrame, ContentKind, DraftItem, Kind, MarkItem, MessageFrame, SendFrame, ServerFrame,
+    SyncPosition, WrapEntry,
 };
 use keryx_core::seed::derive;
 use keryx_core::ulid::Ulid;
@@ -44,7 +44,7 @@ fn events(outputs: &[Output]) -> Vec<Event> {
     let mut list = Vec::new();
     for output in outputs {
         if let Output::Event { event } = output {
-            list.push(event.clone());
+            list.push((**event).clone());
         }
     }
     list
@@ -454,6 +454,14 @@ fn a_quiet_connection_is_pinged_then_given_up_and_retried_after_a_growing_wait()
     let out = command(&mut client, Command::NetworkBack);
     assert!(matches!(out[0], Output::Connect { .. }));
     client.step(Input::Connected, NOW);
+
+    // A socket that outlived the network's loss is reported online again, with no new connect.
+    let out = command(&mut client, Command::NetworkBack);
+    assert!(events(&out).contains(&Event::Online));
+    assert!(
+        !out.iter()
+            .any(|output| matches!(output, Output::Connect { .. }))
+    );
     let out = client.step(
         Input::Closed {
             code: 1006,
@@ -598,6 +606,9 @@ fn what_cannot_be_read_or_done_is_an_error_event() {
     let out = command(
         &mut client,
         Command::SendText {
+            mentions: Vec::new(),
+            thread: None,
+            topic: None,
             chat,
             text: Secret("hello".to_string()),
             reply: None,
@@ -632,7 +643,7 @@ fn the_directory_search_is_escaped_and_answered() {
         asked,
         json!({"account_list": [{"id": found, "username": "sara_x"}]}),
     );
-    let Event::SearchResults { account_list } = &events(&out)[0] else {
+    let Event::SearchResults { account_list, .. } = &events(&out)[0] else {
         panic!("{out:?}");
     };
     assert_eq!(account_list[0].id, found);
@@ -1036,7 +1047,15 @@ fn seen_typing_and_pointers_go_out_as_frames() {
     let (mut client, _, _) = ready();
     client.step(Input::Connected, NOW);
     let chat = id();
-    let out = command(&mut client, Command::Seen { chat, up_to_seq: 4 });
+    let out = command(
+        &mut client,
+        Command::Seen {
+            thread: None,
+            topic: None,
+            chat,
+            up_to_seq: 4,
+        },
+    );
     assert!(matches!(
         frames(&out)[0],
         ClientFrame::Seen {
@@ -1045,8 +1064,24 @@ fn seen_typing_and_pointers_go_out_as_frames() {
             ..
         }
     ));
-    let out = command(&mut client, Command::Typing { chat, on: true });
-    assert_eq!(frames(&out), vec![ClientFrame::Typing { chat, on: true }]);
+    let out = command(
+        &mut client,
+        Command::Typing {
+            thread: None,
+            topic: None,
+            chat,
+            on: true,
+        },
+    );
+    assert_eq!(
+        frames(&out),
+        vec![ClientFrame::Typing {
+            thread_seq: None,
+            topic: None,
+            chat,
+            on: true
+        }]
+    );
     let out = command(
         &mut client,
         Command::Delete {
@@ -1217,6 +1252,8 @@ fn reply_no(status: u16, code: &str) -> (u16, String) {
 
 fn refused(reference: Ulid, code: &str) -> ServerFrame {
     ServerFrame::Refused {
+        account_list: None,
+        seconds: None,
         reference,
         code: code.to_string(),
         message: "Refused".to_string(),
@@ -1251,6 +1288,23 @@ fn kind_of(frame: &ClientFrame) -> &'static str {
         ClientFrame::PresenceOf { .. } => "presence_of",
         ClientFrame::Kv { .. } => "kv",
         ClientFrame::KvSet { .. } => "kv_set",
+        ClientFrame::ChatRemove { .. } => "chat_remove",
+        ClientFrame::Leave { .. } => "leave",
+        ClientFrame::ChatRole { .. } => "chat_role",
+        ClientFrame::JoinRequest { .. } => "join_request",
+        ClientFrame::JoinCancel { .. } => "join_cancel",
+        ClientFrame::JoinDecline { .. } => "join_decline",
+        ClientFrame::Invite { .. } => "invite",
+        ClientFrame::InviteAnswer { .. } => "invite_answer",
+        ClientFrame::TopicId { .. } => "topic_id",
+        ClientFrame::Members { .. } => "members",
+        ClientFrame::Topics { .. } => "topics",
+        ClientFrame::ChatProfile { .. } => "chat_profile",
+        ClientFrame::ChatOptions { .. } => "chat_options",
+        ClientFrame::Findable { .. } => "findable",
+        ClientFrame::TopicProfile { .. } => "topic_profile",
+        ClientFrame::TopicOptions { .. } => "topic_options",
+        ClientFrame::TopicRole { .. } => "topic_role",
     }
 }
 
@@ -1271,13 +1325,32 @@ fn reference_of(frame: &ClientFrame) -> Ulid {
         | ClientFrame::ProfileKeys { reference, .. }
         | ClientFrame::PresenceOf { reference, .. }
         | ClientFrame::Kv { reference, .. }
-        | ClientFrame::KvSet { reference, .. } => *reference,
+        | ClientFrame::KvSet { reference, .. }
+        | ClientFrame::ChatRemove { reference, .. }
+        | ClientFrame::Leave { reference, .. }
+        | ClientFrame::ChatRole { reference, .. }
+        | ClientFrame::JoinRequest { reference, .. }
+        | ClientFrame::JoinCancel { reference, .. }
+        | ClientFrame::JoinDecline { reference, .. }
+        | ClientFrame::Invite { reference, .. }
+        | ClientFrame::InviteAnswer { reference, .. }
+        | ClientFrame::TopicId { reference, .. }
+        | ClientFrame::Members { reference, .. }
+        | ClientFrame::Topics { reference, .. }
+        | ClientFrame::ChatProfile { reference, .. }
+        | ClientFrame::ChatOptions { reference, .. }
+        | ClientFrame::Findable { reference, .. }
+        | ClientFrame::TopicProfile { reference, .. }
+        | ClientFrame::TopicOptions { reference, .. }
+        | ClientFrame::TopicRole { reference, .. } => *reference,
         ClientFrame::Typing { .. } | ClientFrame::Presence { .. } => Ulid::from_bytes([0; 16]),
     }
 }
 
 fn wiped(chat: Ulid, seq: u64, at: i64) -> MessageFrame {
     MessageFrame {
+        thread_seq: None,
+        topic: None,
         chat,
         seq,
         device: None,
@@ -1322,6 +1395,7 @@ impl Phone {
                 id,
                 message_list,
                 call_list,
+                ..
             } => {
                 if self.failing_rows > 0 {
                     self.failing_rows -= 1;
@@ -1371,6 +1445,7 @@ impl Phone {
                     id,
                     message_list,
                     call_list,
+                    chat_event_list: Vec::new(),
                 }
             }
             // Newest first by server time, chat and sequence id, after where the last read stopped.
@@ -1501,7 +1576,7 @@ impl World {
                     phone.wiped = true;
                 }
                 Output::WakeAt { at } => phone.wake = Some(at),
-                Output::Event { event } => phone.events.push(event),
+                Output::Event { event } => phone.events.push(*event),
                 Output::ReadChunk {
                     handle,
                     n,
@@ -1874,6 +1949,9 @@ impl World {
         self.command(
             p,
             Command::SendText {
+                mentions: Vec::new(),
+                thread: None,
+                topic: None,
                 chat,
                 text: Secret(text.to_string()),
                 reply: None,
@@ -1968,7 +2046,15 @@ impl World {
     /// Marks everything stored in this chat as seen, as a person reading it would.
     fn see_all(&mut self, p: usize, chat: Ulid) {
         let up_to_seq = self.hub_chat(chat).message_list.len() as u64;
-        self.command(p, Command::Seen { chat, up_to_seq });
+        self.command(
+            p,
+            Command::Seen {
+                thread: None,
+                topic: None,
+                chat,
+                up_to_seq,
+            },
+        );
         self.settle();
     }
 
@@ -2585,6 +2671,8 @@ impl World {
         self.phones[p].device = Some(device);
         let chat = self.self_chat(me);
         self.append(MessageFrame {
+            thread_seq: None,
+            topic: None,
             chat,
             seq: 0,
             device: Some(device),
@@ -2650,11 +2738,13 @@ impl World {
                 reference,
                 chat,
                 seq,
+                ..
             } => Some(ServerFrame::Times {
                 reference,
                 chat,
                 seq,
                 member_list: Vec::new(),
+                more: false,
             }),
             ClientFrame::Draft {
                 reference,
@@ -2702,12 +2792,14 @@ impl World {
                 remove: None,
             }),
             ClientFrame::Presence { .. } => None,
-            ClientFrame::Typing { chat, on } => {
+            ClientFrame::Typing { chat, on, .. } => {
                 let member_list = self.hub_chat(chat).member_list.clone();
                 self.deliver(
                     &member_list,
                     Some(device),
                     &ServerFrame::Typing {
+                        thread_seq: None,
+                        topic: None,
                         chat,
                         account: me,
                         on,
@@ -2778,6 +2870,9 @@ impl World {
                     }
                 }
                 Some(ServerFrame::Chats {
+                    asked_list: Vec::new(),
+                    chat_event_list: Vec::new(),
+                    invitation_list: Vec::new(),
                     reference,
                     chat_list: match after {
                         Some(_) => Vec::new(),
@@ -2794,6 +2889,7 @@ impl World {
                 chat,
                 epoch,
                 body,
+                ..
             } => {
                 let index = self.chat_index(chat).unwrap();
                 let chat = &mut self.chats[index];
@@ -2831,6 +2927,24 @@ impl World {
                 }
                 Some(ServerFrame::Done { reference })
             }
+            // Groups and channels are the server's tests' to drive.
+            ClientFrame::ChatRemove { .. }
+            | ClientFrame::Leave { .. }
+            | ClientFrame::ChatRole { .. }
+            | ClientFrame::JoinRequest { .. }
+            | ClientFrame::JoinCancel { .. }
+            | ClientFrame::JoinDecline { .. }
+            | ClientFrame::Invite { .. }
+            | ClientFrame::InviteAnswer { .. }
+            | ClientFrame::TopicId { .. }
+            | ClientFrame::Members { .. }
+            | ClientFrame::Topics { .. }
+            | ClientFrame::ChatProfile { .. }
+            | ClientFrame::ChatOptions { .. }
+            | ClientFrame::Findable { .. }
+            | ClientFrame::TopicProfile { .. }
+            | ClientFrame::TopicOptions { .. }
+            | ClientFrame::TopicRole { .. } => Some(refused(reference_of(&frame), "unknown_frame")),
         }
     }
 
@@ -2900,6 +3014,8 @@ impl World {
             }
         }
         let seq = self.append(MessageFrame {
+            thread_seq: None,
+            topic: None,
             chat: send.chat,
             seq: 0,
             device: Some(device),
@@ -3027,7 +3143,16 @@ impl World {
             chat_list.push(ChatItem {
                 chat: chat.id,
                 chat_type: chat.chat_type,
-                mode: ChatMode::Private,
+                role: None,
+                topics_on: false,
+                topic_list: Vec::new(),
+                topic_setting_list: Vec::new(),
+                place_seen_list: Vec::new(),
+                profile: None,
+                options: None,
+                findable: None,
+                member_count: None,
+                request_count: None,
                 last_seq: Some(chat.message_list.len() as u64),
                 last_kind: None,
                 last_at: None,
@@ -3237,8 +3362,24 @@ fn what_needs_the_socket_is_kept_and_typing_is_not() {
         world.sent_frames(mina, "seen"),
         world.sent_frames(mina, "sync"),
     );
-    world.command(mina, Command::Seen { chat, up_to_seq: 1 });
-    world.command(mina, Command::Typing { chat, on: true });
+    world.command(
+        mina,
+        Command::Seen {
+            thread: None,
+            topic: None,
+            chat,
+            up_to_seq: 1,
+        },
+    );
+    world.command(
+        mina,
+        Command::Typing {
+            thread: None,
+            topic: None,
+            chat,
+            on: true,
+        },
+    );
     world.settle();
     assert_eq!(world.sent_frames(mina, "seen"), seen);
     assert_eq!(world.sent_frames(mina, "typing"), 0);
@@ -3351,6 +3492,8 @@ fn a_message_that_cannot_be_shown_still_appears_with_its_problem() {
         }
     }
     world.append(MessageFrame {
+        thread_seq: None,
+        topic: None,
         chat,
         seq: 0,
         device: Some(Ulid::from_bytes([9; 16])),
@@ -3451,10 +3594,12 @@ fn a_failed_commit_or_welcome_rejoins_and_one_refused_for_what_it_is_does_not() 
         stamp: stamp_account_key(&stranger_keys, &stranger_account),
     });
     let join = stranger
-        .join_external(chat, &group_info, world.now, &account_list)
+        .join_external(chat, &group_info, world.now, &account_list, None)
         .unwrap();
     let commits_before = world.sent_frames(omid, "commit");
     world.append(MessageFrame {
+        thread_seq: None,
+        topic: None,
         chat,
         seq: 0,
         device: Some(stranger_id),
@@ -3503,6 +3648,8 @@ fn a_new_device_notice_is_checked() {
         world.phones[first].events
     );
     world.append(MessageFrame {
+        thread_seq: None,
+        topic: None,
         chat,
         seq: 0,
         device: Some(world.device_of(second)),
@@ -3854,6 +4001,8 @@ fn a_refused_sync_after_a_reload_is_reported_and_runs_again_on_the_next_connecti
 
 fn unknown_message(world: &World, chat: Ulid) -> MessageFrame {
     MessageFrame {
+        thread_seq: None,
+        topic: None,
         chat,
         seq: 0,
         device: Some(Ulid::from_bytes([9; 16])),
@@ -4144,6 +4293,8 @@ fn a_refused_seen_is_reported_once_and_not_sent_again() {
     world.command(
         mina,
         Command::Seen {
+            thread: None,
+            topic: None,
             chat,
             up_to_seq: 99,
         },
@@ -4272,6 +4423,8 @@ fn a_reaction_is_one_known_emoji_on_a_message_inside_its_encryption_and_waits_fo
             chat,
             emoji: "\u{2764}".to_string(),
             on: Pointer::Local(first),
+            topic: None,
+            thread: None,
         },
     );
     world.settle();
@@ -4318,6 +4471,8 @@ fn a_reaction_is_one_known_emoji_on_a_message_inside_its_encryption_and_waits_fo
             chat,
             emoji: "x".to_string(),
             on: Pointer::Seq(seq),
+            topic: None,
+            thread: None,
         },
     );
     world.settle();
@@ -4538,6 +4693,24 @@ fn live_messages_arriving_during_a_sync_are_kept_and_shown_after_it() {
 }
 
 #[test]
+fn the_network_back_with_the_socket_still_up_says_online_and_syncs() {
+    let (mut world, _, mina, _) = pair();
+    let pages = world.sent_frames(mina, "sync");
+    world.phones[mina].events.clear();
+    world.command(mina, Command::NetworkBack);
+    world.settle();
+    let events = &world.phones[mina].events;
+    let online = events
+        .iter()
+        .position(|event| matches!(event, Event::Online));
+    let listed = events
+        .iter()
+        .position(|event| matches!(event, Event::Chats { .. }));
+    assert!(online.is_some() && online < listed, "{events:?}");
+    assert_eq!(world.sent_frames(mina, "sync"), pages + 1);
+}
+
+#[test]
 fn a_sync_lost_with_the_connection_is_asked_again() {
     let (mut world, omid, mina, chat) = pair();
     world.offline(mina);
@@ -4685,7 +4858,15 @@ fn small_refusals_say_what_failed_and_leave_the_rest_working() {
         },
     );
     world.command(mina, Command::ChatList);
-    world.command(mina, Command::Typing { chat, on: true });
+    world.command(
+        mina,
+        Command::Typing {
+            thread: None,
+            topic: None,
+            chat,
+            on: true,
+        },
+    );
     world.command(omid, Command::Devices);
     world.settle();
     assert_eq!(world.errors(stranger), vec!["bad_login"]);
@@ -4693,6 +4874,8 @@ fn small_refusals_say_what_failed_and_leave_the_rest_working() {
         chat,
         account: world.account(mina),
         on: true,
+        topic: None,
+        thread: None,
     }));
     assert!(
         world.phones[omid]
@@ -4787,6 +4970,8 @@ fn an_unencrypted_message_shows_as_such_and_one_with_no_device_is_malformed() {
         .unwrap()
         .device;
     let mut message = MessageFrame {
+        thread_seq: None,
+        topic: None,
         chat,
         seq: 0,
         device: Some(world.device_of(omid)),
@@ -4865,6 +5050,8 @@ fn a_device_removed_by_a_commit_keeps_what_it_could_read_stops_and_rejoins_on_re
     let join_info = format!("GET /api/v1/chats/{chat}/group_info");
     let asked = world.asked(mina, &join_info);
     world.append(MessageFrame {
+        thread_seq: None,
+        topic: None,
         chat,
         seq: 0,
         device: Some(world.device_of(more)),
@@ -5021,6 +5208,8 @@ fn a_file_goes_up_in_chunks_after_text_sent_meanwhile_and_comes_down_whole() {
     world.command(
         omid,
         Command::SendFiles {
+            thread: None,
+            topic: None,
             chat,
             files: vec![picture],
             text: Some(Secret("look".to_string())),
@@ -5086,6 +5275,8 @@ fn a_bundle_holds_images_and_videos_and_an_edit_and_a_delete_name_the_files_they
     world.command(
         omid,
         Command::SendFiles {
+            thread: None,
+            topic: None,
             chat,
             files: vec![first, second],
             text: None,
@@ -5180,6 +5371,8 @@ fn music_carries_its_tags_and_cover_and_other_files_do_not() {
         world.command(
             omid,
             Command::SendFiles {
+                thread: None,
+                topic: None,
                 chat,
                 files: vec![one],
                 text: None,
@@ -5223,6 +5416,8 @@ fn a_message_holds_one_file_or_a_bundle_and_a_client_with_no_device_sends_none()
     let out = command(
         &mut client,
         Command::SendFiles {
+            thread: None,
+            topic: None,
             chat: id(),
             files: vec![spec(1, ContentKind::File, 1)],
             text: None,
@@ -5246,6 +5441,8 @@ fn a_message_holds_one_file_or_a_bundle_and_a_client_with_no_device_sends_none()
         world.command(
             omid,
             Command::SendFiles {
+                thread: None,
+                topic: None,
                 chat,
                 files,
                 text: None,
@@ -5270,6 +5467,8 @@ fn an_upload_that_is_refused_or_read_short_stops_and_its_message_is_never_sent()
         world.command(
             omid,
             Command::SendFiles {
+                thread: None,
+                topic: None,
                 chat,
                 files,
                 text: None,
@@ -5340,6 +5539,8 @@ fn a_download_that_is_changed_cut_or_unreadable_stops_with_its_reason() {
     world.command(
         omid,
         Command::SendFiles {
+            thread: None,
+            topic: None,
             chat,
             files: vec![spec(1, ContentKind::File, 10)],
             text: None,

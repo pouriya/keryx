@@ -4,10 +4,11 @@
 use std::future::Future;
 
 use keryx_core::protocol::{
-    AccountBrief, CallEvent, ChatDevice, ChatFolders, ChatItem, ChatMode, ChatType, ContentKind,
-    DeviceItem, DraftItem, KeyPackageItem, Kind, KvChange, KvReply, MarkItem, MessageFrame,
-    ProfileKeyItem, ProfileReply, SessionItem, StickerItem, StickerPack, SyncPosition, TimesItem,
-    WrapEntry,
+    AccountBrief, ActionKind, CallEvent, ChatDevice, ChatEvent, ChatFolders, ChatItem, ChatOptions,
+    ChatProfileItem, ChatRole, ChatType, ContentKind, DeviceItem, DraftItem, FindableItem,
+    FoundChat, InvitationItem, KeyPackageItem, Kind, KvChange, KvReply, MarkItem, MessageFrame,
+    ProfileKeyItem, ProfileReply, RequestItem, SessionItem, StickerItem, StickerPack, SyncPosition,
+    TimesItem, TopicItem, TopicWrite, WrapEntry,
 };
 use keryx_core::ulid::Ulid;
 
@@ -46,7 +47,7 @@ pub struct BuiltInRole {
     /// 0 server, 1 chat.
     pub scope: i64,
     pub name: &'static str,
-    pub permission_list: Vec<&'static str>,
+    pub permission_list: Vec<String>,
 }
 
 /// Which of a member's two positions a report moves: "received up to N" or "seen up to N".
@@ -56,12 +57,21 @@ pub enum Position {
     Seen,
 }
 
+/// Where in a chat a position is: its main list, a topic or a thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Place {
+    Main,
+    Topic(Ulid),
+    Thread(u64),
+}
+
 /// One `received` or `seen` from a device.
 pub struct PositionReport {
     pub position: Position,
     pub chat: Ulid,
     pub account: Ulid,
     pub device: Ulid,
+    pub place: Place,
     pub up_to_seq: u64,
     pub client_at: i64,
     pub now: i64,
@@ -73,12 +83,23 @@ pub struct Account {
     pub display_name: Option<String>,
     /// `None` until the one-time link is used.
     pub password_hash: Option<String>,
-    /// `None` until the words are set up, like the two after it.
+    /// `None` until the words are set up, like the four after it.
     pub master_public: Option<Vec<u8>>,
     pub account_public: Option<Vec<u8>>,
     pub account_stamp: Option<Vec<u8>>,
+    pub invite_public: Option<Vec<u8>>,
+    pub invite_stamp: Option<Vec<u8>>,
     /// Moves on every change of the names, photo, bio or links.
     pub profile_version: u64,
+}
+
+/// The words' public keys and their stamps, checked before they reach storage.
+pub struct NewAccountKeys {
+    pub master_public: Vec<u8>,
+    pub account_public: Vec<u8>,
+    pub account_stamp: Vec<u8>,
+    pub invite_public: Vec<u8>,
+    pub invite_stamp: Vec<u8>,
 }
 
 pub struct NewAccount {
@@ -163,17 +184,243 @@ pub struct DeviceKey {
 /// What a member's check needs to know about a chat.
 pub struct ChatAccess {
     pub chat_type: ChatType,
-    pub mode: ChatMode,
     pub last_seq: u64,
+    /// This member's role. In a direct or self chat, always member.
+    pub role: ChatRole,
+    /// Seconds between one member's messages in the main list or a topic. `None` is off.
+    pub slow_mode: Option<u64>,
+    pub topics_on: bool,
 }
 
-/// A stored message, when deciding about an edit or delete pointing at it. `None` for one removed.
+/// Which of a message's times the asker may see, by its permissions.
+#[derive(Debug, Clone, Copy)]
+pub struct TimesShown {
+    pub received: bool,
+    pub seen: bool,
+}
+
+/// A stored message, when deciding about an edit or delete pointing at it, or a thread under it.
+/// `None` for one removed.
 pub struct MessageBrief {
     pub kind: Kind,
     pub content_kind: Option<ContentKind>,
     pub account: Ulid,
     pub device_created_at: i64,
     pub saved_at: i64,
+    pub topic: Option<Ulid>,
+    pub thread_seq: Option<u64>,
+}
+
+/// A new group or channel, with its owner alone in it.
+pub struct NewGroup {
+    pub id: Ulid,
+    pub chat_type: ChatType,
+    pub owner: Ulid,
+    /// The owner's device, whose "created" line it is.
+    pub device: Ulid,
+    pub topics_on: bool,
+    pub findable: Option<FindableItem>,
+    pub now: i64,
+}
+
+/// What a group's or channel's commit does to its people, as the chat's task checked it.
+pub struct NewAction {
+    pub kind: ActionKind,
+    pub account_list: Vec<Ulid>,
+    /// The account whose device committed.
+    pub actor: Ulid,
+    /// The most member accounts the chat may hold after an add.
+    pub limit: u64,
+}
+
+/// What became of leaving a group or channel.
+pub enum Left {
+    /// Not a member.
+    NotMember,
+    /// Gone from it, with its history row, its line in a group, and the members left.
+    Left {
+        event: Box<ChatEvent>,
+        line: Option<Box<MessageFrame>>,
+        member_list: Vec<Ulid>,
+    },
+    /// The last owner left, so the whole chat went, for these members.
+    Removed(Removed),
+}
+
+/// What became of changing a member's role.
+pub enum RoleSet {
+    /// Not a member.
+    NotMember,
+    /// It would leave the chat with no owner.
+    LastOwner,
+    /// Changed, with its history row, its line in a group, and the members.
+    Set {
+        event: Box<ChatEvent>,
+        line: Option<Box<MessageFrame>>,
+        member_list: Vec<Ulid>,
+    },
+}
+
+/// A chat removed for everyone: who was in it, who had asked to join or was invited, whose rows
+/// went with it, and its files, whose bytes can go.
+pub struct Removed {
+    pub member_list: Vec<Ulid>,
+    pub asker_list: Vec<Ulid>,
+    pub invitee_list: Vec<Ulid>,
+    pub file_list: Vec<Ulid>,
+}
+
+/// What became of asking to join.
+pub enum Asked {
+    /// Not a findable group or channel.
+    NotFindable,
+    AlreadyMember,
+    Saved(Box<RequestItem>),
+}
+
+/// An invitation as its inviter's device sent it.
+pub struct NewInvitation {
+    pub chat: Ulid,
+    pub account: Ulid,
+    pub inviter: Ulid,
+    pub sealed: Vec<u8>,
+    pub signature: Vec<u8>,
+    pub now: i64,
+}
+
+/// What became of answering an invitation.
+pub enum Answered {
+    /// There is none, or it expired.
+    NoInvitation,
+    /// The chat is full.
+    Full,
+    /// Accepted, now a member, with its history row and its line in a group, or declined, with
+    /// the inviter's line.
+    Saved {
+        invitation: Box<InvitationItem>,
+        event: Box<ChatEvent>,
+        line: Option<Box<MessageFrame>>,
+    },
+}
+
+/// What became of a change of topics.
+pub enum TopicsPut {
+    /// Saved, with the events it wrote and whether any topic's messages were wiped.
+    Saved {
+        event_list: Vec<ChatEvent>,
+        wiped: bool,
+    },
+    /// An id that is neither a topic of this chat nor one issued for it to this account.
+    UnknownTopic,
+    TooMany,
+}
+
+/// What a chat's members may do beyond or short of the member role, its names already prefixed,
+/// and its slow mode.
+pub struct NewChatOptions {
+    pub allow: Vec<String>,
+    pub deny: Vec<String>,
+    pub slow_mode: Option<u64>,
+}
+
+/// A new group's or channel's first profile and options, saved with epoch 0's group info.
+pub struct NewGroupStart {
+    pub profile: NewChatProfile,
+    /// The chat's profile key, sealed at epoch 0.
+    pub key: Vec<u8>,
+    pub options: Option<NewChatOptions>,
+}
+
+/// A group's or channel's sealed profile as a device saved it.
+pub struct NewChatProfile {
+    pub chat: Ulid,
+    pub device: Ulid,
+    pub account: Ulid,
+    pub sealed: Vec<u8>,
+    pub signature: Vec<u8>,
+    pub photo: Option<Ulid>,
+    /// `[limits.upload] photo`, which a chat's photo stays under, though it went up as an image.
+    pub photo_limit: u64,
+    pub now: i64,
+}
+
+/// A topic's settings, for one member's check there.
+pub struct TopicAccess {
+    pub closed: bool,
+    pub hidden: bool,
+    pub write: TopicWrite,
+    /// Its own slow mode. `None` follows the chat's, and 0 is off.
+    pub slow_mode: Option<u64>,
+    /// When this account last wrote in its main list, for slow mode.
+    pub last_sent_at: Option<i64>,
+    /// This account is one of the topic's own moderators.
+    pub moderator: bool,
+    /// Its changes to the member role, names prefixed by the chat's type.
+    pub allow: Vec<String>,
+    pub deny: Vec<String>,
+}
+
+/// One live topic's own moderators, and whether it is hidden: from everyone but them and the
+/// chat's owners and moderators.
+pub struct TopicMods {
+    pub topic: Ulid,
+    pub hidden: bool,
+    pub mod_list: Vec<Ulid>,
+}
+
+/// A topic's own options, checked, with their names prefixed.
+pub struct NewTopicOptions {
+    pub allow: Vec<String>,
+    pub deny: Vec<String>,
+    pub slow_mode: Option<u64>,
+    pub write: TopicWrite,
+    pub closed: bool,
+    pub hidden: bool,
+}
+
+/// A topic's sealed profile to keep, its photo checked as a chat's is.
+pub struct NewTopicProfile {
+    pub chat: Ulid,
+    pub topic: Ulid,
+    pub device: Ulid,
+    pub account: Ulid,
+    pub sealed: Vec<u8>,
+    pub signature: Vec<u8>,
+    pub photo: Option<Ulid>,
+    pub photo_limit: u64,
+    pub now: i64,
+}
+
+/// What became of a change to a topic's settings, moderators or profile.
+pub enum TopicSaved {
+    /// Kept, with its history row, the whole item as it is now, whether it was hidden before, and
+    /// photos no longer named, whose bytes can go. No row for a topic's first profile set by
+    /// whoever added it, which is part of creating it.
+    Saved {
+        event: Option<ChatEvent>,
+        item: Box<TopicItem>,
+        was_hidden: bool,
+        removed: Vec<Ulid>,
+    },
+    /// No live topic with that id in the chat.
+    NoSuchTopic,
+    /// The photo named is not a complete image this account uploaded into this chat.
+    NoSuchPhoto,
+    /// The account to make a moderator is not in the chat.
+    NotMember,
+}
+
+pub enum ChatProfileSaved {
+    /// The profile as kept, with the photos no longer named, whose bytes can go.
+    Saved {
+        item: ChatProfileItem,
+        removed: Vec<Ulid>,
+    },
+    /// The photo named is not a complete image this account uploaded into this chat, under the
+    /// photo limit.
+    NoSuchPhoto,
+    /// The chat has no profile yet, which its epoch 0 brings.
+    NotStarted,
 }
 
 /// An upload as it starts.
@@ -266,6 +513,8 @@ pub struct NewWelcome {
 pub struct NewMessage {
     pub chat: Ulid,
     pub device: Ulid,
+    /// The device's account.
+    pub account: Ulid,
     pub kind: Kind,
     pub content_kind: Option<ContentKind>,
     pub encrypted: bool,
@@ -283,16 +532,47 @@ pub struct NewMessage {
     /// A commit's group info at its epoch, saved in the same step so it is never left behind.
     /// `None` otherwise.
     pub group_info: Option<Vec<u8>>,
+    /// A commit's public group after it, which the chat's task read the commit against.
+    pub public_group: Option<Vec<u8>>,
     /// Files a content message names, kept from now on. Checked before.
     pub persist: Vec<Ulid>,
     /// Files an edit or delete drops, marked removed. Checked before; their bytes go after.
     pub remove: Vec<Ulid>,
+    /// A content message's topic, which must be live. `None` for General.
+    pub topic: Option<Ulid>,
+    /// A content message's thread.
+    pub thread_seq: Option<u64>,
+    /// Counted for slow mode: a content message in the main list or a topic.
+    pub slow: bool,
+    /// A group's or channel's delete or edit, written into its history with a copy of what it
+    /// removes or changes: the message's author.
+    pub history: Option<Ulid>,
+    /// A group's or channel's commit's action, applied in the same step.
+    pub action: Option<NewAction>,
+    /// A commit's share of the chat's profile key, sealed at its epoch.
+    pub chat_key: Option<Vec<u8>>,
 }
 
 pub enum Appended {
-    Saved(u64),
+    Saved {
+        seq: u64,
+        /// The chat events it wrote.
+        event_list: Vec<ChatEvent>,
+        /// The membership lines it wrote after it, in a group.
+        line_list: Vec<MessageFrame>,
+        /// Accounts it took out, whose folders changed.
+        gone_list: Vec<Ulid>,
+        /// The chat's profile with the profile key this commit shared, when it shared one.
+        profile: Option<ChatProfileItem>,
+    },
+    /// Content or an edit sealed under an older key than the chat's current one.
+    StaleEpoch,
     /// A commit that was not for the next epoch, or for a group with none uploaded yet.
     CommitLost,
+    /// The topic was removed.
+    TopicGone,
+    /// An add would pass the chat's member limit.
+    Full,
 }
 
 /// Where a `sync` starts: from a server time, already stepped back, or exactly after a page's last
@@ -303,15 +583,19 @@ pub enum SyncFrom {
     After(SyncPosition),
 }
 
-/// One `sync` page: messages and call rows in their order, and whether more follow.
+/// One `sync` page: messages, call rows and chat events in their order, and whether more follow.
 pub struct SyncPage {
     pub message_list: Vec<MessageFrame>,
     pub call_list: Vec<CallEvent>,
+    pub chat_event_list: Vec<ChatEvent>,
     pub more: bool,
 }
 
 pub enum GroupInfoPut {
-    Saved,
+    /// With the first profile as kept, when it carried one and was not a resend.
+    Saved { profile: Option<ChatProfileItem> },
+    /// The first profile names a photo that is not a complete image this account uploaded here.
+    NoSuchPhoto,
     /// Epoch 0 of this chat was already uploaded by someone else, and this one lost. The same
     /// bytes again are `Saved`, since that is a resend whose answer was lost.
     AlreadyStarted,
@@ -361,9 +645,7 @@ pub trait Storage: Send + Sync + 'static {
     fn set_account_keys(
         &self,
         account: Ulid,
-        master_public: Vec<u8>,
-        account_public: Vec<u8>,
-        stamp: Vec<u8>,
+        keys: NewAccountKeys,
         chat: Ulid,
         now: i64,
     ) -> impl Future<Output = Result<bool>> + Send;
@@ -415,13 +697,15 @@ pub trait Storage: Send + Sync + 'static {
     ) -> impl Future<Output = Result<bool>> + Send;
     /// Whether an account holds the built-in server admin role.
     fn is_admin(&self, account: Ulid) -> impl Future<Output = Result<bool>> + Send;
-    /// Whether a chat's member holds a permission there. The server admin role holds them all, and
-    /// in a direct or self chat both people hold the built-in member role.
+    /// Whether a chat's member holds a permission there, named with its prefix. The server admin
+    /// role holds them all. An owner holds the built-in owner role, a `member_role` row adds
+    /// moderator, and every member holds the built-in member role, as the chat's `chat_permission`
+    /// rows change it.
     fn chat_permitted(
         &self,
         chat: Ulid,
         account: Ulid,
-        permission: &'static str,
+        permission: String,
     ) -> impl Future<Output = Result<bool>> + Send;
 
     fn device_usage(
@@ -508,6 +792,176 @@ pub trait Storage: Send + Sync + 'static {
         high: Ulid,
         now: i64,
     ) -> impl Future<Output = Result<(Ulid, bool)>> + Send;
+    /// Makes a group or channel with its owner alone, writing its "created" history row and, in a
+    /// group, its line.
+    fn create_group(
+        &self,
+        group: NewGroup,
+    ) -> impl Future<Output = Result<(ChatEvent, Option<MessageFrame>)>> + Send;
+    /// Each member's role.
+    fn member_roles(
+        &self,
+        chat: Ulid,
+    ) -> impl Future<Output = Result<Vec<(Ulid, ChatRole)>>> + Send;
+    /// Leaves a group or channel, out of the account's folders, writing a "left" line. The last
+    /// owner leaving removes the whole chat.
+    fn leave_chat(
+        &self,
+        chat: Ulid,
+        account: Ulid,
+        device: Ulid,
+        now: i64,
+    ) -> impl Future<Output = Result<Left>> + Send;
+    /// Makes `account` an owner, a moderator or a plain member, by `actor`, writing its line.
+    fn set_role(
+        &self,
+        chat: Ulid,
+        actor: Ulid,
+        device: Ulid,
+        account: Ulid,
+        role: ChatRole,
+        now: i64,
+    ) -> impl Future<Output = Result<RoleSet>> + Send;
+    /// Removes a whole chat for everyone, out of every member's folders. `None` when there is none.
+    fn remove_chat(&self, chat: Ulid) -> impl Future<Output = Result<Option<Removed>>> + Send;
+    /// A join request, replacing a declined one. Requests asked or declined before
+    /// `expire_before` are gone.
+    fn ask_to_join(
+        &self,
+        chat: Ulid,
+        account: Ulid,
+        note: Option<String>,
+        now: i64,
+        expire_before: i64,
+    ) -> impl Future<Output = Result<Asked>> + Send;
+    /// Takes back a request. `false` when there was none.
+    fn cancel_request(
+        &self,
+        chat: Ulid,
+        account: Ulid,
+    ) -> impl Future<Output = Result<bool>> + Send;
+    /// Declines a waiting request. `None` when there was none waiting.
+    fn decline_request(
+        &self,
+        chat: Ulid,
+        account: Ulid,
+        now: i64,
+        expire_before: i64,
+    ) -> impl Future<Output = Result<Option<RequestItem>>> + Send;
+    /// A chat's waiting requests.
+    fn chat_requests(
+        &self,
+        chat: Ulid,
+        expire_before: i64,
+    ) -> impl Future<Output = Result<Vec<RequestItem>>> + Send;
+    /// An account's own requests, waiting or declined.
+    fn own_requests(
+        &self,
+        account: Ulid,
+        expire_before: i64,
+    ) -> impl Future<Output = Result<Vec<RequestItem>>> + Send;
+    /// An invitation, replacing an older one. `false` when the account is already a member.
+    fn invite(&self, invitation: NewInvitation) -> impl Future<Output = Result<bool>> + Send;
+    /// Accepts or declines an account's invitation, in one step: accepting makes it a member.
+    /// `accept` is the accepting device, whose "joined" line it is, and none declines.
+    fn answer_invitation(
+        &self,
+        chat: Ulid,
+        account: Ulid,
+        accept: Option<Ulid>,
+        limit: u64,
+        now: i64,
+        expire_before: i64,
+    ) -> impl Future<Output = Result<Answered>> + Send;
+    /// An account's invitations.
+    fn own_invitations(
+        &self,
+        account: Ulid,
+        expire_before: i64,
+    ) -> impl Future<Output = Result<Vec<InvitationItem>>> + Send;
+    /// A new topic's id for this account in this chat, kept until `expires_at`.
+    fn issue_topic(
+        &self,
+        chat: Ulid,
+        account: Ulid,
+        topic: Ulid,
+        expires_at: i64,
+    ) -> impl Future<Output = Result<()>> + Send;
+    /// Whether topics show, and the live topics: a new id must have been issued to this account for
+    /// this chat, and one left out is removed with its messages wiped.
+    fn put_topics(
+        &self,
+        chat: Ulid,
+        account: Ulid,
+        on: bool,
+        topic_list: Vec<Ulid>,
+        max: u64,
+        now: i64,
+    ) -> impl Future<Output = Result<TopicsPut>> + Send;
+    /// Saves a group's or channel's sealed profile, keeping the photo it names and removing the
+    /// one it replaced.
+    fn put_chat_profile(
+        &self,
+        profile: NewChatProfile,
+    ) -> impl Future<Output = Result<ChatProfileSaved>> + Send;
+    /// Replaces a chat's changes to its member role, its permission names already prefixed, and
+    /// its slow mode.
+    fn put_chat_options(
+        &self,
+        chat: Ulid,
+        options: NewChatOptions,
+    ) -> impl Future<Output = Result<()>> + Send;
+    /// Lists a group or channel in the directory under a readable name and bio, or stops.
+    fn put_findable(
+        &self,
+        chat: Ulid,
+        findable: Option<FindableItem>,
+    ) -> impl Future<Output = Result<()>> + Send;
+    /// Findable groups and channels whose name holds the term.
+    fn search_chats(
+        &self,
+        term: String,
+        limit: u32,
+    ) -> impl Future<Output = Result<Vec<FoundChat>>> + Send;
+    /// A chat's options, as `chat_list` gives them.
+    fn chat_options(&self, chat: Ulid) -> impl Future<Output = Result<ChatOptions>> + Send;
+    /// A topic's settings for this account's check, General's under the all-zero id. `None` when it
+    /// is not a live topic of the chat.
+    fn topic_access(
+        &self,
+        chat: Ulid,
+        topic: Ulid,
+        account: Ulid,
+    ) -> impl Future<Output = Result<Option<TopicAccess>>> + Send;
+    /// Replaces a topic's own options, writing the history row.
+    fn put_topic_options(
+        &self,
+        chat: Ulid,
+        topic: Ulid,
+        actor: Ulid,
+        options: NewTopicOptions,
+        now: i64,
+    ) -> impl Future<Output = Result<TopicSaved>> + Send;
+    /// Keeps a topic's sealed profile, its photo and the history row.
+    fn put_topic_profile(
+        &self,
+        profile: NewTopicProfile,
+    ) -> impl Future<Output = Result<TopicSaved>> + Send;
+    /// Makes a member one of a topic's moderators, or a plain member there again.
+    fn put_topic_role(
+        &self,
+        chat: Ulid,
+        topic: Ulid,
+        actor: Ulid,
+        account: Ulid,
+        moderator: bool,
+        now: i64,
+    ) -> impl Future<Output = Result<TopicSaved>> + Send;
+    /// A chat's live topics, General's settings row included, each with its own moderators and
+    /// whether it is hidden.
+    fn topic_moderators(&self, chat: Ulid) -> impl Future<Output = Result<Vec<TopicMods>>> + Send;
+    /// A chat's type, for one who is not in it yet. `None` when there is no such chat.
+    fn chat_type(&self, chat: Ulid) -> impl Future<Output = Result<Option<ChatType>>> + Send;
     /// `None` if this account is not a member, or the chat does not exist.
     fn chat_access(
         &self,
@@ -522,7 +976,13 @@ pub trait Storage: Send + Sync + 'static {
         chat: Ulid,
         account_list: Vec<Ulid>,
     ) -> impl Future<Output = Result<Vec<ProfileKeyItem>>> + Send;
-    fn chat_list(&self, account: Ulid) -> impl Future<Output = Result<Vec<ChatItem>>> + Send;
+    /// The account's chats. Join requests asked before `expire_before` are gone, so they are not
+    /// counted.
+    fn chat_list(
+        &self,
+        account: Ulid,
+        expire_before: i64,
+    ) -> impl Future<Output = Result<Vec<ChatItem>>> + Send;
     fn chat_devices(&self, chat: Ulid) -> impl Future<Output = Result<Vec<ChatDevice>>> + Send;
     /// Keeps this account's sealed draft in the chat as it is, or clears it with `None`, and gives
     /// what is now kept. The server never reads it.
@@ -549,12 +1009,18 @@ pub trait Storage: Send + Sync + 'static {
         now: i64,
     ) -> impl Future<Output = Result<bool>> + Send;
     /// When each member but the message's sender first received and first saw it, by the server's
-    /// clock, or `None` if there is no such message. A member with receipts off has no `seen_at`.
+    /// clock, or `None` if there is no such message. A page of at most `limit`, seen first, then
+    /// received only, then neither, the newest first and then by account, after the account
+    /// `after`, and whether more follow. A time `shown` says the asker may not see is left out
+    /// before ordering, so the order cannot tell it.
     fn message_times(
         &self,
         chat: Ulid,
         seq: u64,
-    ) -> impl Future<Output = Result<Option<Vec<TimesItem>>>> + Send;
+        after: Option<Ulid>,
+        shown: TimesShown,
+        limit: usize,
+    ) -> impl Future<Output = Result<Option<(Vec<TimesItem>, bool)>>> + Send;
 
     fn message_brief(
         &self,
@@ -586,12 +1052,18 @@ pub trait Storage: Send + Sync + 'static {
 
     fn group_info(&self, chat: Ulid)
     -> impl Future<Output = Result<Option<(u64, Vec<u8>)>>> + Send;
+    /// The chat's public group, which commits are read against. `None` before epoch 0.
+    fn public_group(&self, chat: Ulid) -> impl Future<Output = Result<Option<Vec<u8>>>> + Send;
+    /// A new group's or channel's epoch 0 may carry its first profile and options, saved with it.
+    /// Epoch 0 starts the chat's public group too, as `public_group`.
     fn put_group_info(
         &self,
         chat: Ulid,
         epoch: u64,
         body: Vec<u8>,
         now: i64,
+        start: Option<NewGroupStart>,
+        public_group: Option<Vec<u8>>,
     ) -> impl Future<Output = Result<GroupInfoPut>> + Send;
     fn wraps(&self, chat: Ulid) -> impl Future<Output = Result<Vec<WrapEntry>>> + Send;
     /// Replaces what is stored, because this is how a device corrects a bad wrap.

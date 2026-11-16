@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use keryx_core::client::{Auth, Client, Command, Event, Input, Output, Platform, Secret};
 use keryx_core::mls::{AccountKey, Device, stamp_account_key};
-use keryx_core::protocol::{Bytes, CallEvent, ChatType, Kind, MessageFrame};
+use keryx_core::protocol::{Bytes, CallEvent, ChatEvent, ChatType, Kind, MessageFrame};
 use keryx_core::seed::{AccountKeys, derive};
 use keryx_core::ulid::Ulid;
 use serde_json::{Value, json};
@@ -44,6 +44,8 @@ pub struct App {
     /// The archive an app keeps on disk: every message and call row as the server sent it.
     pub archive: BTreeMap<(Ulid, u64), MessageFrame>,
     pub archive_calls: BTreeMap<(Ulid, u64, u64), CallEvent>,
+    /// A group's or channel's events, by chat and `n`.
+    pub archive_events: BTreeMap<(Ulid, u64), ChatEvent>,
     /// No network: nothing answers a request and no socket connects.
     pub offline: bool,
 }
@@ -110,6 +112,7 @@ impl App {
             call_outputs: VecDeque::new(),
             archive: BTreeMap::new(),
             archive_calls: BTreeMap::new(),
+            archive_events: BTreeMap::new(),
             offline: false,
         }
     }
@@ -301,6 +304,7 @@ impl App {
                     id,
                     message_list,
                     call_list,
+                    chat_event_list,
                 } => {
                     for message in message_list {
                         let key = (message.chat, message.seq);
@@ -321,6 +325,8 @@ impl App {
                                         encrypted: None,
                                         epoch: None,
                                         pointer_seq: None,
+                                        topic: None,
+                                        thread_seq: None,
                                         client_sent_at: None,
                                         server_saved_at: message.server_saved_at,
                                         body: None,
@@ -336,6 +342,11 @@ impl App {
                     for event in call_list {
                         self.archive_calls
                             .entry((event.chat, event.call_seq, event.n))
+                            .or_insert(event);
+                    }
+                    for event in chat_event_list {
+                        self.archive_events
+                            .entry((event.chat, event.n))
                             .or_insert(event);
                     }
                     Some(Input::RowsSaved { id })
@@ -363,10 +374,25 @@ impl App {
                         })
                         .map(|(_, event)| event.clone())
                         .collect();
+                    let from = match message_list.first() {
+                        Some(first) if first.seq > 1 => first.server_saved_at.unwrap_or(0),
+                        _ => i64::MIN,
+                    };
+                    let until = before_seq
+                        .and_then(|seq| self.archive.get(&(chat, seq)))
+                        .map_or(i64::MAX, |message| message.server_saved_at.unwrap_or(0));
+                    let chat_event_list = self
+                        .archive_events
+                        .range((chat, 0)..=(chat, u64::MAX))
+                        .map(|(_, event)| event)
+                        .filter(|event| event.server_at >= from && event.server_at < until)
+                        .cloned()
+                        .collect();
                     Some(Input::RowsRead {
                         id,
                         message_list,
                         call_list,
+                        chat_event_list,
                     })
                 }
                 // Newest by server time first, then by chat and sequence id, as an app's archive
@@ -401,6 +427,7 @@ impl App {
                     })
                 }
                 Output::Event { event } => {
+                    let event = *event;
                     if let Event::Chats { chat_list } = &event {
                         for item in chat_list {
                             if item.chat_type == ChatType::SelfChat {

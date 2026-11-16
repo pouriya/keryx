@@ -27,22 +27,27 @@ use zeroize::Zeroize;
 use crate::call::{CallIndex, CallKey};
 use crate::file::{self, FileInfo};
 use crate::mls::{
-    AccountKey, Device, DeviceRecord, MlsError, sign_revocation, stamp_account_key, verify_logout,
-    verify_message, verify_revocation,
+    AccountKey, Device, DeviceRecord, InviteKey, MlsError, sign_revocation, stamp_account_key,
+    stamp_invite_key, verify_logout, verify_message, verify_revocation,
 };
 use crate::protocol::{
-    AccountBrief, AccountInfo, AccountKeysBody, AccountListReply, AccountReply, Ack, Answer, Bytes,
-    CallBody, CallEvent, CallEventKind, CallOutcome, CallText, CaptchaAnswer, CaptchaReply,
-    ChallengeBody, ChallengeReply, ChatDevice, ChatDeviceListReply, ChatFolders, ChatItem,
-    ChatReply, ChatType, ClientFrame, ContentKind, CountReply, CreateChatBody, CreateFileBody,
-    DeviceProof, DeviceReply, DevicesReply, DraftBody, DraftItem, EmptyReply, FeaturesReply,
-    FileReply, FolderItem, FolderSuggestion, GroupInfoReply, Header, KeyPackageItem,
-    KeyPackageListReply, KeyPackagesBody, Kind, KvChange, KvItem, LoginBody, LoginReply, MarkItem,
-    MessageFrame, NamesBody, PhotoReply, PresenceItem, ProfileBody, ProfileKeyItem,
+    AccountBrief, AccountInfo, AccountKeysBody, AccountListReply, AccountReply, Ack, ActionKind,
+    Answer, Bytes, CallBody, CallEvent, CallEventKind, CallOutcome, CallText, CaptchaAnswer,
+    CaptchaReply, ChallengeBody, ChallengeReply, ChatAction, ChatDevice, ChatDeviceListReply,
+    ChatEvent, ChatFolders, ChatItem, ChatOptions, ChatProfileBody, ChatProfileItem,
+    ChatProfilePlain, ChatReply, ChatRole, ChatType, ClaimBody, ClientFrame, CommitAction,
+    ContentKind, CountReply, CreateChatBody, CreateFileBody, DeviceProof, DeviceReply,
+    DevicesReply, DraftBody, DraftItem, EmptyReply, FeaturesReply, FileReply, FindableBody,
+    FindableItem, FolderItem, FolderSuggestion, FoundChat, GroupInfoReply, Header, InvitationItem,
+    InvitationPlain, InvitationShown, InviteStatement, KeyPackageItem, KeyPackageListReply,
+    KeyPackagesBody, Kind, KvChange, KvItem, LineAction, LineBody, LoginBody, LoginReply, MarkItem,
+    MemberItem, MessageFrame, NamesBody, PhotoReply, PresenceItem, ProfileBody, ProfileKeyItem,
     ProfileKeyShare, ProfileLink, ProfilePhoto, ProfileReply, PutProfileBody, Question,
-    RefusedReply, RegisterBody, RegisterDeviceBody, SendFrame, ServerFrame, SetupBody, SetupReply,
-    SignedBody, SignedProfile, StickerListReply, StickerPack, Suggestion, SyncPosition, TimesItem,
-    VersionReply, WelcomeItem, WrapEntry, WrapItem, WrapListReply, call_text_header,
+    RefusedReply, RegisterBody, RegisterDeviceBody, RequestItem, RequestListReply, RequestState,
+    SendFrame, ServerFrame, SetupBody, SetupReply, SignedBody, SignedProfile, StickerListReply,
+    StickerPack, Suggestion, SyncPosition, TimesItem, TopicItem, TopicName, TopicOptionsBody,
+    TopicProfileItem, TopicProfilePlain, TopicsBody, VersionReply, WelcomeItem, WrapEntry,
+    WrapItem, WrapListReply, call_text_header,
 };
 use crate::queue::{Level, Queue, Target};
 use crate::seed::{self, AccountKeys};
@@ -66,6 +71,14 @@ const BIO_CHARS: usize = 140;
 const LINKS: usize = 3;
 const LINK_NAME_CHARS: usize = 32;
 const LINK_URL_CHARS: usize = 512;
+/// A group's or channel's name, after trimming, as a display name's.
+const CHAT_NAME_CHARS: usize = 64;
+/// A topic's name, after trimming, as a folder's.
+const TOPIC_NAME_CHARS: usize = 32;
+/// A group's, channel's or topic's rules, in Unicode characters.
+const RULES_CHARS: usize = 2000;
+/// An invitation's note from its inviter.
+const INVITE_NOTE_CHARS: usize = 500;
 
 /// Text that must never be printed: a password, the words, a token or a message. Wiped when
 /// dropped, and its `Debug` shows nothing of it.
@@ -128,6 +141,16 @@ pub struct Thumbnail {
     #[serde(with = "serde_bytes")]
     #[cfg_attr(feature = "wasm", tsify(type = "Uint8Array"))]
     pub rgba: Vec<u8>,
+}
+
+/// A new photo for a group or channel: a square JPEG, and its small pixels for the BlurHash.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PhotoInput {
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "wasm", tsify(type = "Uint8Array"))]
+    pub jpeg: Vec<u8>,
+    pub thumbnail: Thumbnail,
 }
 
 /// One file to send. The platform holds its bytes as `handle`, its own number, and core asks for
@@ -205,7 +228,18 @@ fn setting_name_fits(key: &str) -> bool {
         })
 }
 
-/// Whether a setting's value is one this client may keep: the four it knows are checked, and any
+/// Whether a chat is a group or a channel, which have roles, topics and the rest.
+fn grouped(chat_type: ChatType) -> bool {
+    matches!(chat_type, ChatType::Group | ChatType::Channel)
+}
+
+/// Whether a setting is left unsealed because the server acts on it: whether others may add this
+/// account to a group or a channel straight in.
+fn unsealed(key: &str) -> bool {
+    matches!(key, "privacy.add.group" | "privacy.add.channel")
+}
+
+/// Whether a setting's value is one this client may keep: the ones it knows are checked, and any
 /// other is any JSON.
 fn setting_fits(setting: &Setting) -> bool {
     let value = &setting.value;
@@ -230,6 +264,9 @@ fn setting_fits(setting: &Setting) -> bool {
                     })
             }
             "recent.reactions" => strings(RECENT_REACTIONS),
+            "privacy.add.group" | "privacy.add.channel" => {
+                matches!(value.as_str(), Some("everyone" | "nobody"))
+            }
             _ => true,
         }
 }
@@ -335,6 +372,15 @@ pub enum Command {
         text: Secret,
         #[serde(default)]
         reply: Option<Pointer>,
+        /// A group's or channel's topic, none for General.
+        #[serde(default)]
+        topic: Option<Ulid>,
+        /// The main-list message whose thread this goes in.
+        #[serde(default)]
+        thread: Option<u64>,
+        /// The accounts the text mentions as `@username`, each a member, kept inside the encryption.
+        #[serde(default)]
+        mentions: Vec<Ulid>,
     },
     /// One file, or several images and videos as a bundle, with an optional caption. Each goes up
     /// first, and the message joins the queue once all are up.
@@ -343,6 +389,10 @@ pub enum Command {
         files: Vec<FileSpec>,
         #[serde(default)]
         text: Option<Secret>,
+        #[serde(default)]
+        topic: Option<Ulid>,
+        #[serde(default)]
+        thread: Option<u64>,
     },
     /// Fetches a file into the platform's `handle`, chunk by chunk, each opened here.
     Download {
@@ -367,13 +417,23 @@ pub enum Command {
         #[serde(default)]
         remove: Vec<Ulid>,
     },
+    /// Seen up to a message: in the main list, or in a group's or channel's topic or thread.
     Seen {
         chat: Ulid,
         up_to_seq: u64,
+        #[serde(default)]
+        topic: Option<Ulid>,
+        #[serde(default)]
+        thread: Option<u64>,
     },
+    /// In a channel, typing goes out only inside a thread.
     Typing {
         chat: Ulid,
         on: bool,
+        #[serde(default)]
+        topic: Option<Ulid>,
+        #[serde(default)]
+        thread: Option<u64>,
     },
     /// Keeps this chat's draft, or clears it with none. Nothing is queued: a draft is best effort,
     /// and one the connection could not carry is dropped, as the next change replaces it.
@@ -392,10 +452,12 @@ pub enum Command {
         folder_list: Vec<Folder>,
         default: Ulid,
     },
-    /// When each other member received and saw one message, answered as [`Event::Times`].
+    /// When each other member received and saw one message, answered as [`Event::Times`], a page at
+    /// a time: `after` is the last account of the page before.
     Times {
         chat: Ulid,
         seq: u64,
+        after: Option<Ulid>,
     },
     /// The app came on screen or left it. Kept, sent as `presence` now if connected, and on every
     /// connection as its first frame.
@@ -423,7 +485,8 @@ pub enum Command {
         words: Secret,
     },
     LogOut,
-    /// Retry the connection and anything waiting to retry, now.
+    /// Retry the connection and anything waiting to retry, now. A socket still up is reported
+    /// with `Online` again, and syncs.
     NetworkBack,
     /// Starts a call: one message, whose delivery rings the others. It says what the caller has on.
     StartCall {
@@ -457,6 +520,10 @@ pub enum Command {
         sticker: Ulid,
         #[serde(default)]
         reply: Option<Pointer>,
+        #[serde(default)]
+        topic: Option<Ulid>,
+        #[serde(default)]
+        thread: Option<u64>,
     },
     /// A reaction on a message, refused here unless `emoji` is one the `emojis` crate knows. `on`
     /// is inside the encryption, as a reply's is, and it waits for a pending message's sequence id.
@@ -464,6 +531,13 @@ pub enum Command {
         chat: Ulid,
         emoji: String,
         on: Pointer,
+        /// The topic of the message it is on, none for General, so the server can apply the
+        /// topic's own rules.
+        #[serde(default)]
+        topic: Option<Ulid>,
+        /// The main-list message whose thread the message it is on is in.
+        #[serde(default)]
+        thread: Option<u64>,
     },
     /// Every emoji a reaction may be, answered as [`Event::Emoji`].
     Emoji,
@@ -552,6 +626,194 @@ pub enum Command {
         #[serde(default)]
         password: Option<Secret>,
     },
+    /// A group or channel with this account its owner, then its sealed profile, its options, and the
+    /// people in `account_list` added in one commit. Answered with [`Event::Started`] once it has
+    /// its id, and [`Event::ChatReady`] once its group runs.
+    CreateChat {
+        chat_type: ChatType,
+        name: String,
+        #[serde(default)]
+        bio: Option<String>,
+        #[serde(default)]
+        link_list: Vec<ProfileLink>,
+        #[serde(default)]
+        account_list: Vec<Ulid>,
+        /// Unset takes the server's default.
+        #[serde(default)]
+        topics: Option<bool>,
+        /// Listed in the directory under its name and bio, which the server then reads.
+        #[serde(default)]
+        findable: bool,
+        /// Whether plain members may add people is `member.add` in `options.allow`.
+        #[serde(default)]
+        options: ChatOptions,
+        /// Uploaded before anyone is added, so the first profile names it. If it fails, the chat is
+        /// made without it and `photo_failed` is raised.
+        #[serde(default)]
+        photo: Option<PhotoInput>,
+        /// Sealed in the invitation of anyone in `account_list` added by invitation only.
+        #[serde(default)]
+        note: Option<String>,
+    },
+    /// A new photo for a group or channel, which mirrors [`Command::SetPhoto`]: it goes up sealed
+    /// as one of the chat's files, then the profile names it, and the old one is removed.
+    ChatPhoto {
+        chat: Ulid,
+        #[serde(with = "serde_bytes")]
+        #[cfg_attr(feature = "wasm", tsify(type = "Uint8Array"))]
+        jpeg: Vec<u8>,
+        thumbnail: Thumbnail,
+    },
+    /// The photo a group's or channel's shown profile names, opened, answered as
+    /// [`Event::ChatPhoto`].
+    ChatPhotoGet {
+        chat: Ulid,
+    },
+    /// Adds accounts to a group or channel in one commit, each of their devices with a key package.
+    /// Anyone added by invitation only is invited instead, with `note` sealed in the invitation.
+    AddMembers {
+        chat: Ulid,
+        account_list: Vec<Ulid>,
+        #[serde(default)]
+        note: Option<String>,
+    },
+    /// Takes accounts out of a group or channel in one commit.
+    RemoveMembers {
+        chat: Ulid,
+        account_list: Vec<Ulid>,
+    },
+    /// Makes a member an owner, a moderator or a plain member, by an owner, on the server alone.
+    SetRole {
+        chat: Ulid,
+        account: Ulid,
+        role: ChatRole,
+    },
+    /// Leaves a group or channel: at once on the server, and the next member online commits it.
+    Leave {
+        chat: Ulid,
+    },
+    /// Removes a whole group or channel for everyone, by an owner.
+    RemoveChat {
+        chat: Ulid,
+    },
+    /// Asks to join a findable group or channel, with a note the server reads.
+    AskToJoin {
+        chat: Ulid,
+        #[serde(default)]
+        note: Option<String>,
+    },
+    CancelAsk {
+        chat: Ulid,
+    },
+    /// Lets a join request in: an add, by someone who may add people.
+    LetIn {
+        chat: Ulid,
+        account: Ulid,
+    },
+    DeclineAsk {
+        chat: Ulid,
+        account: Ulid,
+    },
+    /// A chat's pending join requests, answered as [`Event::Requests`].
+    Requests {
+        chat: Ulid,
+    },
+    /// Accepts or declines this account's invitation. Accepting joins by external commit, with the
+    /// inviter's signed invitation.
+    AnswerInvite {
+        chat: Ulid,
+        accept: bool,
+    },
+    /// A new topic's id, answered as [`Event::TopicId`], to be named in [`Command::Topics`].
+    TopicId {
+        chat: Ulid,
+    },
+    /// A group's or channel's members and their roles, answered as [`Event::Members`]. Asked when
+    /// its members screen opens; the platform keeps it current from the chat's events.
+    Members {
+        chat: Ulid,
+    },
+    /// History rows the platform read from its archive, handed back one [`Event::ChatEvent`] each
+    /// with their copies opened, so a History page shows what a delete removed or an edit changed.
+    /// Rows of another chat are skipped.
+    OpenHistory {
+        chat: Ulid,
+        event_list: Vec<ChatEvent>,
+    },
+    /// Whether topics show, and the live topics with their names, in order. A topic left out is
+    /// removed with everything in it. Its names go into the chat's sealed profile.
+    Topics {
+        chat: Ulid,
+        on: bool,
+        topic_list: Vec<TopicName>,
+    },
+    /// A group's or channel's name, bio, links and rules, sealed under its key with its topics'
+    /// names.
+    ChatProfile {
+        chat: Ulid,
+        name: String,
+        #[serde(default)]
+        bio: Option<String>,
+        #[serde(default)]
+        link_list: Vec<ProfileLink>,
+        /// At most 2,000 characters.
+        #[serde(default)]
+        rules: Option<String>,
+    },
+    /// A topic's bio, links and rules, General's under `GENERAL_TOPIC`, sealed under the chat's
+    /// profile key, keeping its photo. Its name stays in the chat's topic list.
+    TopicProfile {
+        chat: Ulid,
+        topic: Ulid,
+        #[serde(default)]
+        bio: Option<String>,
+        #[serde(default)]
+        link_list: Vec<ProfileLink>,
+        #[serde(default)]
+        rules: Option<String>,
+    },
+    /// A new photo for a topic, which goes up as one of the chat's files, as a chat's does.
+    TopicPhoto {
+        chat: Ulid,
+        topic: Ulid,
+        #[serde(with = "serde_bytes")]
+        #[cfg_attr(feature = "wasm", tsify(type = "Uint8Array"))]
+        jpeg: Vec<u8>,
+        thumbnail: Thumbnail,
+    },
+    /// The photo a topic's shown profile names, opened, answered as [`Event::TopicPhoto`].
+    TopicPhotoGet {
+        chat: Ulid,
+        topic: Ulid,
+    },
+    /// A topic's own options, by its moderators and the chat's owners and moderators.
+    TopicOptions {
+        chat: Ulid,
+        topic: Ulid,
+        options: TopicOptionsBody,
+    },
+    /// Makes a member a topic's moderator, or a member there again, by the chat's owners: `role`
+    /// is moderator or member.
+    TopicRole {
+        chat: Ulid,
+        topic: Ulid,
+        account: Ulid,
+        role: ChatRole,
+    },
+    /// What a group's or channel's members may do, by owners.
+    ChatOptions {
+        chat: Ulid,
+        options: ChatOptions,
+    },
+    /// Whether the directory lists a group or channel, under a name and bio the server reads.
+    Findable {
+        chat: Ulid,
+        findable: bool,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        bio: Option<String>,
+    },
 }
 
 /// Everything that goes into [`Client::step`].
@@ -637,12 +899,14 @@ pub enum Input {
     RowsSaveFailed {
         id: u64,
     },
-    /// [`Output::ReadRows`]'s answer: the chat's messages, oldest first, and the rows of every call
-    /// among them.
+    /// [`Output::ReadRows`]'s answer: the chat's messages, oldest first, the rows of every call
+    /// among them, and the chat's events in the same span, oldest first.
     RowsRead {
         id: u64,
         message_list: Vec<MessageFrame>,
         call_list: Vec<CallEvent>,
+        #[serde(default)]
+        chat_event_list: Vec<ChatEvent>,
     },
     /// [`Output::ScanRows`]'s answer: the messages, newest first, and how many rows the archive
     /// holds in all, for the search's progress.
@@ -697,7 +961,7 @@ pub enum Output {
         at: i64,
     },
     Event {
-        event: Event,
+        event: Box<Event>,
     },
     /// Read `length` bytes at `offset` of the file the platform holds as `handle`, and answer with
     /// [`Input::ChunkRead`].
@@ -764,14 +1028,17 @@ pub enum Output {
     /// [`Input::RowsSaved`] or [`Input::RowsSaveFailed`]. A row already kept stays, except that a
     /// removed message, with only `chat`, `seq` and `server_saved_at`, replaces its copy, and takes
     /// with it the edits pointing at it, as the server wipes them too, and a removed call message
-    /// that call's rows.
+    /// that call's rows. A group's or channel's events are kept by their chat and `n`.
     SaveRows {
         id: u64,
         message_list: Vec<MessageFrame>,
         call_list: Vec<CallEvent>,
+        chat_event_list: Vec<ChatEvent>,
     },
     /// Read up to `limit` of the chat's newest messages from the archive, below `before_seq` if
-    /// given, with the rows of every call among them, and answer with [`Input::RowsRead`].
+    /// given, with the rows of every call among them, and the chat's events whose server time is
+    /// from the first message's on, or from the start when that is the chat's first, up to the
+    /// message at `before_seq`'s, and answer with [`Input::RowsRead`].
     ReadRows {
         id: u64,
         chat: Ulid,
@@ -905,6 +1172,15 @@ pub struct Shown {
     /// An ack message's ack.
     #[serde(default)]
     pub ack: Option<Box<Ack>>,
+    /// A group's or channel's topic, none for General.
+    #[serde(default)]
+    pub topic: Option<Ulid>,
+    /// The main-list message whose thread this is in.
+    #[serde(default)]
+    pub thread_seq: Option<u64>,
+    /// The accounts a group's or channel's text mentions, from inside its encryption.
+    #[serde(default)]
+    pub mentions: Vec<Ulid>,
     pub problem: Option<Problem>,
 }
 
@@ -1009,6 +1285,19 @@ pub enum Event {
         saved_at: i64,
         problem: Option<Problem>,
     },
+    /// A membership line the server wrote in a group: `account`, through `device`, did `action` to
+    /// `account_list`, or to itself when that is empty. `mine` when this account acted, so it is
+    /// not unread. The server is trusted for it, as for roles, leaving and removals.
+    Line {
+        chat: Ulid,
+        seq: u64,
+        device: Ulid,
+        account: Ulid,
+        action: LineAction,
+        account_list: Vec<Ulid>,
+        saved_at: i64,
+        mine: bool,
+    },
     /// A page has been shown. `has_older` is false once the first message is reached.
     PageLoaded {
         chat: Ulid,
@@ -1039,6 +1328,12 @@ pub enum Event {
         /// An ack, so the platform shows its suggestion handled at once.
         #[serde(default)]
         ack: Option<Ack>,
+        /// A group's or channel's topic, none for General.
+        #[serde(default)]
+        topic: Option<Ulid>,
+        /// The main-list message whose thread it goes in.
+        #[serde(default)]
+        thread: Option<u64>,
     },
     Sent {
         chat: Ulid,
@@ -1050,6 +1345,9 @@ pub enum Event {
         chat: Ulid,
         local: u64,
         code: String,
+        /// Only for `slow_mode`: how many seconds until this member may write there again, chosen
+        /// by the author, so the app can count down.
+        seconds: Option<u64>,
     },
     Marks {
         chat: Ulid,
@@ -1072,11 +1370,13 @@ pub enum Event {
         folder_list: Vec<Folder>,
         default: Ulid,
     },
-    /// The answer to `Times`: each member but the sender, by the server's clock.
+    /// The answer to `Times`: a page of the members but the sender, by the server's clock. `more`
+    /// says another page follows.
     Times {
         chat: Ulid,
         seq: u64,
         member_list: Vec<TimesItem>,
+        more: bool,
     },
     /// Where someone sharing a chat is, after this device's first `presence` on each connection and
     /// on every change, or the answer to [`Command::PresenceOf`]. What the account may not see is
@@ -1121,6 +1421,10 @@ pub enum Event {
         chat: Ulid,
         account: Ulid,
         on: bool,
+        /// The topic typed in, none for General or a chat without topics.
+        topic: Option<Ulid>,
+        /// The thread typed in, by the seq of the message that opened it.
+        thread: Option<u64>,
     },
     /// The chat a `StartChat` asked for, with its id, so the platform can open it. It may not be
     /// ready yet: `ChatReady` follows once this device is in it.
@@ -1135,8 +1439,10 @@ pub enum Event {
     ChatLeft {
         chat: Ulid,
     },
+    /// The directory's answer: accounts, and findable groups and channels, which can be asked to join.
     SearchResults {
         account_list: Vec<AccountBrief>,
+        chat_list: Vec<FoundChat>,
     },
     /// What one read of the archive found for the search under way, and how far it has looked:
     /// `scanned` of `total` rows. `done` once this page of hits is full or the archive is
@@ -1175,6 +1481,97 @@ pub enum Event {
     CallEvent {
         event: ShownCallEvent,
     },
+    /// Something the server wrote happened in a group or channel: a line every member sees, history
+    /// for owners and moderators, or a line for this account alone.
+    ChatEvent {
+        event: ChatEvent,
+        /// A delete's or edit's copies of the message and its edits as they were, oldest first,
+        /// opened and their signatures checked. One this device cannot open or check is left out.
+        #[serde(default)]
+        copy_list: Vec<Shown>,
+    },
+    /// The answer to [`Command::Requests`].
+    Requests {
+        chat: Ulid,
+        request_list: Vec<RequestItem>,
+    },
+    /// Someone's join request to a chat this account may let people into arrived or changed.
+    JoinRequest {
+        request: RequestItem,
+    },
+    /// This account's own join request, as its row in the chat list shows it: waiting, declined,
+    /// let in, or gone, taken back on another device or expired. `name` is the chat's findable
+    /// name, as `chats`' `asked_list` has it.
+    Asked {
+        chat: Ulid,
+        name: Option<String>,
+        state: RequestState,
+        at: i64,
+    },
+    /// An invitation for this account, its name and BlurHash opened, or with none, gone: answered
+    /// on another device or expired.
+    Invitation {
+        chat: Ulid,
+        invitation: Option<InvitationShown>,
+    },
+    /// The answer to [`Command::Members`].
+    Members {
+        chat: Ulid,
+        member_list: Vec<MemberItem>,
+    },
+    /// The answer to [`Command::TopicId`].
+    TopicId {
+        chat: Ulid,
+        topic: Ulid,
+    },
+    /// A group's or channel's topics changed, with their names as its profile has them.
+    Topics {
+        chat: Ulid,
+        on: bool,
+        topic_list: Vec<TopicName>,
+    },
+    /// A group's or channel's profile, opened.
+    ChatProfile {
+        chat: Ulid,
+        profile: ShownChatProfile,
+    },
+    /// The JPEG of the photo a group's or channel's profile names, opened.
+    ChatPhoto {
+        chat: Ulid,
+        photo: Ulid,
+        bytes: Bytes,
+    },
+    ChatOptions {
+        chat: Ulid,
+        options: ChatOptions,
+    },
+    /// A topic's own options and moderators, General's under `GENERAL_TOPIC`. One hidden from
+    /// this account comes as hidden with nothing else, and the platform leaves it out.
+    TopicOptions {
+        chat: Ulid,
+        topic: Ulid,
+        options: TopicOptionsBody,
+        mod_list: Vec<Ulid>,
+    },
+    /// A topic's profile, opened.
+    TopicProfile {
+        chat: Ulid,
+        topic: Ulid,
+        profile: ShownTopicProfile,
+    },
+    /// The JPEG of the photo a topic's profile names, opened.
+    TopicPhoto {
+        chat: Ulid,
+        topic: Ulid,
+        photo: Ulid,
+        bytes: Bytes,
+    },
+    /// Whether the directory lists a group or channel, with the name and bio it shows; none when it
+    /// no longer does.
+    Findable {
+        chat: Ulid,
+        findable: Option<FindableItem>,
+    },
     Online,
     Offline,
     LoggedOut,
@@ -1182,6 +1579,40 @@ pub enum Event {
         code: String,
         message: String,
     },
+}
+
+/// A group's or channel's profile, opened, for the platform to show.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify), tsify(missing_as_null))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShownChatProfile {
+    pub name: String,
+    pub bio: Option<String>,
+    pub link_list: Vec<ProfileLink>,
+    pub rules: Option<String>,
+    pub topic_list: Vec<TopicName>,
+    /// What to draw while [`Command::ChatPhotoGet`] fetches it.
+    pub photo: Option<ShownChatPhoto>,
+    pub version: u64,
+}
+
+/// A topic's profile, opened, for the platform to show.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify), tsify(missing_as_null))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShownTopicProfile {
+    pub bio: Option<String>,
+    pub link_list: Vec<ProfileLink>,
+    pub rules: Option<String>,
+    /// What to draw while [`Command::TopicPhotoGet`] fetches it.
+    pub photo: Option<ShownChatPhoto>,
+    pub version: u64,
+}
+
+/// The photo a group's or channel's profile names: its file, and its BlurHash.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShownChatPhoto {
+    pub id: Ulid,
+    pub blurhash: String,
 }
 
 /// An account's profile, for the platform to show.
@@ -1236,10 +1667,14 @@ enum Item {
         remove: Vec<Ulid>,
         call: Option<CallBody>,
         fields: Option<Secret>,
+        topic: Option<Ulid>,
+        thread_seq: Option<u64>,
     },
     Typing {
         chat: Ulid,
         on: bool,
+        topic: Option<Ulid>,
+        thread_seq: Option<u64>,
     },
     Commit {
         chat: Ulid,
@@ -1254,16 +1689,92 @@ enum Plan {
     Create {
         package_list: Vec<KeyPackageItem>,
     },
+    /// Devices added. In a group or channel, `added` names each new account with its devices'
+    /// packages, and the server is told of them; empty for devices of accounts already in.
     Add {
         package_list: Vec<KeyPackageItem>,
+        added: Vec<(Ulid, Vec<Ulid>)>,
     },
+    /// Devices taken out. `removed` names the accounts a group's or channel's member takes out, and
+    /// the server is told of them; empty for devices that ended and accounts that already left.
     Remove {
         device_list: Vec<Ulid>,
+        removed: Vec<Ulid>,
     },
     Rotate,
+    /// Joining by external commit, with the invitation when this account is not in the group yet.
     Join {
         group_info: Vec<u8>,
+        invite: Option<InviteStatement>,
     },
+}
+
+/// A group's or channel's start, kept until its group runs: its profile, its options and who to
+/// add.
+struct GroupStart {
+    profile: ChatProfilePlain,
+    options: ChatOptions,
+    account_list: Vec<Ulid>,
+    /// Its photo, waiting to go up before epoch 0.
+    photo: Option<PreparedPhoto>,
+    /// Sealed in the invitation of anyone added by invitation only.
+    note: Option<String>,
+}
+
+/// A group's or channel's photo sealed as one chunk under its own key, ready to go up.
+struct PreparedPhoto {
+    sealed: Vec<u8>,
+    key: zeroize::Zeroizing<[u8; 16]>,
+    size: u64,
+    blurhash: String,
+}
+
+/// Checks a photo and seals it under a new key, as an account's photo is.
+fn prepare_photo(jpeg: &[u8], thumbnail: &Thumbnail) -> Result<PreparedPhoto, &'static str> {
+    if jpeg.is_empty() || jpeg.len() as u64 > file::CHUNK {
+        return Err("That photo is too large");
+    }
+    let Ok(blurhash) = file::blurhash_of(thumbnail.width, thumbnail.height, &thumbnail.rgba) else {
+        return Err("That photo's thumbnail is not one");
+    };
+    let Ok(key) = file::new_key() else {
+        return Err("Could not make the photo's key");
+    };
+    let Ok(sealed) = file::seal_chunk(key.as_ref(), 0, true, jpeg) else {
+        return Err("Could not seal the photo");
+    };
+    Ok(PreparedPhoto {
+        sealed,
+        key,
+        size: jpeg.len() as u64,
+        blurhash,
+    })
+}
+
+/// Accounts being added to a group or channel, their devices' packages claimed an account at a
+/// time.
+#[derive(Default)]
+struct AddClaim {
+    account_list: Vec<Ulid>,
+    package_list: Vec<KeyPackageItem>,
+    added: Vec<(Ulid, Vec<Ulid>)>,
+}
+
+/// Rows of the archive: a `sync` page's, one arriving live, or a page read back.
+struct Rows {
+    message_list: Vec<MessageFrame>,
+    call_list: Vec<CallEvent>,
+    chat_event_list: Vec<ChatEvent>,
+}
+
+impl Rows {
+    fn messages(message_list: Vec<MessageFrame>) -> Self {
+        Self {
+            message_list,
+            call_list: Vec::new(),
+            chat_event_list: Vec::new(),
+        }
+    }
 }
 
 /// What a REST request was for.
@@ -1316,6 +1827,34 @@ enum Asked {
     CreateChat {
         account: Ulid,
     },
+    CreateGroup {
+        chat_type: ChatType,
+        start: Box<GroupStart>,
+    },
+    /// A group's or channel's photo: its file made, then its one chunk put. `starting` is a new
+    /// chat's, whose group starts once it is up or has failed.
+    /// A topic's photo when `topic` is set, never starting.
+    ChatPhotoFile {
+        chat: Ulid,
+        topic: Option<Ulid>,
+        photo: Box<PreparedPhoto>,
+        starting: bool,
+    },
+    ChatPhotoChunk {
+        chat: Ulid,
+        topic: Option<Ulid>,
+        file: Ulid,
+        photo: Box<PreparedPhoto>,
+        starting: bool,
+    },
+    ChatPhotoGet {
+        chat: Ulid,
+        topic: Option<Ulid>,
+        photo: Ulid,
+    },
+    Requests {
+        chat: Ulid,
+    },
     StartInfo {
         chat: Ulid,
     },
@@ -1324,6 +1863,12 @@ enum Asked {
         account: Ulid,
         account_list: Vec<Ulid>,
         package_list: Vec<KeyPackageItem>,
+    },
+    /// One account's packages, for adding it to a group or channel.
+    AddClaim {
+        chat: Ulid,
+        account: Ulid,
+        claim: AddClaim,
     },
     JoinInfo {
         chat: Ulid,
@@ -1410,6 +1955,10 @@ struct Content {
     answer: Option<Answer>,
     /// An ack, for its pending message.
     ack: Option<Ack>,
+    /// A group's or channel's topic, signed in the header. None for General.
+    topic: Option<Ulid>,
+    /// The main-list message whose thread this goes in, signed in the header.
+    thread_seq: Option<u64>,
 }
 
 /// An ack waiting for the server to take the arrangement it accepted.
@@ -1434,6 +1983,8 @@ struct Upload {
     files: Vec<UpFile>,
     /// The file going up now.
     current: usize,
+    topic: Option<Ulid>,
+    thread_seq: Option<u64>,
 }
 
 struct UpFile {
@@ -1499,6 +2050,39 @@ enum Waiting {
     Kv,
     /// A `kv_set` frame: the change in flight.
     KvSet,
+    /// A new topic's id.
+    TopicId,
+    /// A chat's members.
+    Members,
+    /// This device left: once the server took it, the chat goes.
+    Left {
+        chat: Ulid,
+    },
+    /// A `topics` frame from this device: once the server took it, this device is shown the new
+    /// topics and a chat that lost a topic is synced, as the push of it goes to every device but
+    /// this one.
+    TopicsSaved {
+        chat: Ulid,
+        on: bool,
+        topic_list: Vec<TopicName>,
+        removed: bool,
+    },
+    /// A `chat_options` frame from this device: once the server took it, this device is shown
+    /// them, as their push goes to every device but this one.
+    OptionsSaved {
+        chat: Ulid,
+        options: ChatOptions,
+    },
+    /// A `findable` frame from this device, shown to it once the server took it, the same way.
+    FindableSaved {
+        chat: Ulid,
+        findable: Option<FindableItem>,
+    },
+    /// This account's answer to an invitation: accepted, its device joins.
+    InviteAnswer {
+        chat: Ulid,
+        accept: bool,
+    },
     Done,
 }
 
@@ -1580,6 +2164,12 @@ struct Shelf {
     /// A change the server has not taken yet.
     #[serde(default)]
     kv_out: Option<KvChange>,
+    /// This account's own join requests and invitations as last shown, so the next `chats` list
+    /// that leaves one out shows it gone, after a restart too.
+    #[serde(default)]
+    asked_list: Vec<RequestItem>,
+    #[serde(default)]
+    invitation_list: Vec<InvitationItem>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1622,6 +2212,15 @@ enum Applied {
     Changed,
 }
 
+/// A new group's or channel's first profile, its profile key sealed at epoch 0, and its options, all
+/// going with epoch 0's group info.
+#[derive(Debug, Clone)]
+struct StartProfile {
+    body: ChatProfileBody,
+    key: Vec<u8>,
+    options: Option<ChatOptions>,
+}
+
 #[derive(Default)]
 struct ChatState {
     chat_type: Option<ChatType>,
@@ -1652,6 +2251,9 @@ struct ChatState {
     joining: bool,
     /// A rotation is planned or in flight.
     rotating: bool,
+    /// Something was refused as sealed under an older key, and a `sync` brings the commits it
+    /// missed before anything is sealed again.
+    catching_up: bool,
     join_attempt: usize,
     join_at: Option<i64>,
     received: Position,
@@ -1662,6 +2264,28 @@ struct ChatState {
     uploading: bool,
     /// A started chat's devices to add, once its first group info and wraps are up.
     start_packages: Option<Vec<KeyPackageItem>>,
+    /// A group's or channel's start, once its group runs.
+    start: Option<GroupStart>,
+    /// A new group's or channel's first profile and options, going up with epoch 0's group info.
+    start_profile: Option<StartProfile>,
+    /// The server's list of its members' devices has come at least once, so a group's or
+    /// channel's commits wrap to everyone in it.
+    members_known: bool,
+    /// A group's or channel's profile, opened, and its version.
+    profile: Option<(ChatProfilePlain, u64)>,
+    /// Whether its topics show, and its live topics in order.
+    topics: Option<TopicsBody>,
+    /// A profile sealed at an epoch this device could not open yet, tried again once it is ready.
+    profile_waiting: Option<ChatProfileItem>,
+    /// Each topic's own settings this account may see, General's under `GENERAL_TOPIC`.
+    topic_settings: HashMap<Ulid, TopicItem>,
+    /// Topics hidden from this account, whose messages the server withheld until they show again.
+    hidden_topics: HashSet<Ulid>,
+    /// Topics shown again, whose withheld messages the next `sync` of this chat opens though they
+    /// sit below `known`, with every edit, since an edit's topic is its target's.
+    refill: HashSet<Ulid>,
+    /// Topics' profiles, opened, and their versions.
+    topic_profiles: HashMap<Ulid, (TopicProfilePlain, u64)>,
 }
 
 #[derive(PartialEq, Eq)]
@@ -1721,6 +2345,10 @@ pub struct Client {
     chats: HashMap<Ulid, ChatState>,
     accounts: HashMap<Ulid, AccountInfo>,
     asked_accounts: HashSet<Ulid>,
+    /// Invitations waiting for their account's keys, which their name is sealed to.
+    inviting: Vec<(Ulid, Ulid)>,
+    /// The note an add's invitations carry, by chat and account, until each is sealed.
+    invite_notes: HashMap<(Ulid, Ulid), String>,
     /// Every device whose stamp has been checked.
     devices: HashMap<Ulid, KnownDevice>,
     /// The last chat list the server sent, previews included, kept in the snapshot's shelf.
@@ -1780,6 +2408,11 @@ pub struct Client {
     profile_shared: HashSet<(Ulid, u64)>,
     /// Keys pushed for a chat this device has not joined yet, opened once it is ready.
     profile_keys_waiting: HashMap<Ulid, Vec<ProfileKeyItem>>,
+    /// This account's invitations, by chat, kept for the signature its join carries.
+    invitations: HashMap<Ulid, InvitationItem>,
+    /// This account's own join requests, waiting or declined, by chat, so one the server stops
+    /// listing is shown gone.
+    own_requests: HashMap<Ulid, RequestItem>,
     /// A login waiting for [`Input::Opened`], once [`Output::Open`] went out.
     opening: Option<Opening>,
     dirty: bool,
@@ -1812,6 +2445,85 @@ fn backoff(now: i64, attempt: usize) -> i64 {
 }
 
 /// Whether a bio and links are within the limits, and each link's address is a web one.
+/// A group's or channel's profile trimmed and checked by an account's limits, with a name.
+/// An invitation's note, trimmed, with an empty one dropped, as the server takes a join request's.
+fn checked_note(note: Option<String>) -> Result<Option<String>, &'static str> {
+    let Some(note) = note else {
+        return Ok(None);
+    };
+    let note = note.trim().to_string();
+    if note.chars().count() > INVITE_NOTE_CHARS {
+        return Err("An invitation's note is at most 500 characters");
+    }
+    Ok((!note.is_empty()).then_some(note))
+}
+
+fn checked_chat_profile(mut profile: ChatProfilePlain) -> Result<ChatProfilePlain, &'static str> {
+    profile.name = profile.name.trim().to_string();
+    let length = profile.name.chars().count();
+    if length == 0 || length > CHAT_NAME_CHARS {
+        return Err("A name is 1 to 64 characters");
+    }
+    profile.bio = profile
+        .bio
+        .map(|bio| bio.trim().to_string())
+        .filter(|bio| !bio.is_empty());
+    profile.link_list = profile
+        .link_list
+        .into_iter()
+        .map(|link| ProfileLink {
+            name: link.name.trim().to_string(),
+            url: link.url.trim().to_string(),
+        })
+        .collect();
+    profile.rules = checked_rules(profile.rules)?;
+    check_profile(&ProfileBody {
+        bio: profile.bio.clone(),
+        link_list: profile.link_list.clone(),
+        photo: None,
+    })?;
+    Ok(profile)
+}
+
+/// A topic's bio, links and rules, trimmed and checked as a chat's are.
+fn checked_topic_profile(
+    mut profile: TopicProfilePlain,
+) -> Result<TopicProfilePlain, &'static str> {
+    profile.bio = profile
+        .bio
+        .map(|bio| bio.trim().to_string())
+        .filter(|bio| !bio.is_empty());
+    profile.link_list = profile
+        .link_list
+        .into_iter()
+        .map(|link| ProfileLink {
+            name: link.name.trim().to_string(),
+            url: link.url.trim().to_string(),
+        })
+        .collect();
+    profile.rules = checked_rules(profile.rules)?;
+    check_profile(&ProfileBody {
+        bio: profile.bio.clone(),
+        link_list: profile.link_list.clone(),
+        photo: None,
+    })?;
+    Ok(profile)
+}
+
+/// Rules trimmed, none when empty, and at most 2,000 characters.
+fn checked_rules(rules: Option<String>) -> Result<Option<String>, &'static str> {
+    let rules = rules
+        .map(|rules| rules.trim().to_string())
+        .filter(|rules| !rules.is_empty());
+    if rules
+        .as_ref()
+        .is_some_and(|rules| rules.chars().count() > RULES_CHARS)
+    {
+        return Err("Rules are at most 2,000 characters");
+    }
+    Ok(rules)
+}
+
 fn check_profile(body: &ProfileBody) -> Result<(), &'static str> {
     if body
         .bio
@@ -1859,6 +2571,8 @@ fn background(asked: &Asked) -> bool {
             | Asked::StickerImage { .. }
             | Asked::PutProfile { .. }
             | Asked::AddPhoto { .. }
+            | Asked::ChatPhotoFile { .. }
+            | Asked::ChatPhotoChunk { .. }
             | Asked::Names
     )
 }
@@ -1954,6 +2668,7 @@ struct Opened {
     answer: Option<Answer>,
     suggestion: Option<Suggestion>,
     ack: Option<Ack>,
+    mentions: Vec<Ulid>,
 }
 
 /// A message's text and files, `{"text": "...", "files": [...]}`, each optional, a call's start,
@@ -1992,6 +2707,8 @@ fn content_of(plaintext: &[u8], content_kind: Option<ContentKind>) -> Opened {
         answers: Vec<crate::protocol::AnswerItem>,
         #[serde(default)]
         skipped: bool,
+        #[serde(default)]
+        mentions: Vec<Ulid>,
     }
     match serde_json::from_slice::<Plain>(plaintext) {
         Ok(plain) => {
@@ -2041,6 +2758,7 @@ fn content_of(plaintext: &[u8], content_kind: Option<ContentKind>) -> Opened {
                         .filter(|ack| ack.check().is_ok()),
                     _ => None,
                 },
+                mentions: plain.mentions,
             }
         }
         Err(_) => Opened::default(),
@@ -2087,6 +2805,7 @@ fn shown(
         answer,
         suggestion,
         ack,
+        mentions,
     } = opened;
     Shown {
         chat: message.chat,
@@ -2111,6 +2830,9 @@ fn shown(
         answer,
         suggestion: suggestion.map(Box::new),
         ack: ack.map(Box::new),
+        topic: message.topic,
+        thread_seq: message.thread_seq,
+        mentions,
         problem: None,
     }
 }
@@ -2153,6 +2875,8 @@ impl Client {
             chats: HashMap::new(),
             accounts: HashMap::new(),
             asked_accounts: HashSet::new(),
+            inviting: Vec::new(),
+            invite_notes: HashMap::new(),
             devices: HashMap::new(),
             chat_cache: Vec::new(),
             folders: None,
@@ -2185,6 +2909,8 @@ impl Client {
             photo_asked: HashSet::new(),
             profile_shared: HashSet::new(),
             profile_keys_waiting: HashMap::new(),
+            invitations: HashMap::new(),
+            own_requests: HashMap::new(),
             opening: None,
             dirty: false,
             now: 0,
@@ -2244,7 +2970,15 @@ impl Client {
                 id,
                 message_list,
                 call_list,
-            } => self.rows_read(id, message_list, call_list),
+                chat_event_list,
+            } => self.rows_read(
+                id,
+                Rows {
+                    message_list,
+                    call_list,
+                    chat_event_list,
+                },
+            ),
             Input::RowsScanned {
                 id,
                 message_list,
@@ -2274,7 +3008,9 @@ impl Client {
     // ---------------------------------------------------------------------------------------------
 
     fn event(&mut self, event: Event) {
-        self.out.push(Output::Event { event });
+        self.out.push(Output::Event {
+            event: Box::new(event),
+        });
     }
 
     fn error(&mut self, code: &str, message: &str) {
@@ -2405,6 +3141,8 @@ impl Client {
                 (flight, Some(out)) => Some(merge_change(flight, out)),
                 (flight, None) => flight,
             },
+            asked_list: self.own_requests.values().cloned().collect(),
+            invitation_list: self.invitations.values().cloned().collect(),
         };
         let Some(device) = self.device.as_mut() else {
             return;
@@ -2537,7 +3275,12 @@ impl Client {
                 if !self.accounts.contains_key(&account) {
                     self.ask_account(account);
                 }
-                let body = CreateChatBody { account };
+                let body = CreateChatBody {
+                    account: Some(account),
+                    chat_type: None,
+                    topics: None,
+                    findable: None,
+                };
                 self.request(
                     "POST",
                     "/api/v1/chats".to_string(),
@@ -2582,17 +3325,49 @@ impl Client {
                 }
                 self.get(format!("/api/v1/accounts?search={encoded}"), Asked::Search);
             }
-            Command::SendText { chat, text, reply } => self.push_content(
+            Command::SendText {
                 chat,
-                Kind::Content,
+                text,
                 reply,
-                Content {
-                    content_kind: Some(ContentKind::Text),
-                    text: Some(text),
-                    ..Content::default()
-                },
-            ),
-            Command::SendFiles { chat, files, text } => self.send_files(chat, files, text),
+                topic,
+                thread,
+                mentions,
+            } => {
+                // Mentions stay inside the encryption, each a member of the chat.
+                let mut fields = None;
+                if !mentions.is_empty() {
+                    let state = self.chat(chat);
+                    if mentions
+                        .iter()
+                        .any(|account| !state.member_list.contains(account))
+                    {
+                        return self.error("not_member", "Someone mentioned is not in this chat");
+                    }
+                    fields = Some(Secret(
+                        serde_json::json!({ "mentions": mentions }).to_string(),
+                    ));
+                }
+                self.push_content(
+                    chat,
+                    Kind::Content,
+                    reply,
+                    Content {
+                        content_kind: Some(ContentKind::Text),
+                        text: Some(text),
+                        fields,
+                        topic,
+                        thread_seq: thread,
+                        ..Content::default()
+                    },
+                );
+            }
+            Command::SendFiles {
+                chat,
+                files,
+                text,
+                topic,
+                thread,
+            } => self.send_files(chat, files, text, (topic, thread)),
             Command::Download { file, handle } => self.download(file, handle),
             Command::Edit {
                 chat,
@@ -2624,7 +3399,17 @@ impl Client {
                     ..Content::default()
                 },
             ),
-            Command::Seen { chat, up_to_seq } => {
+            Command::Seen {
+                chat,
+                up_to_seq,
+                topic,
+                thread,
+            } if topic.is_some() || thread.is_some() => {
+                self.seen_in_place(chat, up_to_seq, topic, thread);
+            }
+            Command::Seen {
+                chat, up_to_seq, ..
+            } => {
                 let now = self.now;
                 let state = self.chat(chat);
                 if up_to_seq > state.seen.wanted {
@@ -2633,11 +3418,21 @@ impl Client {
                 }
                 self.report(chat);
             }
-            Command::Typing { chat, on } => {
+            Command::Typing {
+                chat,
+                on,
+                topic,
+                thread,
+            } => {
                 // Typing is stale by the time a connection comes back, so it is not kept.
                 if self.socket == Socket::Up {
-                    self.queue
-                        .push(Level::Typing, Item::Typing { chat, on }, Target::None);
+                    let item = Item::Typing {
+                        chat,
+                        on,
+                        topic,
+                        thread_seq: thread,
+                    };
+                    self.queue.push(Level::Typing, item, Target::None);
                 }
             }
             Command::Draft { chat, draft } => self.keep_draft(chat, draft),
@@ -2684,6 +3479,13 @@ impl Client {
                     let Ok(plain) = serde_json::to_vec(&setting.value) else {
                         return self.error("internal", "A setting could not be written");
                     };
+                    if unsealed(&setting.key) {
+                        sealed_list.push(KvItem {
+                            key: setting.key,
+                            value: Bytes(plain),
+                        });
+                        continue;
+                    }
                     match device.seal_kv(&setting.key, &plain) {
                         Ok(sealed) => sealed_list.push(KvItem {
                             key: setting.key,
@@ -2703,12 +3505,13 @@ impl Client {
                 self.show_kv();
                 self.send_kv();
             }
-            Command::Times { chat, seq } => {
+            Command::Times { chat, seq, after } => {
                 let reference = reference();
                 let frame = ClientFrame::Times {
                     reference,
                     chat,
                     seq,
+                    after,
                 };
                 if !self.ask(frame, reference, Waiting::Done) {
                     self.error("offline", "Not connected, so the times could not be read");
@@ -2719,6 +3522,8 @@ impl Client {
                 chat,
                 sticker,
                 reply,
+                topic,
+                thread,
             } => {
                 let fields = serde_json::json!({ "sticker": sticker }).to_string();
                 self.push_content(
@@ -2729,11 +3534,19 @@ impl Client {
                         content_kind: Some(ContentKind::Sticker),
                         fields: Some(Secret(fields)),
                         sticker: Some(sticker),
+                        topic,
+                        thread_seq: thread,
                         ..Content::default()
                     },
                 );
             }
-            Command::SendReaction { chat, emoji, on } => {
+            Command::SendReaction {
+                chat,
+                emoji,
+                on,
+                topic,
+                thread,
+            } => {
                 let Some(emoji) = emojis::get(&emoji) else {
                     return self.error("bad_emoji", "That is not an emoji a reaction can be");
                 };
@@ -2747,6 +3560,8 @@ impl Client {
                         content_kind: Some(ContentKind::Reaction),
                         fields: Some(Secret(fields)),
                         emoji: Some(emoji),
+                        topic,
+                        thread_seq: thread,
                         ..Content::default()
                     },
                 );
@@ -3006,6 +3821,293 @@ impl Client {
                     Asked::Names,
                 );
             }
+            Command::CreateChat {
+                chat_type,
+                name,
+                bio,
+                link_list,
+                account_list,
+                topics,
+                findable,
+                options,
+                photo,
+                note,
+            } => {
+                let note = match checked_note(note) {
+                    Ok(note) => note,
+                    Err(message) => return self.error("bad_note", message),
+                };
+                let profile = ChatProfilePlain {
+                    name,
+                    bio,
+                    link_list,
+                    ..ChatProfilePlain::default()
+                };
+                // A photo that cannot be prepared is the same as one that fails to go up.
+                let photo =
+                    photo.and_then(|photo| match prepare_photo(&photo.jpeg, &photo.thumbnail) {
+                        Ok(prepared) => Some(prepared),
+                        Err(message) => {
+                            self.error("photo_failed", message);
+                            None
+                        }
+                    });
+                self.create_group(
+                    chat_type,
+                    GroupStart {
+                        profile,
+                        options,
+                        account_list,
+                        photo,
+                        note,
+                    },
+                    topics,
+                    findable,
+                );
+            }
+            Command::ChatPhoto {
+                chat,
+                jpeg,
+                thumbnail,
+            } => match prepare_photo(&jpeg, &thumbnail) {
+                Ok(photo) => self.upload_chat_photo(chat, None, photo, false),
+                Err(message) => self.error("bad_files", message),
+            },
+            Command::ChatPhotoGet { chat } => self.ask_chat_photo(chat, None),
+            Command::AddMembers {
+                chat,
+                account_list,
+                note,
+            } => {
+                let note = match checked_note(note) {
+                    Ok(note) => note,
+                    Err(message) => return self.error("bad_note", message),
+                };
+                self.add_members(chat, account_list, note);
+            }
+            Command::LetIn { chat, account } => self.add_members(chat, vec![account], None),
+            Command::RemoveMembers { chat, account_list } => {
+                self.remove_members(chat, account_list)
+            }
+            Command::SetRole {
+                chat,
+                account,
+                role,
+            } => {
+                let reference = reference();
+                let frame = ClientFrame::ChatRole {
+                    reference,
+                    chat,
+                    account,
+                    role,
+                };
+                self.ask_done(frame, reference, Waiting::Done);
+            }
+            Command::Leave { chat } => {
+                let reference = reference();
+                let frame = ClientFrame::Leave { reference, chat };
+                self.ask_done(frame, reference, Waiting::Left { chat });
+            }
+            Command::RemoveChat { chat } => {
+                let reference = reference();
+                let frame = ClientFrame::ChatRemove { reference, chat };
+                self.ask_done(frame, reference, Waiting::Left { chat });
+            }
+            Command::AskToJoin { chat, note } => {
+                let reference = reference();
+                let frame = ClientFrame::JoinRequest {
+                    reference,
+                    chat,
+                    note,
+                };
+                self.ask_done(frame, reference, Waiting::Done);
+            }
+            Command::CancelAsk { chat } => {
+                let reference = reference();
+                let frame = ClientFrame::JoinCancel { reference, chat };
+                self.ask_done(frame, reference, Waiting::Done);
+            }
+            Command::DeclineAsk { chat, account } => {
+                let reference = reference();
+                let frame = ClientFrame::JoinDecline {
+                    reference,
+                    chat,
+                    account,
+                };
+                self.ask_done(frame, reference, Waiting::Done);
+            }
+            Command::Requests { chat } => {
+                self.get(
+                    format!("/api/v1/chats/{chat}/requests"),
+                    Asked::Requests { chat },
+                );
+            }
+            Command::AnswerInvite { chat, accept } => {
+                // The invitation holds the chat's profile key, which opens its profile with nobody
+                // online, and which the join commit shares with this account's other devices.
+                let sealed = self
+                    .invitations
+                    .get(&chat)
+                    .map(|item| item.sealed.0.clone());
+                if accept
+                    && let (Some(sealed), Some(device)) = (sealed, self.device.as_mut())
+                    && let Ok(opened) = device.open_invitation(chat, &sealed)
+                    && let Ok(plain) = serde_json::from_slice::<InvitationPlain>(&opened)
+                    && let Some(key) = fixed::<16>(&plain.key.0)
+                {
+                    device.set_chat_key(chat, key);
+                    self.dirty = true;
+                }
+                let reference = reference();
+                let frame = ClientFrame::InviteAnswer {
+                    reference,
+                    chat,
+                    accept,
+                };
+                self.ask_done(frame, reference, Waiting::InviteAnswer { chat, accept });
+            }
+            Command::Members { chat } => {
+                let reference = reference();
+                let frame = ClientFrame::Members { reference, chat };
+                self.ask_done(frame, reference, Waiting::Members);
+            }
+            Command::OpenHistory { chat, event_list } => {
+                for event in event_list {
+                    if event.chat == chat {
+                        self.show_chat_event(event);
+                    }
+                }
+            }
+            Command::TopicId { chat } => {
+                let reference = reference();
+                let frame = ClientFrame::TopicId { reference, chat };
+                self.ask_done(frame, reference, Waiting::TopicId);
+            }
+            Command::Topics {
+                chat,
+                on,
+                topic_list,
+            } => self.set_topics(chat, on, topic_list),
+            Command::ChatProfile {
+                chat,
+                name,
+                bio,
+                link_list,
+                rules,
+            } => {
+                let profile = ChatProfilePlain {
+                    name,
+                    bio,
+                    link_list,
+                    rules,
+                    ..ChatProfilePlain::default()
+                };
+                self.edit_chat_profile(chat, profile);
+            }
+            Command::TopicProfile {
+                chat,
+                topic,
+                bio,
+                link_list,
+                rules,
+            } => {
+                let mut profile = match checked_topic_profile(TopicProfilePlain {
+                    bio,
+                    link_list,
+                    photo: None,
+                    rules,
+                }) {
+                    Ok(profile) => profile,
+                    Err(message) => return self.error("bad_profile", message),
+                };
+                profile.photo = self
+                    .chat(chat)
+                    .topic_profiles
+                    .get(&topic)
+                    .and_then(|(current, _)| current.photo.clone());
+                self.send_topic_profile(chat, topic, profile);
+            }
+            Command::TopicPhoto {
+                chat,
+                topic,
+                jpeg,
+                thumbnail,
+            } => match prepare_photo(&jpeg, &thumbnail) {
+                Ok(photo) => self.upload_chat_photo(chat, Some(topic), photo, false),
+                Err(message) => self.error("bad_files", message),
+            },
+            Command::TopicPhotoGet { chat, topic } => self.ask_chat_photo(chat, Some(topic)),
+            Command::TopicOptions {
+                chat,
+                topic,
+                options,
+            } => {
+                let reference = reference();
+                let frame = ClientFrame::TopicOptions {
+                    reference,
+                    chat,
+                    topic,
+                    options: Box::new(options),
+                };
+                self.ask_done(frame, reference, Waiting::Done);
+            }
+            Command::TopicRole {
+                chat,
+                topic,
+                account,
+                role,
+            } => {
+                let reference = reference();
+                let frame = ClientFrame::TopicRole {
+                    reference,
+                    chat,
+                    topic,
+                    account,
+                    role,
+                };
+                self.ask_done(frame, reference, Waiting::Done);
+            }
+            Command::ChatOptions { chat, options } => {
+                let reference = reference();
+                let frame = ClientFrame::ChatOptions {
+                    reference,
+                    chat,
+                    options: options.clone(),
+                };
+                self.ask_done(frame, reference, Waiting::OptionsSaved { chat, options });
+            }
+            Command::Findable {
+                chat,
+                findable,
+                name,
+                bio,
+            } => {
+                let reference = reference();
+                let shown = match (findable, &name) {
+                    (true, Some(name)) => Some(FindableItem {
+                        name: name.clone(),
+                        bio: bio.clone(),
+                    }),
+                    _ => None,
+                };
+                let frame = ClientFrame::Findable {
+                    reference,
+                    chat,
+                    findable: FindableBody {
+                        findable,
+                        name,
+                        bio,
+                    },
+                };
+                self.ask_done(
+                    frame,
+                    reference,
+                    Waiting::FindableSaved {
+                        chat,
+                        findable: shown,
+                    },
+                );
+            }
             Command::NetworkBack => {
                 for (_, request) in std::mem::take(&mut self.later) {
                     self.issue(request);
@@ -3013,6 +4115,13 @@ impl Client {
                 if self.socket == Socket::Down && !self.stopped && self.device.is_some() {
                     self.retry = 0;
                     self.connect();
+                }
+                // A socket that outlived the network's loss: the platform's own state may have
+                // moved off connected, so it hears it again, and one `sync` brings the list that
+                // tells it the server answered, with anything the flap cost.
+                if self.socket == Socket::Up {
+                    self.event(Event::Online);
+                    self.start_sync(None, self.since);
                 }
             }
         }
@@ -3166,6 +4275,17 @@ impl Client {
             master_public: Bytes(keys.master_public().to_vec()),
             account_public: Bytes(keys.account_public().to_vec()),
             account_stamp: Bytes(stamp_account_key(keys, &account).to_vec()),
+            invite_public: Bytes(keys.invite_public().to_vec()),
+            invite_stamp: Bytes(stamp_invite_key(keys, &account).to_vec()),
+        }
+    }
+
+    /// Asks for each account not known yet, so the platform can name the people a list shows.
+    fn know(&mut self, account_list: impl IntoIterator<Item = Ulid>) {
+        for account in account_list {
+            if !self.accounts.contains_key(&account) {
+                self.ask_account(account);
+            }
         }
     }
 
@@ -3207,13 +4327,23 @@ impl Client {
         self.read_rows(chat, before);
     }
 
-    /// The archive's answer to `read_rows`: call rows first, so their messages show their ends.
-    fn rows_read(&mut self, id: u64, message_list: Vec<MessageFrame>, call_list: Vec<CallEvent>) {
+    /// The archive's answer to `read_rows`: call rows first, so their messages show their ends. The
+    /// chat's events are shown as lines only, since what they changed is long applied.
+    fn rows_read(&mut self, id: u64, rows: Rows) {
+        let Rows {
+            message_list,
+            call_list,
+            chat_event_list,
+        } = rows;
         let Some(chat) = self.reading.remove(&id) else {
             return;
         };
         for event in call_list {
             self.call_row(event, false);
+        }
+        for event in chat_event_list {
+            self.know([event.actor].into_iter().chain(account_target(&event)));
+            self.show_chat_event(event);
         }
         let state = self.chat(chat);
         if let Some(first) = message_list.first() {
@@ -3440,6 +4570,8 @@ impl Client {
             emoji,
             answer,
             ack,
+            topic,
+            thread_seq,
         } = content;
         let item = Item::Content {
             chat,
@@ -3450,6 +4582,8 @@ impl Client {
             remove,
             call,
             fields,
+            topic,
+            thread_seq,
         };
         let local = self.queue.push(Level::Content, item, queue_target);
         self.event(Event::Pending {
@@ -3464,6 +4598,8 @@ impl Client {
             emoji,
             answer,
             ack,
+            topic,
+            thread: thread_seq,
         });
     }
 
@@ -3473,7 +4609,13 @@ impl Client {
 
     /// One file, or a bundle of images and videos. Each file gets its own key, and goes up before
     /// the message joins the queue, so text sent meanwhile is not held behind it.
-    fn send_files(&mut self, chat: Ulid, specs: Vec<FileSpec>, text: Option<Secret>) {
+    fn send_files(
+        &mut self,
+        chat: Ulid,
+        specs: Vec<FileSpec>,
+        text: Option<Secret>,
+        place: (Option<Ulid>, Option<u64>),
+    ) {
         if self.device.is_none() {
             return self.error("no_device", "This client has no device");
         }
@@ -3557,6 +4699,8 @@ impl Client {
                 text,
                 files,
                 current: 0,
+                topic: place.0,
+                thread_seq: place.1,
             },
         );
         self.create_file(upload);
@@ -3574,6 +4718,7 @@ impl Client {
             kind: current.info.kind,
             size: file::sealed_size(current.info.size),
             chunks: current.info.chunks,
+            encrypted: None,
         };
         let path = format!("/api/v1/chats/{}/files", going.chat);
         self.request("POST", path, Some(&body), Asked::CreateFile { upload });
@@ -3699,10 +4844,9 @@ impl Client {
                 call: None,
                 fields: None,
                 handles,
-                sticker: None,
-                emoji: None,
-                answer: None,
-                ack: None,
+                topic: going.topic,
+                thread_seq: going.thread_seq,
+                ..Content::default()
             },
         );
     }
@@ -3807,6 +4951,19 @@ impl Client {
             if status == 404 {
                 self.asked.remove(&id);
                 return self.event(Event::StickerMissing { sticker });
+            }
+        }
+        if let Asked::ChatPhotoGet { chat, topic, photo } = request.asked {
+            if (200..300).contains(&status) {
+                self.asked.remove(&id);
+                self.photo_asked.remove(&photo);
+                return self.chat_photo_got(chat, topic, photo, bytes);
+            }
+            // Replaced since, so the profile keeps its BlurHash.
+            if status == 404 {
+                self.asked.remove(&id);
+                self.photo_asked.remove(&photo);
+                return;
             }
         }
         if let Asked::Photo { account, photo } = request.asked {
@@ -4577,11 +5734,35 @@ impl Client {
         self.kv_version = shelf.kv_version;
         self.kv_out = shelf.kv_out.clone();
         self.show_kv();
+        self.own_requests = shelf
+            .asked_list
+            .iter()
+            .map(|item| (item.chat, item.clone()))
+            .collect();
+        self.invitations = shelf
+            .invitation_list
+            .iter()
+            .map(|item| (item.chat, item.clone()))
+            .collect();
         let mut shown = Vec::with_capacity(shelf.chat_list.len());
         let mut preview_list = Vec::new();
+        // A group's or channel's opened profile is not kept, so the sealed one in the list is opened
+        // again, and the platform gets its name after a restart as it did before.
+        let mut profile_list = Vec::new();
+        let mut setting_list = Vec::new();
         for mut item in shelf.chat_list {
             let state = self.chats.entry(item.chat).or_default();
             state.chat_type = Some(item.chat_type);
+            if grouped(item.chat_type) {
+                state.topics = Some(TopicsBody {
+                    on: item.topics_on,
+                    topic_list: item.topic_list.clone(),
+                });
+                if let Some(profile) = item.profile.clone() {
+                    profile_list.push((item.chat, profile));
+                }
+                setting_list.push((item.chat, item.topic_setting_list.clone()));
+            }
             let mut member_list = vec![me];
             for mark in &item.mark_list {
                 if !member_list.contains(&mark.account) {
@@ -4597,6 +5778,30 @@ impl Client {
             shown.push(item);
         }
         self.event(Event::Chats { chat_list: shown });
+        for (chat, profile) in profile_list {
+            self.chat_profile_in(chat, profile);
+        }
+        for (chat, list) in setting_list {
+            self.topic_settings_in(chat, list);
+        }
+        let asked_list: Vec<RequestItem> = self.own_requests.values().cloned().collect();
+        for request in asked_list {
+            self.event(Event::Asked {
+                chat: request.chat,
+                name: request.name,
+                state: request.state,
+                at: request.at,
+            });
+        }
+        let invitation_list: Vec<InvitationItem> = self.invitations.values().cloned().collect();
+        for invitation in invitation_list {
+            self.know([invitation.inviter]);
+            let invitation_shown = self.invitation_shown(&invitation);
+            self.event(Event::Invitation {
+                chat: invitation.chat,
+                invitation: Some(invitation_shown),
+            });
+        }
         for message in preview_list {
             let chat = message.chat;
             self.open_list(chat, vec![message], false, false);
@@ -4671,12 +5876,28 @@ impl Client {
     fn run_plans(&mut self) {
         let mut ready = Vec::new();
         let mut missing = Vec::new();
+        let mut devices_wanted = Vec::new();
         for (chat, state) in &mut self.chats {
             if state.plan_list.is_empty() {
                 continue;
             }
             let mut all_known = true;
-            for account in &state.member_list {
+            let mut needed = state.member_list.clone();
+            for plan in &state.plan_list {
+                if let Plan::Add { added, .. } = plan {
+                    for (account, _) in added {
+                        needed.push(*account);
+                    }
+                }
+            }
+            // A group's or channel's members come from the server's device list.
+            if state.chat_type.is_some_and(grouped) && !state.members_known {
+                all_known = false;
+                if !state.fetching_devices {
+                    devices_wanted.push(*chat);
+                }
+            }
+            for account in &needed {
                 let known = match self.accounts.get(account) {
                     Some(info) => info.account_public.is_some(),
                     None => false,
@@ -4695,6 +5916,9 @@ impl Client {
         for account in missing {
             self.ask_account(account);
         }
+        for chat in devices_wanted {
+            self.devices_of(chat);
+        }
         for (chat, plan) in ready {
             match plan {
                 Plan::Create { package_list } => self.create(chat, package_list),
@@ -4707,14 +5931,20 @@ impl Client {
     }
 
     fn account_list(&self, chat: Ulid) -> Vec<AccountKey> {
+        match self.chats.get(&chat) {
+            Some(state) => self.account_keys(&state.member_list),
+            None => Vec::new(),
+        }
+    }
+
+    /// The keys of these accounts that are known.
+    fn account_keys(&self, account_list: &[Ulid]) -> Vec<AccountKey> {
         let mut list = Vec::new();
-        if let Some(state) = self.chats.get(&chat) {
-            for account in &state.member_list {
-                if let Some(info) = self.accounts.get(account)
-                    && let Some(key) = account_key(info)
-                {
-                    list.push(key);
-                }
+        for account in account_list {
+            if let Some(info) = self.accounts.get(account)
+                && let Some(key) = account_key(info)
+            {
+                list.push(key);
             }
         }
         list
@@ -4727,8 +5957,18 @@ impl Client {
                 return false;
             };
             match outgoing.item {
-                Item::Typing { chat, on } => {
-                    self.send(&ClientFrame::Typing { chat, on });
+                Item::Typing {
+                    chat,
+                    on,
+                    topic,
+                    thread_seq,
+                } => {
+                    self.send(&ClientFrame::Typing {
+                        chat,
+                        on,
+                        topic,
+                        thread_seq,
+                    });
                 }
                 Item::Content {
                     chat,
@@ -4739,6 +5979,8 @@ impl Client {
                     remove,
                     call,
                     fields,
+                    topic,
+                    thread_seq,
                 } => match self.can_seal(chat) {
                     Seal::Now => {
                         let content = Content {
@@ -4748,11 +5990,9 @@ impl Client {
                             remove,
                             call,
                             fields,
-                            handles: Vec::new(),
-                            sticker: None,
-                            emoji: None,
-                            answer: None,
-                            ack: None,
+                            topic,
+                            thread_seq,
+                            ..Content::default()
                         };
                         self.send_content(outgoing.id, chat, kind, outgoing.pointer_seq, content);
                     }
@@ -4784,7 +6024,7 @@ impl Client {
             None => return Seal::Fail("no_device"),
         };
         let state = self.chat(chat);
-        if state.joining || state.rotating || !state.plan_list.is_empty() {
+        if state.joining || state.rotating || state.catching_up || !state.plan_list.is_empty() {
             return Seal::Wait;
         }
         if !joined {
@@ -4813,6 +6053,8 @@ impl Client {
             remove,
             call,
             fields,
+            topic,
+            thread_seq,
             ..
         } = content;
         let Some(device) = self.device.as_ref() else {
@@ -4841,6 +6083,8 @@ impl Client {
                 pointer_seq
             },
             call_seq: None,
+            topic,
+            thread_seq,
             client_sent_at: self.now,
         };
         let persist = if kind == Kind::Content {
@@ -4926,6 +6170,10 @@ impl Client {
             persist,
             remove,
             profile_key_list: Vec::new(),
+            topic,
+            thread_seq,
+            action: None,
+            chat_key: None,
         };
         self.in_flight.insert(
             local,
@@ -4945,12 +6193,18 @@ impl Client {
 
     /// Gives up on a message and everything pointing at it.
     fn fail(&mut self, chat: Ulid, local: u64, code: &str) {
+        self.fail_waiting(chat, local, code, None);
+    }
+
+    /// Fails a message and what waits on it, with the seconds a slow mode asks to wait.
+    fn fail_waiting(&mut self, chat: Ulid, local: u64, code: &str, seconds: Option<u64>) {
         for dropped in self.queue.drop_with_dependents(local) {
             self.in_flight.remove(&dropped);
             self.event(Event::Failed {
                 chat,
                 local: dropped,
                 code: code.to_string(),
+                seconds,
             });
         }
     }
@@ -4976,6 +6230,7 @@ impl Client {
                     chat,
                     local: dropped,
                     code: code.to_string(),
+                    seconds: None,
                 });
             }
         }
@@ -4997,7 +6252,24 @@ impl Client {
     }
 
     fn send_commit(&mut self, local: u64, chat: Ulid, plan: Plan) {
-        let account_list = self.account_list(chat);
+        // Wrapped to everyone in the chat afterwards: those added in, those taken out not.
+        let mut after = self
+            .chats
+            .get(&chat)
+            .map(|state| state.member_list.clone())
+            .unwrap_or_default();
+        match &plan {
+            Plan::Add { added, .. } => {
+                for (account, _) in added {
+                    if !after.contains(account) {
+                        after.push(*account);
+                    }
+                }
+            }
+            Plan::Remove { removed, .. } => after.retain(|account| !removed.contains(account)),
+            _ => {}
+        }
+        let account_list = self.account_keys(&after);
         let now = self.now;
         let Some(device) = self.device.as_mut() else {
             return;
@@ -5015,7 +6287,10 @@ impl Client {
                 return;
             }
             // A commit that won meanwhile may have added some of these devices already.
-            Plan::Add { package_list } => {
+            Plan::Add {
+                package_list,
+                added,
+            } => {
                 let mut adding = Vec::new();
                 for package in package_list {
                     if !member_set.contains(&package.device) {
@@ -5028,34 +6303,66 @@ impl Client {
                 }
                 Plan::Add {
                     package_list: adding,
+                    added,
                 }
             }
-            plan => plan,
-        };
-        let mut welcome_list = Vec::new();
-        let built = match &plan {
-            Plan::Add { package_list } => {
-                let mut bodies = Vec::new();
-                for package in package_list {
-                    bodies.push(package.body.0.clone());
-                }
-                device.add_devices(chat, &bodies, &account_list)
-            }
-            Plan::Remove { device_list } => {
+            // Or taken out some of these.
+            Plan::Remove {
+                device_list,
+                removed,
+            } => {
                 let mut still_in = Vec::new();
-                for ended in device_list {
-                    if member_set.contains(ended) {
-                        still_in.push(*ended);
+                for gone in device_list {
+                    if member_set.contains(&gone) {
+                        still_in.push(gone);
                     }
                 }
                 if still_in.is_empty() {
                     self.queue.confirm(local, 0);
                     return;
                 }
-                device.remove_devices(chat, &still_in, &account_list)
+                Plan::Remove {
+                    device_list: still_in,
+                    removed,
+                }
+            }
+            plan => plan,
+        };
+        let mut welcome_list = Vec::new();
+        let mut action = None;
+        let built = match &plan {
+            Plan::Add {
+                package_list,
+                added,
+            } => {
+                let mut bodies = Vec::new();
+                for package in package_list {
+                    bodies.push(package.body.0.clone());
+                }
+                if !added.is_empty() {
+                    action = Some(CommitAction {
+                        kind: ActionKind::Add,
+                        account_list: added.iter().map(|(account, _)| *account).collect(),
+                    });
+                }
+                device.add_devices(chat, &bodies, &account_list)
+            }
+            Plan::Remove {
+                device_list,
+                removed,
+            } => {
+                if !removed.is_empty() {
+                    action = Some(CommitAction {
+                        kind: ActionKind::Remove,
+                        account_list: removed.clone(),
+                    });
+                }
+                device.remove_devices(chat, device_list, &account_list)
             }
             Plan::Rotate => device.rotate(chat, &account_list),
-            Plan::Join { group_info } => device.join_external(chat, group_info, now, &account_list),
+            Plan::Join { group_info, invite } => {
+                device.join_external(chat, group_info, now, &account_list, invite.as_ref())
+            }
             Plan::Create { .. } => return,
         };
         let commit = match built {
@@ -5065,7 +6372,7 @@ impl Client {
                 return self.error("commit_failed", &error.to_string());
             }
         };
-        if let (Plan::Add { package_list }, Some(welcome)) = (&plan, &commit.welcome) {
+        if let (Plan::Add { package_list, .. }, Some(welcome)) = (&plan, &commit.welcome) {
             for package in package_list {
                 welcome_list.push(WelcomeItem {
                     device: package.device,
@@ -5073,6 +6380,16 @@ impl Client {
                 });
             }
         }
+        // The people an add brings in, and a device joining by invitation, hold only the new key, so
+        // the chat's profile key goes sealed under it, saved with the commit.
+        let shares_key = matches!(plan, Plan::Join { .. })
+            || action
+                .as_ref()
+                .is_some_and(|action| action.kind == ActionKind::Add);
+        let chat_key = match commit.chat_key.clone() {
+            Some(sealed) if shares_key => Some(Bytes(sealed)),
+            _ => None,
+        };
         let header = Header {
             chat,
             device: device.record().device,
@@ -5082,6 +6399,8 @@ impl Client {
             epoch: Some(commit.epoch),
             pointer_seq: None,
             call_seq: None,
+            topic: None,
+            thread_seq: None,
             client_sent_at: now,
         };
         let signature = match device.sign(&header, &commit.commit) {
@@ -5123,6 +6442,10 @@ impl Client {
                     sealed: Bytes(sealed),
                 })
                 .collect(),
+            topic: None,
+            thread_seq: None,
+            action,
+            chat_key,
         };
         let snapshot = match device.export() {
             Ok(snapshot) => snapshot,
@@ -5177,6 +6500,28 @@ impl Client {
                 wrapped: Bytes(wrap.wrapped.to_vec()),
             });
         }
+        // A group's or channel's first profile and options go with epoch 0's group info, saved in
+        // the same step, so a crash can never leave it nameless. Its profile key is made here and
+        // goes with them, sealed at epoch 0.
+        if let Some(start) = self.chat(chat).start.as_ref() {
+            let profile = start.profile.clone();
+            let options = (start.options != ChatOptions::default()).then(|| start.options.clone());
+            let shared = match self.device.as_mut() {
+                Some(device) => device
+                    .new_chat_key(chat)
+                    .and_then(|()| device.share_chat_key(chat)),
+                None => return,
+            };
+            let Ok((_, key)) = shared else {
+                self.fail_chat(chat, "start_failed");
+                return self.error("start_failed", "The chat's profile key could not be made");
+            };
+            let Some(body) = self.keep_chat_profile(chat, profile) else {
+                self.fail_chat(chat, "start_failed");
+                return;
+            };
+            self.chat(chat).start_profile = Some(StartProfile { body, key, options });
+        }
         let state = self.chat(chat);
         state.known = Some(state.known.unwrap_or(0));
         state.group_info_out = Some((0, created.group_info));
@@ -5197,12 +6542,23 @@ impl Client {
         }
         if let Some((epoch, body)) = state.group_info_out.clone() {
             state.uploading = true;
+            let (chat_profile, chat_key, chat_options) = match &state.start_profile {
+                Some(start) if epoch == 0 => (
+                    Some(Box::new(start.body.clone())),
+                    Some(Bytes(start.key.clone())),
+                    start.options.clone().map(Box::new),
+                ),
+                _ => (None, None, None),
+            };
             let reference = reference();
             let frame = ClientFrame::GroupInfo {
                 reference,
                 chat,
                 epoch,
                 body: Bytes(body),
+                chat_profile,
+                chat_key,
+                chat_options,
             };
             self.ask(frame, reference, Waiting::GroupInfo { chat, epoch });
             return;
@@ -5223,7 +6579,10 @@ impl Client {
             if package_list.is_empty() {
                 self.ready(chat);
             } else {
-                state.plan_list.push(Plan::Add { package_list });
+                state.plan_list.push(Plan::Add {
+                    package_list,
+                    added: Vec::new(),
+                });
             }
         }
     }
@@ -5239,6 +6598,10 @@ impl Client {
             self.take_profile_keys(chat, me, key_list);
         }
         self.profile_pass(chat);
+        if let Some(item) = self.chat(chat).profile_waiting.take() {
+            self.chat_profile_in(chat, item);
+        }
+        self.group_started(chat);
     }
 
     /// Drops this chat's group, keeping its keys, and joins it again by external commit.
@@ -5260,6 +6623,970 @@ impl Client {
             format!("/api/v1/chats/{chat}/group_info"),
             Asked::JoinInfo { chat },
         );
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Groups and channels
+    // ---------------------------------------------------------------------------------------------
+
+    /// Sends a frame answered with `done`, or says it needs a connection.
+    fn ask_done(&mut self, frame: ClientFrame, reference: Ulid, waiting: Waiting) {
+        if !self.ask(frame, reference, waiting) {
+            self.error("offline", "This needs a connection");
+        }
+    }
+
+    /// Asks the server for the chat's id, then builds its group with this account its owner. Its
+    /// profile, options and people follow once the group runs, in [`Client::ready`].
+    fn create_group(
+        &mut self,
+        chat_type: ChatType,
+        mut start: GroupStart,
+        topics: Option<bool>,
+        findable: bool,
+    ) {
+        if !grouped(chat_type) {
+            return self.error("bad_chat_type", "CreateChat makes a group or a channel");
+        }
+        let profile = match checked_chat_profile(start.profile) {
+            Ok(profile) => profile,
+            Err(message) => return self.error("bad_profile", message),
+        };
+        let body = CreateChatBody {
+            account: None,
+            chat_type: Some(chat_type),
+            topics,
+            findable: findable.then(|| FindableItem {
+                name: profile.name.clone(),
+                bio: profile.bio.clone(),
+            }),
+        };
+        start.profile = profile;
+        self.request(
+            "POST",
+            "/api/v1/chats".to_string(),
+            Some(&body),
+            Asked::CreateGroup {
+                chat_type,
+                start: Box::new(start),
+            },
+        );
+    }
+
+    /// The server made the chat: this device starts its group, alone in it, as its owner.
+    fn group_created(&mut self, chat: Ulid, chat_type: ChatType, mut start: GroupStart) {
+        let Some(me) = self.account else {
+            return;
+        };
+        self.event(Event::Started { chat, account: me });
+        let state = self.chat(chat);
+        state.chat_type = Some(chat_type);
+        state.member_list = vec![me];
+        state.members_known = true;
+        let photo = start.photo.take();
+        state.start = Some(start);
+        state.joining = true;
+        // A photo goes up first, so the first profile anyone gets already names it.
+        match photo {
+            Some(photo) => self.upload_chat_photo(chat, None, photo, true),
+            None => self.start_group(chat),
+        }
+    }
+
+    fn start_group(&mut self, chat: Ulid) {
+        self.chat(chat).plan_list.push(Plan::Create {
+            package_list: Vec::new(),
+        });
+    }
+
+    /// A group's or channel's photo, or one of its topics', goes up as one of its files, of one
+    /// chunk.
+    fn upload_chat_photo(
+        &mut self,
+        chat: Ulid,
+        topic: Option<Ulid>,
+        photo: PreparedPhoto,
+        starting: bool,
+    ) {
+        let body = CreateFileBody {
+            kind: ContentKind::Image,
+            size: photo.sealed.len() as u64,
+            chunks: 1,
+            encrypted: None,
+        };
+        self.request(
+            "POST",
+            format!("/api/v1/chats/{chat}/files"),
+            Some(&body),
+            Asked::ChatPhotoFile {
+                chat,
+                topic,
+                photo: Box::new(photo),
+                starting,
+            },
+        );
+    }
+
+    /// The photo is up: a new chat's first profile names it and its group starts, and an existing
+    /// chat's or topic's profile is sealed again naming it.
+    fn chat_photo_up(
+        &mut self,
+        chat: Ulid,
+        topic: Option<Ulid>,
+        file: Ulid,
+        photo: PreparedPhoto,
+        starting: bool,
+    ) {
+        let named = ProfilePhoto {
+            id: file,
+            key: Bytes(photo.key.to_vec()),
+            size: photo.size,
+            blurhash: photo.blurhash,
+        };
+        if let Some(topic) = topic {
+            let mut profile = self
+                .chat(chat)
+                .topic_profiles
+                .get(&topic)
+                .map(|(profile, _)| profile.clone())
+                .unwrap_or_default();
+            profile.photo = Some(named);
+            return self.send_topic_profile(chat, topic, profile);
+        }
+        if starting {
+            if let Some(start) = self.chat(chat).start.as_mut() {
+                start.profile.photo = Some(named);
+            }
+            return self.start_group(chat);
+        }
+        let Some((mut profile, _)) = self.chat(chat).profile.clone() else {
+            return self.error("not_joined", "This chat's profile is not known yet");
+        };
+        profile.photo = Some(named);
+        self.send_chat_profile(chat, profile);
+    }
+
+    /// A photo that did not go up: a new chat starts without it, and the person is told.
+    fn chat_photo_failed(&mut self, chat: Ulid, starting: bool, code: &str, message: &str) {
+        if starting {
+            self.error("photo_failed", message);
+            return self.start_group(chat);
+        }
+        self.error(code, message);
+    }
+
+    /// Fetches the one chunk of the photo a group's or channel's profile names, or one of its
+    /// topics', once at a time.
+    fn ask_chat_photo(&mut self, chat: Ulid, topic: Option<Ulid>) {
+        let Some(photo) = self.named_photo(chat, topic).map(|photo| photo.id) else {
+            return;
+        };
+        if !self.photo_asked.insert(photo) {
+            return;
+        }
+        self.issue(Request {
+            method: "GET".to_string(),
+            path: format!("/api/v1/files/{photo}/chunks/0"),
+            body: None,
+            bytes: None,
+            raw: true,
+            asked: Asked::ChatPhotoGet { chat, topic, photo },
+            attempt: 0,
+        });
+    }
+
+    /// The photo a chat's profile names, or one of its topics'.
+    fn named_photo(&self, chat: Ulid, topic: Option<Ulid>) -> Option<ProfilePhoto> {
+        let state = self.chats.get(&chat)?;
+        match topic {
+            Some(topic) => state.topic_profiles.get(&topic)?.0.photo.clone(),
+            None => state.profile.as_ref()?.0.photo.clone(),
+        }
+    }
+
+    fn chat_photo_got(&mut self, chat: Ulid, topic: Option<Ulid>, photo: Ulid, sealed: &[u8]) {
+        let Some(named) = self
+            .named_photo(chat, topic)
+            .filter(|named| named.id == photo)
+        else {
+            return;
+        };
+        let bytes = match file::open_chunk(&named.key.0, 0, true, sealed) {
+            Ok(jpeg) => Bytes(jpeg.to_vec()),
+            Err(error) => return self.error("bad_photo", &error.to_string()),
+        };
+        match topic {
+            Some(topic) => self.event(Event::TopicPhoto {
+                chat,
+                topic,
+                photo,
+                bytes,
+            }),
+            None => self.event(Event::ChatPhoto { chat, photo, bytes }),
+        }
+    }
+
+    /// A new group's people are added once it runs, its profile and options having gone up with
+    /// epoch 0's group info.
+    fn group_started(&mut self, chat: Ulid) {
+        let Some(start) = self.chat(chat).start.take() else {
+            return;
+        };
+        if !start.account_list.is_empty() {
+            self.add_members(chat, start.account_list, start.note);
+        }
+    }
+
+    /// Claims a package for each device of each new account, then adds them all in one commit.
+    fn add_members(&mut self, chat: Ulid, account_list: Vec<Ulid>, note: Option<String>) {
+        let me = self.account;
+        let state = self.chat(chat);
+        let mut adding = Vec::new();
+        for account in account_list {
+            if Some(account) != me
+                && !state.member_list.contains(&account)
+                && !adding.contains(&account)
+            {
+                adding.push(account);
+            }
+        }
+        if adding.is_empty() {
+            return self.error("already_member", "Everyone named is in this chat already");
+        }
+        for account in &adding {
+            if !self.accounts.contains_key(account) {
+                self.ask_account(*account);
+            }
+            match &note {
+                Some(note) => self.invite_notes.insert((chat, *account), note.clone()),
+                None => self.invite_notes.remove(&(chat, *account)),
+            };
+        }
+        self.claim_add(
+            chat,
+            AddClaim {
+                account_list: adding,
+                ..AddClaim::default()
+            },
+        );
+    }
+
+    /// Claims the next account's packages, or plans the add once every account was asked.
+    fn claim_add(&mut self, chat: Ulid, mut claim: AddClaim) {
+        if claim.account_list.is_empty() {
+            if !claim.package_list.is_empty() {
+                self.chat(chat).plan_list.push(Plan::Add {
+                    package_list: claim.package_list,
+                    added: claim.added,
+                });
+            }
+            return;
+        }
+        let account = claim.account_list.remove(0);
+        // Naming the chat lets the server refuse someone added by invitation only before any of
+        // their one-use packages goes.
+        let body = ClaimBody { chat: Some(chat) };
+        self.request(
+            "POST",
+            format!("/api/v1/accounts/{account}/key_packages/claim"),
+            Some(&body),
+            Asked::AddClaim {
+                chat,
+                account,
+                claim,
+            },
+        );
+    }
+
+    /// One account's packages came. An account none of whose devices has one left cannot be added
+    /// yet, and is left out.
+    fn add_claimed(
+        &mut self,
+        chat: Ulid,
+        account: Ulid,
+        mut claim: AddClaim,
+        package_list: Vec<KeyPackageItem>,
+    ) {
+        if package_list.is_empty() {
+            self.error(
+                "no_key_packages",
+                "Someone named has no device that can be added yet",
+            );
+        } else {
+            claim.added.push((
+                account,
+                package_list.iter().map(|item| item.device).collect(),
+            ));
+            claim.package_list.extend(package_list);
+        }
+        self.claim_add(chat, claim);
+    }
+
+    /// Takes these accounts out in one commit, every device of theirs in the group.
+    fn remove_members(&mut self, chat: Ulid, account_list: Vec<Ulid>) {
+        let Some(device) = self.device.as_ref() else {
+            return self.error("no_device", "This client has no device");
+        };
+        let Ok(member_list) = device.member_list(chat) else {
+            return self.error("not_joined", "This device is not in the chat yet");
+        };
+        let mut device_list = Vec::new();
+        for member in member_list {
+            if account_list.contains(&member.account) {
+                device_list.push(member.device);
+            }
+        }
+        if device_list.is_empty() {
+            return self.error("not_member", "Nobody named is in this chat");
+        }
+        self.chat(chat).plan_list.push(Plan::Remove {
+            device_list,
+            removed: account_list,
+        });
+    }
+
+    /// Some accounts named in an add take invitations only: the commit goes, each of them is
+    /// invited, and the rest are added again with the packages already claimed.
+    fn invite_needed(&mut self, chat: Ulid, local: u64, plan: Plan, account_list: Vec<Ulid>) {
+        self.commit_busy = false;
+        if let Some(device) = self.device.as_mut() {
+            let _ = device.commit_rejected(chat);
+        }
+        self.dirty = true;
+        self.in_flight.remove(&local);
+        self.queue.drop_with_dependents(local);
+        for account in &account_list {
+            self.invite(chat, *account);
+        }
+        let Plan::Add {
+            package_list,
+            added,
+        } = plan
+        else {
+            return;
+        };
+        let mut kept = Vec::new();
+        let mut kept_devices = Vec::new();
+        for (account, device_list) in added {
+            if !account_list.contains(&account) {
+                kept_devices.extend(device_list.iter().copied());
+                kept.push((account, device_list));
+            }
+        }
+        if kept.is_empty() {
+            return;
+        }
+        let package_list = package_list
+            .into_iter()
+            .filter(|package| kept_devices.contains(&package.device))
+            .collect();
+        self.chat(chat).plan_list.push(Plan::Add {
+            package_list,
+            added: kept,
+        });
+    }
+
+    /// Invites an account whose switch turns every add into an invitation, signed by this device
+    /// so members accept the join it makes.
+    /// The group's name and its photo's BlurHash are sealed to the account's invite key, once its
+    /// stamp checks out against the pinned master key, so it waits for the account's keys.
+    fn invite(&mut self, chat: Ulid, account: Ulid) {
+        let Some(info) = self.accounts.get(&account) else {
+            self.inviting.push((chat, account));
+            return self.ask_account(account);
+        };
+        let (Some(master), Some(public), Some(stamp)) =
+            (&info.master_public, &info.invite_public, &info.invite_stamp)
+        else {
+            return self.error("no_keys", "That account has not set up its words yet");
+        };
+        let (Some(master_public), Some(invite_public), Some(stamp)) =
+            (fixed(&master.0), fixed(&public.0), fixed(&stamp.0))
+        else {
+            return self.error("bad_keys", "That account's keys are not the right size");
+        };
+        let invitee = InviteKey {
+            account,
+            invite_public,
+            master_public,
+            stamp,
+        };
+        let Some((profile, _)) = self
+            .chats
+            .get(&chat)
+            .and_then(|state| state.profile.as_ref())
+        else {
+            return self.error("no_profile", "This chat's name is not known yet");
+        };
+        let Some(Ok(key)) = self.device.as_ref().map(|device| device.chat_key(chat)) else {
+            return self.error("no_profile", "This chat's profile key is not known yet");
+        };
+        let plain = InvitationPlain {
+            name: profile.name.clone(),
+            blurhash: profile.photo.as_ref().map(|photo| photo.blurhash.clone()),
+            key: Bytes(key.to_vec()),
+            note: self.invite_notes.remove(&(chat, account)),
+        };
+        let Ok(plain) = serde_json::to_vec(&plain) else {
+            return self.error("internal", "An invitation could not be written");
+        };
+        let Some(device) = self.device.as_mut() else {
+            return;
+        };
+        let sealed = match device.seal_invitation(chat, &invitee, &plain) {
+            Ok(sealed) => sealed,
+            Err(error) => return self.error("seal_failed", &error.to_string()),
+        };
+        let signature = match device.sign_invite(&chat, &account) {
+            Ok(signature) => signature,
+            Err(error) => return self.error("sign_failed", &error.to_string()),
+        };
+        self.dirty = true;
+        let reference = reference();
+        let frame = ClientFrame::Invite {
+            reference,
+            chat,
+            account,
+            sealed: Bytes(sealed),
+            signature: Bytes(signature.to_vec()),
+        };
+        self.ask_done(frame, reference, Waiting::Done);
+    }
+
+    /// Accepted, this account is a member on the server, and this device joins by itself with the
+    /// invitation.
+    fn invite_answered(&mut self, chat: Ulid, accept: bool) {
+        if !accept {
+            self.invitations.remove(&chat);
+            self.dirty = true;
+            return self.event(Event::Invitation {
+                chat,
+                invitation: None,
+            });
+        }
+        let chat_type = self.invitations.get(&chat).map(|item| item.chat_type);
+        let state = self.chat(chat);
+        state.chat_type = chat_type;
+        state.members_known = false;
+        if state.joining {
+            return;
+        }
+        state.joining = true;
+        self.devices_of(chat);
+        self.get(
+            format!("/api/v1/chats/{chat}/group_info"),
+            Asked::JoinInfo { chat },
+        );
+    }
+
+    /// This account is out of the chat: its group, keys and state go, and the platform is told.
+    fn drop_chat(&mut self, chat: Ulid) {
+        if let Some(device) = self.device.as_mut()
+            && device.epoch(chat).is_ok()
+        {
+            let _ = device.forget_chat(chat);
+        }
+        self.chats.remove(&chat);
+        self.invitations.remove(&chat);
+        self.chat_cache.retain(|item| item.chat != chat);
+        self.dirty = true;
+        self.event(Event::ChatLeft { chat });
+    }
+
+    /// An invitation with its sealed name and BlurHash opened, or without them if they do not open.
+    fn invitation_shown(&self, item: &InvitationItem) -> InvitationShown {
+        let plain = self
+            .device
+            .as_ref()
+            .and_then(|device| device.open_invitation(item.chat, &item.sealed.0).ok())
+            .and_then(|opened| serde_json::from_slice::<InvitationPlain>(&opened).ok());
+        let (name, blurhash, note) = match plain {
+            Some(plain) => (Some(plain.name), plain.blurhash, plain.note),
+            None => (None, None, None),
+        };
+        InvitationShown {
+            chat_type: item.chat_type,
+            inviter: item.inviter,
+            name,
+            blurhash,
+            note,
+            at: item.at,
+        }
+    }
+
+    /// This account's own join request changed, or was listed.
+    fn asked(&mut self, request: RequestItem) {
+        if request.state == RequestState::Gone {
+            self.own_requests.remove(&request.chat);
+        } else {
+            self.own_requests.insert(request.chat, request.clone());
+        }
+        self.dirty = true;
+        self.event(Event::Asked {
+            chat: request.chat,
+            name: request.name,
+            state: request.state,
+            at: request.at,
+        });
+    }
+
+    /// Something the server wrote in a group or channel. Membership changes move what this device
+    /// knows of the members: someone leaving or removed is taken out of the group by the next
+    /// member online, and this account taken out drops the chat. From `sync`, this account's own
+    /// leaving drops nothing while the chat list still has the chat, as it came back since.
+    fn chat_event(&mut self, event: ChatEvent, live: bool) {
+        self.know([event.actor].into_iter().chain(account_target(&event)));
+        let chat = event.chat;
+        let me = self.account;
+        let listed = self.chat_cache.iter().any(|item| item.chat == chat);
+        let about_me = event.target.is_some() && event.target == me && (live || !listed);
+        match event.action {
+            ChatAction::ChatRemoved => {
+                self.show_chat_event(event);
+                return self.drop_chat(chat);
+            }
+            ChatAction::Left | ChatAction::Removed if about_me => {
+                self.show_chat_event(event);
+                return self.drop_chat(chat);
+            }
+            ChatAction::Left | ChatAction::Removed => {
+                if let Some(target) = event.target
+                    && Some(target) != me
+                {
+                    self.chat(chat)
+                        .member_list
+                        .retain(|account| *account != target);
+                }
+                // The leaver's devices are still in the group until a member commits it.
+                if event.action == ChatAction::Left {
+                    self.chat(chat).members_known = false;
+                    self.devices_of(chat);
+                }
+            }
+            ChatAction::Added | ChatAction::LetIn | ChatAction::Joined => {
+                if let Some(target) = event.target {
+                    let state = self.chat(chat);
+                    if !state.member_list.contains(&target) {
+                        state.member_list.push(target);
+                    }
+                    if !self.accounts.contains_key(&target) {
+                        self.ask_account(target);
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.show_chat_event(event);
+    }
+
+    /// Hands a chat event to the platform with its copies opened, never their ciphertext.
+    fn show_chat_event(&mut self, mut event: ChatEvent) {
+        let copies = std::mem::take(&mut event.copy_list);
+        let copy_list = copies
+            .iter()
+            .filter_map(|copy| self.open_copy(copy))
+            .collect();
+        self.event(Event::ChatEvent { event, copy_list });
+    }
+
+    /// One copy a history row kept: its signature checked against its device, then opened with the
+    /// epoch key this device holds.
+    fn open_copy(&self, message: &MessageFrame) -> Option<Shown> {
+        let known = self.devices.get(&message.device?)?;
+        let signature = fixed::<64>(&message.signature.as_ref()?.0)?;
+        let header = message.header()?;
+        let body = message
+            .body
+            .as_ref()
+            .map(|body| body.0.clone())
+            .unwrap_or_default();
+        verify_message(&header, &body, &signature, &known.public).ok()?;
+        let content = if header.encrypted {
+            let plaintext = self
+                .device
+                .as_ref()?
+                .open(&header, &body, &signature, &known.public)
+                .ok()?;
+            content_of(&plaintext, message.content_kind)
+        } else {
+            content_of(&body, message.content_kind)
+        };
+        let mine = self.account == Some(known.account);
+        Some(shown(message, Some(known.account), mine, content, None))
+    }
+
+    /// Seals the profile under the chat's current key and sends it, keeping it as the one shown.
+    fn send_chat_profile(&mut self, chat: Ulid, profile: ChatProfilePlain) {
+        let Some(body) = self.keep_chat_profile(chat, profile) else {
+            return;
+        };
+        let reference = reference();
+        let frame = ClientFrame::ChatProfile {
+            reference,
+            chat,
+            profile: body,
+        };
+        self.ask_done(frame, reference, Waiting::Done);
+    }
+
+    /// Seals the profile under the chat's profile key and keeps it as the one shown, handing back
+    /// what goes up, which names its photo so the server keeps that file.
+    fn keep_chat_profile(
+        &mut self,
+        chat: Ulid,
+        profile: ChatProfilePlain,
+    ) -> Option<ChatProfileBody> {
+        let device = self.device.as_ref()?;
+        let Ok(plain) = serde_json::to_vec(&profile) else {
+            self.error("internal", "A profile could not be written");
+            return None;
+        };
+        let (sealed, signature) = match device.seal_chat_profile(chat, None, &plain) {
+            Ok(sealed) => sealed,
+            Err(error) => {
+                self.error("seal_failed", &error.to_string());
+                return None;
+            }
+        };
+        let photo = profile.photo.as_ref().map(|photo| photo.id);
+        let state = self.chat(chat);
+        let version = state.profile.as_ref().map_or(0, |(_, version)| *version);
+        state.profile = Some((profile, version));
+        self.dirty = true;
+        Some(ChatProfileBody {
+            sealed: Bytes(sealed),
+            signature: Bytes(signature.to_vec()),
+            photo,
+        })
+    }
+
+    /// A profile from the server: checked against its device when that is known, opened, kept and
+    /// shown. Its profile key is taken from the share beside it when this device has none, and one
+    /// whose share is at an epoch this device cannot open yet waits until the chat is ready.
+    fn chat_profile_in(&mut self, chat: Ulid, item: ChatProfileItem) {
+        let Some(device) = self.device.as_mut() else {
+            return;
+        };
+        if !device.has_chat_key(chat)
+            && device
+                .take_chat_key(chat, item.key_epoch, &item.key.0)
+                .is_err()
+        {
+            self.chat(chat).profile_waiting = Some(item);
+            return;
+        }
+        self.dirty = true;
+        let Some(device) = self.device.as_ref() else {
+            return;
+        };
+        if let (Some(known), Some(signature)) = (
+            self.devices.get(&item.device),
+            fixed::<64>(&item.signature.0),
+        ) && crate::mls::verify_chat_profile(
+            &known.public,
+            &chat,
+            None,
+            &item.sealed.0,
+            &signature,
+        )
+        .is_err()
+        {
+            return self.error(
+                "bad_signature",
+                "A chat's profile is not signed by its device",
+            );
+        }
+        let opened = match device.open_chat_profile(chat, None, &item.sealed.0) {
+            Ok(opened) => opened,
+            Err(_) => {
+                self.chat(chat).profile_waiting = Some(item);
+                return;
+            }
+        };
+        let Ok(profile) = serde_json::from_slice::<ChatProfilePlain>(&opened) else {
+            return self.error("bad_profile", "A chat's profile could not be read");
+        };
+        let shown = ShownChatProfile {
+            name: profile.name.clone(),
+            bio: profile.bio.clone(),
+            link_list: profile.link_list.clone(),
+            rules: profile.rules.clone(),
+            topic_list: profile.topic_list.clone(),
+            photo: profile.photo.as_ref().map(|photo| ShownChatPhoto {
+                id: photo.id,
+                blurhash: photo.blurhash.clone(),
+            }),
+            version: item.version,
+        };
+        self.chat(chat).profile = Some((profile, item.version));
+        self.dirty = true;
+        self.event(Event::ChatProfile {
+            chat,
+            profile: shown,
+        });
+    }
+
+    /// Changes a group's or channel's name, bio and links, keeping its topics' names and photo.
+    fn edit_chat_profile(&mut self, chat: Ulid, profile: ChatProfilePlain) {
+        let mut profile = match checked_chat_profile(profile) {
+            Ok(profile) => profile,
+            Err(message) => return self.error("bad_profile", message),
+        };
+        if let Some((current, _)) = &self.chat(chat).profile {
+            profile.topic_list = current.topic_list.clone();
+            profile.photo = current.photo.clone();
+        }
+        self.send_chat_profile(chat, profile);
+    }
+
+    /// Seals a topic's profile under the chat's profile key and sends it, keeping it as the one
+    /// shown. It names its photo, so the server keeps that file.
+    fn send_topic_profile(&mut self, chat: Ulid, topic: Ulid, profile: TopicProfilePlain) {
+        let Some(device) = self.device.as_ref() else {
+            return;
+        };
+        let Ok(plain) = serde_json::to_vec(&profile) else {
+            return self.error("internal", "A profile could not be written");
+        };
+        let (sealed, signature) = match device.seal_chat_profile(chat, Some(topic), &plain) {
+            Ok(sealed) => sealed,
+            Err(error) => return self.error("seal_failed", &error.to_string()),
+        };
+        let photo = profile.photo.as_ref().map(|photo| photo.id);
+        let state = self.chat(chat);
+        let version = state
+            .topic_profiles
+            .get(&topic)
+            .map_or(0, |(_, version)| *version);
+        state.topic_profiles.insert(topic, (profile, version));
+        let reference = reference();
+        let frame = ClientFrame::TopicProfile {
+            reference,
+            chat,
+            topic,
+            profile: Box::new(ChatProfileBody {
+                sealed: Bytes(sealed),
+                signature: Bytes(signature.to_vec()),
+                photo,
+            }),
+        };
+        self.ask_done(frame, reference, Waiting::Done);
+    }
+
+    /// A topic's sealed profile from the server: checked against its device when that is known,
+    /// opened under the chat's profile key, kept and shown. One this device cannot open yet stays
+    /// unshown until the next list brings it again.
+    fn topic_profile_in(&mut self, chat: Ulid, topic: Ulid, item: TopicProfileItem) {
+        let known = self
+            .chats
+            .get(&chat)
+            .and_then(|state| state.topic_profiles.get(&topic))
+            .map(|(_, version)| *version);
+        if known == Some(item.version) {
+            return;
+        }
+        let Some(device) = self.device.as_ref() else {
+            return;
+        };
+        if let (Some(known), Some(signature)) = (
+            self.devices.get(&item.device),
+            fixed::<64>(&item.signature.0),
+        ) && crate::mls::verify_chat_profile(
+            &known.public,
+            &chat,
+            Some(topic),
+            &item.sealed.0,
+            &signature,
+        )
+        .is_err()
+        {
+            return self.error(
+                "bad_signature",
+                "A topic's profile is not signed by its device",
+            );
+        }
+        let Ok(opened) = device.open_chat_profile(chat, Some(topic), &item.sealed.0) else {
+            return;
+        };
+        let Ok(profile) = serde_json::from_slice::<TopicProfilePlain>(&opened) else {
+            return self.error("bad_profile", "A topic's profile could not be read");
+        };
+        let shown = ShownTopicProfile {
+            bio: profile.bio.clone(),
+            link_list: profile.link_list.clone(),
+            rules: profile.rules.clone(),
+            photo: profile.photo.as_ref().map(|photo| ShownChatPhoto {
+                id: photo.id,
+                blurhash: photo.blurhash.clone(),
+            }),
+            version: item.version,
+        };
+        self.chat(chat)
+            .topic_profiles
+            .insert(topic, (profile, item.version));
+        self.event(Event::TopicProfile {
+            chat,
+            topic,
+            profile: shown,
+        });
+    }
+
+    /// Topics' settings as a `chats` entry lists them, every one this account may see; a live topic
+    /// left out is hidden from it. One that was hidden and now shows again had its messages
+    /// withheld, so the chat is synced from its start.
+    fn topic_settings_in(&mut self, chat: Ulid, setting_list: Vec<TopicItem>) {
+        let state = self.chat(chat);
+        let listed: Vec<Ulid> = state
+            .topics
+            .as_ref()
+            .map(|topics| topics.topic_list.clone())
+            .unwrap_or_default();
+        let unhidden: Vec<Ulid> = setting_list
+            .iter()
+            .map(|item| item.topic)
+            .filter(|topic| state.hidden_topics.contains(topic))
+            .collect();
+        let mut profile_list = Vec::new();
+        let mut settings = HashMap::with_capacity(setting_list.len());
+        for mut item in setting_list {
+            if let Some(profile) = item.profile.take() {
+                profile_list.push((item.topic, profile));
+            }
+            settings.insert(item.topic, item);
+        }
+        state.hidden_topics = listed
+            .into_iter()
+            .filter(|topic| !settings.contains_key(topic))
+            .collect();
+        state.topic_settings = settings;
+        let live: HashSet<Ulid> = state.topic_settings.keys().copied().collect();
+        state.topic_profiles.retain(|topic, _| live.contains(topic));
+        for (topic, profile) in profile_list {
+            self.topic_profile_in(chat, topic, profile);
+        }
+        if !unhidden.is_empty() {
+            self.chat(chat).refill.extend(unhidden);
+            self.start_sync(Some(chat), None);
+        }
+    }
+
+    /// One topic's settings, pushed live. One hidden from this account comes with nothing else and
+    /// is dropped; one shown again after that syncs the chat from its start.
+    fn topic_in(&mut self, chat: Ulid, mut item: TopicItem) {
+        let hidden_from_me =
+            item.options.hidden && item.mod_list.is_empty() && item.profile.is_none();
+        let state = self.chat(chat);
+        let profile = item.profile.take();
+        let shown_again = !item.options.hidden && state.hidden_topics.remove(&item.topic);
+        if hidden_from_me {
+            state.hidden_topics.insert(item.topic);
+            state.topic_settings.remove(&item.topic);
+            state.topic_profiles.remove(&item.topic);
+        } else {
+            state.topic_settings.insert(item.topic, item.clone());
+        }
+        self.event(Event::TopicOptions {
+            chat,
+            topic: item.topic,
+            options: item.options,
+            mod_list: item.mod_list,
+        });
+        if let Some(profile) = profile {
+            self.topic_profile_in(chat, item.topic, profile);
+        }
+        if shown_again {
+            self.chat(chat).refill.insert(item.topic);
+            self.start_sync(Some(chat), None);
+        }
+    }
+
+    /// Topics on or off and the live ones in order, then the profile resealed with their names.
+    fn set_topics(&mut self, chat: Ulid, on: bool, topic_list: Vec<TopicName>) {
+        let mut named = Vec::with_capacity(topic_list.len());
+        for (place, topic) in topic_list.into_iter().enumerate() {
+            let name = topic.name.trim().to_string();
+            let length = name.chars().count();
+            if length == 0 || length > TOPIC_NAME_CHARS {
+                return self.error("bad_topic", "A topic's name is 1 to 32 characters");
+            }
+            named.push(TopicName {
+                id: topic.id,
+                name,
+                place: place as u64,
+            });
+        }
+        let Some((mut profile, _)) = self.chat(chat).profile.clone() else {
+            return self.error("not_joined", "This chat's profile is not known yet");
+        };
+        let topics = TopicsBody {
+            on,
+            topic_list: named.iter().map(|topic| topic.id).collect(),
+        };
+        let removed = self.chat(chat).topics.as_ref().is_some_and(|old| {
+            old.topic_list
+                .iter()
+                .any(|topic| !topics.topic_list.contains(topic))
+        });
+        let reference = reference();
+        let frame = ClientFrame::Topics {
+            reference,
+            chat,
+            topics: topics.clone(),
+        };
+        self.ask_done(
+            frame,
+            reference,
+            Waiting::TopicsSaved {
+                chat,
+                on,
+                topic_list: named.clone(),
+                removed,
+            },
+        );
+        self.chat(chat).topics = Some(topics);
+        profile.topic_list = named;
+        self.send_chat_profile(chat, profile);
+    }
+
+    /// The live topics with the names the profile gives them.
+    fn named_topics(&mut self, chat: Ulid, topic_list: &[Ulid]) -> Vec<TopicName> {
+        let state = self.chat(chat);
+        let mut named = Vec::with_capacity(topic_list.len());
+        for (place, id) in topic_list.iter().enumerate() {
+            let name = state
+                .profile
+                .as_ref()
+                .and_then(|(profile, _)| profile.topic_list.iter().find(|topic| topic.id == *id))
+                .map(|topic| topic.name.clone())
+                .unwrap_or_default();
+            named.push(TopicName {
+                id: *id,
+                name,
+                place: place as u64,
+            });
+        }
+        named
+    }
+
+    /// Seen up to a message inside a topic or a thread, sent at once with no retry, as the main
+    /// list's position is the one counted for the chat.
+    fn seen_in_place(
+        &mut self,
+        chat: Ulid,
+        up_to_seq: u64,
+        topic: Option<Ulid>,
+        thread: Option<u64>,
+    ) {
+        let reference = reference();
+        let frame = ClientFrame::Seen {
+            reference,
+            chat,
+            up_to_seq,
+            client_seen_at: self.now,
+            topic,
+            thread_seq: thread,
+        };
+        self.ask(frame, reference, Waiting::Done);
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -5445,6 +7772,104 @@ impl Client {
 
     fn frame(&mut self, frame: ServerFrame) {
         match frame {
+            ServerFrame::ChatEvent(event) => {
+                let last = SyncPosition {
+                    at: event.server_at,
+                    chat: event.chat,
+                    seq: 0,
+                    n: event.n,
+                };
+                let chat = event.chat;
+                self.chat_event((*event).clone(), true);
+                // A chat this event took away is wiped from the archive, not kept in it.
+                if !self.chats.contains_key(&chat) {
+                    return;
+                }
+                let rows = Rows {
+                    message_list: Vec::new(),
+                    call_list: Vec::new(),
+                    chat_event_list: vec![*event],
+                };
+                self.save_rows(rows, Some(last), None);
+            }
+            ServerFrame::Members {
+                reference,
+                chat,
+                member_list,
+            } => {
+                if self.waiting.remove(&reference).is_some() {
+                    self.know(member_list.iter().map(|item| item.account));
+                    self.event(Event::Members { chat, member_list });
+                }
+            }
+            ServerFrame::TopicId {
+                reference,
+                chat,
+                topic,
+            } => {
+                if self.waiting.remove(&reference).is_some() {
+                    self.event(Event::TopicId { chat, topic });
+                }
+            }
+            ServerFrame::Topics { chat, topics } => {
+                let topic_list = self.named_topics(chat, &topics.topic_list);
+                let on = topics.on;
+                let state = self.chat(chat);
+                // A removed topic's messages were wiped with no delete sent, so this chat is synced
+                // to drop them from the archive at once.
+                let removed = state.topics.as_ref().is_some_and(|old| {
+                    old.topic_list
+                        .iter()
+                        .any(|topic| !topics.topic_list.contains(topic))
+                });
+                state.topics = Some(topics);
+                self.dirty = true;
+                if removed {
+                    let since = self.chat(chat).known_at.or(self.since);
+                    self.start_sync(Some(chat), since);
+                }
+                self.event(Event::Topics {
+                    chat,
+                    on,
+                    topic_list,
+                });
+            }
+            ServerFrame::ChatProfile { chat, profile } => self.chat_profile_in(chat, profile),
+            ServerFrame::Topic { chat, item } => self.topic_in(chat, *item),
+            ServerFrame::ChatOptions { chat, options } => {
+                self.event(Event::ChatOptions { chat, options })
+            }
+            ServerFrame::Findable { chat, findable } => {
+                let findable = match (findable.findable, findable.name) {
+                    (true, Some(name)) => Some(FindableItem {
+                        name,
+                        bio: findable.bio,
+                    }),
+                    _ => None,
+                };
+                self.event(Event::Findable { chat, findable });
+            }
+            ServerFrame::JoinRequest(request) => {
+                if Some(request.account) == self.account {
+                    self.asked(*request);
+                } else {
+                    self.know([request.account]);
+                    self.event(Event::JoinRequest { request: *request });
+                }
+            }
+            ServerFrame::Invitation { chat, invitation } => {
+                self.know(invitation.iter().map(|item| item.inviter));
+                let shown = invitation.as_ref().map(|item| self.invitation_shown(item));
+                match invitation {
+                    Some(item) => self.invitations.insert(chat, item),
+                    None => self.invitations.remove(&chat),
+                };
+                self.dirty = true;
+                self.event(Event::Invitation {
+                    chat,
+                    invitation: shown,
+                });
+            }
             ServerFrame::Features {
                 ping_after,
                 ping_every,
@@ -5478,9 +7903,19 @@ impl Client {
                 message,
                 version,
                 kv_list,
+                account_list,
+                seconds,
                 ..
             } => match self.waiting.remove(&reference) {
                 Some(Waiting::KvSet) => self.kv_refused(&code, &message, version, kv_list),
+                Some(Waiting::Content { chat, local }) if seconds.is_some() => {
+                    self.fail_waiting(chat, local, &code, seconds);
+                }
+                Some(Waiting::Commit { chat, local, plan })
+                    if code == "invite_needed" && account_list.is_some() =>
+                {
+                    self.invite_needed(chat, local, plan, account_list.unwrap_or_default());
+                }
                 Some(waiting) => self.refused(waiting, &code, &message),
                 None => {}
             },
@@ -5532,16 +7967,83 @@ impl Client {
                 call_list,
                 more,
                 chat_folders,
+                chat_event_list,
+                asked_list,
+                invitation_list,
             } => {
                 if let Some(folders) = chat_folders {
                     self.folders_listed(folders);
                 }
-                self.synced(reference, chat_list, message_list, call_list, more)
+                // Pending requests and invitations come whole with the first page only, so one shown
+                // before and no longer listed, expired or its chat removed meanwhile, is shown gone.
+                // An invitation being accepted stays: the server dropped it, and the join still
+                // carries its signature.
+                let first = matches!(self.waiting.get(&reference), Some(Waiting::Sync { .. }))
+                    && self.sync_run.as_ref().is_some_and(|run| run.first);
+                if first {
+                    let gone: Vec<RequestItem> = self
+                        .own_requests
+                        .values()
+                        .filter(|item| !asked_list.iter().any(|listed| listed.chat == item.chat))
+                        .cloned()
+                        .collect();
+                    for mut request in gone {
+                        request.state = RequestState::Gone;
+                        self.asked(request);
+                    }
+                    let gone: Vec<Ulid> = self
+                        .invitations
+                        .keys()
+                        .filter(|chat| {
+                            !invitation_list.iter().any(|listed| listed.chat == **chat)
+                                && !self.chats.get(*chat).is_some_and(|state| state.joining)
+                        })
+                        .copied()
+                        .collect();
+                    for chat in gone {
+                        self.invitations.remove(&chat);
+                        self.dirty = true;
+                        self.event(Event::Invitation {
+                            chat,
+                            invitation: None,
+                        });
+                    }
+                }
+                for request in asked_list {
+                    self.asked(request);
+                }
+                for invitation in invitation_list {
+                    let chat = invitation.chat;
+                    self.know([invitation.inviter]);
+                    let shown = self.invitation_shown(&invitation);
+                    self.invitations.insert(chat, invitation);
+                    self.dirty = true;
+                    self.event(Event::Invitation {
+                        chat,
+                        invitation: Some(shown),
+                    });
+                }
+                let rows = Rows {
+                    message_list,
+                    call_list,
+                    chat_event_list,
+                };
+                self.synced(reference, chat_list, rows, more)
             }
             ServerFrame::Welcome { chat, body } => self.welcome(chat, &body.0),
-            ServerFrame::Typing { chat, account, on } => {
-                self.event(Event::Typing { chat, account, on })
-            }
+            ServerFrame::Typing {
+                chat,
+                account,
+                on,
+                topic,
+                thread_seq,
+            } => self.event(Event::Typing {
+                chat,
+                account,
+                on,
+                topic,
+                thread: thread_seq,
+            }),
             ServerFrame::Marks { chat, mark } => self.event(Event::Marks { chat, mark }),
             ServerFrame::Draft { chat, draft } => self.show_draft(chat, draft),
             ServerFrame::ChatFolders(folders) => self.folders_listed(*folders),
@@ -5559,12 +8061,14 @@ impl Client {
                 chat,
                 seq,
                 member_list,
+                more,
             } => {
                 self.waiting.remove(&reference);
                 self.event(Event::Times {
                     chat,
                     seq,
                     member_list,
+                    more,
                 });
             }
             ServerFrame::Revoked {
@@ -5655,6 +8159,8 @@ impl Client {
             encrypted: Some(frame.encrypted),
             epoch: frame.epoch,
             pointer_seq: frame.pointer_seq,
+            topic: frame.topic,
+            thread_seq: frame.thread_seq,
             client_sent_at: Some(frame.client_sent_at),
             server_saved_at: Some(saved_at),
             body: Some(frame.body),
@@ -5666,7 +8172,7 @@ impl Client {
             seq,
             n: 0,
         };
-        self.save_rows(vec![row], Vec::new(), Some(last), None);
+        self.save_rows(Rows::messages(vec![row]), Some(last), None);
     }
 
     /// This client's own message took `seq`: it is handled, or shows that something was missed.
@@ -5705,7 +8211,10 @@ impl Client {
             return self.rejoin(chat);
         }
         match plan {
-            Plan::Join { .. } => {
+            Plan::Join { invite, .. } => {
+                if invite.is_some() {
+                    self.invitations.remove(&chat);
+                }
                 self.ready(chat);
                 self.devices_of(chat);
                 self.restore_chat(chat);
@@ -5714,7 +8223,9 @@ impl Client {
                     self.open_list(chat, waiting, true, true);
                 }
             }
-            Plan::Add { .. } => self.ready(chat),
+            Plan::Add { added, .. } if added.is_empty() => self.ready(chat),
+            // The profile sealed under the new key went with the commit.
+            Plan::Add { .. } => {}
             Plan::Rotate => self.chat(chat).rotating = false,
             Plan::Remove { .. } | Plan::Create { .. } => {}
         }
@@ -5727,6 +8238,7 @@ impl Client {
                 state.uploading = false;
                 if matches!(state.group_info_out, Some((out, _)) if out == epoch) {
                     state.group_info_out = None;
+                    state.start_profile = None;
                 }
                 self.send_outs(chat);
             }
@@ -5752,6 +8264,30 @@ impl Client {
                 for waiting in taken {
                     self.send_ack(waiting.chat, waiting.ack);
                 }
+            }
+            Waiting::Left { chat } => self.drop_chat(chat),
+            Waiting::TopicsSaved {
+                chat,
+                on,
+                topic_list,
+                removed,
+            } => {
+                if removed {
+                    let since = self.chat(chat).known_at.or(self.since);
+                    self.start_sync(Some(chat), since);
+                }
+                self.event(Event::Topics {
+                    chat,
+                    on,
+                    topic_list,
+                });
+            }
+            Waiting::InviteAnswer { chat, accept } => self.invite_answered(chat, accept),
+            Waiting::OptionsSaved { chat, options } => {
+                self.event(Event::ChatOptions { chat, options })
+            }
+            Waiting::FindableSaved { chat, findable } => {
+                self.event(Event::Findable { chat, findable })
             }
             _ => {}
         }
@@ -5791,12 +8327,16 @@ impl Client {
                     chat,
                     up_to_seq: up_to,
                     client_received_at: at,
+                    topic: None,
+                    thread_seq: None,
                 },
                 Which::Seen => ClientFrame::Seen {
                     reference,
                     chat,
                     up_to_seq: up_to,
                     client_seen_at: at,
+                    topic: None,
+                    thread_seq: None,
                 },
             };
             self.ask(frame, reference, Waiting::Position { chat, which, up_to });
@@ -5805,6 +8345,15 @@ impl Client {
 
     fn refused(&mut self, waiting: Waiting, code: &str, message: &str) {
         match waiting {
+            // Sealed under a key older than the chat's: the commits it missed are fetched, then it
+            // is sealed again under the newest.
+            Waiting::Content { chat, local } if code == "stale_epoch" => {
+                self.in_flight.remove(&local);
+                self.queue.put_back(local);
+                self.chat(chat).catching_up = true;
+                let since = self.chat(chat).known_at.or(self.since);
+                self.start_sync(Some(chat), since);
+            }
             Waiting::Content { chat, local } => self.fail(chat, local, code),
             Waiting::Commit { chat, local, plan } => {
                 self.commit_busy = false;
@@ -5844,10 +8393,36 @@ impl Client {
                 self.sync_ended();
             }
             Waiting::GroupInfo { chat, epoch } => {
+                // A start's photo the server would not keep, such as one over its limit: the group
+                // is still made, its first profile sealed again without it, and the person told.
+                if code == "no_such_file" && epoch == 0 {
+                    let unnamed = self
+                        .chats
+                        .get(&chat)
+                        .filter(|state| state.start_profile.is_some())
+                        .and_then(|state| state.profile.as_ref())
+                        .filter(|(profile, _)| profile.photo.is_some())
+                        .map(|(profile, _)| ChatProfilePlain {
+                            photo: None,
+                            ..profile.clone()
+                        });
+                    if let Some(profile) = unnamed
+                        && let Some(body) = self.keep_chat_profile(chat, profile)
+                    {
+                        let state = self.chat(chat);
+                        state.uploading = false;
+                        if let Some(start) = state.start_profile.as_mut() {
+                            start.body = body;
+                        }
+                        self.error("photo_failed", message);
+                        return self.send_outs(chat);
+                    }
+                }
                 let state = self.chat(chat);
                 state.uploading = false;
                 if matches!(state.group_info_out, Some((out, _)) if out == epoch) {
                     state.group_info_out = None;
+                    state.start_profile = None;
                 }
                 match code {
                     // Someone else started this chat first: join theirs instead.
@@ -5883,6 +8458,10 @@ impl Client {
                 self.position_done(chat, which, up_to);
             }
             Waiting::FolderId | Waiting::SuggestionFolder { .. } => self.error(code, message),
+            Waiting::TopicId
+            | Waiting::Members
+            | Waiting::Left { .. }
+            | Waiting::InviteAnswer { .. } => self.error(code, message),
             // Refused, it would be refused again, so it goes, and the server's shows instead, with
             // no ack for a suggestion it accepted.
             Waiting::Folders { folders } => {
@@ -5897,7 +8476,10 @@ impl Client {
             }
             Waiting::Kv => self.error(code, message),
             Waiting::KvSet => self.kv_refused(code, message, None, None),
-            Waiting::Done => self.error(code, message),
+            Waiting::TopicsSaved { .. }
+            | Waiting::OptionsSaved { .. }
+            | Waiting::FindableSaved { .. }
+            | Waiting::Done => self.error(code, message),
         }
     }
 
@@ -6129,8 +8711,13 @@ impl Client {
         };
         let mut setting_list = Vec::with_capacity(self.kv.len());
         for item in &self.kv {
-            let Ok(opened) = device.open_kv(&item.key, &item.value.0) else {
-                continue;
+            let opened = if unsealed(&item.key) {
+                zeroize::Zeroizing::new(item.value.0.clone())
+            } else {
+                let Ok(opened) = device.open_kv(&item.key, &item.value.0) else {
+                    continue;
+                };
+                opened
             };
             if let Ok(value) = serde_json::from_slice(&opened) {
                 setting_list.push(Setting {
@@ -6399,6 +8986,21 @@ impl Client {
         let mut preview_list = Vec::new();
         let mut draft_list = Vec::new();
         let mut join_list = Vec::new();
+        let mut profile_list = Vec::new();
+        let mut topics_list = Vec::new();
+        let mut setting_list = Vec::new();
+        // A group or channel this device was in and the list no longer has went while it was away.
+        let mut gone_list = Vec::new();
+        for (chat, state) in &self.chats {
+            if state.chat_type.is_some_and(grouped)
+                && !chat_list.iter().any(|item| item.chat == *chat)
+            {
+                gone_list.push(*chat);
+            }
+        }
+        for chat in gone_list {
+            self.drop_chat(chat);
+        }
         for mut item in chat_list {
             let own_epoch = match self.device.as_ref() {
                 Some(device) => device.epoch(item.chat).ok(),
@@ -6407,13 +9009,36 @@ impl Client {
             let state = self.chats.entry(item.chat).or_default();
             state.chat_type = Some(item.chat_type);
             let mut member_list = vec![me];
-            for mark in &item.mark_list {
-                if !member_list.contains(&mark.account) {
-                    member_list.push(mark.account);
+            if grouped(item.chat_type) {
+                // Its members come from the server's device list, asked for before any commit,
+                // as some may have left while this device was away.
+                state.members_known = false;
+                let topics = TopicsBody {
+                    on: item.topics_on,
+                    topic_list: item.topic_list.clone(),
+                };
+                // Topics this device has not shown yet, a change made while it was away too, are
+                // shown as a live change is.
+                if state.topics.as_ref() != Some(&topics) {
+                    topics_list.push((item.chat, topics.on));
                 }
-            }
-            if state.member_list.is_empty() || member_list.len() > 1 {
-                state.member_list = member_list.clone();
+                state.topics = Some(topics);
+                setting_list.push((item.chat, item.topic_setting_list.clone()));
+                let known = state.profile.as_ref().map(|(_, version)| *version);
+                if let Some(profile) = item.profile.take()
+                    && known != Some(profile.version)
+                {
+                    profile_list.push((item.chat, profile));
+                }
+            } else {
+                for mark in &item.mark_list {
+                    if !member_list.contains(&mark.account) {
+                        member_list.push(mark.account);
+                    }
+                }
+                if state.member_list.is_empty() || member_list.len() > 1 {
+                    state.member_list = member_list.clone();
+                }
             }
             if let Some(message) = item.last_content.take() {
                 preview_list.push(*message);
@@ -6459,6 +9084,28 @@ impl Client {
         for message in preview_list {
             let chat = message.chat;
             self.open_list(chat, vec![message], true, true);
+        }
+        for (chat, profile) in profile_list {
+            self.chat_profile_in(chat, profile);
+        }
+        for (chat, list) in setting_list {
+            self.topic_settings_in(chat, list);
+        }
+        // After the profiles, so the topics carry their new names. The reconnect's sync brings any
+        // removed topic's wiped rows.
+        for (chat, on) in topics_list {
+            let ids = self
+                .chat(chat)
+                .topics
+                .as_ref()
+                .map(|topics| topics.topic_list.clone())
+                .unwrap_or_default();
+            let topic_list = self.named_topics(chat, &ids);
+            self.event(Event::Topics {
+                chat,
+                on,
+                topic_list,
+            });
         }
         let chat_list: Vec<Ulid> = self.chat_cache.iter().map(|item| item.chat).collect();
         for chat in chat_list {
@@ -6511,14 +9158,12 @@ impl Client {
 
     /// A `sync` page: its call rows are noted, its messages handled chat by chat in order, then all
     /// of it goes to the platform to keep, and the next page waits for that.
-    fn synced(
-        &mut self,
-        reference: Ulid,
-        chat_list: Vec<ChatItem>,
-        message_list: Vec<MessageFrame>,
-        call_list: Vec<CallEvent>,
-        more: bool,
-    ) {
+    fn synced(&mut self, reference: Ulid, chat_list: Vec<ChatItem>, rows: Rows, more: bool) {
+        let Rows {
+            message_list,
+            call_list,
+            chat_event_list,
+        } = rows;
         let Some(Waiting::Sync { chat: scope }) = self.waiting.remove(&reference) else {
             return;
         };
@@ -6552,8 +9197,21 @@ impl Client {
             };
             last = last.max(Some(position));
         }
+        // A group's or channel's events sit at seq 0, numbered by their own n.
+        for event in &chat_event_list {
+            let position = SyncPosition {
+                at: event.server_at,
+                chat: event.chat,
+                seq: 0,
+                n: event.n,
+            };
+            last = last.max(Some(position));
+        }
         for event in &call_list {
             self.call_row(event.clone(), false);
+        }
+        for event in &chat_event_list {
+            self.chat_event(event.clone(), false);
         }
         let mut by_chat: Vec<(Ulid, Vec<MessageFrame>)> = Vec::new();
         for message in &message_list {
@@ -6574,19 +9232,23 @@ impl Client {
             more,
             generation: self.sync_generation,
         };
-        self.save_rows(message_list, call_list, last, Some(page));
+        let rows = Rows {
+            message_list,
+            call_list,
+            chat_event_list,
+        };
+        self.save_rows(rows, last, Some(page));
     }
 
     /// Hands rows to the platform to keep. A delete the server has saved, this device's own once
     /// answered or another's as it arrives, brings its target's removed row with it, as the server
     /// already wiped it, so the archive never holds a deleted message until the next `sync`.
-    fn save_rows(
-        &mut self,
-        mut message_list: Vec<MessageFrame>,
-        call_list: Vec<CallEvent>,
-        last: Option<SyncPosition>,
-        page: Option<PageSaved>,
-    ) {
+    fn save_rows(&mut self, rows: Rows, last: Option<SyncPosition>, page: Option<PageSaved>) {
+        let Rows {
+            mut message_list,
+            call_list,
+            chat_event_list,
+        } = rows;
         let wiped: Vec<MessageFrame> = message_list
             .iter()
             .filter(|message| message.kind == Some(Kind::Delete))
@@ -6600,6 +9262,8 @@ impl Client {
                     encrypted: None,
                     epoch: None,
                     pointer_seq: None,
+                    topic: None,
+                    thread_seq: None,
                     client_sent_at: None,
                     server_saved_at: message.server_saved_at,
                     body: None,
@@ -6615,6 +9279,7 @@ impl Client {
             id,
             message_list,
             call_list,
+            chat_event_list,
         });
     }
 
@@ -6684,7 +9349,12 @@ impl Client {
         };
         chat_list.sort();
         for chat in &chat_list {
-            self.chat(*chat).busy = Busy::Idle;
+            let state = self.chat(*chat);
+            state.busy = Busy::Idle;
+            state.catching_up = false;
+            if run.chat.is_some() {
+                state.refill.clear();
+            }
         }
         for chat in chat_list {
             self.settle(chat);
@@ -6784,7 +9454,7 @@ impl Client {
             n: 0,
         };
         self.handle(chat, vec![message.clone()]);
-        self.save_rows(vec![message], Vec::new(), Some(last), None);
+        self.save_rows(Rows::messages(vec![message]), Some(last), None);
     }
 
     /// A device whose stamp checked out: if it is this account's, the platform hears of it, so it
@@ -6813,7 +9483,12 @@ impl Client {
                 seq: event.call_seq,
                 n: event.n,
             };
-            self.save_rows(Vec::new(), vec![event], Some(last), None);
+            let rows = Rows {
+                message_list: Vec::new(),
+                call_list: vec![event],
+                chat_event_list: Vec::new(),
+            };
+            self.save_rows(rows, Some(last), None);
         }
     }
 
@@ -6826,6 +9501,15 @@ impl Client {
             if let Some(known) = self.chat(chat).known
                 && message.seq <= known
             {
+                // A topic shown again: what was withheld from it opens now.
+                let state = self.chat(chat);
+                let withheld = message.kind == Some(Kind::Edit)
+                    || message
+                        .topic
+                        .is_some_and(|topic| state.refill.contains(&topic));
+                if withheld && !state.refill.is_empty() {
+                    opened.push(message);
+                }
                 continue;
             }
             let state = self.chat(chat);
@@ -6983,6 +9667,32 @@ impl Client {
             };
             if kind == Kind::DeviceNotice {
                 self.notice(&message, device, known);
+                continue;
+            }
+            if kind == Kind::Line {
+                let body = match &message.body {
+                    Some(body) => serde_json::from_slice::<LineBody>(&body.0).ok(),
+                    None => None,
+                };
+                let Some(body) = body else {
+                    self.problem(&message, Some(known.account), Problem::Malformed);
+                    continue;
+                };
+                for account in &body.account_list {
+                    if !self.accounts.contains_key(account) {
+                        self.ask_account(*account);
+                    }
+                }
+                self.event(Event::Line {
+                    chat,
+                    seq: message.seq,
+                    device,
+                    account: known.account,
+                    action: body.action,
+                    account_list: body.account_list,
+                    saved_at: message.server_saved_at.unwrap_or(0),
+                    mine: self.account == Some(known.account),
+                });
                 continue;
             }
             let signature = match &message.signature {
@@ -7157,6 +9867,7 @@ impl Client {
         for chat in chat_list {
             self.chat(chat).plan_list.push(Plan::Remove {
                 device_list: vec![ended],
+                removed: Vec::new(),
             });
         }
     }
@@ -7444,8 +10155,18 @@ impl Client {
                 if self.joined(chat) {
                     return;
                 }
+                // An invited account joins with its invitation.
+                let mut invite = None;
+                if let (Some(me), Some(invitation)) = (self.account, self.invitations.get(&chat)) {
+                    invite = Some(InviteStatement {
+                        account: me,
+                        device: invitation.device,
+                        signature: invitation.signature.clone(),
+                    });
+                }
                 self.chat(chat).plan_list.push(Plan::Join {
                     group_info: group_info.0,
+                    invite,
                 });
             }
             Asked::Claim {
@@ -7463,6 +10184,66 @@ impl Client {
                     }
                 }
                 self.claim_next(chat, &mut account_list, package_list);
+            }
+            Asked::CreateGroup { chat_type, start } => {
+                if let Some(ChatReply { chat, .. }) = self.data(body) {
+                    self.group_created(chat, chat_type, *start);
+                }
+            }
+            Asked::ChatPhotoFile {
+                chat,
+                topic,
+                photo,
+                starting,
+            } => {
+                let Some(FileReply { file }) = self.data(body) else {
+                    return self.chat_photo_failed(
+                        chat,
+                        starting,
+                        "bad_reply",
+                        "No file came back",
+                    );
+                };
+                let sealed = photo.sealed.clone();
+                self.issue(Request {
+                    method: "PUT".to_string(),
+                    path: format!("/api/v1/files/{file}/chunks/0"),
+                    body: None,
+                    bytes: Some(sealed),
+                    raw: false,
+                    asked: Asked::ChatPhotoChunk {
+                        chat,
+                        topic,
+                        file,
+                        photo,
+                        starting,
+                    },
+                    attempt: 0,
+                });
+            }
+            Asked::ChatPhotoChunk {
+                chat,
+                topic,
+                file,
+                photo,
+                starting,
+            } => self.chat_photo_up(chat, topic, file, *photo, starting),
+            Asked::Requests { chat } => {
+                if let Some(RequestListReply { request_list }) = self.data(body) {
+                    self.know(request_list.iter().map(|item| item.account));
+                    self.event(Event::Requests { chat, request_list });
+                }
+            }
+            Asked::AddClaim {
+                chat,
+                account,
+                claim,
+            } => {
+                let mut package_list = Vec::new();
+                if let Some(KeyPackageListReply { key_package_list }) = self.data(body) {
+                    package_list = key_package_list;
+                }
+                self.add_claimed(chat, account, claim, package_list);
             }
             Asked::ChatDevices { chat, judged } => {
                 self.chat(chat).fetching_devices = false;
@@ -7484,7 +10265,7 @@ impl Client {
             }
             // An image's reply arrives as `Fetched`, so only a refusal's text reaches here.
             Asked::StickerImage { .. } => self.error("bad_reply", "The sticker could not be read"),
-            Asked::Photo { photo, .. } => {
+            Asked::Photo { photo, .. } | Asked::ChatPhotoGet { photo, .. } => {
                 self.photo_asked.remove(&photo);
                 self.error("bad_reply", "The photo could not be read");
             }
@@ -7521,8 +10302,15 @@ impl Client {
             // The server's `profile` frame brings the names, and a moved version the rest.
             Asked::Names => self.event(Event::ProfileSaved),
             Asked::Search => {
-                if let Some(AccountListReply { account_list }) = self.data(body) {
-                    self.event(Event::SearchResults { account_list });
+                if let Some(AccountListReply {
+                    account_list,
+                    chat_list,
+                }) = self.data(body)
+                {
+                    self.event(Event::SearchResults {
+                        account_list,
+                        chat_list,
+                    });
                 }
             }
             Asked::Devices => {
@@ -7660,6 +10448,16 @@ impl Client {
         for (account, ended, statement) in pending {
             self.revoked(account, ended, &statement);
         }
+        let mut waiting = Vec::new();
+        self.inviting.retain(|(chat, invited)| {
+            if *invited == account {
+                waiting.push(*chat);
+            }
+            *invited != account
+        });
+        for chat in waiting {
+            self.invite(chat, account);
+        }
         // A sealed profile waits for its account's master key.
         if self
             .profiles
@@ -7736,6 +10534,7 @@ impl Client {
             }
             Asked::Account { account } => {
                 self.asked_accounts.remove(&account);
+                self.inviting.retain(|(_, invited)| *invited != account);
                 self.error(code, message);
             }
             Asked::CreateChat { account } => {
@@ -7744,6 +10543,10 @@ impl Client {
             }
             Asked::CreateFile { upload } | Asked::PutChunk { upload, .. } => {
                 self.upload_stopped(upload, code)
+            }
+            Asked::ChatPhotoFile { chat, starting, .. }
+            | Asked::ChatPhotoChunk { chat, starting, .. } => {
+                self.chat_photo_failed(chat, starting, code, message)
             }
             Asked::GetChunk { handle, .. } => self.download_failed(handle, code),
             Asked::StartInfo { chat } if code == "no_group_info" => {
@@ -7784,6 +10587,23 @@ impl Client {
             } if code == "no_key_packages" && Some(account) == self.account => {
                 self.claim_next(chat, &mut account_list, package_list);
             }
+            // That account cannot be added yet, or only by invitation, and the rest still can.
+            Asked::AddClaim {
+                chat,
+                account,
+                claim,
+            } => {
+                if code == "invite_needed" {
+                    self.invite(chat, account);
+                    self.claim_add(chat, claim);
+                } else {
+                    if code != "no_key_packages" {
+                        self.error(code, message);
+                    }
+                    self.add_claimed(chat, account, claim, Vec::new());
+                }
+            }
+            Asked::CreateGroup { .. } | Asked::Requests { .. } => self.error(code, message),
             Asked::StartInfo { chat } | Asked::JoinInfo { chat } | Asked::Claim { chat, .. } => {
                 self.chat(chat).joining = false;
                 self.restore_done(chat);
@@ -7814,7 +10634,7 @@ impl Client {
                     self.error(code, message);
                 }
             }
-            Asked::Photo { photo, .. } => {
+            Asked::Photo { photo, .. } | Asked::ChatPhotoGet { photo, .. } => {
                 self.photo_asked.remove(&photo);
                 self.error(code, message);
             }
@@ -7893,8 +10713,39 @@ impl Client {
                 ended_list.push((item.account, item.device, statement));
             }
         }
-        if !member_list.is_empty() {
-            self.chat(chat).member_list = member_list;
+        let state = self.chat(chat);
+        if state.chat_type.is_some_and(grouped) {
+            state.members_known = true;
+            if let Some(me) = self.account
+                && !member_list.contains(&me)
+            {
+                member_list.push(me);
+            }
+            // Devices of accounts the server no longer lists, which left or were taken out: the
+            // first member online commits their removal, trusting the server.
+            let mut stray = Vec::new();
+            if let Some(device) = self.device.as_ref()
+                && let Ok(in_group) = device.member_list(chat)
+            {
+                for member in in_group {
+                    if !member_list.contains(&member.account) {
+                        stray.push(member.device);
+                    }
+                }
+            }
+            let state = self.chat(chat);
+            state.member_list = member_list;
+            let planned = state.plan_list.iter().any(
+                |plan| matches!(plan, Plan::Remove { device_list, .. } if *device_list == stray),
+            );
+            if !stray.is_empty() && !planned {
+                state.plan_list.push(Plan::Remove {
+                    device_list: stray,
+                    removed: Vec::new(),
+                });
+            }
+        } else if !member_list.is_empty() {
+            state.member_list = member_list;
         }
         for (account, ended, statement) in ended_list {
             let in_group = match self.device.as_ref() {
@@ -7941,8 +10792,12 @@ impl Client {
             }
             self.restore_done(chat);
             self.release(chat);
-            // Profile keys shared at an epoch before this device joined open only now.
+            // Profile keys shared at an epoch before this device joined open only now, and so does
+            // the chat's own profile key.
             self.profile_pass(chat);
+            if let Some(item) = self.chat(chat).profile_waiting.take() {
+                self.chat_profile_in(chat, item);
+            }
         }
         let Some(device) = self.device.as_mut() else {
             return;
@@ -7981,5 +10836,14 @@ impl Client {
             _ => state.wraps_out = Some((epoch, wrap_list)),
         }
         self.send_outs(chat);
+    }
+}
+
+/// The account a chat event acts on. A topic's events name the topic there instead, which is no
+/// account to ask the server about.
+fn account_target(event: &ChatEvent) -> Option<Ulid> {
+    match event.action {
+        ChatAction::TopicAdded | ChatAction::TopicRemoved => None,
+        _ => event.target,
     }
 }

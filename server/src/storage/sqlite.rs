@@ -11,32 +11,51 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use keryx_core::protocol::{
-    AccountBrief, Bytes, CallEvent, CallEventKind, ChatDevice, ChatFolders, ChatItem, ChatMode,
-    ChatType, ContentKind, DeviceItem, DeviceLogItem, DraftItem, FolderItem, KeyPackageItem, Kind,
-    KvChange, KvItem, KvReply, MarkItem, MessageFrame, ProfileKeyItem, ProfileReply, SessionItem,
-    SignedProfile, StickerItem, StickerPack, SyncPosition, TimesItem, WrapEntry,
+    AccountBrief, ActionKind, Audience, Bytes, CallEvent, CallEventKind, ChatAction, ChatDevice,
+    ChatEvent, ChatFolders, ChatItem, ChatOptions, ChatProfileItem, ChatRole, ChatType,
+    ContentKind, DeviceItem, DeviceLogItem, DraftItem, FindableItem, FolderItem, FoundChat,
+    GENERAL_TOPIC, InvitationItem, KeyPackageItem, Kind, KvChange, KvItem, KvReply, LineAction,
+    LineBody, MarkItem, MessageFrame, PlaceSeen, ProfileKeyItem, ProfileReply, RequestItem,
+    RequestState, SessionItem, SignedProfile, StickerItem, StickerPack, SyncPosition, TimesItem,
+    TopicItem, TopicOptionsBody, TopicProfileItem, TopicWrite, WrapEntry,
 };
 use keryx_core::ulid::Ulid;
+use rusqlite::types::Type;
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
 use super::{
-    Account, Appended, BuiltInRole, ChatAccess, DeviceKey, DeviceUsage, Error, GroupInfoPut,
-    KvChanged, MessageBrief, NamesSaved, NewAccount, NewDevice, NewFile, NewMessage, NewNames,
-    NewPhoto, NewProfile, NewSession, NewSticker, NewWrap, Position, PositionReport, PresenceTimes,
-    ProfileSaved, Registered, Result, Session, SetupLink, Storage, StoredFile, SyncFrom, SyncPage,
+    Account, Answered, Appended, Asked, BuiltInRole, ChatAccess, ChatProfileSaved, DeviceKey,
+    DeviceUsage, Error, GroupInfoPut, KvChanged, Left, MessageBrief, NamesSaved, NewAccount,
+    NewAccountKeys, NewChatOptions, NewChatProfile, NewDevice, NewFile, NewGroup, NewGroupStart,
+    NewInvitation, NewMessage, NewNames, NewPhoto, NewProfile, NewSession, NewSticker,
+    NewTopicOptions, NewTopicProfile, NewWrap, Place, Position, PositionReport, PresenceTimes,
+    ProfileSaved, Registered, Removed, Result, RoleSet, Session, SetupLink, Storage, StoredFile,
+    SyncFrom, SyncPage, TimesShown, TopicAccess, TopicMods, TopicSaved, TopicsPut,
 };
 
 /// How long a connection waits for a lock another process holds, such as a backup.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 const MESSAGE_COLUMNS: &str = "conversation_id, seq, device_id, kind, content_kind, encrypted, \
-     epoch, pointer_seq, client_sent_at, server_saved_at, body, signature";
+     epoch, pointer_seq, client_sent_at, server_saved_at, body, signature, topic_id, thread_seq";
+
+const CHAT_EVENT_COLUMNS: &str =
+    "conversation_id, n, actor, action, target, seq, audience, server_at, topic_id, copy";
 
 const CALL_COLUMNS: &str = "conversation_id, call_seq, n, kind, device_id, server_at, client_at, \
      epoch, signature, body, outcome";
 
-/// A message's kind, content kind, sender's account, sender's device's age, and save time.
-type BriefRow = (i64, Option<i64>, [u8; 16], i64, i64);
+/// A message's kind, content kind, sender's account, sender's device's age, save time, topic and
+/// thread.
+type BriefRow = (
+    i64,
+    Option<i64>,
+    [u8; 16],
+    i64,
+    i64,
+    Option<[u8; 16]>,
+    Option<i64>,
+);
 
 pub struct Sqlite {
     writer: Arc<Mutex<Connection>>,
@@ -128,6 +147,156 @@ impl Sqlite {
             Err(error) => Err(Error::Task(error)),
         }
     }
+}
+
+/// Whether a group's or channel's profile names a photo it may keep: a complete image of this chat
+/// uploaded by its account, or the photo it already has. One naming none fits.
+fn photo_fits(connection: &Connection, profile: &NewChatProfile) -> rusqlite::Result<bool> {
+    let Some(photo) = profile.photo else {
+        return Ok(true);
+    };
+    connection.query_row(
+        "SELECT EXISTS (SELECT 1 FROM file f JOIN device d ON d.id = f.uploaded_by
+         WHERE f.id = ?1 AND f.conversation_id = ?2 AND f.kind = 3 AND f.size <= ?4
+         AND f.received = f.chunks AND f.removed_at IS NULL
+         AND (d.account_id = ?3 OR f.id = (SELECT photo_id FROM conversation_profile
+                                           WHERE conversation_id = ?2)))",
+        params![
+            photo.bytes(),
+            profile.chat.bytes(),
+            profile.account.bytes(),
+            int(profile.photo_limit)
+        ],
+        |row| row.get(0),
+    )
+}
+
+/// Keeps a group's or channel's profile, whose photo [`photo_fits`] checked, with the file it
+/// names kept from now on and the one it replaced marked removed. Its first, at epoch 0, comes with
+/// the chat's profile key, and later ones replace it beside the key already kept.
+fn save_chat_profile(
+    connection: &Connection,
+    profile: NewChatProfile,
+    first_key: Option<Vec<u8>>,
+) -> rusqlite::Result<ChatProfileSaved> {
+    if let Some(photo) = profile.photo {
+        connection.execute(
+            "UPDATE file SET used_at = ?2 WHERE id = ?1 AND used_at IS NULL",
+            params![photo.bytes(), profile.now],
+        )?;
+    }
+    let old_photo: Option<Option<[u8; 16]>> = connection
+        .query_row(
+            "SELECT photo_id FROM conversation_profile WHERE conversation_id = ?1",
+            params![profile.chat.bytes()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let mut removed = Vec::new();
+    if let Some(Some(old)) = old_photo {
+        let old = Ulid::from_bytes(old);
+        if Some(old) != profile.photo {
+            connection.execute(
+                "UPDATE file SET removed_at = ?2 WHERE id = ?1 AND removed_at IS NULL",
+                params![old.bytes(), profile.now],
+            )?;
+            removed.push(old);
+        }
+    }
+    let photo = profile.photo.as_ref().map(|photo| photo.bytes().to_vec());
+    let kept = match first_key {
+        Some(key) => connection
+            .query_row(
+                "INSERT INTO conversation_profile (conversation_id, sealed, key, key_epoch,
+                 photo_id, signature, updated_by, version, updated_at)
+                 VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, 1, ?7)
+                 RETURNING version, key, key_epoch",
+                params![
+                    profile.chat.bytes(),
+                    profile.sealed,
+                    key,
+                    photo,
+                    profile.signature,
+                    profile.device.bytes(),
+                    profile.now
+                ],
+                kept_key,
+            )
+            .optional()?,
+        None => connection
+            .query_row(
+                "UPDATE conversation_profile SET sealed = ?2, photo_id = ?3, signature = ?4,
+                 updated_by = ?5, version = version + 1, updated_at = ?6
+                 WHERE conversation_id = ?1
+                 RETURNING version, key, key_epoch",
+                params![
+                    profile.chat.bytes(),
+                    profile.sealed,
+                    photo,
+                    profile.signature,
+                    profile.device.bytes(),
+                    profile.now
+                ],
+                kept_key,
+            )
+            .optional()?,
+    };
+    let Some((version, key, key_epoch)) = kept else {
+        return Ok(ChatProfileSaved::NotStarted);
+    };
+    Ok(ChatProfileSaved::Saved {
+        item: ChatProfileItem {
+            sealed: Bytes(profile.sealed),
+            signature: Bytes(profile.signature),
+            device: profile.device,
+            version,
+            key_epoch,
+            key: Bytes(key),
+        },
+        removed,
+    })
+}
+
+fn kept_key(row: &Row<'_>) -> rusqlite::Result<(u64, Vec<u8>, u64)> {
+    Ok((unsigned(row.get(0)?), row.get(1)?, unsigned(row.get(2)?)))
+}
+
+/// A chat's profile row, read back with its key.
+fn chat_profile_row(row: &Row<'_>) -> rusqlite::Result<ChatProfileItem> {
+    Ok(ChatProfileItem {
+        sealed: Bytes(row.get(0)?),
+        signature: Bytes(row.get(1)?),
+        device: Ulid::from_bytes(row.get(2)?),
+        version: unsigned(row.get(3)?),
+        key: Bytes(row.get(4)?),
+        key_epoch: unsigned(row.get(5)?),
+    })
+}
+
+/// What a chat's members may do beyond or short of the member role, replacing what was kept.
+fn save_chat_options(
+    connection: &Connection,
+    chat: Ulid,
+    options: &NewChatOptions,
+) -> rusqlite::Result<()> {
+    connection.execute(
+        "DELETE FROM chat_permission WHERE conversation_id = ?1",
+        params![chat.bytes()],
+    )?;
+    for (list, allowed) in [(&options.allow, true), (&options.deny, false)] {
+        for permission in list {
+            connection.execute(
+                "INSERT OR REPLACE INTO chat_permission (conversation_id, permission,
+                 allowed) VALUES (?1, ?2, ?3)",
+                params![chat.bytes(), permission, allowed],
+            )?;
+        }
+    }
+    connection.execute(
+        "UPDATE conversation SET slow_mode = ?2 WHERE id = ?1",
+        params![chat.bytes(), opt_int(options.slow_mode)],
+    )?;
+    Ok(())
 }
 
 /// A sequence id or epoch as SQLite holds it. A larger number than any stored can match nothing.
@@ -240,11 +409,545 @@ fn message_frame(row: &Row<'_>) -> rusqlite::Result<MessageFrame> {
         encrypted: encrypted.map(|encrypted| encrypted == 1),
         epoch: opt_unsigned(row.get(6)?),
         pointer_seq: opt_unsigned(row.get(7)?),
+        topic: opt_id(row.get(12)?),
+        thread_seq: opt_unsigned(row.get(13)?),
         client_sent_at: row.get(8)?,
         server_saved_at: row.get(9)?,
         body: body.map(Bytes),
         signature: signature.map(Bytes),
     })
+}
+
+fn chat_event_row(row: &Row<'_>) -> rusqlite::Result<ChatEvent> {
+    Ok(ChatEvent {
+        chat: Ulid::from_bytes(row.get(0)?),
+        n: unsigned(row.get(1)?),
+        actor: Ulid::from_bytes(row.get(2)?),
+        action: numbered(row.get(3)?)?,
+        target: opt_id(row.get(4)?),
+        seq: opt_unsigned(row.get(5)?),
+        topic: opt_id(row.get(8)?),
+        audience: numbered(row.get(6)?)?,
+        server_at: row.get(7)?,
+        copy_list: match row.get::<_, Option<Vec<u8>>>(9)? {
+            Some(copy) => serde_json::from_slice(&copy).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(9, Type::Blob, Box::new(error))
+            })?,
+            None => Vec::new(),
+        },
+    })
+}
+
+/// Writes a delete's or edit's history row, in its message's topic, with a copy of the message and
+/// its edits as they are now, so the row keeps what the delete wipes.
+fn write_copied(
+    connection: &Connection,
+    message: &NewMessage,
+    author: Ulid,
+) -> rusqlite::Result<ChatEvent> {
+    let chat = message.chat;
+    let target = opt_int(message.pointer_seq);
+    let topic: Option<Option<[u8; 16]>> = connection
+        .query_row(
+            "SELECT topic_id FROM message WHERE conversation_id = ?1 AND seq = ?2",
+            params![chat.bytes(), target],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let action = if message.kind == Kind::Edit {
+        ChatAction::Edited
+    } else {
+        ChatAction::Deleted
+    };
+    let mut changed = event(
+        chat,
+        message.account,
+        action,
+        Some(author),
+        Audience::Moderators,
+        message.now,
+    );
+    changed.seq = message.pointer_seq;
+    changed.topic = topic.flatten().map(Ulid::from_bytes);
+    let mut statement = connection.prepare(&format!(
+        "SELECT {MESSAGE_COLUMNS} FROM message WHERE conversation_id = ?1 AND kind IS NOT NULL
+         AND (seq = ?2 OR (kind = 1 AND pointer_seq = ?2)) ORDER BY seq"
+    ))?;
+    let rows = statement.query_map(params![chat.bytes(), target], message_frame)?;
+    changed.copy_list = rows.collect::<rusqlite::Result<_>>()?;
+    write_event(connection, changed, None)
+}
+
+fn chat_event_position(event: &ChatEvent) -> SyncPosition {
+    SyncPosition {
+        at: event.server_at,
+        chat: event.chat,
+        seq: 0,
+        n: event.n,
+    }
+}
+
+/// Writes a chat event under the chat's next `n`. `viewer` is the one account an audience-2 event
+/// is for.
+fn write_event(
+    connection: &Connection,
+    mut event: ChatEvent,
+    viewer: Option<Ulid>,
+) -> rusqlite::Result<ChatEvent> {
+    let n: i64 = connection.query_row(
+        "SELECT COALESCE(MAX(n), 0) + 1 FROM chat_event WHERE conversation_id = ?1",
+        params![event.chat.bytes()],
+        |row| row.get(0),
+    )?;
+    let copy = if event.copy_list.is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::to_vec(&event.copy_list)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?,
+        )
+    };
+    connection.execute(
+        "INSERT INTO chat_event (conversation_id, n, actor, action, target, seq, topic_id, audience,
+         viewer, server_at, copy) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            event.chat.bytes(),
+            n,
+            event.actor.bytes(),
+            u8::from(event.action),
+            event.target.as_ref().map(|target| target.bytes().to_vec()),
+            opt_int(event.seq),
+            event.topic.as_ref().map(|topic| topic.bytes().to_vec()),
+            u8::from(event.audience),
+            viewer.as_ref().map(|viewer| viewer.bytes().to_vec()),
+            event.server_at,
+            copy
+        ],
+    )?;
+    event.n = unsigned(n);
+    Ok(event)
+}
+
+/// A new event, before its `n` is known.
+fn event(
+    chat: Ulid,
+    actor: Ulid,
+    action: ChatAction,
+    target: Option<Ulid>,
+    audience: Audience,
+    now: i64,
+) -> ChatEvent {
+    ChatEvent {
+        chat,
+        n: 0,
+        actor,
+        action,
+        target,
+        seq: None,
+        topic: None,
+        audience,
+        server_at: now,
+        copy_list: Vec::new(),
+    }
+}
+
+/// Writes a membership line as the chat's next message, in a group only, since a channel's main
+/// list holds posts alone. Unencrypted and unsigned, its device the actor's, it moves the chat up
+/// and is its preview, as text is.
+fn write_line(
+    connection: &Connection,
+    chat: Ulid,
+    device: Ulid,
+    action: LineAction,
+    account_list: Vec<Ulid>,
+    now: i64,
+) -> rusqlite::Result<Option<MessageFrame>> {
+    let chat_type: u8 = connection.query_row(
+        "SELECT type FROM conversation WHERE id = ?1",
+        params![chat.bytes()],
+        |row| row.get(0),
+    )?;
+    if chat_type != u8::from(ChatType::Group) {
+        return Ok(None);
+    }
+    let body = serde_json::to_vec(&LineBody {
+        action,
+        account_list,
+    })
+    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    let seq: i64 = connection.query_row(
+        "UPDATE conversation SET last_seq = last_seq + 1, last_kind = 5, last_at = ?2,
+         last_content_seq = last_seq + 1 WHERE id = ?1 RETURNING last_seq",
+        params![chat.bytes(), now],
+        |row| row.get(0),
+    )?;
+    connection.execute(
+        "INSERT INTO message (conversation_id, seq, device_id, kind, encrypted, client_sent_at,
+         server_saved_at, body) VALUES (?1, ?2, ?3, 5, 0, ?4, ?4, ?5)",
+        params![chat.bytes(), seq, device.bytes(), now, body],
+    )?;
+    Ok(Some(MessageFrame {
+        chat,
+        seq: unsigned(seq),
+        device: Some(device),
+        kind: Some(Kind::Line),
+        content_kind: None,
+        encrypted: Some(false),
+        epoch: None,
+        pointer_seq: None,
+        topic: None,
+        thread_seq: None,
+        client_sent_at: Some(now),
+        server_saved_at: Some(now),
+        body: Some(Bytes(body)),
+        signature: None,
+    }))
+}
+
+/// Takes a chat out of an account's folders and pins, as it stops being in the chat.
+fn drop_from_folders(connection: &Connection, chat: Ulid, account: Ulid) -> rusqlite::Result<()> {
+    let mut statement =
+        connection.prepare("SELECT id, chats, pins FROM folder WHERE account_id = ?1")?;
+    let mut changed = Vec::new();
+    let rows = statement.query_map(params![account.bytes()], |row| {
+        Ok((
+            Ulid::from_bytes(row.get(0)?),
+            row.get::<_, Option<Vec<u8>>>(1)?,
+            row.get::<_, Vec<u8>>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (folder, chats, pins) = row?;
+        let mut chat_list = None;
+        if let Some(chats) = &chats {
+            chat_list = Some(id_list(chats));
+        }
+        let mut pin_list = id_list(&pins);
+        let had = pin_list.contains(&chat)
+            || chat_list
+                .as_ref()
+                .is_some_and(|chat_list| chat_list.contains(&chat));
+        if !had {
+            continue;
+        }
+        pin_list.retain(|pinned| *pinned != chat);
+        if let Some(chat_list) = &mut chat_list {
+            chat_list.retain(|held| *held != chat);
+        }
+        changed.push((folder, chat_list, pin_list));
+    }
+    for (folder, chat_list, pin_list) in changed {
+        connection.execute(
+            "UPDATE folder SET chats = ?2, pins = ?3 WHERE id = ?1",
+            params![
+                folder.bytes(),
+                chat_list.as_deref().map(id_bytes),
+                id_bytes(&pin_list)
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// A chat's options: its member role's changes, without their prefix, and its slow mode.
+fn chat_options(connection: &Connection, chat: Ulid) -> rusqlite::Result<ChatOptions> {
+    let mut options = ChatOptions::default();
+    let mut statement = connection.prepare(
+        "SELECT permission, allowed FROM chat_permission WHERE conversation_id = ?1
+         ORDER BY permission",
+    )?;
+    let rows = statement.query_map(params![chat.bytes()], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+    })?;
+    for row in rows {
+        let (permission, allowed) = row?;
+        let name = match permission.split_once('.') {
+            Some((_, name)) => name.to_string(),
+            None => permission,
+        };
+        if allowed {
+            options.allow.push(name);
+        } else {
+            options.deny.push(name);
+        }
+    }
+    let slow_mode: Option<i64> = connection.query_row(
+        "SELECT slow_mode FROM conversation WHERE id = ?1",
+        params![chat.bytes()],
+        |row| row.get(0),
+    )?;
+    options.slow_mode = opt_unsigned(slow_mode);
+    Ok(options)
+}
+
+/// General's id where its own settings are kept, as SQL: all zeros. Lists of live topics leave it out.
+const GENERAL_SQL: &str = "X'00000000000000000000000000000000'";
+
+/// Leaves out a message in a hidden topic, or an edit of one, unless the account in `?9` sees it:
+/// the chat's owners and moderators, and the topic's own moderators.
+const HIDDEN_FROM: &str = "NOT EXISTS (SELECT 1 FROM topic t
+     WHERE t.conversation_id = message.conversation_id AND t.hidden = 1 AND t.removed = 0
+     AND t.id = COALESCE(message.topic_id, (SELECT p.topic_id FROM message p
+                WHERE p.conversation_id = message.conversation_id AND p.seq = message.pointer_seq
+                AND message.kind = 1))
+     AND NOT EXISTS (SELECT 1 FROM member m WHERE m.conversation_id = t.conversation_id
+                     AND m.account_id = ?9 AND m.is_owner = 1)
+     AND NOT EXISTS (SELECT 1 FROM member_role r WHERE r.conversation_id = t.conversation_id
+                     AND r.account_id = ?9)
+     AND NOT EXISTS (SELECT 1 FROM topic_moderator d WHERE d.conversation_id = t.conversation_id
+                     AND d.topic_id = t.id AND d.account_id = ?9))";
+
+/// One topic's settings, moderators and sealed profile, General's under the all-zero id. `None` when
+/// it is not a live topic of the chat.
+fn topic_item(
+    connection: &Connection,
+    chat: Ulid,
+    topic: Ulid,
+) -> rusqlite::Result<Option<TopicItem>> {
+    type TopicRow = (
+        bool,
+        bool,
+        i64,
+        Option<i64>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<[u8; 16]>,
+        i64,
+    );
+    let row: Option<TopicRow> = connection
+        .query_row(
+            "SELECT closed, hidden, write, slow_mode, sealed, signature, updated_by, version
+             FROM topic WHERE conversation_id = ?1 AND id = ?2 AND removed = 0",
+            params![chat.bytes(), topic.bytes()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((closed, hidden, write, slow_mode, sealed, signature, updated_by, version)) = row
+    else {
+        return Ok(None);
+    };
+    let mut options = TopicOptionsBody {
+        slow_mode: opt_unsigned(slow_mode),
+        write: if write == 1 {
+            TopicWrite::Moderators
+        } else {
+            TopicWrite::Everyone
+        },
+        closed,
+        hidden,
+        ..TopicOptionsBody::default()
+    };
+    let mut statement = connection.prepare(
+        "SELECT permission, allowed FROM topic_permission WHERE conversation_id = ?1
+         AND topic_id = ?2 ORDER BY permission",
+    )?;
+    let rows = statement.query_map(params![chat.bytes(), topic.bytes()], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+    })?;
+    for row in rows {
+        let (permission, allowed) = row?;
+        let name = match permission.split_once('.') {
+            Some((_, name)) => name.to_string(),
+            None => permission,
+        };
+        if allowed {
+            options.allow.push(name);
+        } else {
+            options.deny.push(name);
+        }
+    }
+    let mut statement = connection.prepare(
+        "SELECT account_id FROM topic_moderator WHERE conversation_id = ?1 AND topic_id = ?2
+         ORDER BY account_id",
+    )?;
+    let mut mod_list = Vec::new();
+    for account in statement.query_map(params![chat.bytes(), topic.bytes()], |row| row.get(0))? {
+        mod_list.push(Ulid::from_bytes(account?));
+    }
+    let profile = match (sealed, signature, updated_by) {
+        (Some(sealed), Some(signature), Some(device)) => Some(TopicProfileItem {
+            sealed: Bytes(sealed),
+            signature: Bytes(signature),
+            device: Ulid::from_bytes(device),
+            version: unsigned(version),
+        }),
+        _ => None,
+    };
+    Ok(Some(TopicItem {
+        topic,
+        options,
+        mod_list,
+        profile,
+    }))
+}
+
+/// Whether a topic is hidden from this account: hidden, and it is none of the chat's owners and
+/// moderators nor the topic's own.
+fn hidden_from(
+    connection: &Connection,
+    chat: Ulid,
+    topic: Ulid,
+    account: Ulid,
+) -> rusqlite::Result<bool> {
+    connection.query_row(
+        "SELECT EXISTS (SELECT 1 FROM topic WHERE conversation_id = ?1 AND id = ?2 AND hidden = 1)
+         AND NOT EXISTS (SELECT 1 FROM member WHERE conversation_id = ?1 AND account_id = ?3
+                         AND is_owner = 1)
+         AND NOT EXISTS (SELECT 1 FROM member_role WHERE conversation_id = ?1 AND account_id = ?3)
+         AND NOT EXISTS (SELECT 1 FROM topic_moderator WHERE conversation_id = ?1 AND topic_id = ?2
+                         AND account_id = ?3)",
+        params![chat.bytes(), topic.bytes(), account.bytes()],
+        |row| row.get(0),
+    )
+}
+
+/// A topic's history row and the whole item after a change, or `NoSuchTopic`.
+fn topic_saved(
+    connection: &Connection,
+    chat: Ulid,
+    topic: Ulid,
+    changed: Option<ChatEvent>,
+    was_hidden: bool,
+    removed: Vec<Ulid>,
+) -> rusqlite::Result<TopicSaved> {
+    let Some(item) = topic_item(connection, chat, topic)? else {
+        return Ok(TopicSaved::NoSuchTopic);
+    };
+    let event = match changed {
+        Some(mut changed) => {
+            changed.topic = Some(topic);
+            Some(write_event(connection, changed, None)?)
+        }
+        None => None,
+    };
+    Ok(TopicSaved::Saved {
+        event,
+        item: Box::new(item),
+        was_hidden,
+        removed,
+    })
+}
+
+/// Whether the live topic exists and was hidden.
+fn topic_hidden(
+    connection: &Connection,
+    chat: Ulid,
+    topic: Ulid,
+) -> rusqlite::Result<Option<bool>> {
+    connection
+        .query_row(
+            "SELECT hidden FROM topic WHERE conversation_id = ?1 AND id = ?2 AND removed = 0",
+            params![chat.bytes(), topic.bytes()],
+            |row| row.get(0),
+        )
+        .optional()
+}
+
+/// A LIKE pattern finding `term` anywhere, its own `%`, `_` and `\\` escaped.
+fn like_pattern(term: &str) -> String {
+    let mut escaped = String::with_capacity(term.len() + 2);
+    escaped.push('%');
+    for character in term.chars() {
+        if matches!(character, '%' | '_' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped.push('%');
+    escaped
+}
+
+/// Removes a whole chat for everyone, out of every member's folders, giving who was in it, who had
+/// asked to join or was invited, and its files, whose bytes can go.
+fn remove_chat_rows(connection: &Connection, chat: Ulid) -> rusqlite::Result<Option<Removed>> {
+    let mut lists = [Vec::new(), Vec::new(), Vec::new()];
+    for (table, list) in ["member", "join_request", "invitation"]
+        .into_iter()
+        .zip(lists.iter_mut())
+    {
+        let mut statement = connection.prepare(&format!(
+            "SELECT account_id FROM {table} WHERE conversation_id = ?1"
+        ))?;
+        for account in statement.query_map(params![chat.bytes()], |row| row.get(0))? {
+            list.push(Ulid::from_bytes(account?));
+        }
+    }
+    let [member_list, asker_list, invitee_list] = lists;
+    let mut statement = connection
+        .prepare("SELECT id FROM file WHERE conversation_id = ?1 AND removed_at IS NULL")?;
+    let mut file_list = Vec::new();
+    for file in statement.query_map(params![chat.bytes()], |row| row.get(0))? {
+        file_list.push(Ulid::from_bytes(file?));
+    }
+    for account in &member_list {
+        drop_from_folders(connection, chat, *account)?;
+    }
+    let removed = connection.execute(
+        "DELETE FROM conversation WHERE id = ?1",
+        params![chat.bytes()],
+    )?;
+    if removed == 0 {
+        return Ok(None);
+    }
+    Ok(Some(Removed {
+        member_list,
+        asker_list,
+        invitee_list,
+        file_list,
+    }))
+}
+
+fn request_row(row: &Row<'_>) -> rusqlite::Result<RequestItem> {
+    let state: i64 = row.get(4)?;
+    Ok(RequestItem {
+        chat: Ulid::from_bytes(row.get(0)?),
+        account: Ulid::from_bytes(row.get(1)?),
+        note: row.get(2)?,
+        name: row.get(3)?,
+        state: if state == 1 {
+            RequestState::Declined
+        } else {
+            RequestState::Waiting
+        },
+        at: row.get(5)?,
+    })
+}
+
+const REQUEST_COLUMNS: &str = "r.conversation_id, r.account_id, r.note, c.find_name, r.state, r.at";
+
+fn invitation_row(row: &Row<'_>) -> rusqlite::Result<InvitationItem> {
+    Ok(InvitationItem {
+        chat: Ulid::from_bytes(row.get(0)?),
+        chat_type: numbered(row.get(1)?)?,
+        inviter: Ulid::from_bytes(row.get(2)?),
+        device: Ulid::from_bytes(row.get(3)?),
+        sealed: Bytes(row.get(4)?),
+        signature: Bytes(row.get(5)?),
+        at: row.get(6)?,
+    })
+}
+
+const INVITATION_COLUMNS: &str =
+    "i.conversation_id, c.type, d.account_id, i.inviter, i.sealed, i.signature, i.at";
+
+/// A place's two columns in `seen` and `received`.
+fn place_columns(place: Place) -> (i64, Vec<u8>) {
+    match place {
+        Place::Main => (0, Vec::new()),
+        Place::Topic(topic) => (1, topic.bytes().to_vec()),
+        Place::Thread(seq) => (2, seq.to_be_bytes().to_vec()),
+    }
 }
 
 fn call_event_row(row: &Row<'_>) -> rusqlite::Result<CallEvent> {
@@ -295,10 +998,12 @@ struct SyncAsk {
 
 /// Rows of one table for `ask`. `order` names the time and sequence id columns this table orders
 /// by, and its `n` column. A message has none, and stands at `n` 0 before its call's rows.
+/// `seen` adds a condition naming the asking account as `?9`, for rows only some members see.
 fn sync_rows<T>(
     connection: &Connection,
     query: &str,
     order: (&str, &str, Option<&str>),
+    seen: Option<&str>,
     ask: SyncAsk,
     row_of: fn(&Row<'_>) -> rusqlite::Result<T>,
 ) -> rusqlite::Result<Vec<T>> {
@@ -310,9 +1015,11 @@ fn sync_rows<T>(
     } = ask;
     let (at, seq, n) = order;
     // SQLite reads a bare number in ORDER BY as a column's place, so a message orders without one.
-    let order_by = match n {
-        Some(n) => format!("{at}, conversation_id, {seq}, {n}"),
-        None => format!("{at}, conversation_id, {seq}"),
+    // A chat event's sequence id is the bare 0, so it orders by its `n` alone.
+    let order_by = match (n, seq) {
+        (Some(n), "0") => format!("{at}, conversation_id, {n}"),
+        (Some(n), _) => format!("{at}, conversation_id, {seq}, {n}"),
+        (None, _) => format!("{at}, conversation_id, {seq}"),
     };
     let n = n.unwrap_or("0");
     let scope = match chat {
@@ -323,37 +1030,42 @@ fn sync_rows<T>(
         Some(chat) => *chat.bytes(),
         None => *account.bytes(),
     };
-    let mut row_list = Vec::new();
-    match from {
+    let seen = match seen {
+        Some(seen) => format!(" AND {seen}"),
+        None => String::new(),
+    };
+    let mut value_list: Vec<rusqlite::types::Value> = vec![scope_id.to_vec().into()];
+    let query = match from {
         SyncFrom::Since(since) => {
-            let mut statement = connection.prepare(&format!(
-                "{query} WHERE {scope} AND {at} >= ?2
+            value_list.push(since.into());
+            value_list.push(i64::from(limit).into());
+            format!(
+                "{query} WHERE {scope} AND {at} >= ?2{seen}
                  ORDER BY {order_by} LIMIT ?3"
-            ))?;
-            for row in statement.query_map(params![scope_id, since, limit], row_of)? {
-                row_list.push(row?);
-            }
+            )
         }
         SyncFrom::After(position) => {
-            let mut statement = connection.prepare(&format!(
+            value_list.push(position.at.into());
+            value_list.push(position.chat.bytes().to_vec().into());
+            value_list.push(int(position.seq).into());
+            value_list.push(int(position.n).into());
+            value_list.push(i64::from(limit).into());
+            format!(
                 "{query} WHERE {scope} AND ({at}, conversation_id, {seq}, {n}) > (?2, ?3, ?4, ?5)
-                 ORDER BY {order_by} LIMIT ?6"
-            ))?;
-            let rows = statement.query_map(
-                params![
-                    scope_id,
-                    position.at,
-                    position.chat.bytes(),
-                    int(position.seq),
-                    int(position.n),
-                    limit
-                ],
-                row_of,
-            )?;
-            for row in rows {
-                row_list.push(row?);
-            }
+                 {seen} ORDER BY {order_by} LIMIT ?6"
+            )
         }
+    };
+    if !seen.is_empty() {
+        while value_list.len() < 8 {
+            value_list.push(rusqlite::types::Value::Null);
+        }
+        value_list.push(account.bytes().to_vec().into());
+    }
+    let mut statement = connection.prepare(&query)?;
+    let mut row_list = Vec::new();
+    for row in statement.query_map(rusqlite::params_from_iter(value_list), row_of)? {
+        row_list.push(row?);
     }
     Ok(row_list)
 }
@@ -368,6 +1080,8 @@ fn account_row(row: &Row<'_>) -> rusqlite::Result<Account> {
         account_public: row.get(5)?,
         account_stamp: row.get(6)?,
         profile_version: unsigned(row.get(7)?),
+        invite_public: row.get(8)?,
+        invite_stamp: row.get(9)?,
     })
 }
 
@@ -534,7 +1248,8 @@ impl Storage for Sqlite {
             connection
                 .query_row(
                     "SELECT id, username, display_name, password_hash, master_public_key,
-                     account_public_key, account_key_stamp, profile_version
+                     account_public_key, account_key_stamp, profile_version, invite_public_key,
+                     invite_key_stamp
                      FROM account WHERE username = ?1",
                     params![username],
                     account_row,
@@ -549,7 +1264,8 @@ impl Storage for Sqlite {
             connection
                 .query_row(
                     "SELECT id, username, display_name, password_hash, master_public_key,
-                     account_public_key, account_key_stamp, profile_version
+                     account_public_key, account_key_stamp, profile_version, invite_public_key,
+                     invite_key_stamp
                      FROM account WHERE id = ?1",
                     params![id.bytes()],
                     account_row,
@@ -561,15 +1277,7 @@ impl Storage for Sqlite {
 
     async fn search_accounts(&self, term: String, limit: u32) -> Result<Vec<AccountBrief>> {
         self.read(move |connection| {
-            let mut escaped = String::with_capacity(term.len() + 2);
-            escaped.push('%');
-            for character in term.chars() {
-                if matches!(character, '%' | '_' | '\\') {
-                    escaped.push('\\');
-                }
-                escaped.push(character);
-            }
-            escaped.push('%');
+            let escaped = like_pattern(&term);
             let mut statement = connection.prepare(
                 "SELECT id, username, display_name FROM account
                  WHERE username LIKE ?1 ESCAPE '\\' OR display_name LIKE ?1 ESCAPE '\\'
@@ -672,18 +1380,25 @@ impl Storage for Sqlite {
     async fn set_account_keys(
         &self,
         account: Ulid,
-        master_public: Vec<u8>,
-        account_public: Vec<u8>,
-        stamp: Vec<u8>,
+        keys: NewAccountKeys,
         chat: Ulid,
         now: i64,
     ) -> Result<bool> {
         self.write(move |connection| {
             let changed = connection.execute(
                 "UPDATE account SET master_public_key = ?2, account_public_key = ?3,
-                 account_key_stamp = ?4, words_set_at = ?5
+                 account_key_stamp = ?4, invite_public_key = ?5, invite_key_stamp = ?6,
+                 words_set_at = ?7
                  WHERE id = ?1 AND master_public_key IS NULL",
-                params![account.bytes(), master_public, account_public, stamp, now],
+                params![
+                    account.bytes(),
+                    keys.master_public,
+                    keys.account_public,
+                    keys.account_stamp,
+                    keys.invite_public,
+                    keys.invite_stamp,
+                    now
+                ],
             )?;
             if changed == 0 {
                 return Ok(false);
@@ -896,26 +1611,34 @@ impl Storage for Sqlite {
         .await
     }
 
-    async fn chat_permitted(
-        &self,
-        chat: Ulid,
-        account: Ulid,
-        permission: &'static str,
-    ) -> Result<bool> {
+    async fn chat_permitted(&self, chat: Ulid, account: Ulid, permission: String) -> Result<bool> {
         self.read(move |connection| {
             connection.query_row(
                 "SELECT EXISTS (
                      SELECT 1 FROM account_role a JOIN role r ON r.id = a.role_id
                      WHERE a.account_id = ?2 AND r.scope = 0 AND r.built_in = 1 AND r.name = 'admin'
                  ) OR EXISTS (
-                     SELECT 1 FROM conversation c
-                     JOIN role r ON r.scope = 1 AND r.built_in = 1 AND r.name = 'member'
+                     SELECT 1 FROM member m
+                     JOIN role r ON r.scope = 1 AND r.built_in = 1 AND r.name = 'owner'
                      JOIN role_permission p ON p.role_id = r.id AND p.permission = ?3
-                     WHERE c.id = ?1 AND c.type IN (0, 1)
+                     WHERE m.conversation_id = ?1 AND m.account_id = ?2 AND m.is_owner = 1
                  ) OR EXISTS (
                      SELECT 1 FROM member_role m
                      JOIN role_permission p ON p.role_id = m.role_id AND p.permission = ?3
                      WHERE m.conversation_id = ?1 AND m.account_id = ?2
+                 ) OR (
+                     EXISTS (
+                         SELECT 1 FROM member
+                         WHERE conversation_id = ?1 AND account_id = ?2
+                     ) AND COALESCE(
+                         (SELECT allowed FROM chat_permission
+                          WHERE conversation_id = ?1 AND permission = ?3),
+                         EXISTS (
+                             SELECT 1 FROM role r
+                             JOIN role_permission p ON p.role_id = r.id AND p.permission = ?3
+                             WHERE r.scope = 1 AND r.built_in = 1 AND r.name = 'member'
+                         )
+                     )
                  )",
                 params![chat.bytes(), account.bytes(), permission],
                 |row| row.get(0),
@@ -982,8 +1705,9 @@ impl Storage for Sqlite {
                 params![session.bytes(), device.id.bytes()],
             )?;
             let (chat, seq): ([u8; 16], i64) = connection.query_row(
-                "UPDATE conversation SET last_seq = last_seq + 1, last_kind = 4, last_at = ?2
-                 WHERE type = 0 AND direct_low = ?1
+                // The notice is the self chat's last content, so a later commit never hides it.
+                "UPDATE conversation SET last_seq = last_seq + 1, last_kind = 4, last_at = ?2,
+                 last_content_seq = last_seq + 1 WHERE type = 0 AND direct_low = ?1
                  RETURNING id, last_seq",
                 params![device.account.bytes(), device.now],
                 |row| Ok((row.get(0)?, row.get(1)?)),
@@ -1003,6 +1727,8 @@ impl Storage for Sqlite {
                 encrypted: Some(false),
                 epoch: None,
                 pointer_seq: None,
+                topic: None,
+                thread_seq: None,
                 client_sent_at: Some(device.now),
                 server_saved_at: Some(device.now),
                 body: Some(Bytes(Vec::new())),
@@ -1368,25 +2094,1049 @@ impl Storage for Sqlite {
         .await
     }
 
+    async fn create_group(&self, group: NewGroup) -> Result<(ChatEvent, Option<MessageFrame>)> {
+        self.write(move |connection| {
+            let (findable, find_name, find_bio) = match group.findable {
+                Some(findable) => (true, Some(findable.name), findable.bio),
+                None => (false, None, None),
+            };
+            connection.execute(
+                "INSERT INTO conversation (id, type, topics_on, findable, find_name, find_bio,
+                 created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    group.id.bytes(),
+                    u8::from(group.chat_type),
+                    group.topics_on,
+                    findable,
+                    find_name,
+                    find_bio,
+                    group.now
+                ],
+            )?;
+            connection.execute(
+                "INSERT INTO member (conversation_id, account_id, joined_seq, is_owner)
+                 VALUES (?1, ?2, 0, 1)",
+                params![group.id.bytes(), group.owner.bytes()],
+            )?;
+            // General's own settings live in a topic row under the all-zero id.
+            connection.execute(
+                &format!(
+                    "INSERT INTO topic (conversation_id, id, issued_at) VALUES (?1, {GENERAL_SQL}, ?2)"
+                ),
+                params![group.id.bytes(), group.now],
+            )?;
+            let created = event(
+                group.id,
+                group.owner,
+                ChatAction::Created,
+                None,
+                Audience::Moderators,
+                group.now,
+            );
+            let created = write_event(connection, created, None)?;
+            let line = write_line(
+                connection,
+                group.id,
+                group.device,
+                LineAction::Created,
+                Vec::new(),
+                group.now,
+            )?;
+            Ok((created, line))
+        })
+        .await
+    }
+
+    async fn member_roles(&self, chat: Ulid) -> Result<Vec<(Ulid, ChatRole)>> {
+        self.read(move |connection| {
+            let mut statement = connection.prepare(
+                "SELECT m.account_id, m.is_owner,
+                 EXISTS (SELECT 1 FROM member_role r WHERE r.conversation_id = m.conversation_id
+                         AND r.account_id = m.account_id)
+                 FROM member m WHERE m.conversation_id = ?1",
+            )?;
+            let rows = statement.query_map(params![chat.bytes()], |row| {
+                let owner: bool = row.get(1)?;
+                let moderator: bool = row.get(2)?;
+                Ok((
+                    Ulid::from_bytes(row.get(0)?),
+                    if owner {
+                        ChatRole::Owner
+                    } else if moderator {
+                        ChatRole::Moderator
+                    } else {
+                        ChatRole::Member
+                    },
+                ))
+            })?;
+            let mut role_list = Vec::new();
+            for row in rows {
+                role_list.push(row?);
+            }
+            Ok(role_list)
+        })
+        .await
+    }
+
+    async fn leave_chat(&self, chat: Ulid, account: Ulid, device: Ulid, now: i64) -> Result<Left> {
+        self.write(move |connection| {
+            let owner: Option<bool> = connection
+                .query_row(
+                    "SELECT is_owner FROM member WHERE conversation_id = ?1 AND account_id = ?2",
+                    params![chat.bytes(), account.bytes()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(owner) = owner else {
+                return Ok(Left::NotMember);
+            };
+            let owners: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM member WHERE conversation_id = ?1 AND is_owner = 1",
+                params![chat.bytes()],
+                |row| row.get(0),
+            )?;
+            // The last owner leaving removes the chat for everyone, so a group always has an owner.
+            if owner && owners == 1 {
+                return match remove_chat_rows(connection, chat)? {
+                    Some(removed) => Ok(Left::Removed(removed)),
+                    None => Ok(Left::NotMember),
+                };
+            }
+            connection.execute(
+                "DELETE FROM member WHERE conversation_id = ?1 AND account_id = ?2",
+                params![chat.bytes(), account.bytes()],
+            )?;
+            drop_from_folders(connection, chat, account)?;
+            let left = event(
+                chat,
+                account,
+                ChatAction::Left,
+                Some(account),
+                Audience::Moderators,
+                now,
+            );
+            let left = write_event(connection, left, None)?;
+            let line = write_line(connection, chat, device, LineAction::Left, Vec::new(), now)?;
+            let mut statement =
+                connection.prepare("SELECT account_id FROM member WHERE conversation_id = ?1")?;
+            let mut member_list = Vec::new();
+            for member in statement.query_map(params![chat.bytes()], |row| row.get(0))? {
+                member_list.push(Ulid::from_bytes(member?));
+            }
+            Ok(Left::Left {
+                event: Box::new(left),
+                line: line.map(Box::new),
+                member_list,
+            })
+        })
+        .await
+    }
+
+    async fn set_role(
+        &self,
+        chat: Ulid,
+        actor: Ulid,
+        device: Ulid,
+        account: Ulid,
+        role: ChatRole,
+        now: i64,
+    ) -> Result<RoleSet> {
+        self.write(move |connection| {
+            let owner: Option<bool> = connection
+                .query_row(
+                    "SELECT is_owner FROM member WHERE conversation_id = ?1 AND account_id = ?2",
+                    params![chat.bytes(), account.bytes()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(owner) = owner else {
+                return Ok(RoleSet::NotMember);
+            };
+            let owners: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM member WHERE conversation_id = ?1 AND is_owner = 1",
+                params![chat.bytes()],
+                |row| row.get(0),
+            )?;
+            if owner && owners == 1 && role != ChatRole::Owner {
+                return Ok(RoleSet::LastOwner);
+            }
+            connection.execute(
+                "UPDATE member SET is_owner = ?3 WHERE conversation_id = ?1 AND account_id = ?2",
+                params![chat.bytes(), account.bytes(), role == ChatRole::Owner],
+            )?;
+            connection.execute(
+                "DELETE FROM member_role WHERE conversation_id = ?1 AND account_id = ?2",
+                params![chat.bytes(), account.bytes()],
+            )?;
+            if role == ChatRole::Moderator {
+                connection.execute(
+                    "INSERT INTO member_role (conversation_id, account_id, role_id)
+                     SELECT ?1, ?2, id FROM role WHERE scope = 1 AND built_in = 1
+                     AND name = 'moderator' AND conversation_id IS NULL",
+                    params![chat.bytes(), account.bytes()],
+                )?;
+            }
+            let (action, said) = match role {
+                ChatRole::Owner => (ChatAction::MadeOwner, LineAction::MadeOwner),
+                ChatRole::Moderator => (ChatAction::MadeModerator, LineAction::MadeModerator),
+                ChatRole::Member => (ChatAction::MadeMember, LineAction::MadeMember),
+            };
+            let history = event(
+                chat,
+                actor,
+                action,
+                Some(account),
+                Audience::Moderators,
+                now,
+            );
+            let history = write_event(connection, history, None)?;
+            let line = write_line(connection, chat, device, said, vec![account], now)?;
+            let mut statement =
+                connection.prepare("SELECT account_id FROM member WHERE conversation_id = ?1")?;
+            let mut member_list = Vec::new();
+            for member in statement.query_map(params![chat.bytes()], |row| row.get(0))? {
+                member_list.push(Ulid::from_bytes(member?));
+            }
+            Ok(RoleSet::Set {
+                event: Box::new(history),
+                line: line.map(Box::new),
+                member_list,
+            })
+        })
+        .await
+    }
+
+    async fn remove_chat(&self, chat: Ulid) -> Result<Option<Removed>> {
+        self.write(move |connection| remove_chat_rows(connection, chat))
+            .await
+    }
+
+    async fn ask_to_join(
+        &self,
+        chat: Ulid,
+        account: Ulid,
+        note: Option<String>,
+        now: i64,
+        expire_before: i64,
+    ) -> Result<Asked> {
+        self.write(move |connection| {
+            let name: Option<Option<String>> = connection
+                .query_row(
+                    "SELECT find_name FROM conversation WHERE id = ?1 AND findable = 1
+                     AND type IN (2, 3)",
+                    params![chat.bytes()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(name) = name else {
+                return Ok(Asked::NotFindable);
+            };
+            let member: bool = connection.query_row(
+                "SELECT EXISTS (SELECT 1 FROM member WHERE conversation_id = ?1
+                 AND account_id = ?2)",
+                params![chat.bytes(), account.bytes()],
+                |row| row.get(0),
+            )?;
+            if member {
+                return Ok(Asked::AlreadyMember);
+            }
+            // A waiting request stays as it was asked; a declined or expired one is asked anew.
+            connection.execute(
+                "DELETE FROM join_request WHERE conversation_id = ?1 AND account_id = ?2
+                 AND (state = 1 OR at < ?3)",
+                params![chat.bytes(), account.bytes(), expire_before],
+            )?;
+            connection.execute(
+                "INSERT OR IGNORE INTO join_request (conversation_id, account_id, note, state, at)
+                 VALUES (?1, ?2, ?3, 0, ?4)",
+                params![chat.bytes(), account.bytes(), note, now],
+            )?;
+            let (note, at): (Option<String>, i64) = connection.query_row(
+                "SELECT note, at FROM join_request WHERE conversation_id = ?1 AND account_id = ?2",
+                params![chat.bytes(), account.bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            Ok(Asked::Saved(Box::new(RequestItem {
+                chat,
+                account,
+                name,
+                note,
+                state: RequestState::Waiting,
+                at,
+            })))
+        })
+        .await
+    }
+
+    async fn cancel_request(&self, chat: Ulid, account: Ulid) -> Result<bool> {
+        self.write(move |connection| {
+            let removed = connection.execute(
+                "DELETE FROM join_request WHERE conversation_id = ?1 AND account_id = ?2",
+                params![chat.bytes(), account.bytes()],
+            )?;
+            Ok(removed > 0)
+        })
+        .await
+    }
+
+    async fn decline_request(
+        &self,
+        chat: Ulid,
+        account: Ulid,
+        now: i64,
+        expire_before: i64,
+    ) -> Result<Option<RequestItem>> {
+        self.write(move |connection| {
+            let changed = connection.execute(
+                "UPDATE join_request SET state = 1, at = ?3 WHERE conversation_id = ?1
+                 AND account_id = ?2 AND state = 0 AND at >= ?4",
+                params![chat.bytes(), account.bytes(), now, expire_before],
+            )?;
+            if changed == 0 {
+                return Ok(None);
+            }
+            connection
+                .query_row(
+                    &format!(
+                        "SELECT {REQUEST_COLUMNS} FROM join_request r
+                         JOIN conversation c ON c.id = r.conversation_id
+                         WHERE r.conversation_id = ?1 AND r.account_id = ?2"
+                    ),
+                    params![chat.bytes(), account.bytes()],
+                    request_row,
+                )
+                .optional()
+        })
+        .await
+    }
+
+    async fn chat_requests(&self, chat: Ulid, expire_before: i64) -> Result<Vec<RequestItem>> {
+        self.read(move |connection| {
+            let mut statement = connection.prepare(&format!(
+                "SELECT {REQUEST_COLUMNS} FROM join_request r
+                 JOIN conversation c ON c.id = r.conversation_id
+                 WHERE r.conversation_id = ?1 AND r.state = 0 AND r.at >= ?2 ORDER BY r.at"
+            ))?;
+            let mut request_list = Vec::new();
+            for row in statement.query_map(params![chat.bytes(), expire_before], request_row)? {
+                request_list.push(row?);
+            }
+            Ok(request_list)
+        })
+        .await
+    }
+
+    async fn own_requests(&self, account: Ulid, expire_before: i64) -> Result<Vec<RequestItem>> {
+        self.read(move |connection| {
+            let mut statement = connection.prepare(&format!(
+                "SELECT {REQUEST_COLUMNS} FROM join_request r
+                 JOIN conversation c ON c.id = r.conversation_id
+                 WHERE r.account_id = ?1 AND r.at >= ?2 ORDER BY r.at"
+            ))?;
+            let mut request_list = Vec::new();
+            for row in statement.query_map(params![account.bytes(), expire_before], request_row)? {
+                request_list.push(row?);
+            }
+            Ok(request_list)
+        })
+        .await
+    }
+
+    async fn invite(&self, invitation: NewInvitation) -> Result<bool> {
+        self.write(move |connection| {
+            let member: bool = connection.query_row(
+                "SELECT EXISTS (SELECT 1 FROM member WHERE conversation_id = ?1
+                 AND account_id = ?2)",
+                params![invitation.chat.bytes(), invitation.account.bytes()],
+                |row| row.get(0),
+            )?;
+            if member {
+                return Ok(false);
+            }
+            connection.execute(
+                "INSERT OR REPLACE INTO invitation (conversation_id, account_id, inviter, sealed,
+                 signature, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    invitation.chat.bytes(),
+                    invitation.account.bytes(),
+                    invitation.inviter.bytes(),
+                    invitation.sealed,
+                    invitation.signature,
+                    invitation.now
+                ],
+            )?;
+            Ok(true)
+        })
+        .await
+    }
+
+    async fn answer_invitation(
+        &self,
+        chat: Ulid,
+        account: Ulid,
+        accept: Option<Ulid>,
+        limit: u64,
+        now: i64,
+        expire_before: i64,
+    ) -> Result<Answered> {
+        self.write(move |connection| {
+            let invitation = connection
+                .query_row(
+                    &format!(
+                        "SELECT {INVITATION_COLUMNS} FROM invitation i
+                         JOIN conversation c ON c.id = i.conversation_id
+                         JOIN device d ON d.id = i.inviter
+                         WHERE i.conversation_id = ?1 AND i.account_id = ?2 AND i.at >= ?3"
+                    ),
+                    params![chat.bytes(), account.bytes(), expire_before],
+                    invitation_row,
+                )
+                .optional()?;
+            let Some(invitation) = invitation else {
+                return Ok(Answered::NoInvitation);
+            };
+            if accept.is_some() {
+                let count: i64 = connection.query_row(
+                    "SELECT COUNT(*) FROM member WHERE conversation_id = ?1",
+                    params![chat.bytes()],
+                    |row| row.get(0),
+                )?;
+                if unsigned(count) >= limit {
+                    return Ok(Answered::Full);
+                }
+            }
+            connection.execute(
+                "DELETE FROM invitation WHERE conversation_id = ?1 AND account_id = ?2",
+                params![chat.bytes(), account.bytes()],
+            )?;
+            let (history, line) = if let Some(device) = accept {
+                let last_seq: i64 = connection.query_row(
+                    "SELECT last_seq FROM conversation WHERE id = ?1",
+                    params![chat.bytes()],
+                    |row| row.get(0),
+                )?;
+                connection.execute(
+                    "INSERT OR IGNORE INTO member (conversation_id, account_id, joined_seq)
+                     VALUES (?1, ?2, ?3)",
+                    params![chat.bytes(), account.bytes(), last_seq + 1],
+                )?;
+                connection.execute(
+                    "DELETE FROM join_request WHERE conversation_id = ?1 AND account_id = ?2",
+                    params![chat.bytes(), account.bytes()],
+                )?;
+                let joined = event(
+                    chat,
+                    account,
+                    ChatAction::Joined,
+                    Some(invitation.inviter),
+                    Audience::Moderators,
+                    now,
+                );
+                (
+                    write_event(connection, joined, None)?,
+                    write_line(
+                        connection,
+                        chat,
+                        device,
+                        LineAction::Joined,
+                        Vec::new(),
+                        now,
+                    )?,
+                )
+            } else {
+                // Only the inviter sees a decline.
+                let declined = event(
+                    chat,
+                    account,
+                    ChatAction::InvitationDeclined,
+                    Some(account),
+                    Audience::One,
+                    now,
+                );
+                (
+                    write_event(connection, declined, Some(invitation.inviter))?,
+                    None,
+                )
+            };
+            Ok(Answered::Saved {
+                invitation: Box::new(invitation),
+                event: Box::new(history),
+                line: line.map(Box::new),
+            })
+        })
+        .await
+    }
+
+    async fn own_invitations(
+        &self,
+        account: Ulid,
+        expire_before: i64,
+    ) -> Result<Vec<InvitationItem>> {
+        self.read(move |connection| {
+            let mut statement = connection.prepare(&format!(
+                "SELECT {INVITATION_COLUMNS} FROM invitation i
+                 JOIN conversation c ON c.id = i.conversation_id
+                 JOIN device d ON d.id = i.inviter
+                 WHERE i.account_id = ?1 AND i.at >= ?2 ORDER BY i.at"
+            ))?;
+            let mut invitation_list = Vec::new();
+            let rows =
+                statement.query_map(params![account.bytes(), expire_before], invitation_row)?;
+            for row in rows {
+                invitation_list.push(row?);
+            }
+            Ok(invitation_list)
+        })
+        .await
+    }
+
+    async fn issue_topic(
+        &self,
+        chat: Ulid,
+        account: Ulid,
+        topic: Ulid,
+        expires_at: i64,
+    ) -> Result<()> {
+        self.write(move |connection| {
+            connection.execute(
+                "DELETE FROM challenge WHERE expires_at < ?1",
+                params![Ulid::now()],
+            )?;
+            connection.execute(
+                "INSERT INTO challenge (value, account_id, purpose, conversation_id, expires_at)
+                 VALUES (?1, ?2, 4, ?3, ?4)",
+                params![topic.bytes(), account.bytes(), chat.bytes(), expires_at],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn put_topics(
+        &self,
+        chat: Ulid,
+        account: Ulid,
+        on: bool,
+        topic_list: Vec<Ulid>,
+        max: u64,
+        now: i64,
+    ) -> Result<TopicsPut> {
+        self.write(move |connection| {
+            if topic_list.len() as u64 > max {
+                return Ok(TopicsPut::TooMany);
+            }
+            let mut statement = connection.prepare(&format!(
+                "SELECT id FROM topic WHERE conversation_id = ?1 AND removed = 0
+                     AND id != {GENERAL_SQL}"
+            ))?;
+            let mut live = Vec::new();
+            for topic in statement.query_map(params![chat.bytes()], |row| row.get(0))? {
+                live.push(Ulid::from_bytes(topic?));
+            }
+            let mut issued = Vec::new();
+            for topic in &topic_list {
+                if live.contains(topic) {
+                    continue;
+                }
+                let expires_at: Option<i64> = connection
+                    .query_row(
+                        "SELECT expires_at FROM challenge WHERE value = ?1 AND account_id = ?2
+                         AND purpose = 4 AND conversation_id = ?3",
+                        params![topic.bytes(), account.bytes(), chat.bytes()],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                match expires_at {
+                    Some(expires_at) if expires_at >= now => issued.push(*topic),
+                    _ => return Ok(TopicsPut::UnknownTopic),
+                }
+            }
+            let mut event_list = Vec::new();
+            let was_on: bool = connection.query_row(
+                "SELECT topics_on FROM conversation WHERE id = ?1",
+                params![chat.bytes()],
+                |row| row.get(0),
+            )?;
+            if was_on != on {
+                connection.execute(
+                    "UPDATE conversation SET topics_on = ?2 WHERE id = ?1",
+                    params![chat.bytes(), on],
+                )?;
+                let action = if on {
+                    ChatAction::TopicsOn
+                } else {
+                    ChatAction::TopicsOff
+                };
+                let changed = event(chat, account, action, None, Audience::Moderators, now);
+                event_list.push(write_event(connection, changed, None)?);
+            }
+            for topic in issued {
+                connection.execute(
+                    "DELETE FROM challenge WHERE value = ?1",
+                    params![topic.bytes()],
+                )?;
+                connection.execute(
+                    "INSERT INTO topic (conversation_id, id, issued_at) VALUES (?1, ?2, ?3)",
+                    params![chat.bytes(), topic.bytes(), now],
+                )?;
+                let added = event(
+                    chat,
+                    account,
+                    ChatAction::TopicAdded,
+                    Some(topic),
+                    Audience::Moderators,
+                    now,
+                );
+                event_list.push(write_event(connection, added, None)?);
+            }
+            let mut wiped = false;
+            for topic in live {
+                if topic_list.contains(&topic) {
+                    continue;
+                }
+                connection.execute(
+                    "UPDATE topic SET removed = 1 WHERE conversation_id = ?1 AND id = ?2",
+                    params![chat.bytes(), topic.bytes()],
+                )?;
+                // Wiped as a delete wipes: the topic's messages, their threads, and their edits.
+                connection.execute(
+                    "UPDATE message SET device_id = NULL, kind = NULL, content_kind = NULL,
+                     encrypted = NULL, epoch = NULL, pointer_seq = NULL, client_sent_at = NULL,
+                     server_saved_at = ?3, topic_id = NULL, thread_seq = NULL,
+                     expires_at = NULL, signature = NULL, body = NULL
+                     WHERE conversation_id = ?1 AND kind = 1 AND pointer_seq IN (
+                         SELECT seq FROM message WHERE conversation_id = ?1 AND topic_id = ?2
+                     )",
+                    params![chat.bytes(), topic.bytes(), now],
+                )?;
+                connection.execute(
+                    "UPDATE message SET device_id = NULL, kind = NULL, content_kind = NULL,
+                     encrypted = NULL, epoch = NULL, pointer_seq = NULL, client_sent_at = NULL,
+                     server_saved_at = ?3, topic_id = NULL, thread_seq = NULL,
+                     expires_at = NULL, signature = NULL, body = NULL
+                     WHERE conversation_id = ?1 AND topic_id = ?2",
+                    params![chat.bytes(), topic.bytes(), now],
+                )?;
+                wiped = true;
+                let removed = event(
+                    chat,
+                    account,
+                    ChatAction::TopicRemoved,
+                    Some(topic),
+                    Audience::Moderators,
+                    now,
+                );
+                event_list.push(write_event(connection, removed, None)?);
+            }
+            if wiped {
+                connection.execute(
+                    "UPDATE conversation SET
+                     last_content_seq = (
+                         SELECT seq FROM message WHERE conversation_id = ?1
+                         AND (kind IN (4, 5) OR (kind = 0 AND content_kind IS NOT 14))
+                         AND thread_seq IS NULL
+                         ORDER BY seq DESC LIMIT 1
+                     ),
+                     last_at = (
+                         SELECT server_saved_at FROM message WHERE conversation_id = ?1
+                         AND kind IN (0, 4, 5) AND content_kind IS NOT 14 AND thread_seq IS NULL
+                         ORDER BY seq DESC LIMIT 1
+                     )
+                     WHERE id = ?1",
+                    params![chat.bytes()],
+                )?;
+            }
+            Ok(TopicsPut::Saved { event_list, wiped })
+        })
+        .await
+    }
+
+    async fn put_chat_profile(&self, profile: NewChatProfile) -> Result<ChatProfileSaved> {
+        self.write(move |connection| {
+            if !photo_fits(connection, &profile)? {
+                return Ok(ChatProfileSaved::NoSuchPhoto);
+            }
+            save_chat_profile(connection, profile, None)
+        })
+        .await
+    }
+
+    async fn put_chat_options(&self, chat: Ulid, options: NewChatOptions) -> Result<()> {
+        self.write(move |connection| save_chat_options(connection, chat, &options))
+            .await
+    }
+
+    async fn put_findable(&self, chat: Ulid, findable: Option<FindableItem>) -> Result<()> {
+        self.write(move |connection| {
+            let (on, name, bio) = match findable {
+                Some(findable) => (true, Some(findable.name), findable.bio),
+                None => (false, None, None),
+            };
+            connection.execute(
+                "UPDATE conversation SET findable = ?2, find_name = ?3, find_bio = ?4
+                 WHERE id = ?1",
+                params![chat.bytes(), on, name, bio],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn search_chats(&self, term: String, limit: u32) -> Result<Vec<FoundChat>> {
+        self.read(move |connection| {
+            let mut statement = connection.prepare(
+                "SELECT c.id, c.type, c.find_name, c.find_bio,
+                 (SELECT COUNT(*) FROM member m WHERE m.conversation_id = c.id)
+                 FROM conversation c
+                 WHERE c.findable = 1 AND c.find_name LIKE ?1 ESCAPE '\\'
+                 ORDER BY c.find_name LIMIT ?2",
+            )?;
+            let rows = statement.query_map(params![like_pattern(&term), limit], |row| {
+                Ok(FoundChat {
+                    chat: Ulid::from_bytes(row.get(0)?),
+                    chat_type: numbered(row.get(1)?)?,
+                    name: row.get(2)?,
+                    bio: row.get(3)?,
+                    member_count: unsigned(row.get(4)?),
+                })
+            })?;
+            let mut chat_list = Vec::new();
+            for row in rows {
+                chat_list.push(row?);
+            }
+            Ok(chat_list)
+        })
+        .await
+    }
+
+    async fn chat_type(&self, chat: Ulid) -> Result<Option<ChatType>> {
+        self.read(move |connection| {
+            let chat_type: Option<i64> = connection
+                .query_row(
+                    "SELECT type FROM conversation WHERE id = ?1",
+                    params![chat.bytes()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match chat_type {
+                Some(number) => Ok(Some(numbered(number)?)),
+                None => Ok(None),
+            }
+        })
+        .await
+    }
+
+    async fn chat_options(&self, chat: Ulid) -> Result<ChatOptions> {
+        self.read(move |connection| chat_options(connection, chat))
+            .await
+    }
+
+    async fn topic_access(
+        &self,
+        chat: Ulid,
+        topic: Ulid,
+        account: Ulid,
+    ) -> Result<Option<TopicAccess>> {
+        self.read(move |connection| {
+            let Some(item) = topic_item(connection, chat, topic)? else {
+                return Ok(None);
+            };
+            let chat_type: i64 = connection.query_row(
+                "SELECT type FROM conversation WHERE id = ?1",
+                params![chat.bytes()],
+                |row| row.get(0),
+            )?;
+            let prefix = if numbered::<ChatType>(chat_type)? == ChatType::Channel {
+                "channel"
+            } else {
+                "group"
+            };
+            let last_sent_at = connection
+                .query_row(
+                    "SELECT at FROM slow_sent WHERE conversation_id = ?1 AND topic_id = ?2
+                     AND account_id = ?3",
+                    params![chat.bytes(), topic.bytes(), account.bytes()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(Some(TopicAccess {
+                closed: item.options.closed,
+                hidden: item.options.hidden,
+                write: item.options.write,
+                slow_mode: item.options.slow_mode,
+                last_sent_at,
+                moderator: item.mod_list.contains(&account),
+                allow: item
+                    .options
+                    .allow
+                    .iter()
+                    .map(|name| format!("{prefix}.{name}"))
+                    .collect(),
+                deny: item
+                    .options
+                    .deny
+                    .iter()
+                    .map(|name| format!("{prefix}.{name}"))
+                    .collect(),
+            }))
+        })
+        .await
+    }
+
+    async fn put_topic_options(
+        &self,
+        chat: Ulid,
+        topic: Ulid,
+        actor: Ulid,
+        options: NewTopicOptions,
+        now: i64,
+    ) -> Result<TopicSaved> {
+        self.write(move |connection| {
+            let Some(was_hidden) = topic_hidden(connection, chat, topic)? else {
+                return Ok(TopicSaved::NoSuchTopic);
+            };
+            connection.execute(
+                "UPDATE topic SET closed = ?3, hidden = ?4, write = ?5, slow_mode = ?6
+                 WHERE conversation_id = ?1 AND id = ?2",
+                params![
+                    chat.bytes(),
+                    topic.bytes(),
+                    options.closed,
+                    options.hidden,
+                    i64::from(options.write == TopicWrite::Moderators),
+                    opt_int(options.slow_mode)
+                ],
+            )?;
+            connection.execute(
+                "DELETE FROM topic_permission WHERE conversation_id = ?1 AND topic_id = ?2",
+                params![chat.bytes(), topic.bytes()],
+            )?;
+            for (list, allowed) in [(&options.allow, true), (&options.deny, false)] {
+                for permission in list {
+                    connection.execute(
+                        "INSERT OR REPLACE INTO topic_permission (conversation_id, topic_id,
+                         permission, allowed) VALUES (?1, ?2, ?3, ?4)",
+                        params![chat.bytes(), topic.bytes(), permission, allowed],
+                    )?;
+                }
+            }
+            let changed = event(
+                chat,
+                actor,
+                ChatAction::TopicOptions,
+                None,
+                Audience::Moderators,
+                now,
+            );
+            topic_saved(
+                connection,
+                chat,
+                topic,
+                Some(changed),
+                was_hidden,
+                Vec::new(),
+            )
+        })
+        .await
+    }
+
+    async fn put_topic_profile(&self, profile: NewTopicProfile) -> Result<TopicSaved> {
+        self.write(move |connection| {
+            let chat = profile.chat;
+            let topic = profile.topic;
+            let Some(was_hidden) = topic_hidden(connection, chat, topic)? else {
+                return Ok(TopicSaved::NoSuchTopic);
+            };
+            let old_photo: Option<[u8; 16]> = connection.query_row(
+                "SELECT photo_id FROM topic WHERE conversation_id = ?1 AND id = ?2",
+                params![chat.bytes(), topic.bytes()],
+                |row| row.get(0),
+            )?;
+            let old_photo = old_photo.map(Ulid::from_bytes);
+            // The first profile, set by whoever added the topic, is part of creating it, which its
+            // "added" row already says, so it writes no "edited" row.
+            let creating: bool = connection.query_row(
+                "SELECT EXISTS (SELECT 1 FROM topic t JOIN chat_event e
+                 ON e.conversation_id = t.conversation_id AND e.action = 10 AND e.target = t.id
+                 WHERE t.conversation_id = ?1 AND t.id = ?2 AND t.version = 0 AND e.actor = ?3)",
+                params![chat.bytes(), topic.bytes(), profile.account.bytes()],
+                |row| row.get(0),
+            )?;
+            if let Some(photo) = profile.photo {
+                let fits: bool = connection.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM file f JOIN device d ON d.id = f.uploaded_by
+                     WHERE f.id = ?1 AND f.conversation_id = ?2 AND f.kind = 3 AND f.size <= ?4
+                     AND f.received = f.chunks AND f.removed_at IS NULL
+                     AND (d.account_id = ?3 OR f.id = ?5))",
+                    params![
+                        photo.bytes(),
+                        chat.bytes(),
+                        profile.account.bytes(),
+                        int(profile.photo_limit),
+                        old_photo.map(|old| old.bytes().to_vec())
+                    ],
+                    |row| row.get(0),
+                )?;
+                if !fits {
+                    return Ok(TopicSaved::NoSuchPhoto);
+                }
+                connection.execute(
+                    "UPDATE file SET used_at = ?2 WHERE id = ?1 AND used_at IS NULL",
+                    params![photo.bytes(), profile.now],
+                )?;
+            }
+            let mut removed = Vec::new();
+            if let Some(old) = old_photo
+                && Some(old) != profile.photo
+            {
+                connection.execute(
+                    "UPDATE file SET removed_at = ?2 WHERE id = ?1 AND removed_at IS NULL",
+                    params![old.bytes(), profile.now],
+                )?;
+                removed.push(old);
+            }
+            connection.execute(
+                "UPDATE topic SET sealed = ?3, signature = ?4, photo_id = ?5, updated_by = ?6,
+                 version = version + 1, updated_at = ?7 WHERE conversation_id = ?1 AND id = ?2",
+                params![
+                    chat.bytes(),
+                    topic.bytes(),
+                    profile.sealed,
+                    profile.signature,
+                    profile.photo.map(|photo| photo.bytes().to_vec()),
+                    profile.device.bytes(),
+                    profile.now
+                ],
+            )?;
+            let changed = (!creating).then(|| {
+                event(
+                    chat,
+                    profile.account,
+                    ChatAction::TopicEdited,
+                    None,
+                    Audience::Moderators,
+                    profile.now,
+                )
+            });
+            topic_saved(connection, chat, topic, changed, was_hidden, removed)
+        })
+        .await
+    }
+
+    async fn put_topic_role(
+        &self,
+        chat: Ulid,
+        topic: Ulid,
+        actor: Ulid,
+        account: Ulid,
+        moderator: bool,
+        now: i64,
+    ) -> Result<TopicSaved> {
+        self.write(move |connection| {
+            let Some(was_hidden) = topic_hidden(connection, chat, topic)? else {
+                return Ok(TopicSaved::NoSuchTopic);
+            };
+            let member: bool = connection.query_row(
+                "SELECT EXISTS (SELECT 1 FROM member WHERE conversation_id = ?1 AND account_id = ?2)",
+                params![chat.bytes(), account.bytes()],
+                |row| row.get(0),
+            )?;
+            if !member {
+                return Ok(TopicSaved::NotMember);
+            }
+            let action = if moderator {
+                connection.execute(
+                    "INSERT OR IGNORE INTO topic_moderator (conversation_id, topic_id, account_id)
+                     VALUES (?1, ?2, ?3)",
+                    params![chat.bytes(), topic.bytes(), account.bytes()],
+                )?;
+                ChatAction::MadeTopicModerator
+            } else {
+                connection.execute(
+                    "DELETE FROM topic_moderator WHERE conversation_id = ?1 AND topic_id = ?2
+                     AND account_id = ?3",
+                    params![chat.bytes(), topic.bytes(), account.bytes()],
+                )?;
+                ChatAction::MadeTopicMember
+            };
+            let changed = event(chat, actor, action, Some(account), Audience::Moderators, now);
+            topic_saved(connection, chat, topic, Some(changed), was_hidden, Vec::new())
+        })
+        .await
+    }
+
+    async fn topic_moderators(&self, chat: Ulid) -> Result<Vec<TopicMods>> {
+        self.read(move |connection| {
+            let mut statement = connection.prepare(
+                "SELECT id, hidden FROM topic WHERE conversation_id = ?1 AND removed = 0",
+            )?;
+            let rows = statement.query_map(params![chat.bytes()], |row| {
+                Ok((Ulid::from_bytes(row.get(0)?), row.get::<_, bool>(1)?))
+            })?;
+            let mut list = Vec::new();
+            for row in rows {
+                let (topic, hidden) = row?;
+                let mut mods = connection.prepare(
+                    "SELECT account_id FROM topic_moderator WHERE conversation_id = ?1
+                     AND topic_id = ?2",
+                )?;
+                let mut mod_list = Vec::new();
+                for account in
+                    mods.query_map(params![chat.bytes(), topic.bytes()], |row| row.get(0))?
+                {
+                    mod_list.push(Ulid::from_bytes(account?));
+                }
+                list.push(TopicMods {
+                    topic,
+                    hidden,
+                    mod_list,
+                });
+            }
+            Ok(list)
+        })
+        .await
+    }
+
     async fn chat_access(&self, chat: Ulid, account: Ulid) -> Result<Option<ChatAccess>> {
         self.read(move |connection| {
-            let row: Option<(i64, i64, i64)> = connection
+            type AccessRow = (i64, i64, bool, bool, Option<i64>, bool);
+            let row: Option<AccessRow> = connection
                 .query_row(
-                    "SELECT c.type, c.mode, c.last_seq FROM conversation c
+                    "SELECT c.type, c.last_seq, m.is_owner,
+                     EXISTS (SELECT 1 FROM member_role r WHERE r.conversation_id = c.id
+                             AND r.account_id = m.account_id),
+                     c.slow_mode, c.topics_on
+                     FROM conversation c
                      JOIN member m ON m.conversation_id = c.id
                      WHERE c.id = ?1 AND m.account_id = ?2",
                     params![chat.bytes(), account.bytes()],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                        ))
+                    },
                 )
                 .optional()?;
-            let Some((chat_type, mode, last_seq)) = row else {
+            let Some((chat_type, last_seq, owner, moderator, slow_mode, topics_on)) = row else {
                 return Ok(None);
             };
             let chat_type: ChatType = numbered(chat_type)?;
-            let mode: ChatMode = numbered(mode)?;
             Ok(Some(ChatAccess {
                 chat_type,
-                mode,
+                role: if owner {
+                    ChatRole::Owner
+                } else if moderator {
+                    ChatRole::Moderator
+                } else {
+                    ChatRole::Member
+                },
+                slow_mode: opt_unsigned(slow_mode),
+                topics_on,
                 last_seq: unsigned(last_seq),
             }))
         })
@@ -1436,38 +3186,68 @@ impl Storage for Sqlite {
         .await
     }
 
-    async fn chat_list(&self, account: Ulid) -> Result<Vec<ChatItem>> {
+    async fn chat_list(&self, account: Ulid, expire_before: i64) -> Result<Vec<ChatItem>> {
         self.read(move |connection| {
             let mut statement = connection.prepare(
-                "SELECT c.id, c.type, c.mode, c.last_seq, c.last_kind, c.last_at, c.last_content_seq,
-                 g.epoch, m.seen_seq, m.draft, m.draft_epoch, m.draft_at
+                "SELECT c.id, c.type, c.last_seq, c.last_kind, c.last_at, c.last_content_seq,
+                 g.epoch, m.seen_seq, m.draft, m.draft_epoch, m.draft_at, m.is_owner,
+                 EXISTS (SELECT 1 FROM member_role r WHERE r.conversation_id = c.id
+                         AND r.account_id = m.account_id),
+                 c.topics_on, c.find_name, c.find_bio
                  FROM member m JOIN conversation c ON c.id = m.conversation_id
                  LEFT JOIN mls_group g ON g.conversation_id = c.id
                  WHERE m.account_id = ?1
                  ORDER BY COALESCE(c.last_at, c.created_at) DESC",
             )?;
             let rows = statement.query_map(params![account.bytes()], |row| {
-                let last_seq: i64 = row.get(3)?;
+                let last_seq: i64 = row.get(2)?;
+                let chat_type: ChatType = numbered(row.get(1)?)?;
+                let owner: bool = row.get(11)?;
+                let moderator: bool = row.get(12)?;
+                let find_name: Option<String> = row.get(14)?;
                 Ok(ChatItem {
                     chat: Ulid::from_bytes(row.get(0)?),
-                    chat_type: numbered(row.get(1)?)?,
-                    mode: numbered(row.get(2)?)?,
+                    chat_type,
+                    role: if !matches!(chat_type, ChatType::Group | ChatType::Channel) {
+                        None
+                    } else if owner {
+                        Some(ChatRole::Owner)
+                    } else if moderator {
+                        Some(ChatRole::Moderator)
+                    } else {
+                        Some(ChatRole::Member)
+                    },
+                    topics_on: row.get(13)?,
+                    topic_list: Vec::new(),
+                    topic_setting_list: Vec::new(),
+                    place_seen_list: Vec::new(),
+                    profile: None,
+                    options: None,
+                    findable: match find_name {
+                        Some(name) => Some(FindableItem {
+                            name,
+                            bio: row.get(15)?,
+                        }),
+                        None => None,
+                    },
+                    member_count: None,
+                    request_count: None,
                     last_seq: if last_seq == 0 {
                         None
                     } else {
                         Some(unsigned(last_seq))
                     },
-                    last_kind: opt_numbered(row.get(4)?)?,
-                    last_at: row.get(5)?,
-                    last_content_seq: opt_unsigned(row.get(6)?),
-                    epoch: opt_unsigned(row.get(7)?),
+                    last_kind: opt_numbered(row.get(3)?)?,
+                    last_at: row.get(4)?,
+                    last_content_seq: opt_unsigned(row.get(5)?),
+                    epoch: opt_unsigned(row.get(6)?),
                     last_content: None,
                     mark_list: Vec::new(),
-                    seen_seq: Some(unsigned(row.get(8)?)),
+                    seen_seq: Some(unsigned(row.get(7)?)),
                     draft: {
-                        let body: Option<Vec<u8>> = row.get(9)?;
-                        let epoch: Option<i64> = row.get(10)?;
-                        let saved_at: Option<i64> = row.get(11)?;
+                        let body: Option<Vec<u8>> = row.get(8)?;
+                        let epoch: Option<i64> = row.get(9)?;
+                        let saved_at: Option<i64> = row.get(10)?;
                         match (body, epoch, saved_at) {
                             (Some(body), Some(epoch), Some(saved_at)) => Some(DraftItem {
                                 epoch: unsigned(epoch),
@@ -1498,16 +3278,104 @@ impl Storage for Sqlite {
                      ON k.conversation_id = m.conversation_id AND k.account_id = m.account_id
                  WHERE m.conversation_id = ?1 ORDER BY m.account_id",
             )?;
+            let mut topics = connection.prepare(&format!(
+                "SELECT id FROM topic WHERE conversation_id = ?1 AND removed = 0
+                 AND id != {GENERAL_SQL} ORDER BY id"
+            ))?;
+            let mut places = connection.prepare(
+                "SELECT kind, place, MAX(up_to_seq) FROM seen
+                 WHERE conversation_id = ?1 AND account_id = ?2 AND kind > 0
+                 GROUP BY kind, place",
+            )?;
+            let mut profile = connection.prepare(
+                "SELECT sealed, signature, updated_by, version, key, key_epoch
+                 FROM conversation_profile WHERE conversation_id = ?1",
+            )?;
+            let mut count =
+                connection.prepare("SELECT COUNT(*) FROM member WHERE conversation_id = ?1")?;
+            let mut requests = connection.prepare(
+                "SELECT COUNT(*) FROM join_request WHERE conversation_id = ?1 AND state = 0
+                 AND at >= ?2",
+            )?;
             for item in &mut chat_list {
                 if let Some(seq) = item.last_content_seq {
                     let message = content
                         .query_row(params![item.chat.bytes(), int(seq)], message_frame)
                         .optional()?;
-                    if let Some(message) = message {
+                    // A hidden topic's message is no preview for whoever may not see it.
+                    if let Some(message) = message
+                        && match message.topic {
+                            Some(topic) => !hidden_from(connection, item.chat, topic, account)?,
+                            None => true,
+                        }
+                    {
                         item.last_content = Some(Box::new(message));
                     }
                 }
+                if matches!(item.chat_type, ChatType::Group | ChatType::Channel) {
+                    for topic in topics.query_map(params![item.chat.bytes()], |row| row.get(0))? {
+                        item.topic_list.push(Ulid::from_bytes(topic?));
+                    }
+                    // Each topic's own settings, General's first, leaving out a hidden one for
+                    // whoever may not see it.
+                    let manager = item.role != Some(ChatRole::Member);
+                    let ids = std::iter::once(GENERAL_TOPIC).chain(item.topic_list.iter().copied());
+                    for topic in ids.collect::<Vec<_>>() {
+                        if let Some(setting) = topic_item(connection, item.chat, topic)?
+                            && (!setting.options.hidden
+                                || manager
+                                || setting.mod_list.contains(&account))
+                        {
+                            item.topic_setting_list.push(setting);
+                        }
+                    }
+                    let rows =
+                        places.query_map(params![item.chat.bytes(), account.bytes()], |row| {
+                            let kind: i64 = row.get(0)?;
+                            let place: Vec<u8> = row.get(1)?;
+                            let seen_seq: i64 = row.get(2)?;
+                            Ok((kind, place, seen_seq))
+                        })?;
+                    for row in rows {
+                        let (kind, place, seen_seq) = row?;
+                        let mut seen = PlaceSeen {
+                            topic: None,
+                            thread_seq: None,
+                            seen_seq: unsigned(seen_seq),
+                        };
+                        if kind == 1
+                            && let Ok(topic) = <[u8; 16]>::try_from(place.as_slice())
+                        {
+                            seen.topic = Some(Ulid::from_bytes(topic));
+                        } else if let Ok(thread) = <[u8; 8]>::try_from(place.as_slice()) {
+                            seen.thread_seq = Some(u64::from_be_bytes(thread));
+                        }
+                        item.place_seen_list.push(seen);
+                    }
+                    item.profile = profile
+                        .query_row(params![item.chat.bytes()], chat_profile_row)
+                        .optional()?;
+                    let options = chat_options(connection, item.chat)?;
+                    // Owners and moderators let people in, and members too where the chat's
+                    // options say so.
+                    let may_add = item.role != Some(ChatRole::Member)
+                        || (options.allow.iter().any(|name| name == "member.add")
+                            && !options.deny.iter().any(|name| name == "member.add"));
+                    if may_add {
+                        let waiting: i64 = requests
+                            .query_row(params![item.chat.bytes(), expire_before], |row| {
+                                row.get(0)
+                            })?;
+                        item.request_count = Some(unsigned(waiting));
+                    }
+                    if options != ChatOptions::default() {
+                        item.options = Some(options);
+                    }
+                }
                 if item.chat_type == ChatType::Channel {
+                    let members: i64 =
+                        count.query_row(params![item.chat.bytes()], |row| row.get(0))?;
+                    item.member_count = Some(unsigned(members));
                     continue;
                 }
                 let rows = marks.query_map(params![item.chat.bytes(), account.bytes()], |row| {
@@ -1714,60 +3582,107 @@ impl Storage for Sqlite {
         .await
     }
 
-    async fn message_times(&self, chat: Ulid, seq: u64) -> Result<Option<Vec<TimesItem>>> {
+    async fn message_times(
+        &self,
+        chat: Ulid,
+        seq: u64,
+        after: Option<Ulid>,
+        shown: TimesShown,
+        limit: usize,
+    ) -> Result<Option<(Vec<TimesItem>, bool)>> {
         self.read(move |connection| {
-            let sender: Option<[u8; 16]> = connection
+            type Found = ([u8; 16], Option<[u8; 16]>, Option<i64>, bool);
+            let found: Option<Found> = connection
                 .query_row(
-                    "SELECT d.account_id FROM message m JOIN device d ON d.id = m.device_id
+                    "SELECT d.account_id, m.topic_id, m.thread_seq, c.topics_on
+                     FROM message m JOIN device d ON d.id = m.device_id
+                     JOIN conversation c ON c.id = m.conversation_id
                      WHERE m.conversation_id = ?1 AND m.seq = ?2",
                     params![chat.bytes(), int(seq)],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .optional()?;
-            let Some(sender) = sender else {
+            let Some((sender, topic, thread, topics_on)) = found else {
                 return Ok(None);
             };
-            let mut members = connection.prepare(
-                "SELECT m.account_id, a.receipts_enabled FROM member m
-                 JOIN account a ON a.id = m.account_id
-                 WHERE m.conversation_id = ?1 AND m.account_id != ?2 ORDER BY m.account_id",
+            // Where reading it was reported. A thread's own place; a topic's while topics are on;
+            // with them off the one list, or the topic from while they were on. Received is only
+            // ever reported for the whole chat.
+            let (first, second) = match (thread, topic) {
+                (Some(thread), _) => {
+                    let place = place_columns(Place::Thread(unsigned(thread)));
+                    (place.clone(), place)
+                }
+                (None, Some(topic)) if topics_on => {
+                    let place = place_columns(Place::Topic(Ulid::from_bytes(topic)));
+                    (place.clone(), place)
+                }
+                (None, Some(topic)) => (
+                    place_columns(Place::Main),
+                    place_columns(Place::Topic(Ulid::from_bytes(topic))),
+                ),
+                (None, None) => (place_columns(Place::Main), place_columns(Place::Main)),
+            };
+            // One query, so a page is ordered as a whole: seen first, then received only, then
+            // neither, the newest first, then by account. `after`'s own place is worked out from
+            // its times, a member or not, so one who left between pages does not end the list.
+            let mut page = connection.prepare(
+                "WITH people (account) AS (
+                     SELECT account_id FROM member WHERE conversation_id = ?1 AND account_id != ?3
+                     UNION SELECT ?4 WHERE ?4 IS NOT NULL
+                 ),
+                 times AS (
+                     SELECT account,
+                     CASE WHEN ?5 THEN (SELECT MIN(server_received_at) FROM received
+                         WHERE conversation_id = ?1 AND account_id = account AND kind = 0
+                         AND place = x'' AND up_to_seq >= ?2) END AS received_at,
+                     CASE WHEN ?6 THEN (SELECT MIN(server_seen_at) FROM seen
+                         WHERE conversation_id = ?1 AND account_id = account AND up_to_seq >= ?2
+                         AND ((kind = ?7 AND place = ?8) OR (kind = ?9 AND place = ?10))) END
+                         AS seen_at
+                     FROM people
+                 ),
+                 keyed AS (
+                     SELECT account, received_at, seen_at,
+                     CASE WHEN seen_at IS NOT NULL THEN 0 WHEN received_at IS NOT NULL THEN 1
+                         ELSE 2 END AS bucket,
+                     -COALESCE(seen_at, received_at, 0) AS late
+                     FROM times
+                 )
+                 SELECT account, received_at, seen_at FROM keyed
+                 WHERE ?4 IS NULL
+                 OR (bucket, late, account) > (SELECT bucket, late, account FROM keyed WHERE account = ?4)
+                 ORDER BY bucket, late, account LIMIT ?11",
             )?;
-            let rows = members.query_map(params![chat.bytes(), sender], |row| {
-                Ok((row.get::<_, [u8; 16]>(0)?, row.get::<_, i64>(1)? == 1))
-            })?;
+            let rows = page.query_map(
+                params![
+                    chat.bytes(),
+                    int(seq),
+                    sender,
+                    after.map(|account| account.bytes().to_vec()),
+                    shown.received,
+                    shown.seen,
+                    first.0,
+                    first.1,
+                    second.0,
+                    second.1,
+                    int(limit as u64 + 1),
+                ],
+                |row| {
+                    Ok(TimesItem {
+                        account: Ulid::from_bytes(row.get(0)?),
+                        received_at: row.get(1)?,
+                        seen_at: row.get(2)?,
+                    })
+                },
+            )?;
             let mut member_list = Vec::new();
             for row in rows {
-                let (account, receipts) = row?;
-                // The first row reaching this message is the one with the smallest position.
-                let received_at: Option<i64> = connection
-                    .query_row(
-                        "SELECT server_received_at FROM received
-                         WHERE conversation_id = ?1 AND account_id = ?2 AND up_to_seq >= ?3
-                         ORDER BY up_to_seq LIMIT 1",
-                        params![chat.bytes(), account, int(seq)],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                let seen_at: Option<i64> = if receipts {
-                    connection
-                        .query_row(
-                            "SELECT server_seen_at FROM seen
-                             WHERE conversation_id = ?1 AND account_id = ?2 AND up_to_seq >= ?3
-                             ORDER BY up_to_seq LIMIT 1",
-                            params![chat.bytes(), account, int(seq)],
-                            |row| row.get(0),
-                        )
-                        .optional()?
-                } else {
-                    None
-                };
-                member_list.push(TimesItem {
-                    account: Ulid::from_bytes(account),
-                    received_at,
-                    seen_at,
-                });
+                member_list.push(row?);
             }
-            Ok(Some(member_list))
+            let more = member_list.len() > limit;
+            member_list.truncate(limit);
+            Ok(Some((member_list, more)))
         })
         .await
     }
@@ -1776,7 +3691,8 @@ impl Storage for Sqlite {
         self.read(move |connection| {
             let row: Option<BriefRow> = connection
                 .query_row(
-                    "SELECT m.kind, m.content_kind, d.account_id, d.created_at, m.server_saved_at
+                    "SELECT m.kind, m.content_kind, d.account_id, d.created_at, m.server_saved_at,
+                     m.topic_id, m.thread_seq
                      FROM message m JOIN device d ON d.id = m.device_id
                      WHERE m.conversation_id = ?1 AND m.seq = ?2",
                     params![chat.bytes(), int(seq)],
@@ -1787,11 +3703,15 @@ impl Storage for Sqlite {
                             row.get(2)?,
                             row.get(3)?,
                             row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
                         ))
                     },
                 )
                 .optional()?;
-            let Some((kind, content_kind, account, device_created_at, saved_at)) = row else {
+            let Some((kind, content_kind, account, device_created_at, saved_at, topic, thread)) =
+                row
+            else {
                 return Ok(None);
             };
             Ok(Some(MessageBrief {
@@ -1800,6 +3720,8 @@ impl Storage for Sqlite {
                 account: Ulid::from_bytes(account),
                 device_created_at,
                 saved_at,
+                topic: opt_id(topic),
+                thread_seq: opt_unsigned(thread),
             }))
         })
         .await
@@ -1821,17 +3743,74 @@ impl Storage for Sqlite {
                     _ => return Ok(Appended::CommitLost),
                 }
             }
+            // Nothing new is sealed under a key someone taken out still holds.
+            if matches!(message.kind, Kind::Content | Kind::Edit)
+                && message.encrypted
+                && let Some(epoch) = message.epoch
+            {
+                let current: Option<i64> = connection
+                    .query_row(
+                        "SELECT epoch FROM mls_group WHERE conversation_id = ?1",
+                        params![chat.bytes()],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if current.is_some_and(|current| int(epoch) < current) {
+                    return Ok(Appended::StaleEpoch);
+                }
+            }
+            if let Some(topic) = message.topic {
+                let live: bool = connection.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM topic WHERE conversation_id = ?1 AND id = ?2
+                     AND removed = 0)",
+                    params![chat.bytes(), topic.bytes()],
+                    |row| row.get(0),
+                )?;
+                if !live {
+                    return Ok(Appended::TopicGone);
+                }
+            }
+            if let Some(action) = &message.action
+                && action.kind == ActionKind::Add
+            {
+                let mut count: i64 = connection.query_row(
+                    "SELECT COUNT(*) FROM member WHERE conversation_id = ?1",
+                    params![chat.bytes()],
+                    |row| row.get(0),
+                )?;
+                for account in &action.account_list {
+                    let member: bool = connection.query_row(
+                        "SELECT EXISTS (SELECT 1 FROM member WHERE conversation_id = ?1
+                         AND account_id = ?2)",
+                        params![chat.bytes(), account.bytes()],
+                        |row| row.get(0),
+                    )?;
+                    if !member {
+                        count += 1;
+                    }
+                }
+                if unsigned(count) > action.limit {
+                    return Ok(Appended::Full);
+                }
+            }
             let seq: i64 = connection.query_row(
                 "UPDATE conversation SET last_seq = last_seq + 1, last_kind = ?2 WHERE id = ?1
                  RETURNING last_seq",
                 params![chat.bytes(), message.kind as u8],
                 |row| row.get(0),
             )?;
+            let mut event_list = Vec::new();
+            // A delete's history row copies what it is about to wipe.
+            if message.kind == Kind::Delete
+                && let Some(author) = message.history
+            {
+                event_list.push(write_copied(connection, &message, author)?);
+            }
             if message.kind == Kind::Delete {
                 connection.execute(
                     "UPDATE message SET device_id = NULL, kind = NULL, content_kind = NULL,
                      encrypted = NULL, epoch = NULL, pointer_seq = NULL, client_sent_at = NULL,
-                     server_saved_at = ?3,
+                     server_saved_at = ?3, topic_id = NULL, thread_seq = NULL,
                      expires_at = NULL, signature = NULL, body = NULL
                      WHERE conversation_id = ?1 AND (seq = ?2 OR (kind = 1 AND pointer_seq = ?2))",
                     params![chat.bytes(), opt_int(message.pointer_seq), message.now],
@@ -1846,7 +3825,8 @@ impl Storage for Sqlite {
             connection.execute(
                 "INSERT INTO message (conversation_id, seq, device_id, kind, content_kind,
                  encrypted, epoch, pointer_seq, client_sent_at, server_saved_at,
-                 signature, body) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 signature, body, topic_id, thread_seq)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     chat.bytes(),
                     seq,
@@ -1859,9 +3839,32 @@ impl Storage for Sqlite {
                     message.client_sent_at,
                     message.now,
                     message.signature,
-                    message.body
+                    message.body,
+                    message.topic.as_ref().map(|topic| topic.bytes().to_vec()),
+                    opt_int(message.thread_seq)
                 ],
             )?;
+            if message.slow {
+                let topic = message.topic.unwrap_or(GENERAL_TOPIC);
+                connection.execute(
+                    "INSERT INTO slow_sent (conversation_id, topic_id, account_id, at)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT (conversation_id, topic_id, account_id) DO UPDATE SET at = ?4",
+                    params![
+                        chat.bytes(),
+                        topic.bytes(),
+                        message.account.bytes(),
+                        message.now
+                    ],
+                )?;
+            }
+            let mut gone_list = Vec::new();
+            // An edit's history row holds the message and every edit so far, this one included.
+            if message.kind == Kind::Edit
+                && let Some(author) = message.history
+            {
+                event_list.push(write_copied(connection, &message, author)?);
+            }
             for file in &message.persist {
                 connection.execute(
                     "UPDATE file SET used_at = ?2 WHERE id = ?1",
@@ -1878,6 +3881,8 @@ impl Storage for Sqlite {
                 Kind::Content => {
                     if message.content_kind == Some(ContentKind::Ack) {
                         // An ack is quiet: it moves neither the chat's time nor its preview.
+                    } else if message.thread_seq.is_some() {
+                        // A thread's reply counts under the message it answers, not in the list.
                     } else if message.content_kind == Some(ContentKind::Call) {
                         // A call is the preview, and it leaves the chat's time where it was.
                         connection.execute(
@@ -1896,13 +3901,14 @@ impl Storage for Sqlite {
                     connection.execute(
                         "UPDATE conversation SET
                          last_content_seq = (
-                             SELECT seq FROM message WHERE conversation_id = ?1 AND kind = 0
-                             AND content_kind IS NOT 14
+                             SELECT seq FROM message WHERE conversation_id = ?1
+                             AND (kind IN (4, 5) OR (kind = 0 AND content_kind IS NOT 14))
+                             AND thread_seq IS NULL
                              ORDER BY seq DESC LIMIT 1
                          ),
                          last_at = (
                              SELECT server_saved_at FROM message WHERE conversation_id = ?1
-                             AND kind IN (0, 4) AND content_kind IS NOT 14
+                             AND kind IN (0, 4, 5) AND content_kind IS NOT 14 AND thread_seq IS NULL
                              ORDER BY seq DESC LIMIT 1
                          )
                          WHERE id = ?1",
@@ -1911,12 +3917,13 @@ impl Storage for Sqlite {
                 }
                 Kind::Commit => {
                     connection.execute(
-                        "UPDATE mls_group SET epoch = ?2, group_info = ?3, updated_at = ?4
-                         WHERE conversation_id = ?1",
+                        "UPDATE mls_group SET epoch = ?2, group_info = ?3, public_group = ?4,
+                         updated_at = ?5 WHERE conversation_id = ?1",
                         params![
                             chat.bytes(),
                             opt_int(message.epoch),
                             message.group_info,
+                            message.public_group,
                             message.now
                         ],
                     )?;
@@ -1952,7 +3959,111 @@ impl Storage for Sqlite {
                 }
                 _ => {}
             }
-            Ok(Appended::Saved(unsigned(seq)))
+            let mut line_list = Vec::new();
+            if let Some(action) = &message.action {
+                let mut added_list = Vec::new();
+                let mut let_in_list = Vec::new();
+                let mut removed_list = Vec::new();
+                for account in &action.account_list {
+                    let member: bool = connection.query_row(
+                        "SELECT EXISTS (SELECT 1 FROM member WHERE conversation_id = ?1
+                         AND account_id = ?2)",
+                        params![chat.bytes(), account.bytes()],
+                        |row| row.get(0),
+                    )?;
+                    let line = match action.kind {
+                        ActionKind::Add => {
+                            if member {
+                                continue;
+                            }
+                            connection.execute(
+                                "INSERT INTO member (conversation_id, account_id, joined_seq)
+                                 VALUES (?1, ?2, ?3)",
+                                params![chat.bytes(), account.bytes(), seq],
+                            )?;
+                            connection.execute(
+                                "DELETE FROM invitation WHERE conversation_id = ?1
+                                 AND account_id = ?2",
+                                params![chat.bytes(), account.bytes()],
+                            )?;
+                            let asked = connection.execute(
+                                "DELETE FROM join_request WHERE conversation_id = ?1
+                                 AND account_id = ?2 AND state = 0",
+                                params![chat.bytes(), account.bytes()],
+                            )?;
+                            if asked > 0 {
+                                let_in_list.push(*account);
+                                ChatAction::LetIn
+                            } else {
+                                added_list.push(*account);
+                                ChatAction::Added
+                            }
+                        }
+                        // Someone who left is gone already, and a commit only finishes it in MLS.
+                        ActionKind::Remove => {
+                            if !member {
+                                continue;
+                            }
+                            connection.execute(
+                                "DELETE FROM member WHERE conversation_id = ?1 AND account_id = ?2",
+                                params![chat.bytes(), account.bytes()],
+                            )?;
+                            drop_from_folders(connection, chat, *account)?;
+                            gone_list.push(*account);
+                            removed_list.push(*account);
+                            ChatAction::Removed
+                        }
+                    };
+                    let history = event(
+                        chat,
+                        action.actor,
+                        line,
+                        Some(*account),
+                        Audience::Moderators,
+                        message.now,
+                    );
+                    event_list.push(write_event(connection, history, None)?);
+                }
+                // One line per action, however many people it names.
+                for (said, account_list) in [
+                    (LineAction::Added, added_list),
+                    (LineAction::LetIn, let_in_list),
+                    (LineAction::Removed, removed_list),
+                ] {
+                    if account_list.is_empty() {
+                        continue;
+                    }
+                    line_list.extend(write_line(
+                        connection,
+                        chat,
+                        message.device,
+                        said,
+                        account_list,
+                        message.now,
+                    )?);
+                }
+            }
+            // The profile key shared at this commit's epoch replaces the one kept, so every member,
+            // the people it brought in too, holds the key the newest share is sealed under.
+            let mut profile = None;
+            if let (Some(key), Some(epoch)) = (message.chat_key, message.epoch) {
+                profile = connection
+                    .query_row(
+                        "UPDATE conversation_profile SET key = ?2, key_epoch = ?3
+                         WHERE conversation_id = ?1
+                         RETURNING sealed, signature, updated_by, version, key, key_epoch",
+                        params![chat.bytes(), key, int(epoch)],
+                        chat_profile_row,
+                    )
+                    .optional()?;
+            }
+            Ok(Appended::Saved {
+                seq: unsigned(seq),
+                event_list,
+                line_list,
+                gone_list,
+                profile,
+            })
         })
         .await
     }
@@ -1972,10 +4083,13 @@ impl Storage for Sqlite {
                 from,
                 limit: limit.saturating_add(1),
             };
+            // A hidden topic's messages, and edits of them, reach only its moderators and the chat's
+            // owners and moderators.
             let message_list = sync_rows(
                 connection,
                 &format!("SELECT {MESSAGE_COLUMNS} FROM message"),
                 ("server_saved_at", "seq", None),
+                Some(HIDDEN_FROM),
                 ask,
                 message_frame,
             )?;
@@ -1983,37 +4097,71 @@ impl Storage for Sqlite {
                 connection,
                 &format!("SELECT {CALL_COLUMNS} FROM call"),
                 ("server_at", "call_seq", Some("n")),
+                None,
                 ask,
                 call_event_row,
             )?;
-            // The two merged in order, cut at the page's size.
+            // A chat event stands at sequence id 0, before every message of its time. Owners and
+            // moderators see history, and a line for one account only that account.
+            let chat_event_list = sync_rows(
+                connection,
+                &format!("SELECT {CHAT_EVENT_COLUMNS} FROM chat_event"),
+                ("server_at", "0", Some("n")),
+                Some(
+                    "((audience = 2 AND viewer = ?9) OR (audience = 1 AND (
+                         EXISTS (SELECT 1 FROM member m WHERE m.conversation_id =
+                                 chat_event.conversation_id AND m.account_id = ?9
+                                 AND m.is_owner = 1)
+                         OR EXISTS (SELECT 1 FROM member_role r WHERE r.conversation_id =
+                                    chat_event.conversation_id AND r.account_id = ?9)
+                         OR EXISTS (SELECT 1 FROM topic_moderator t WHERE t.conversation_id =
+                                    chat_event.conversation_id AND t.topic_id = chat_event.topic_id
+                                    AND t.account_id = ?9))))",
+                ),
+                ask,
+                chat_event_row,
+            )?;
+            // The three merged in order, cut at the page's size.
             let limit = usize::try_from(limit).unwrap_or(usize::MAX);
             let mut page = SyncPage {
                 message_list: Vec::new(),
                 call_list: Vec::new(),
+                chat_event_list: Vec::new(),
                 more: false,
             };
             let mut messages = message_list.into_iter().peekable();
             let mut calls = call_list.into_iter().peekable();
+            let mut events = chat_event_list.into_iter().peekable();
             loop {
-                let take_message = match (messages.peek(), calls.peek()) {
-                    (Some(message), Some(event)) => {
-                        message_position(message) < call_position(event)
+                let mut next = None;
+                if let Some(message) = messages.peek() {
+                    next = Some((message_position(message), 0));
+                }
+                if let Some(call) = calls.peek() {
+                    let position = call_position(call);
+                    if next.is_none_or(|(least, _)| position < least) {
+                        next = Some((position, 1));
                     }
-                    (Some(_), None) => true,
-                    (None, Some(_)) => false,
-                    (None, None) => break,
+                }
+                if let Some(chat_event) = events.peek() {
+                    let position = chat_event_position(chat_event);
+                    if next.is_none_or(|(least, _)| position < least) {
+                        next = Some((position, 2));
+                    }
+                }
+                let Some((_, which)) = next else {
+                    break;
                 };
-                if page.message_list.len() + page.call_list.len() == limit {
+                if page.message_list.len() + page.call_list.len() + page.chat_event_list.len()
+                    == limit
+                {
                     page.more = true;
                     break;
                 }
-                if take_message {
-                    if let Some(message) = messages.next() {
-                        page.message_list.push(message);
-                    }
-                } else if let Some(event) = calls.next() {
-                    page.call_list.push(event);
+                match which {
+                    0 => page.message_list.extend(messages.next()),
+                    1 => page.call_list.extend(calls.next()),
+                    _ => page.chat_event_list.extend(events.next()),
                 }
             }
             Ok(page)
@@ -2027,18 +4175,24 @@ impl Storage for Sqlite {
     }
 
     async fn record_position(&self, report: PositionReport) -> Result<Option<MarkItem>> {
-        let (update, insert) = match report.position {
+        let (update, insert, highest) = match report.position {
             Position::Received => (
                 "UPDATE member SET received_seq = ?3
                  WHERE conversation_id = ?1 AND account_id = ?2 AND received_seq < ?3",
-                "INSERT INTO received (conversation_id, account_id, up_to_seq, device_id,
-                 client_received_at, server_received_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO received (conversation_id, account_id, kind, place, up_to_seq,
+                 device_id, client_received_at, server_received_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "SELECT MAX(up_to_seq) FROM received
+                 WHERE conversation_id = ?1 AND account_id = ?2 AND kind = ?3 AND place = ?4",
             ),
             Position::Seen => (
                 "UPDATE member SET seen_seq = ?3
                  WHERE conversation_id = ?1 AND account_id = ?2 AND seen_seq < ?3",
-                "INSERT INTO seen (conversation_id, account_id, up_to_seq, device_id,
-                 client_seen_at, server_seen_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO seen (conversation_id, account_id, kind, place, up_to_seq,
+                 device_id, client_seen_at, server_seen_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "SELECT MAX(up_to_seq) FROM seen
+                 WHERE conversation_id = ?1 AND account_id = ?2 AND kind = ?3 AND place = ?4",
             ),
         };
         self.write(move |connection| {
@@ -2046,29 +4200,49 @@ impl Storage for Sqlite {
                 chat,
                 account,
                 device,
+                place,
                 up_to_seq,
                 client_at,
                 now,
                 ..
             } = report;
-            let changed = connection.execute(
-                update,
-                params![chat.bytes(), account.bytes(), int(up_to_seq)],
-            )?;
-            if changed == 0 {
-                return Ok(None);
+            let (kind, place_bytes) = place_columns(place);
+            // A topic's or thread's position is the highest of its rows, and only the main list's
+            // sits on `member`.
+            if place == Place::Main {
+                let changed = connection.execute(
+                    update,
+                    params![chat.bytes(), account.bytes(), int(up_to_seq)],
+                )?;
+                if changed == 0 {
+                    return Ok(None);
+                }
+            } else {
+                let highest: Option<i64> = connection.query_row(
+                    highest,
+                    params![chat.bytes(), account.bytes(), kind, place_bytes],
+                    |row| row.get(0),
+                )?;
+                if highest.is_some_and(|highest| highest >= int(up_to_seq)) {
+                    return Ok(None);
+                }
             }
             connection.execute(
                 insert,
                 params![
                     chat.bytes(),
                     account.bytes(),
+                    kind,
+                    place_bytes,
                     int(up_to_seq),
                     device.bytes(),
                     client_at,
                     now
                 ],
             )?;
+            if place != Place::Main {
+                return Ok(None);
+            }
             let (received_seq, seen_seq): (i64, i64) = connection.query_row(
                 "SELECT received_seq, seen_seq FROM member
                  WHERE conversation_id = ?1 AND account_id = ?2",
@@ -2101,12 +4275,27 @@ impl Storage for Sqlite {
         .await
     }
 
+    async fn public_group(&self, chat: Ulid) -> Result<Option<Vec<u8>>> {
+        self.read(move |connection| {
+            connection
+                .query_row(
+                    "SELECT public_group FROM mls_group WHERE conversation_id = ?1",
+                    params![chat.bytes()],
+                    |row| row.get(0),
+                )
+                .optional()
+        })
+        .await
+    }
+
     async fn put_group_info(
         &self,
         chat: Ulid,
         epoch: u64,
         body: Vec<u8>,
         now: i64,
+        start: Option<NewGroupStart>,
+        public_group: Option<Vec<u8>>,
     ) -> Result<GroupInfoPut> {
         self.write(move |connection| {
             let current: Option<i64> = connection
@@ -2118,12 +4307,31 @@ impl Storage for Sqlite {
                 .optional()?;
             match current {
                 None if epoch == 0 => {
+                    let Some(public_group) = public_group else {
+                        return Ok(GroupInfoPut::Stale);
+                    };
+                    if let Some(start) = &start
+                        && !photo_fits(connection, &start.profile)?
+                    {
+                        return Ok(GroupInfoPut::NoSuchPhoto);
+                    }
                     connection.execute(
-                        "INSERT INTO mls_group (conversation_id, epoch, group_info, updated_at)
-                         VALUES (?1, 0, ?2, ?3)",
-                        params![chat.bytes(), body, now],
+                        "INSERT INTO mls_group (conversation_id, epoch, group_info, public_group,
+                         updated_at) VALUES (?1, 0, ?2, ?3, ?4)",
+                        params![chat.bytes(), body, public_group, now],
                     )?;
-                    Ok(GroupInfoPut::Saved)
+                    let mut profile = None;
+                    if let Some(start) = start {
+                        if let Some(options) = &start.options {
+                            save_chat_options(connection, chat, options)?;
+                        }
+                        if let ChatProfileSaved::Saved { item, .. } =
+                            save_chat_profile(connection, start.profile, Some(start.key))?
+                        {
+                            profile = Some(item);
+                        }
+                    }
+                    Ok(GroupInfoPut::Saved { profile })
                 }
                 None => Ok(GroupInfoPut::Stale),
                 Some(0) if epoch == 0 => {
@@ -2133,7 +4341,7 @@ impl Storage for Sqlite {
                         |row| row.get(0),
                     )?;
                     if stored == body {
-                        Ok(GroupInfoPut::Saved)
+                        Ok(GroupInfoPut::Saved { profile: None })
                     } else {
                         Ok(GroupInfoPut::AlreadyStarted)
                     }
@@ -2145,7 +4353,7 @@ impl Storage for Sqlite {
                          WHERE conversation_id = ?1",
                         params![chat.bytes(), body, now],
                     )?;
-                    Ok(GroupInfoPut::Saved)
+                    Ok(GroupInfoPut::Saved { profile: None })
                 }
                 Some(_) => Ok(GroupInfoPut::Stale),
             }

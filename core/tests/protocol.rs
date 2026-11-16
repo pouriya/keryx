@@ -1,8 +1,8 @@
 use keryx_core::mls::{Device, verify_message};
 use keryx_core::protocol::{
-    Ack, Answer, Bytes, ChatFolders, ChatItem, ChatMode, ChatType, ClientFrame, ContentKind,
-    FolderItem, FolderSuggestion, FormError, Header, Kind, MarkItem, MessageFrame, Question,
-    SendFrame, ServerFrame, Suggestion, SyncPosition, WelcomeItem, WrapItem,
+    Ack, Answer, Bytes, ChatFolders, ChatItem, ChatType, ClientFrame, ContentKind, FolderItem,
+    FolderSuggestion, FormError, Header, Kind, MarkItem, MessageFrame, Question, SendFrame,
+    ServerFrame, Suggestion, SyncPosition, WelcomeItem, WrapItem,
 };
 use keryx_core::seed::derive;
 use keryx_core::ulid::Ulid;
@@ -18,6 +18,10 @@ fn ulid(text: &str) -> Ulid {
 
 fn send_frame() -> SendFrame {
     SendFrame {
+        action: None,
+        chat_key: None,
+        thread_seq: None,
+        topic: None,
         reference: ulid(REF),
         chat: ulid(CHAT),
         kind: Kind::Content,
@@ -39,6 +43,8 @@ fn send_frame() -> SendFrame {
 
 fn header() -> Header {
     Header {
+        thread_seq: None,
+        topic: None,
         chat: Ulid::from_bytes([1; 16]),
         device: Ulid::from_bytes([2; 16]),
         kind: Kind::Content,
@@ -60,6 +66,9 @@ fn layout_is_pinned() {
     expected.extend_from_slice(&[0, 1, 0, 1]);
     expected.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0, 4]);
     expected.extend_from_slice(&[0; 18]);
+    // No topic and no thread: each a presence byte, then its fixed width.
+    expected.extend_from_slice(&[0; 17]);
+    expected.extend_from_slice(&[0; 9]);
     expected.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 5]);
     assert_eq!(header().bytes(), expected);
 }
@@ -67,7 +76,7 @@ fn layout_is_pinned() {
 #[test]
 fn every_field_changes_the_bytes() {
     let base = header().bytes();
-    let mut changes = vec![header(); 9];
+    let mut changes = vec![header(); 11];
     changes[0].chat = Ulid::from_bytes([9; 16]);
     changes[1].device = Ulid::from_bytes([9; 16]);
     changes[2].kind = Kind::Edit;
@@ -77,6 +86,8 @@ fn every_field_changes_the_bytes() {
     changes[6].pointer_seq = Some(0);
     changes[7].call_seq = Some(0);
     changes[8].client_sent_at = 6;
+    changes[9].topic = Some(Ulid::from_bytes([0; 16]));
+    changes[10].thread_seq = Some(0);
     for change in &changes {
         assert_ne!(change.bytes(), base, "{change:?}");
         assert_eq!(change.bytes().len(), base.len());
@@ -172,6 +183,8 @@ fn every_client_frame_has_the_agreed_shape() {
     let cases = [
         (
             ClientFrame::Seen {
+                thread_seq: None,
+                topic: None,
                 reference: ulid(REF),
                 chat: ulid(CHAT),
                 up_to_seq: 41,
@@ -219,6 +232,8 @@ fn every_client_frame_has_the_agreed_shape() {
         ),
         (
             ClientFrame::Typing {
+                thread_seq: None,
+                topic: None,
                 chat: ulid(CHAT),
                 on: true,
             },
@@ -259,6 +274,8 @@ fn every_client_frame_has_the_agreed_shape() {
         ),
         (
             ClientFrame::Received {
+                thread_seq: None,
+                topic: None,
                 reference: ulid(REF),
                 chat: ulid(CHAT),
                 up_to_seq: 42,
@@ -273,6 +290,9 @@ fn every_client_frame_has_the_agreed_shape() {
                 chat: ulid(CHAT),
                 epoch: 4,
                 body: Bytes(vec![1, 2, 3]),
+                chat_profile: None,
+                chat_key: None,
+                chat_options: None,
             },
             json!({"type": "group_info", "ref": REF, "chat": CHAT, "epoch": 4, "body": "AQID"}),
         ),
@@ -302,6 +322,8 @@ fn every_client_frame_has_the_agreed_shape() {
 #[test]
 fn every_server_frame_has_the_agreed_shape() {
     let removed = MessageFrame {
+        thread_seq: None,
+        topic: None,
         chat: ulid(CHAT),
         seq: 5,
         device: None,
@@ -318,7 +340,16 @@ fn every_server_frame_has_the_agreed_shape() {
     let chat = ChatItem {
         chat: ulid(CHAT),
         chat_type: ChatType::Direct,
-        mode: ChatMode::Private,
+        role: None,
+        topics_on: false,
+        topic_list: Vec::new(),
+        topic_setting_list: Vec::new(),
+        place_seen_list: Vec::new(),
+        profile: None,
+        options: None,
+        findable: None,
+        member_count: None,
+        request_count: None,
         last_seq: Some(42),
         last_kind: Some(Kind::Content),
         last_at: Some(1800),
@@ -358,6 +389,8 @@ fn every_server_frame_has_the_agreed_shape() {
         ),
         (
             ServerFrame::Refused {
+                account_list: None,
+                seconds: None,
                 reference: ulid(REF),
                 code: "too_many_devices".to_string(),
                 message: "No".to_string(),
@@ -373,6 +406,9 @@ fn every_server_frame_has_the_agreed_shape() {
         ),
         (
             ServerFrame::Chats {
+                asked_list: Vec::new(),
+                chat_event_list: Vec::new(),
+                invitation_list: Vec::new(),
                 reference: ulid(REF),
                 chat_list: vec![chat, marked],
                 message_list: vec![removed.clone()],
@@ -392,9 +428,9 @@ fn every_server_frame_has_the_agreed_shape() {
                    "server_saved_at": 1900}], "call_list": [], "more": true,
                    "chat_folders": {"folder_list": [{"id": ID, "pin_list": []}], "default": ID},
                    "chat_list": [{
-                "chat": CHAT, "type": 1, "mode": 0, "last_seq": 42, "last_kind": 0, "last_at": 1800,
+                "chat": CHAT, "type": 1, "last_seq": 42, "last_kind": 0, "last_at": 1800,
             }, {
-                "chat": CHAT, "type": 1, "mode": 0, "last_seq": 42, "last_kind": 0, "last_at": 1800,
+                "chat": CHAT, "type": 1, "last_seq": 42, "last_kind": 0, "last_at": 1800,
                 "last_content_seq": 5, "epoch": 3, "last_content": {"chat": CHAT, "seq": 5,
                 "server_saved_at": 1900},
                 "mark_list": [{"account": ID, "received_seq": 42, "seen_seq": 41}],
@@ -456,6 +492,8 @@ fn every_server_frame_has_the_agreed_shape() {
         ),
         (
             ServerFrame::Typing {
+                thread_seq: None,
+                topic: None,
                 chat: ulid(CHAT),
                 account: ulid(ID),
                 on: false,
@@ -526,6 +564,8 @@ fn a_removed_message_has_no_header_and_a_stored_one_verifies_after_the_wire() {
     let signature = device.sign(&header, b"hello").unwrap();
 
     let frame = MessageFrame {
+        thread_seq: None,
+        topic: None,
         chat: header.chat,
         seq: 1,
         device: Some(header.device),

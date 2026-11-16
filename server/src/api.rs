@@ -32,20 +32,24 @@ use axum_server::accept::Accept;
 use axum_server::tls_rustls::{RustlsAcceptor, RustlsConfig};
 use base64ct::{Base64UrlUnpadded, Encoding};
 use keryx_core::mls::{
-    verify_account_key, verify_device_login, verify_device_stamp, verify_logout,
-    verify_password_reset, verify_revocation,
+    verify_account_key, verify_device_login, verify_device_stamp, verify_invite, verify_invite_key,
+    verify_logout, verify_password_reset, verify_revocation,
 };
 use keryx_core::protocol::{
-    AccountInfo, AccountKeysBody, AccountListReply, AccountReply, Bytes, ChallengeBody,
-    ChallengeReply, ChatDeviceListReply, ChatFolders, ChatMode, ChatReply, ClientFrame,
+    AccountInfo, AccountKeysBody, AccountListReply, AccountReply, Audience, Bytes, ChallengeBody,
+    ChallengeReply, ChatAction, ChatDeviceListReply, ChatEvent, ChatFolders, ChatOptions,
+    ChatProfileBody, ChatProfileItem, ChatReply, ChatRole, ChatType, ClaimBody, ClientFrame,
     ContentKind, CountReply, CreateAccountBody, CreateChatBody, CreateFileBody, CreatePackBody,
     CreatedAccountReply, DeviceListReply, DeviceReply, DevicesReply, DraftBody, DraftRequest,
-    EmptyReply, FeaturesReply, FileReply, FileStatusReply, FolderReply, GroupInfoReply,
-    KeyPackageListReply, KeyPackagesBody, KvChange, KvReply, LoginBody, LoginReply, NamesBody,
-    PackReply, PhotoReply, PresenceBody, PresenceItem, PresenceListReply, ProfileReply,
-    PutProfileBody, ReducedDeviceItem, ReducedDeviceListReply, RegisterBody, RegisterDeviceBody,
-    ResetBody, SelfChatReply, ServerFrame, SessionListReply, SetupBody, SetupReply, SignedBody,
-    StickerItem, StickerListReply, StickerReply, TimesReply, VersionReply, WrapListReply,
+    EmptyReply, FeaturesReply, FileReply, FileStatusReply, FindableBody, FindableItem, FolderReply,
+    GENERAL_TOPIC, GroupInfoReply, InvitationItem, InviteAnswerBody, InviteBody,
+    KeyPackageListReply, KeyPackagesBody, KvChange, KvReply, LoginBody, LoginReply, MemberItem,
+    MemberListReply, NamesBody, PackReply, PhotoReply, PresenceBody, PresenceItem,
+    PresenceListReply, ProfileReply, PutProfileBody, ReducedDeviceItem, ReducedDeviceListReply,
+    RegisterBody, RegisterDeviceBody, RequestBody, RequestItem, RequestListReply, RequestState,
+    ResetBody, RoleBody, SelfChatReply, ServerFrame, SessionListReply, SetupBody, SetupReply,
+    SignedBody, StickerItem, StickerListReply, StickerReply, TimesReply, TopicItem,
+    TopicOptionsBody, TopicReply, TopicsBody, VersionReply, WrapListReply,
 };
 use keryx_core::ulid::Ulid;
 use serde::de::DeserializeOwned;
@@ -60,23 +64,26 @@ use tower_http::services::{ServeDir, ServeFile};
 use tracing::Instrument;
 
 use crate::captcha;
-use crate::chat::{Hub, Job, Out, Work, answer_of, encode, hand_welcomes, push};
+use crate::chat::{
+    Hub, Job, Out, Work, answer_of, encode, hand_welcomes, push, push_events, push_folders,
+    push_lines,
+};
 use crate::file;
 use crate::moq;
 use crate::storage::sqlite::Sqlite;
 use crate::storage::{
-    self, BuiltInRole, KvChanged, NamesSaved, NewAccount, NewDevice, NewFile, NewNames, NewPhoto,
-    NewProfile, NewSession, NewSticker, ProfileSaved, Registered, Session, Storage, StoredFile,
-    SyncFrom,
+    self, Answered, Asked, BuiltInRole, ChatAccess, ChatProfileSaved, KvChanged, Left, NamesSaved,
+    NewAccount, NewAccountKeys, NewChatOptions, NewChatProfile, NewDevice, NewFile, NewGroup,
+    NewInvitation, NewNames, NewPhoto, NewProfile, NewSession, NewSticker, NewTopicOptions,
+    NewTopicProfile, ProfileSaved, Registered, Removed, RoleSet, Session, Storage, StoredFile,
+    SyncFrom, TimesShown, TopicAccess, TopicSaved, TopicsPut,
 };
 
-pub const CHAT_CREATE_DIRECT: &str = "chat.create_direct";
+pub const DIRECT_CREATE: &str = "direct.create";
+pub const GROUP_CREATE: &str = "group.create";
+pub const CHANNEL_CREATE: &str = "channel.create";
 pub const DIRECTORY_SEARCH: &str = "directory.search";
 pub const ACCOUNT_CREATE: &str = "account.create";
-pub const SEND_UNENCRYPTED: &str = "message.send.unencrypted";
-pub const MESSAGE_COMMIT: &str = "message.commit";
-pub const EDIT_OWN: &str = "message.edit.own";
-pub const DELETE_OWN: &str = "message.delete.own";
 pub const STICKER_MANAGE: &str = "sticker.manage";
 pub const PROFILE_EDIT: &str = "profile.edit";
 pub const ACCOUNT_RENAME: &str = "account.rename";
@@ -90,12 +97,57 @@ pub const CHAT_PIN: &str = "chat.pin";
 pub const PRESENCE_IN_APP: &str = "presence.in_app";
 pub const PRESENCE_CONNECTED: &str = "presence.connected";
 
-/// The closed list of permission names. A stored role holding any other name stops startup, so a
-/// typo in a role cannot silently grant nothing.
-pub const PERMISSION_LIST: &[&str] = &[
-    CHAT_CREATE_DIRECT,
+/// The server-wide permission names, which server roles hold.
+const SERVER_PERMISSION_LIST: &[&str] = &[
+    DIRECT_CREATE,
+    GROUP_CREATE,
+    CHANNEL_CREATE,
     DIRECTORY_SEARCH,
     ACCOUNT_CREATE,
+    STICKER_MANAGE,
+    PROFILE_EDIT,
+    ACCOUNT_RENAME,
+    FOLDER_CREATE,
+    FOLDER_RENAME,
+    FOLDER_REMOVE,
+    FOLDER_REORDER,
+    FOLDER_DEFAULT,
+    FOLDER_CHATS,
+    CHAT_PIN,
+    PRESENCE_IN_APP,
+    PRESENCE_CONNECTED,
+];
+
+/// Server names the built-in admin alone holds.
+const SERVER_ADMIN_ONLY: &[&str] = &[ACCOUNT_CREATE, STICKER_MANAGE];
+
+// The names used inside a chat, without their prefix: `direct.`, `group.` or `channel.`, by the
+// chat's type, chosen by the author. A check names one of these, and `check` puts the prefix on.
+pub const SEND_UNENCRYPTED: &str = "message.send.unencrypted";
+pub const MESSAGE_COMMIT: &str = "message.commit";
+pub const EDIT_OWN: &str = "message.edit.own";
+pub const DELETE_OWN: &str = "message.delete.own";
+pub const MEMBER_ADD: &str = "member.add";
+pub const MEMBER_REMOVE: &str = "member.remove";
+pub const MEMBER_ROLE: &str = "member.role";
+pub const DELETE_OTHERS: &str = "message.delete.others";
+/// Seeing when members got and saw a message: your own messages, and others', chosen by the author.
+pub const VIEW_RECEIVED_OWN: &str = "message.view_received.own";
+pub const VIEW_SEEN_OWN: &str = "message.view_seen.own";
+pub const VIEW_RECEIVED_OTHERS: &str = "message.view_received.others";
+pub const VIEW_SEEN_OTHERS: &str = "message.view_seen.others";
+pub const TOPIC_MANAGE: &str = "topic.manage";
+pub const CHAT_PROFILE_EDIT: &str = "profile.edit";
+pub const OPTIONS_EDIT: &str = "options.edit";
+/// A topic's profile, options, closing and hiding: owners and moderators, and a topic's own
+/// moderators there.
+pub const TOPIC_EDIT: &str = "topic.edit";
+/// Channels only: writing in the main list.
+pub const MESSAGE_POST: &str = "message.post";
+
+/// Every chat type's names. Members hold them all but unencrypted, which is the admin's alone, and
+/// in groups and channels but `VIEWS_OF_OTHERS`, which owners and moderators hold there.
+const CHAT_PERMISSION_LIST: &[&str] = &[
     "message.send.text",
     "message.send.voice",
     "message.send.reaction",
@@ -115,24 +167,96 @@ pub const PERMISSION_LIST: &[&str] = &[
     MESSAGE_COMMIT,
     EDIT_OWN,
     DELETE_OWN,
-    STICKER_MANAGE,
-    PROFILE_EDIT,
-    ACCOUNT_RENAME,
-    FOLDER_CREATE,
-    FOLDER_RENAME,
-    FOLDER_REMOVE,
-    FOLDER_REORDER,
-    FOLDER_DEFAULT,
-    FOLDER_CHATS,
-    CHAT_PIN,
-    PRESENCE_IN_APP,
-    PRESENCE_CONNECTED,
+    VIEW_RECEIVED_OWN,
+    VIEW_SEEN_OWN,
+    VIEW_RECEIVED_OTHERS,
+    VIEW_SEEN_OTHERS,
+];
+const VIEWS_OF_OTHERS: &[&str] = &[VIEW_RECEIVED_OTHERS, VIEW_SEEN_OTHERS];
+
+/// Groups' and channels' own names. Owners hold them all, and moderators all but these two.
+const GROUP_PERMISSION_LIST: &[&str] = &[
+    MEMBER_ADD,
+    MEMBER_REMOVE,
+    MEMBER_ROLE,
+    DELETE_OTHERS,
+    TOPIC_MANAGE,
+    TOPIC_EDIT,
+    CHAT_PROFILE_EDIT,
+    OPTIONS_EDIT,
 ];
 
-/// Everyone's built-in roles hold the whole list, except these, which are the admin's alone.
-const ADMIN_ONLY: &[&str] = &[ACCOUNT_CREATE, SEND_UNENCRYPTED, STICKER_MANAGE];
+/// What a topic's own options may change of the member role, chosen by the author: reactions,
+/// stickers, files and the four times permissions.
+const TOPIC_OPTION_LIST: &[&str] = &[
+    "message.send.reaction",
+    "message.send.sticker",
+    "message.send.voice",
+    "message.send.image",
+    "message.send.music",
+    "message.send.video",
+    "message.send.doc",
+    "message.send.file",
+    "message.send.media_bundle",
+    VIEW_RECEIVED_OWN,
+    VIEW_SEEN_OWN,
+    VIEW_RECEIVED_OTHERS,
+    VIEW_SEEN_OTHERS,
+];
 
-/// The permission to send one content kind.
+/// A topic's own answer to a member's permission there, before the chat's: allowed, refused, or
+/// `None` to ask the chat. Moderators follow the chat's alone.
+pub fn topic_says(
+    rules: &Option<(TopicAccess, bool)>,
+    chat_type: ChatType,
+    name: &str,
+) -> Option<bool> {
+    let (rules, moderator) = rules.as_ref()?;
+    if *moderator {
+        return None;
+    }
+    let full = format!("{}.{name}", chat_prefix(chat_type));
+    if rules.deny.contains(&full) {
+        return Some(false);
+    }
+    if rules.allow.contains(&full) {
+        return Some(true);
+    }
+    None
+}
+const OWNER_ONLY: &[&str] = &[MEMBER_ROLE, OPTIONS_EDIT];
+
+/// The closed list of permission names, prefixed. A stored role holding any other name stops
+/// startup, so a typo in a role cannot silently grant nothing.
+pub fn permission_list() -> Vec<String> {
+    let mut list = Vec::new();
+    for name in SERVER_PERMISSION_LIST {
+        list.push(name.to_string());
+    }
+    for prefix in ["direct", "group", "channel"] {
+        for name in CHAT_PERMISSION_LIST {
+            list.push(format!("{prefix}.{name}"));
+        }
+        if prefix != "direct" {
+            for name in GROUP_PERMISSION_LIST {
+                list.push(format!("{prefix}.{name}"));
+            }
+        }
+    }
+    list.push(format!("channel.{MESSAGE_POST}"));
+    list
+}
+
+/// The prefix a chat type's permission names carry. A self chat is a direct one.
+pub fn chat_prefix(chat_type: ChatType) -> &'static str {
+    match chat_type {
+        ChatType::SelfChat | ChatType::Direct => "direct",
+        ChatType::Group => "group",
+        ChatType::Channel => "channel",
+    }
+}
+
+/// The permission to send one content kind, without its prefix.
 pub fn send_permission(content_kind: ContentKind) -> &'static str {
     match content_kind {
         ContentKind::Text => "message.send.text",
@@ -277,11 +401,16 @@ impl Default for SessionSettings {
 #[serde(default)]
 pub struct ChatSettings {
     pub idle_after: u64,
+    /// Whether a new group or channel has topics on when its creator does not say.
+    pub topics: bool,
 }
 
 impl Default for ChatSettings {
     fn default() -> Self {
-        Self { idle_after: 5 * 60 }
+        Self {
+            idle_after: 5 * 60,
+            topics: false,
+        }
     }
 }
 
@@ -322,6 +451,14 @@ pub struct Limits {
     pub folders: usize,
     /// How many settings an account may keep.
     pub kv_keys: u64,
+    /// A group's member accounts.
+    pub group_members: u64,
+    /// A channel's member accounts.
+    pub channel_members: u64,
+    /// A group's or channel's topics, General not counted.
+    pub topics: u64,
+    /// Seconds an invitation or a join request waits before it goes.
+    pub invitation_lifetime: u64,
     pub body: BodyLimits,
     pub upload: UploadLimits,
 }
@@ -341,6 +478,10 @@ impl Default for Limits {
             call_cache: 16 * 1024 * 1024,
             folders: 20,
             kv_keys: 64,
+            group_members: 200,
+            channel_members: 1000,
+            topics: 100,
+            invitation_lifetime: 30 * 24 * 60 * 60,
             body: BodyLimits::default(),
             upload: UploadLimits::default(),
         }
@@ -552,7 +693,11 @@ pub struct Refused {
     /// Only for `call_open`: the open call's sequence id, so the client joins that one.
     pub call_seq: Option<u64>,
     /// Only for `kv_stale`: the server's version of the settings, and its whole set.
-    pub kv: Option<KvReply>,
+    pub kv: Option<Box<KvReply>>,
+    /// Only for `slow_mode`: the seconds until this member may write there again.
+    pub seconds: Option<u64>,
+    /// Only for `invite_needed`: the accounts that are added by invitation only.
+    pub account_list: Option<Vec<Ulid>>,
 }
 
 pub fn refused(status: u16, code: &'static str, message: &str) -> Refused {
@@ -562,6 +707,8 @@ pub fn refused(status: u16, code: &'static str, message: &str) -> Refused {
         message: message.to_string(),
         call_seq: None,
         kv: None,
+        seconds: None,
+        account_list: None,
     }
 }
 
@@ -669,7 +816,8 @@ pub enum Need {
     /// A server permission. The operator and the admin hold them all.
     Server(&'static str),
     Member(Ulid),
-    /// Membership is not a permission, so the admin needs it too. Then a permission in that chat.
+    /// Membership is not a permission, so the admin needs it too. Then a permission in that chat,
+    /// named without its prefix, which comes from the chat's type.
     MemberWith(Ulid, &'static str),
     /// The built-in server admin role, or the operator, for acting on someone else's account.
     Admin,
@@ -704,6 +852,8 @@ pub async fn check(app: &App, caller: &Caller, need: Need) -> Result<(), Refused
                     message: format!("This account may have {limit} devices"),
                     call_seq: None,
                     kv: None,
+                    seconds: None,
+                    account_list: None,
                 });
             }
             Ok(())
@@ -731,14 +881,10 @@ pub async fn check(app: &App, caller: &Caller, need: Need) -> Result<(), Refused
             None => Err(refused(404, "not_member", "You are not in that chat")),
         },
         Need::MemberWith(chat, permission) => {
-            if app
-                .storage
-                .chat_access(chat, session.account)
-                .await?
-                .is_none()
-            {
+            let Some(access) = app.storage.chat_access(chat, session.account).await? else {
                 return Err(refused(404, "not_member", "You are not in that chat"));
-            }
+            };
+            let permission = format!("{}.{permission}", chat_prefix(access.chat_type));
             if app
                 .storage
                 .chat_permitted(chat, session.account, permission)
@@ -777,6 +923,8 @@ fn fixed<const N: usize>(bytes: &Bytes, field: &str) -> Result<[u8; N], Refused>
             message: format!("{field} must be {N} bytes"),
             call_seq: None,
             kv: None,
+            seconds: None,
+            account_list: None,
         }),
     }
 }
@@ -1175,20 +1323,24 @@ pub async fn run_account_keys(
     let master: [u8; 32] = fixed(&input.master_public, "master_public")?;
     let public: [u8; 32] = fixed(&input.account_public, "account_public")?;
     let stamp: [u8; 64] = fixed(&input.account_stamp, "account_stamp")?;
-    if verify_account_key(&master, &session.account, &public, &stamp).is_err() {
+    let invite_public: [u8; 32] = fixed(&input.invite_public, "invite_public")?;
+    let invite_stamp: [u8; 64] = fixed(&input.invite_stamp, "invite_stamp")?;
+    if verify_account_key(&master, &session.account, &public, &stamp).is_err()
+        || verify_invite_key(&master, &session.account, &invite_public, &invite_stamp).is_err()
+    {
         return Err(refused(403, "bad_signature", "That stamp does not verify"));
     }
     let chat = new_id()?;
+    let keys = NewAccountKeys {
+        master_public: master.to_vec(),
+        account_public: public.to_vec(),
+        account_stamp: stamp.to_vec(),
+        invite_public: invite_public.to_vec(),
+        invite_stamp: invite_stamp.to_vec(),
+    };
     let saved = app
         .storage
-        .set_account_keys(
-            session.account,
-            master.to_vec(),
-            public.to_vec(),
-            stamp.to_vec(),
-            chat,
-            Ulid::now(),
-        )
+        .set_account_keys(session.account, keys, chat, Ulid::now())
         .await?;
     if !saved {
         return Err(refused(
@@ -1216,15 +1368,21 @@ pub async fn run_account(app: &App, caller: &Caller, id: Ulid) -> Result<Account
         master_public: None,
         account_public: None,
         account_stamp: None,
+        invite_public: None,
+        invite_stamp: None,
     };
-    if let (Some(master), Some(public), Some(stamp)) = (
+    if let (Some(master), Some(public), Some(stamp), Some(invite_public), Some(invite_stamp)) = (
         account.master_public,
         account.account_public,
         account.account_stamp,
+        account.invite_public,
+        account.invite_stamp,
     ) {
         reply.master_public = Some(Bytes(master));
         reply.account_public = Some(Bytes(public));
         reply.account_stamp = Some(Bytes(stamp));
+        reply.invite_public = Some(Bytes(invite_public));
+        reply.invite_stamp = Some(Bytes(invite_stamp));
     }
     Ok(reply)
 }
@@ -1237,9 +1395,17 @@ pub async fn run_directory(
     check(app, caller, Need::Server(DIRECTORY_SEARCH)).await?;
     let account_list = app
         .storage
-        .search_accounts(term, app.settings.limits.history_page)
+        .search_accounts(term.clone(), app.settings.limits.history_page)
         .await?;
-    Ok(AccountListReply { account_list })
+    // Findable groups and channels show beside accounts, chosen by the author.
+    let chat_list = app
+        .storage
+        .search_chats(term, app.settings.limits.history_page)
+        .await?;
+    Ok(AccountListReply {
+        account_list,
+        chat_list,
+    })
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -1359,6 +1525,8 @@ pub async fn run_register_device(
             message: format!("This account may have {limit} devices"),
             call_seq: None,
             kv: None,
+            seconds: None,
+            account_list: None,
         }),
         Registered::Saved(notice) => {
             app.hub.deliver(
@@ -1514,8 +1682,25 @@ pub async fn run_claim_key_packages(
     app: &App,
     caller: &Caller,
     account: Ulid,
+    input: ClaimBody,
 ) -> Result<KeyPackageListReply, Refused> {
     check(app, caller, Need::Device).await?;
+    // Adding to a group or channel: someone added by invitation only is refused before any of
+    // their one-use packages goes, so the client invites them instead.
+    if let Some(chat) = input.chat {
+        let (_, access) = group_access(app, caller, chat).await?;
+        check(app, caller, Need::MemberWith(chat, MEMBER_ADD)).await?;
+        let member = app.storage.chat_access(chat, account).await?.is_some();
+        if !member && invite_only(app, chat, account, access.chat_type).await? {
+            let mut refusal = refused(
+                403,
+                "invite_needed",
+                "That account is added by invitation only",
+            );
+            refusal.account_list = Some(vec![account]);
+            return Err(refusal);
+        }
+    }
     let key_package_list = app.storage.claim_key_packages(account).await?;
     if key_package_list.is_empty() {
         return Err(refused(
@@ -1531,17 +1716,113 @@ pub async fn run_claim_key_packages(
 // Chats
 // -------------------------------------------------------------------------------------------------
 
-/// The pair's chat, made if it is new. If two people start it at once they get the same id, and the
-/// first to upload epoch 0's group info wins, while the other waits for its Welcome.
+/// A display name's longest, in characters after trimming, fixed by the author, and a group's or
+/// channel's name too.
+const DISPLAY_NAME_CHARS: usize = 64;
+
+/// A findable group's or channel's readable bio, at most an account's, fixed by the author.
+const BIO_CHARS: usize = 140;
+
+/// A join request's note, which the server reads, fixed by the author.
+const NOTE_CHARS: usize = 140;
+
+/// A findable group's or channel's readable name and bio, under an account's limits.
+fn check_findable(name: Option<String>, bio: Option<String>) -> Result<FindableItem, Refused> {
+    let Some(name) = name else {
+        return Err(refused(400, "bad_body", "A findable chat needs its name"));
+    };
+    let name = name.trim().to_string();
+    let length = name.chars().count();
+    if length == 0 || length > DISPLAY_NAME_CHARS {
+        return Err(refused(
+            400,
+            "bad_name",
+            "That name is too short or too long",
+        ));
+    }
+    if let Some(bio) = &bio
+        && bio.chars().count() > BIO_CHARS
+    {
+        return Err(refused(400, "bad_bio", "That bio is too long"));
+    }
+    Ok(FindableItem { name, bio })
+}
+
+/// A direct chat with the pair, made if it is new, or a new group or channel with this account its
+/// owner, alone in it until it adds people. If two people start a direct chat at once they get the
+/// same id, and the first to upload epoch 0's group info wins, while the other waits for its
+/// Welcome.
 pub async fn run_create_chat(
     app: &App,
     caller: &Caller,
     input: CreateChatBody,
 ) -> Result<ChatReply, Refused> {
     check(app, caller, Need::Device).await?;
-    check(app, caller, Need::Server(CHAT_CREATE_DIRECT)).await?;
     let session = caller.session()?;
-    let Some(other) = app.storage.account_by_id(input.account).await? else {
+    if let Some(chat_type) = input.chat_type
+        && matches!(chat_type, ChatType::Group | ChatType::Channel)
+    {
+        let permission = if chat_type == ChatType::Group {
+            GROUP_CREATE
+        } else {
+            CHANNEL_CREATE
+        };
+        check(app, caller, Need::Server(permission)).await?;
+        if input.account.is_some() {
+            return Err(refused(
+                400,
+                "bad_body",
+                "A group or channel starts with its owner alone",
+            ));
+        }
+        let mut findable = None;
+        if let Some(item) = input.findable {
+            findable = Some(check_findable(Some(item.name), item.bio)?);
+        }
+        let topics_on = match input.topics {
+            Some(on) => on,
+            None => app.settings.chat.topics,
+        };
+        let chat = new_id()?;
+        let (event, line) = app
+            .storage
+            .create_group(NewGroup {
+                id: chat,
+                chat_type,
+                owner: session.account,
+                device: session.device()?,
+                topics_on,
+                findable,
+                now: Ulid::now(),
+            })
+            .await?;
+        app.hub.deliver(
+            &[session.account],
+            session.device,
+            &ServerFrame::ChatEvent(Box::new(event)),
+        );
+        push_lines(app, &[session.account], line.into_iter().collect());
+        return Ok(ChatReply {
+            chat,
+            created: true,
+        });
+    }
+    check(app, caller, Need::Server(DIRECT_CREATE)).await?;
+    if input.topics.is_some() || input.findable.is_some() {
+        return Err(refused(
+            400,
+            "bad_body",
+            "Only a group or channel has topics or is findable",
+        ));
+    }
+    let Some(account) = input.account else {
+        return Err(refused(
+            400,
+            "bad_body",
+            "A direct chat names its other person",
+        ));
+    };
+    let Some(other) = app.storage.account_by_id(account).await? else {
         return Err(refused(
             404,
             "no_such_account",
@@ -1555,10 +1836,10 @@ pub async fn run_create_chat(
             "That person has no words yet",
         ));
     }
-    let (low, high) = if session.account <= input.account {
-        (session.account, input.account)
+    let (low, high) = if session.account <= account {
+        (session.account, account)
     } else {
-        (input.account, session.account)
+        (account, session.account)
     };
     let (chat, created) = app
         .storage
@@ -1592,6 +1873,953 @@ pub async fn run_create_chat(
     Ok(ChatReply { chat, created })
 }
 
+/// How long an invitation or a join request lasts, from `[limits] invitation_lifetime`.
+fn invitation_ms(app: &App) -> i64 {
+    millis(app.settings.limits.invitation_lifetime)
+}
+
+/// A registered device's account in a group or channel, with what its check needs.
+async fn group_access(
+    app: &App,
+    caller: &Caller,
+    chat: Ulid,
+) -> Result<(Session, ChatAccess), Refused> {
+    check(app, caller, Need::Device).await?;
+    let session = caller.session()?;
+    let Some(access) = app.storage.chat_access(chat, session.account).await? else {
+        return Err(refused(404, "not_member", "You are not in that chat"));
+    };
+    if !matches!(access.chat_type, ChatType::Group | ChatType::Channel) {
+        return Err(refused(400, "not_group", "That is not a group or channel"));
+    }
+    Ok((session, access))
+}
+
+/// Who may let a request in: every member holding `member.add` there.
+async fn adders(app: &App, chat: Ulid, chat_type: ChatType) -> Result<Vec<Ulid>, Refused> {
+    let permission = format!("{}.{MEMBER_ADD}", chat_prefix(chat_type));
+    let mut list = Vec::new();
+    for account in app.storage.member_accounts(chat).await? {
+        if app
+            .storage
+            .chat_permitted(chat, account, permission.clone())
+            .await?
+        {
+            list.push(account);
+        }
+    }
+    Ok(list)
+}
+
+/// A whole chat gone for everyone: its members told, out of their folders, and its files' bytes
+/// removed.
+async fn chat_gone(app: &App, chat: Ulid, actor: Ulid, removed: Removed) -> Result<(), Refused> {
+    app.hub.deliver(
+        &removed.member_list,
+        None,
+        &ServerFrame::ChatEvent(Box::new(ChatEvent {
+            chat,
+            n: 0,
+            actor,
+            action: ChatAction::ChatRemoved,
+            target: None,
+            seq: None,
+            topic: None,
+            audience: Audience::Everyone,
+            server_at: Ulid::now(),
+            copy_list: Vec::new(),
+        })),
+    );
+    push_folders(app, &removed.member_list).await?;
+    // Their requests and invitations went with the chat, so their rows go too.
+    for account in removed.asker_list {
+        app.hub.deliver(
+            &[account],
+            None,
+            &ServerFrame::JoinRequest(Box::new(RequestItem {
+                chat,
+                account,
+                name: None,
+                note: None,
+                state: RequestState::Gone,
+                at: Ulid::now(),
+            })),
+        );
+    }
+    app.hub.deliver(
+        &removed.invitee_list,
+        None,
+        &ServerFrame::Invitation {
+            chat,
+            invitation: None,
+        },
+    );
+    for file in removed.file_list {
+        file::remove(app, chat, file).await;
+    }
+    tracing::info!(msg = "Removed a chat", chat = %chat);
+    Ok(())
+}
+
+/// Any owner removes a whole group or channel for everyone, with no named permission, since
+/// ownership is in MLS. Admin can too.
+pub async fn run_chat_remove(
+    app: &App,
+    caller: &Caller,
+    chat: Ulid,
+) -> Result<EmptyReply, Refused> {
+    let (session, access) = group_access(app, caller, chat).await?;
+    if access.role != ChatRole::Owner && !app.storage.is_admin(session.account).await? {
+        return Err(refused(403, "no_permission", "You may not do this"));
+    }
+    let Some(removed) = app.storage.remove_chat(chat).await? else {
+        return Err(refused(404, "not_member", "You are not in that chat"));
+    };
+    chat_gone(app, chat, session.account, removed).await?;
+    Ok(EmptyReply {})
+}
+
+/// Leaving takes effect at once: no more delivery, out of the account's folders, and a "left" line,
+/// after which the next member online commits the MLS removal. The last owner leaving removes the
+/// whole chat.
+pub async fn run_leave(app: &App, caller: &Caller, chat: Ulid) -> Result<EmptyReply, Refused> {
+    let (session, _) = group_access(app, caller, chat).await?;
+    let device = session.device()?;
+    match app
+        .storage
+        .leave_chat(chat, session.account, device, Ulid::now())
+        .await?
+    {
+        Left::NotMember => Err(refused(404, "not_member", "You are not in that chat")),
+        Left::Left {
+            event,
+            line,
+            mut member_list,
+        } => {
+            push_lines(
+                app,
+                &member_list,
+                line.into_iter().map(|line| *line).collect(),
+            );
+            member_list.push(session.account);
+            push_events(app, chat, &member_list, vec![*event]).await?;
+            push_folders(app, &[session.account]).await?;
+            Ok(EmptyReply {})
+        }
+        Left::Removed(removed) => {
+            chat_gone(app, chat, session.account, removed).await?;
+            Ok(EmptyReply {})
+        }
+    }
+}
+
+/// Makes a member an owner, a moderator or a plain member. Only owners hold `member.role`, and the
+/// last owner cannot step down. The server alone keeps roles, which clients trust.
+pub async fn run_chat_role(
+    app: &App,
+    caller: &Caller,
+    chat: Ulid,
+    account: Ulid,
+    role: ChatRole,
+) -> Result<EmptyReply, Refused> {
+    let (session, _) = group_access(app, caller, chat).await?;
+    check(app, caller, Need::MemberWith(chat, MEMBER_ROLE)).await?;
+    match app
+        .storage
+        .set_role(
+            chat,
+            session.account,
+            session.device()?,
+            account,
+            role,
+            Ulid::now(),
+        )
+        .await?
+    {
+        RoleSet::NotMember => Err(refused(
+            404,
+            "not_member",
+            "That account is not in this chat",
+        )),
+        RoleSet::LastOwner => Err(refused(
+            409,
+            "last_owner",
+            "A group or channel always keeps an owner",
+        )),
+        RoleSet::Set {
+            event,
+            line,
+            member_list,
+        } => {
+            push_events(app, chat, &member_list, vec![*event]).await?;
+            push_lines(
+                app,
+                &member_list,
+                line.into_iter().map(|line| *line).collect(),
+            );
+            Ok(EmptyReply {})
+        }
+    }
+}
+
+/// Asks to join a findable group or channel, with a note the server reads. Every device of the
+/// asker, the asking one too, and those who may let it in are told, chosen by the author, so the
+/// asking device's chat list shows the request with the name the server keeps.
+pub async fn run_join_request(
+    app: &App,
+    caller: &Caller,
+    chat: Ulid,
+    note: Option<String>,
+) -> Result<EmptyReply, Refused> {
+    check(app, caller, Need::Device).await?;
+    let session = caller.session()?;
+    let mut kept = None;
+    if let Some(note) = note {
+        let note = note.trim().to_string();
+        if note.chars().count() > NOTE_CHARS {
+            return Err(refused(400, "bad_note", "That note is too long"));
+        }
+        if !note.is_empty() {
+            kept = Some(note);
+        }
+    }
+    let now = Ulid::now();
+    let item = match app
+        .storage
+        .ask_to_join(chat, session.account, kept, now, now - invitation_ms(app))
+        .await?
+    {
+        Asked::NotFindable => {
+            return Err(refused(
+                404,
+                "not_findable",
+                "There is no such findable chat",
+            ));
+        }
+        Asked::AlreadyMember => {
+            return Err(refused(
+                409,
+                "already_member",
+                "You are already in that chat",
+            ));
+        }
+        Asked::Saved(item) => item,
+    };
+    let Some(chat_type) = app.storage.chat_type(chat).await? else {
+        return Err(refused(
+            404,
+            "not_findable",
+            "There is no such findable chat",
+        ));
+    };
+    let mut told = adders(app, chat, chat_type).await?;
+    told.push(session.account);
+    app.hub
+        .deliver(&told, None, &ServerFrame::JoinRequest(item));
+    Ok(EmptyReply {})
+}
+
+/// Takes back this account's request, telling every device of the asker, the taking one too, and
+/// those who may let it in.
+pub async fn run_join_cancel(
+    app: &App,
+    caller: &Caller,
+    chat: Ulid,
+) -> Result<EmptyReply, Refused> {
+    check(app, caller, Need::Device).await?;
+    let session = caller.session()?;
+    if !app.storage.cancel_request(chat, session.account).await? {
+        return Err(refused(404, "no_request", "There is no such request"));
+    }
+    let mut told = vec![session.account];
+    if let Some(chat_type) = app.storage.chat_type(chat).await? {
+        told.extend(adders(app, chat, chat_type).await?);
+    }
+    app.hub.deliver(
+        &told,
+        None,
+        &ServerFrame::JoinRequest(Box::new(RequestItem {
+            chat,
+            account: session.account,
+            name: None,
+            note: None,
+            state: RequestState::Gone,
+            at: Ulid::now(),
+        })),
+    );
+    Ok(EmptyReply {})
+}
+
+/// Declines someone's request, by one who may let it in. The asker may ask again.
+pub async fn run_join_decline(
+    app: &App,
+    caller: &Caller,
+    chat: Ulid,
+    account: Ulid,
+) -> Result<EmptyReply, Refused> {
+    let (session, access) = group_access(app, caller, chat).await?;
+    check(app, caller, Need::MemberWith(chat, MEMBER_ADD)).await?;
+    let now = Ulid::now();
+    let Some(item) = app
+        .storage
+        .decline_request(chat, account, now, now - invitation_ms(app))
+        .await?
+    else {
+        return Err(refused(404, "no_request", "There is no such request"));
+    };
+    let mut told = adders(app, chat, access.chat_type).await?;
+    told.push(account);
+    app.hub.deliver(
+        &told,
+        session.device,
+        &ServerFrame::JoinRequest(Box::new(item)),
+    );
+    Ok(EmptyReply {})
+}
+
+/// A chat's waiting requests, for those who may let them in.
+pub async fn run_requests(
+    app: &App,
+    caller: &Caller,
+    chat: Ulid,
+) -> Result<RequestListReply, Refused> {
+    group_access(app, caller, chat).await?;
+    check(app, caller, Need::MemberWith(chat, MEMBER_ADD)).await?;
+    let request_list = app
+        .storage
+        .chat_requests(chat, Ulid::now() - invitation_ms(app))
+        .await?;
+    Ok(RequestListReply { request_list })
+}
+
+/// Invites someone whose switch turns every add into an invitation. The server keeps the sealed
+/// part and the inviting device's signed statement, and tells the invited account's devices.
+pub async fn run_invite(
+    app: &App,
+    caller: &Caller,
+    chat: Ulid,
+    input: InviteBody,
+) -> Result<EmptyReply, Refused> {
+    let (session, access) = group_access(app, caller, chat).await?;
+    check(app, caller, Need::MemberWith(chat, MEMBER_ADD)).await?;
+    let device = session.device()?;
+    let signature: [u8; 64] = fixed(&input.signature, "signature")?;
+    if app.storage.account_by_id(input.account).await?.is_none() {
+        return Err(refused(
+            404,
+            "no_such_account",
+            "That account does not exist",
+        ));
+    }
+    let Some(key) = app.storage.device_key(device).await? else {
+        return Err(refused(404, "no_such_device", "That device does not exist"));
+    };
+    let public: [u8; 32] = stored_key(&key.public_key)?;
+    if verify_invite(&public, &chat, &input.account, &signature).is_err() {
+        return Err(refused(
+            403,
+            "bad_signature",
+            "That invitation is not signed",
+        ));
+    }
+    let now = Ulid::now();
+    if !app
+        .storage
+        .invite(NewInvitation {
+            chat,
+            account: input.account,
+            inviter: device,
+            sealed: input.sealed.0.clone(),
+            signature: signature.to_vec(),
+            now,
+        })
+        .await?
+    {
+        return Err(refused(
+            409,
+            "already_member",
+            "That account is already in this chat",
+        ));
+    }
+    app.hub.deliver(
+        &[input.account],
+        None,
+        &ServerFrame::Invitation {
+            chat,
+            invitation: Some(InvitationItem {
+                chat,
+                chat_type: access.chat_type,
+                inviter: session.account,
+                device,
+                sealed: input.sealed,
+                signature: Bytes(signature.to_vec()),
+                at: now,
+            }),
+        },
+    );
+    Ok(EmptyReply {})
+}
+
+/// Accepts or declines this account's invitation. Accepting makes it a member at once, and its
+/// device joins by external commit. Declining tells the inviter alone.
+pub async fn run_invite_answer(
+    app: &App,
+    caller: &Caller,
+    chat: Ulid,
+    accept: bool,
+) -> Result<EmptyReply, Refused> {
+    check(app, caller, Need::Device).await?;
+    let session = caller.session()?;
+    let now = Ulid::now();
+    let expire_before = now - invitation_ms(app);
+    let mut chat_type = None;
+    for item in app
+        .storage
+        .own_invitations(session.account, expire_before)
+        .await?
+    {
+        if item.chat == chat {
+            chat_type = Some(item.chat_type);
+        }
+    }
+    let Some(chat_type) = chat_type else {
+        return Err(refused(404, "no_invitation", "There is no such invitation"));
+    };
+    let limit = if chat_type == ChatType::Group {
+        app.settings.limits.group_members
+    } else {
+        app.settings.limits.channel_members
+    };
+    match app
+        .storage
+        .answer_invitation(
+            chat,
+            session.account,
+            accept.then_some(session.device()?),
+            limit,
+            now,
+            expire_before,
+        )
+        .await?
+    {
+        Answered::NoInvitation => Err(refused(404, "no_invitation", "There is no such invitation")),
+        Answered::Full => Err(refused(409, "chat_full", "This chat has no room for you")),
+        Answered::Saved {
+            invitation,
+            event,
+            line,
+        } => {
+            if accept {
+                let member_list = app.storage.member_accounts(chat).await?;
+                push_events(app, chat, &member_list, vec![*event]).await?;
+                push_lines(
+                    app,
+                    &member_list,
+                    line.into_iter().map(|line| *line).collect(),
+                );
+            } else {
+                app.hub
+                    .deliver(&[invitation.inviter], None, &ServerFrame::ChatEvent(event));
+            }
+            app.hub.deliver(
+                &[session.account],
+                session.device,
+                &ServerFrame::Invitation {
+                    chat,
+                    invitation: None,
+                },
+            );
+            Ok(EmptyReply {})
+        }
+    }
+}
+
+/// Every member of a group or channel with its role, for any member, channel subscribers too: the
+/// group's tree names every device anyway.
+pub async fn run_members(
+    app: &App,
+    caller: &Caller,
+    chat: Ulid,
+) -> Result<MemberListReply, Refused> {
+    group_access(app, caller, chat).await?;
+    let member_list = app
+        .storage
+        .member_roles(chat)
+        .await?
+        .into_iter()
+        .map(|(account, role)| MemberItem { account, role })
+        .collect();
+    Ok(MemberListReply { member_list })
+}
+
+/// A new topic's id, kept for this account for 5 minutes, so its name can be sealed with it.
+pub async fn run_topic_id(app: &App, caller: &Caller, chat: Ulid) -> Result<TopicReply, Refused> {
+    let (session, _) = group_access(app, caller, chat).await?;
+    check(app, caller, Need::MemberWith(chat, TOPIC_MANAGE)).await?;
+    let topic = new_id()?;
+    app.storage
+        .issue_topic(chat, session.account, topic, Ulid::now() + CHALLENGE_MS)
+        .await?;
+    Ok(TopicReply { topic })
+}
+
+/// Whether topics show, and the live topics in order. One left out is removed with every message
+/// in it, for everyone.
+pub async fn run_topics(
+    app: &App,
+    caller: &Caller,
+    chat: Ulid,
+    topics: TopicsBody,
+) -> Result<EmptyReply, Refused> {
+    let (session, _) = group_access(app, caller, chat).await?;
+    check(app, caller, Need::MemberWith(chat, TOPIC_MANAGE)).await?;
+    for (index, topic) in topics.topic_list.iter().enumerate() {
+        if topics.topic_list[..index].contains(topic) {
+            return Err(refused(400, "bad_body", "A topic is named twice"));
+        }
+    }
+    let event_list = match app
+        .storage
+        .put_topics(
+            chat,
+            session.account,
+            topics.on,
+            topics.topic_list.clone(),
+            app.settings.limits.topics,
+            Ulid::now(),
+        )
+        .await?
+    {
+        TopicsPut::Saved { event_list, .. } => event_list,
+        TopicsPut::UnknownTopic => {
+            return Err(refused(
+                404,
+                "unknown_topic",
+                "That topic is not one of this chat's",
+            ));
+        }
+        TopicsPut::TooMany => {
+            return Err(refused(
+                409,
+                "too_many_topics",
+                "This chat has as many topics as it may",
+            ));
+        }
+    };
+    let member_list = app.storage.member_accounts(chat).await?;
+    app.hub.deliver(
+        &member_list,
+        session.device,
+        &ServerFrame::Topics { chat, topics },
+    );
+    push_events(app, chat, &member_list, event_list).await?;
+    Ok(EmptyReply {})
+}
+
+/// A group's or channel's sealed profile, with its topics' names, and the chat file it names as its
+/// photo, kept from now on. The photo it replaced goes.
+pub async fn run_chat_profile(
+    app: &App,
+    caller: &Caller,
+    chat: Ulid,
+    profile: ChatProfileBody,
+) -> Result<EmptyReply, Refused> {
+    let (session, _) = group_access(app, caller, chat).await?;
+    check(app, caller, Need::MemberWith(chat, CHAT_PROFILE_EDIT)).await?;
+    let profile = new_chat_profile(app, &session, chat, profile)?;
+    let (item, removed) = match app.storage.put_chat_profile(profile).await? {
+        ChatProfileSaved::Saved { item, removed } => (item, removed),
+        ChatProfileSaved::NoSuchPhoto => return Err(no_such_photo()),
+        ChatProfileSaved::NotStarted => {
+            return Err(refused(
+                409,
+                "no_group_info",
+                "That chat has no profile until its epoch 0 is up",
+            ));
+        }
+    };
+    let member_list = app.storage.member_accounts(chat).await?;
+    // The device that saved it gets it too, so it shows the server's copy, chosen by the author.
+    chat_profile_kept(app, chat, &member_list, None, item, removed).await;
+    Ok(EmptyReply {})
+}
+
+/// A sealed profile from this session's device, to keep.
+pub fn new_chat_profile(
+    app: &App,
+    session: &Session,
+    chat: Ulid,
+    profile: ChatProfileBody,
+) -> Result<NewChatProfile, Refused> {
+    let device = session.device()?;
+    let signature: [u8; 64] = fixed(&profile.signature, "signature")?;
+    Ok(NewChatProfile {
+        chat,
+        device,
+        account: session.account,
+        sealed: profile.sealed.0,
+        signature: signature.to_vec(),
+        photo: profile.photo,
+        photo_limit: app.settings.limits.upload.photo,
+        now: Ulid::now(),
+    })
+}
+
+pub fn no_such_photo() -> Refused {
+    refused(404, "no_such_file", "That photo does not exist")
+}
+
+/// A kept profile reaches the members' online devices but `from`, every one when `from` is none,
+/// and the photos it no longer names go.
+pub async fn chat_profile_kept(
+    app: &App,
+    chat: Ulid,
+    member_list: &[Ulid],
+    from: Option<Ulid>,
+    item: ChatProfileItem,
+    removed: Vec<Ulid>,
+) {
+    for file in removed {
+        file::remove(app, chat, file).await;
+    }
+    app.hub.deliver(
+        member_list,
+        from,
+        &ServerFrame::ChatProfile {
+            chat,
+            profile: item,
+        },
+    );
+}
+
+/// Slow mode's choices, in seconds, chosen by the author.
+const SLOW_MODE_LIST: &[u64] = &[10, 30, 60, 300, 900, 3600];
+
+/// What a group's or channel's members may do beyond or short of the built-in member role, by
+/// owners. Names are a chat's own, without their prefix.
+pub async fn run_chat_options(
+    app: &App,
+    caller: &Caller,
+    chat: Ulid,
+    options: ChatOptions,
+) -> Result<EmptyReply, Refused> {
+    let (session, access) = group_access(app, caller, chat).await?;
+    check(app, caller, Need::MemberWith(chat, OPTIONS_EDIT)).await?;
+    let checked = new_chat_options(access.chat_type, &options)?;
+    app.storage.put_chat_options(chat, checked).await?;
+    let member_list = app.storage.member_accounts(chat).await?;
+    app.hub.deliver(
+        &member_list,
+        session.device,
+        &ServerFrame::ChatOptions { chat, options },
+    );
+    Ok(EmptyReply {})
+}
+
+/// A chat's options checked, with their names prefixed by its type.
+pub fn new_chat_options(
+    chat_type: ChatType,
+    options: &ChatOptions,
+) -> Result<NewChatOptions, Refused> {
+    if let Some(seconds) = options.slow_mode
+        && !SLOW_MODE_LIST.contains(&seconds)
+    {
+        return Err(refused(400, "bad_body", "That is not a slow mode"));
+    }
+    let prefix = chat_prefix(chat_type);
+    let mut allow = Vec::with_capacity(options.allow.len());
+    let mut deny = Vec::with_capacity(options.deny.len());
+    for (name, allowed) in options
+        .allow
+        .iter()
+        .map(|name| (name, true))
+        .chain(options.deny.iter().map(|name| (name, false)))
+    {
+        let known = CHAT_PERMISSION_LIST.contains(&name.as_str())
+            || GROUP_PERMISSION_LIST.contains(&name.as_str())
+            || (chat_type == ChatType::Channel && name == MESSAGE_POST);
+        if !known {
+            return Err(refused(
+                400,
+                "unknown_permission",
+                "That is not a permission",
+            ));
+        }
+        // Options change what members may do, never hand them an owner's or the admin's power.
+        if allowed && (OWNER_ONLY.contains(&name.as_str()) || name == SEND_UNENCRYPTED) {
+            return Err(refused(403, "no_permission", "Members may not hold that"));
+        }
+        let full = format!("{prefix}.{name}");
+        if allow.contains(&full) || deny.contains(&full) {
+            return Err(refused(400, "bad_body", "A permission is named twice"));
+        }
+        if allowed {
+            allow.push(full);
+        } else {
+            deny.push(full);
+        }
+    }
+    Ok(NewChatOptions {
+        allow,
+        deny,
+        slow_mode: options.slow_mode,
+    })
+}
+
+/// The topic an editor names, which must be live and, when hidden, theirs to see: its moderators
+/// and the chat's owners and moderators, through `topic.edit`, change its settings.
+async fn topic_editor(
+    app: &App,
+    caller: &Caller,
+    session: &Session,
+    access: &ChatAccess,
+    chat: Ulid,
+    topic: Ulid,
+) -> Result<TopicAccess, Refused> {
+    let Some(rules) = app
+        .storage
+        .topic_access(chat, topic, session.account)
+        .await?
+    else {
+        return Err(no_such_topic());
+    };
+    let moderator = access.role != ChatRole::Member || rules.moderator;
+    if rules.hidden && !moderator {
+        return Err(no_such_topic());
+    }
+    if !rules.moderator {
+        check(app, caller, Need::MemberWith(chat, TOPIC_EDIT)).await?;
+    }
+    Ok(rules)
+}
+
+fn no_such_topic() -> Refused {
+    refused(404, "no_such_topic", "That topic does not exist")
+}
+
+/// A topic's own options, by its moderators and the chat's owners and moderators. General cannot
+/// be hidden, as it cannot be removed.
+pub async fn run_topic_options(
+    app: &App,
+    caller: &Caller,
+    chat: Ulid,
+    topic: Ulid,
+    options: TopicOptionsBody,
+) -> Result<EmptyReply, Refused> {
+    let (session, access) = group_access(app, caller, chat).await?;
+    topic_editor(app, caller, &session, &access, chat, topic).await?;
+    if topic == GENERAL_TOPIC && options.hidden {
+        return Err(refused(400, "bad_body", "General cannot be hidden"));
+    }
+    // A topic's 0 is off, even while its chat has slow mode on; none follows the chat's.
+    if let Some(seconds) = options.slow_mode
+        && seconds != 0
+        && !SLOW_MODE_LIST.contains(&seconds)
+    {
+        return Err(refused(400, "bad_body", "That is not a slow mode"));
+    }
+    let prefix = chat_prefix(access.chat_type);
+    let mut allow = Vec::with_capacity(options.allow.len());
+    let mut deny = Vec::with_capacity(options.deny.len());
+    for (name, allowed) in options
+        .allow
+        .iter()
+        .map(|name| (name, true))
+        .chain(options.deny.iter().map(|name| (name, false)))
+    {
+        if !TOPIC_OPTION_LIST.contains(&name.as_str()) {
+            return Err(refused(
+                400,
+                "unknown_permission",
+                "A topic cannot change that",
+            ));
+        }
+        let full = format!("{prefix}.{name}");
+        if allow.contains(&full) || deny.contains(&full) {
+            return Err(refused(400, "bad_body", "A permission is named twice"));
+        }
+        if allowed {
+            allow.push(full);
+        } else {
+            deny.push(full);
+        }
+    }
+    let checked = NewTopicOptions {
+        allow,
+        deny,
+        slow_mode: options.slow_mode,
+        write: options.write,
+        closed: options.closed,
+        hidden: options.hidden,
+    };
+    let saved = app
+        .storage
+        .put_topic_options(chat, topic, session.account, checked, Ulid::now())
+        .await?;
+    topic_saved(app, chat, saved).await
+}
+
+/// A topic's sealed profile, by its moderators and the chat's owners and moderators, its photo one
+/// of the chat's files.
+pub async fn run_topic_profile(
+    app: &App,
+    caller: &Caller,
+    chat: Ulid,
+    topic: Ulid,
+    profile: ChatProfileBody,
+) -> Result<EmptyReply, Refused> {
+    let (session, access) = group_access(app, caller, chat).await?;
+    topic_editor(app, caller, &session, &access, chat, topic).await?;
+    let device = session.device()?;
+    let signature: [u8; 64] = fixed(&profile.signature, "signature")?;
+    let saved = app
+        .storage
+        .put_topic_profile(NewTopicProfile {
+            chat,
+            topic,
+            device,
+            account: session.account,
+            sealed: profile.sealed.0,
+            signature: signature.to_vec(),
+            photo: profile.photo,
+            photo_limit: app.settings.limits.upload.photo,
+            now: Ulid::now(),
+        })
+        .await?;
+    topic_saved(app, chat, saved).await
+}
+
+/// Makes a member a topic's moderator, or a member there again, by the chat's owners.
+pub async fn run_topic_role(
+    app: &App,
+    caller: &Caller,
+    chat: Ulid,
+    topic: Ulid,
+    account: Ulid,
+    role: ChatRole,
+) -> Result<EmptyReply, Refused> {
+    let (session, _) = group_access(app, caller, chat).await?;
+    check(app, caller, Need::MemberWith(chat, MEMBER_ROLE)).await?;
+    let moderator = match role {
+        ChatRole::Moderator => true,
+        ChatRole::Member => false,
+        ChatRole::Owner => {
+            return Err(refused(
+                400,
+                "bad_body",
+                "A topic has moderators, not owners",
+            ));
+        }
+    };
+    let saved = app
+        .storage
+        .put_topic_role(
+            chat,
+            topic,
+            session.account,
+            account,
+            moderator,
+            Ulid::now(),
+        )
+        .await?;
+    topic_saved(app, chat, saved).await
+}
+
+/// A kept topic change reaches the chat's online devices, the one that made it too: the whole item for those who
+/// may see it, and for the rest of a hidden topic only that it is hidden. Its history row reaches
+/// those who read the topic's history, and photos it no longer names go.
+async fn topic_saved(app: &App, chat: Ulid, saved: TopicSaved) -> Result<EmptyReply, Refused> {
+    let (event, item, removed) = match saved {
+        TopicSaved::Saved {
+            event,
+            item,
+            removed,
+            ..
+        } => (event, item, removed),
+        TopicSaved::NoSuchTopic => return Err(no_such_topic()),
+        TopicSaved::NoSuchPhoto => return Err(no_such_photo()),
+        TopicSaved::NotMember => {
+            return Err(refused(404, "not_member", "They are not in that chat"));
+        }
+    };
+    for file in removed {
+        file::remove(app, chat, file).await;
+    }
+    let mut viewer_list = Vec::new();
+    let mut other_list = Vec::new();
+    for (account, role) in app.storage.member_roles(chat).await? {
+        if role != ChatRole::Member || item.mod_list.contains(&account) {
+            viewer_list.push(account);
+        } else {
+            other_list.push(account);
+        }
+    }
+    if let Some(event) = event {
+        app.hub
+            .deliver(&viewer_list, None, &ServerFrame::ChatEvent(Box::new(event)));
+    }
+    if item.options.hidden {
+        let trimmed = TopicItem {
+            topic: item.topic,
+            options: TopicOptionsBody {
+                hidden: true,
+                ..TopicOptionsBody::default()
+            },
+            mod_list: Vec::new(),
+            profile: None,
+        };
+        app.hub.deliver(
+            &other_list,
+            None,
+            &ServerFrame::Topic {
+                chat,
+                item: Box::new(trimmed),
+            },
+        );
+    } else {
+        viewer_list.extend(other_list);
+    }
+    app.hub
+        .deliver(&viewer_list, None, &ServerFrame::Topic { chat, item });
+    Ok(EmptyReply {})
+}
+
+/// Lists a group or channel in the directory under a name and bio the server reads, or stops, by
+/// owners.
+pub async fn run_findable(
+    app: &App,
+    caller: &Caller,
+    chat: Ulid,
+    input: FindableBody,
+) -> Result<EmptyReply, Refused> {
+    let (session, _) = group_access(app, caller, chat).await?;
+    check(app, caller, Need::MemberWith(chat, OPTIONS_EDIT)).await?;
+    let mut findable = None;
+    if input.findable {
+        findable = Some(check_findable(input.name, input.bio)?);
+    }
+    app.storage.put_findable(chat, findable.clone()).await?;
+    let member_list = app.storage.member_accounts(chat).await?;
+    let findable = match findable {
+        Some(item) => FindableBody {
+            findable: true,
+            name: Some(item.name),
+            bio: item.bio,
+        },
+        None => FindableBody {
+            findable: false,
+            name: None,
+            bio: None,
+        },
+    };
+    app.hub.deliver(
+        &member_list,
+        session.device,
+        &ServerFrame::Findable { chat, findable },
+    );
+    Ok(EmptyReply {})
+}
+
 pub async fn run_group_info(
     app: &App,
     caller: &Caller,
@@ -1623,24 +2851,94 @@ pub async fn run_chat_devices(
     Ok(ChatDeviceListReply { device_list })
 }
 
-/// When each member but the sender got and saw one message. Membership is all it needs, since a
-/// direct chat's members are the two people, and nobody else can ask.
+/// One page of a message's times: 50 members, chosen by the author, so a large group or channel
+/// never answers with every member at once.
+const TIMES_PAGE: usize = 50;
+
+/// When each member but the sender got and saw one message, keeping only the times the asker may
+/// see: received and seen are a permission each, for your own messages and for others', chosen by
+/// the author. Someone who may see neither on this message is refused. A page at a time, after the
+/// account `after`.
 pub async fn run_message_times(
     app: &App,
     caller: &Caller,
     chat: Ulid,
     seq: u64,
+    after: Option<Ulid>,
 ) -> Result<TimesReply, Refused> {
     check(app, caller, Need::Device).await?;
     check(app, caller, Need::Member(chat)).await?;
-    match app.storage.message_times(chat, seq).await? {
-        Some(member_list) => Ok(TimesReply {
-            chat,
-            seq,
-            member_list,
-        }),
-        None => Err(refused(404, "not_found", "There is no such message")),
+    let session = caller.session()?;
+    let Some(brief) = app.storage.message_brief(chat, seq).await? else {
+        return Err(refused(404, "not_found", "There is no such message"));
+    };
+    let name_list = if brief.account == session.account {
+        [VIEW_RECEIVED_OWN, VIEW_SEEN_OWN]
+    } else {
+        [VIEW_RECEIVED_OTHERS, VIEW_SEEN_OTHERS]
+    };
+    // A topic's own times permissions come before the chat's, for its members. A hidden topic's
+    // message is one that does not exist for whoever may not see it.
+    let mut topic_rules = None;
+    let mut chat_type = ChatType::Direct;
+    if let Some(access) = app.storage.chat_access(chat, session.account).await?
+        && matches!(access.chat_type, ChatType::Group | ChatType::Channel)
+    {
+        chat_type = access.chat_type;
+        let topic = brief.topic.unwrap_or(GENERAL_TOPIC);
+        if let Some(rules) = app
+            .storage
+            .topic_access(chat, topic, session.account)
+            .await?
+        {
+            let moderator = access.role != ChatRole::Member || rules.moderator;
+            if rules.hidden && !moderator {
+                return Err(refused(404, "not_found", "There is no such message"));
+            }
+            topic_rules = Some((rules, moderator));
+        }
     }
+    let mut allowed = [false; 2];
+    // A topic's own moderators see everyone's times there.
+    let topic_moderator = topic_rules
+        .as_ref()
+        .is_some_and(|(rules, _)| rules.moderator);
+    for (place, name) in name_list.into_iter().enumerate() {
+        if topic_moderator {
+            allowed[place] = true;
+            continue;
+        }
+        allowed[place] = match topic_says(&topic_rules, chat_type, name) {
+            Some(said) => said,
+            None => match check(app, caller, Need::MemberWith(chat, name)).await {
+                Ok(()) => true,
+                Err(refusal) if refusal.code == "no_permission" => false,
+                Err(refusal) => return Err(refusal),
+            },
+        };
+    }
+    let [received, seen] = allowed;
+    if !received && !seen {
+        return Err(refused(
+            403,
+            "no_permission",
+            "You may not see this message's times",
+        ));
+    }
+    let shown = TimesShown { received, seen };
+    let Some((member_list, more)) = app
+        .storage
+        .message_times(chat, seq, after, shown, TIMES_PAGE)
+        .await?
+    else {
+        return Err(refused(404, "not_found", "There is no such message"));
+    };
+    Ok(TimesReply {
+        chat,
+        seq,
+        member_list,
+        more,
+    })
 }
 
 /// Keeps or clears this account's draft in a chat, and tells its other online devices. A draft is
@@ -1725,11 +3023,18 @@ pub async fn run_put_chat_folders(
         before.insert(folder.id, folder);
     }
 
-    // The shape first: one `all`, this account's own, and every id, chat and pin once.
+    // The shape first: one `all`, this account's own and first, and every id, chat and pin once.
     let mut folders = folders;
     let mut id_list = HashSet::new();
     let mut all = None;
     let mut named = 0;
+    if folders
+        .folder_list
+        .first()
+        .is_some_and(|folder| folder.name.is_some() || folder.chat_list.is_some())
+    {
+        return Err(refused(400, "bad_body", "All is always the first folder"));
+    }
     for folder in &folders.folder_list {
         if !id_list.insert(folder.id) {
             return Err(refused(400, "bad_body", "A folder is named twice"));
@@ -1800,6 +3105,8 @@ pub async fn run_put_chat_folders(
             ),
             call_seq: None,
             kv: None,
+            seconds: None,
+            account_list: None,
         });
     }
     for folder in &mut folders.folder_list {
@@ -1914,6 +3221,10 @@ pub async fn run_create_file(
         Need::MemberWith(chat, send_permission(input.kind)),
     )
     .await?;
+    let encrypted = input.encrypted != Some(false);
+    if !encrypted {
+        check(app, caller, Need::MemberWith(chat, SEND_UNENCRYPTED)).await?;
+    }
     let session = caller.session()?;
     let Some(limit) = app.settings.limits.upload.of(input.kind) else {
         return Err(refused(400, "bad_body", "That type is not uploaded"));
@@ -1928,15 +3239,12 @@ pub async fn run_create_file(
             "That size does not fit those chunks",
         ));
     }
-    let Some(access) = app.storage.chat_access(chat, session.account).await? else {
-        return Err(refused(404, "not_member", "You are not in that chat"));
-    };
     let id = new_id()?;
     app.storage
         .create_file(NewFile {
             id,
             chat,
-            encrypted: access.mode != ChatMode::Open,
+            encrypted,
             kind: input.kind,
             size: input.size,
             chunks: input.chunks,
@@ -2183,9 +3491,6 @@ pub async fn run_remove_sticker(
 // -------------------------------------------------------------------------------------------------
 // Profiles
 // -------------------------------------------------------------------------------------------------
-
-/// A display name's longest, in characters after trimming, fixed by the author.
-const DISPLAY_NAME_CHARS: usize = 64;
 
 /// Whether `other` is this account or shares a chat with it, as profiles and photos need.
 async fn shares_or_self(app: &App, account: Ulid, other: Ulid) -> Result<bool, Refused> {
@@ -2780,7 +4085,9 @@ pub async fn run_kv_set(
             code: "kv_stale",
             message: "These settings changed on another device".to_string(),
             call_seq: None,
-            kv: Some(kv),
+            kv: Some(Box::new(kv)),
+            seconds: None,
+            account_list: None,
         }),
         KvChanged::TooMany => Err(Refused {
             status: 413,
@@ -2791,6 +4098,8 @@ pub async fn run_kv_set(
             ),
             call_seq: None,
             kv: None,
+            seconds: None,
+            account_list: None,
         }),
     }
 }
@@ -2807,15 +4116,17 @@ pub async fn run_frame(
             reference,
             chat,
             seq,
+            after,
         } => {
             let reference = *reference;
             let result = operation!("Times", "times", async {
-                let reply = run_message_times(app, &caller, *chat, *seq).await?;
+                let reply = run_message_times(app, &caller, *chat, *seq, *after).await?;
                 Ok(ServerFrame::Times {
                     reference,
                     chat: reply.chat,
                     seq: reply.seq,
                     member_list: reply.member_list,
+                    more: reply.more,
                 })
             });
             return Some(answer_of(reference, result));
@@ -2920,13 +4231,27 @@ pub async fn run_frame(
                         SyncFrom::Since(since.map_or(0, |since| since.saturating_sub(SYNC_BACK_MS)))
                     }
                 };
-                let (chat_list, chat_folders) = match after {
-                    Some(_) => (Vec::new(), None),
-                    None => (
-                        app.storage.chat_list(session.account).await?,
-                        Some(app.storage.chat_folders(session.account).await?.0),
-                    ),
-                };
+                // The chats list, folders, requests and invitations come on the first page only.
+                let mut chat_list = Vec::new();
+                let mut chat_folders = None;
+                let mut asked_list = Vec::new();
+                let mut invitation_list = Vec::new();
+                if after.is_none() {
+                    let expire_before = Ulid::now() - invitation_ms(app);
+                    chat_list = app
+                        .storage
+                        .chat_list(session.account, Ulid::now() - invitation_ms(app))
+                        .await?;
+                    chat_folders = Some(app.storage.chat_folders(session.account).await?.0);
+                    asked_list = app
+                        .storage
+                        .own_requests(session.account, expire_before)
+                        .await?;
+                    invitation_list = app
+                        .storage
+                        .own_invitations(session.account, expire_before)
+                        .await?;
+                }
                 let page = app
                     .storage
                     .sync(
@@ -2941,9 +4266,217 @@ pub async fn run_frame(
                     chat_list,
                     message_list: page.message_list,
                     call_list: page.call_list,
+                    chat_event_list: page.chat_event_list,
                     more: page.more,
                     chat_folders,
+                    asked_list,
+                    invitation_list,
                 })
+            });
+            return Some(answer_of(reference, result));
+        }
+        ClientFrame::ChatRemove { reference, chat } => {
+            let (reference, chat) = (*reference, *chat);
+            let result = operation!("ChatRemove", "chat_remove", async {
+                run_chat_remove(app, &caller, chat).await?;
+                Ok(ServerFrame::Done { reference })
+            });
+            return Some(answer_of(reference, result));
+        }
+        ClientFrame::Leave { reference, chat } => {
+            let (reference, chat) = (*reference, *chat);
+            let result = operation!("Leave", "leave", async {
+                run_leave(app, &caller, chat).await?;
+                Ok(ServerFrame::Done { reference })
+            });
+            return Some(answer_of(reference, result));
+        }
+        ClientFrame::ChatRole {
+            reference,
+            chat,
+            account,
+            role,
+        } => {
+            let (reference, chat, account, role) = (*reference, *chat, *account, *role);
+            let result = operation!("ChatRole", "chat_role", async {
+                run_chat_role(app, &caller, chat, account, role).await?;
+                Ok(ServerFrame::Done { reference })
+            });
+            return Some(answer_of(reference, result));
+        }
+        ClientFrame::JoinRequest {
+            reference,
+            chat,
+            note,
+        } => {
+            let (reference, chat, note) = (*reference, *chat, note.clone());
+            let result = operation!("JoinRequest", "join_request", async {
+                run_join_request(app, &caller, chat, note).await?;
+                Ok(ServerFrame::Done { reference })
+            });
+            return Some(answer_of(reference, result));
+        }
+        ClientFrame::JoinCancel { reference, chat } => {
+            let (reference, chat) = (*reference, *chat);
+            let result = operation!("JoinCancel", "join_cancel", async {
+                run_join_cancel(app, &caller, chat).await?;
+                Ok(ServerFrame::Done { reference })
+            });
+            return Some(answer_of(reference, result));
+        }
+        ClientFrame::JoinDecline {
+            reference,
+            chat,
+            account,
+        } => {
+            let (reference, chat, account) = (*reference, *chat, *account);
+            let result = operation!("JoinDecline", "join_decline", async {
+                run_join_decline(app, &caller, chat, account).await?;
+                Ok(ServerFrame::Done { reference })
+            });
+            return Some(answer_of(reference, result));
+        }
+        ClientFrame::Invite {
+            reference,
+            chat,
+            account,
+            sealed,
+            signature,
+        } => {
+            let (reference, chat) = (*reference, *chat);
+            let input = InviteBody {
+                account: *account,
+                sealed: sealed.clone(),
+                signature: signature.clone(),
+            };
+            let result = operation!("Invite", "invite", async {
+                run_invite(app, &caller, chat, input).await?;
+                Ok(ServerFrame::Done { reference })
+            });
+            return Some(answer_of(reference, result));
+        }
+        ClientFrame::InviteAnswer {
+            reference,
+            chat,
+            accept,
+        } => {
+            let (reference, chat, accept) = (*reference, *chat, *accept);
+            let result = operation!("InviteAnswer", "invite_answer", async {
+                run_invite_answer(app, &caller, chat, accept).await?;
+                Ok(ServerFrame::Done { reference })
+            });
+            return Some(answer_of(reference, result));
+        }
+        ClientFrame::Members { reference, chat } => {
+            let (reference, chat) = (*reference, *chat);
+            let result = operation!("Members", "members", async {
+                let reply = run_members(app, &caller, chat).await?;
+                Ok(ServerFrame::Members {
+                    reference,
+                    chat,
+                    member_list: reply.member_list,
+                })
+            });
+            return Some(answer_of(reference, result));
+        }
+        ClientFrame::TopicId { reference, chat } => {
+            let (reference, chat) = (*reference, *chat);
+            let result = operation!("TopicId", "topic_id", async {
+                let reply = run_topic_id(app, &caller, chat).await?;
+                Ok(ServerFrame::TopicId {
+                    reference,
+                    chat,
+                    topic: reply.topic,
+                })
+            });
+            return Some(answer_of(reference, result));
+        }
+        ClientFrame::Topics {
+            reference,
+            chat,
+            topics,
+        } => {
+            let (reference, chat, topics) = (*reference, *chat, topics.clone());
+            let result = operation!("Topics", "topics", async {
+                run_topics(app, &caller, chat, topics).await?;
+                Ok(ServerFrame::Done { reference })
+            });
+            return Some(answer_of(reference, result));
+        }
+        ClientFrame::ChatProfile {
+            reference,
+            chat,
+            profile,
+        } => {
+            let (reference, chat, profile) = (*reference, *chat, profile.clone());
+            let result = operation!("ChatProfile", "chat_profile", async {
+                run_chat_profile(app, &caller, chat, profile).await?;
+                Ok(ServerFrame::Done { reference })
+            });
+            return Some(answer_of(reference, result));
+        }
+        ClientFrame::ChatOptions {
+            reference,
+            chat,
+            options,
+        } => {
+            let (reference, chat, options) = (*reference, *chat, options.clone());
+            let result = operation!("ChatOptions", "chat_options", async {
+                run_chat_options(app, &caller, chat, options).await?;
+                Ok(ServerFrame::Done { reference })
+            });
+            return Some(answer_of(reference, result));
+        }
+        ClientFrame::TopicOptions {
+            reference,
+            chat,
+            topic,
+            options,
+        } => {
+            let (reference, chat, topic, options) = (*reference, *chat, *topic, options.clone());
+            let result = operation!("TopicOptions", "topic_options", async {
+                run_topic_options(app, &caller, chat, topic, *options).await?;
+                Ok(ServerFrame::Done { reference })
+            });
+            return Some(answer_of(reference, result));
+        }
+        ClientFrame::TopicProfile {
+            reference,
+            chat,
+            topic,
+            profile,
+        } => {
+            let (reference, chat, topic, profile) = (*reference, *chat, *topic, profile.clone());
+            let result = operation!("TopicProfile", "topic_profile", async {
+                run_topic_profile(app, &caller, chat, topic, *profile).await?;
+                Ok(ServerFrame::Done { reference })
+            });
+            return Some(answer_of(reference, result));
+        }
+        ClientFrame::TopicRole {
+            reference,
+            chat,
+            topic,
+            account,
+            role,
+        } => {
+            let (reference, chat, topic, account, role) =
+                (*reference, *chat, *topic, *account, *role);
+            let result = operation!("TopicRole", "topic_role", async {
+                run_topic_role(app, &caller, chat, topic, account, role).await?;
+                Ok(ServerFrame::Done { reference })
+            });
+            return Some(answer_of(reference, result));
+        }
+        ClientFrame::Findable {
+            reference,
+            chat,
+            findable,
+        } => {
+            let (reference, chat, findable) = (*reference, *chat, findable.clone());
+            let result = operation!("Findable", "findable", async {
+                run_findable(app, &caller, chat, findable).await?;
+                Ok(ServerFrame::Done { reference })
             });
             return Some(answer_of(reference, result));
         }
@@ -3033,6 +4566,12 @@ impl IntoResponse for Refused {
             let mut body = json!({"ok": false, "code": self.code, "message": self.message});
             if let Some(call_seq) = self.call_seq {
                 body["call_seq"] = json!(call_seq);
+            }
+            if let Some(seconds) = self.seconds {
+                body["seconds"] = json!(seconds);
+            }
+            if let Some(account_list) = self.account_list {
+                body["account_list"] = json!(account_list);
             }
             if let Some(kv) = self.kv {
                 body["version"] = json!(kv.version);
@@ -3375,21 +4914,259 @@ async fn claim_key_packages(
     State(app): Shared,
     headers: HeaderMap,
     Path(id): Path<String>,
+    body: Body,
 ) -> Response {
     respond(operation!(
         "ClaimKeyPackages",
         "claim_key_packages",
         async {
             let caller = caller_of(&app, &headers).await?;
-            run_claim_key_packages(&app, &caller, path_id(&id)?).await
+            let input = match &body {
+                Ok(bytes) if bytes.is_empty() => ClaimBody::default(),
+                _ => parse(body)?,
+            };
+            run_claim_key_packages(&app, &caller, path_id(&id)?, input).await
         }
     ))
+}
+
+/// Whether this account's switch turns every add to this type of chat into an invitation: a `kv`
+/// key left unsealed because the server acts on it. Someone who asked to join this chat is let in
+/// whatever it says.
+pub async fn invite_only(
+    app: &App,
+    chat: Ulid,
+    account: Ulid,
+    chat_type: ChatType,
+) -> Result<bool, Refused> {
+    let expire_before = Ulid::now() - invitation_ms(app);
+    for request in app.storage.own_requests(account, expire_before).await? {
+        if request.chat == chat && request.state == RequestState::Waiting {
+            return Ok(false);
+        }
+    }
+    let key = if chat_type == ChatType::Channel {
+        "privacy.add.channel"
+    } else {
+        "privacy.add.group"
+    };
+    if let Some(kv_list) = app.storage.kv(account, None).await?.kv_list {
+        for item in kv_list {
+            if item.key == key && item.value.0 == b"\"nobody\"" {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 async fn create_chat(State(app): Shared, headers: HeaderMap, body: Body) -> Response {
     respond(operation!("CreateChat", "create_chat", async {
         let caller = caller_of(&app, &headers).await?;
         run_create_chat(&app, &caller, parse(body)?).await
+    }))
+}
+
+async fn chat_remove(State(app): Shared, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    respond(operation!("ChatRemove", "chat_remove", async {
+        let caller = caller_of(&app, &headers).await?;
+        run_chat_remove(&app, &caller, path_id(&id)?).await
+    }))
+}
+
+async fn leave(State(app): Shared, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    respond(operation!("Leave", "leave", async {
+        let caller = caller_of(&app, &headers).await?;
+        run_leave(&app, &caller, path_id(&id)?).await
+    }))
+}
+
+async fn chat_role(
+    State(app): Shared,
+    headers: HeaderMap,
+    Path((id, account)): Path<(String, String)>,
+    body: Body,
+) -> Response {
+    respond(operation!("ChatRole", "chat_role", async {
+        let caller = caller_of(&app, &headers).await?;
+        let input: RoleBody = parse(body)?;
+        run_chat_role(&app, &caller, path_id(&id)?, path_id(&account)?, input.role).await
+    }))
+}
+
+async fn join_request(
+    State(app): Shared,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Body,
+) -> Response {
+    respond(operation!("JoinRequest", "join_request", async {
+        let caller = caller_of(&app, &headers).await?;
+        let input: RequestBody = parse(body)?;
+        run_join_request(&app, &caller, path_id(&id)?, input.note).await
+    }))
+}
+
+async fn join_cancel(State(app): Shared, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    respond(operation!("JoinCancel", "join_cancel", async {
+        let caller = caller_of(&app, &headers).await?;
+        run_join_cancel(&app, &caller, path_id(&id)?).await
+    }))
+}
+
+async fn join_decline(
+    State(app): Shared,
+    headers: HeaderMap,
+    Path((id, account)): Path<(String, String)>,
+) -> Response {
+    respond(operation!("JoinDecline", "join_decline", async {
+        let caller = caller_of(&app, &headers).await?;
+        run_join_decline(&app, &caller, path_id(&id)?, path_id(&account)?).await
+    }))
+}
+
+async fn requests(State(app): Shared, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    respond(operation!("Requests", "requests", async {
+        let caller = caller_of(&app, &headers).await?;
+        run_requests(&app, &caller, path_id(&id)?).await
+    }))
+}
+
+async fn invite(
+    State(app): Shared,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Body,
+) -> Response {
+    respond(operation!("Invite", "invite", async {
+        let caller = caller_of(&app, &headers).await?;
+        run_invite(&app, &caller, path_id(&id)?, parse(body)?).await
+    }))
+}
+
+async fn invite_answer(
+    State(app): Shared,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Body,
+) -> Response {
+    respond(operation!("InviteAnswer", "invite_answer", async {
+        let caller = caller_of(&app, &headers).await?;
+        let input: InviteAnswerBody = parse(body)?;
+        run_invite_answer(&app, &caller, path_id(&id)?, input.accept).await
+    }))
+}
+
+async fn members(State(app): Shared, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    respond(operation!("Members", "members", async {
+        let caller = caller_of(&app, &headers).await?;
+        run_members(&app, &caller, path_id(&id)?).await
+    }))
+}
+
+async fn topic_id(State(app): Shared, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    respond(operation!("TopicId", "topic_id", async {
+        let caller = caller_of(&app, &headers).await?;
+        run_topic_id(&app, &caller, path_id(&id)?).await
+    }))
+}
+
+async fn put_topics(
+    State(app): Shared,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Body,
+) -> Response {
+    respond(operation!("Topics", "topics", async {
+        let caller = caller_of(&app, &headers).await?;
+        run_topics(&app, &caller, path_id(&id)?, parse(body)?).await
+    }))
+}
+
+async fn put_chat_profile(
+    State(app): Shared,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Body,
+) -> Response {
+    respond(operation!("ChatProfile", "chat_profile", async {
+        let caller = caller_of(&app, &headers).await?;
+        run_chat_profile(&app, &caller, path_id(&id)?, parse(body)?).await
+    }))
+}
+
+async fn put_chat_options(
+    State(app): Shared,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Body,
+) -> Response {
+    respond(operation!("ChatOptions", "chat_options", async {
+        let caller = caller_of(&app, &headers).await?;
+        run_chat_options(&app, &caller, path_id(&id)?, parse(body)?).await
+    }))
+}
+
+async fn put_topic_options(
+    State(app): Shared,
+    headers: HeaderMap,
+    Path((id, topic)): Path<(String, String)>,
+    body: Body,
+) -> Response {
+    respond(operation!("TopicOptions", "topic_options", async {
+        let caller = caller_of(&app, &headers).await?;
+        run_topic_options(&app, &caller, path_id(&id)?, path_id(&topic)?, parse(body)?).await
+    }))
+}
+
+async fn put_topic_profile(
+    State(app): Shared,
+    headers: HeaderMap,
+    Path((id, topic)): Path<(String, String)>,
+    body: Body,
+) -> Response {
+    respond(operation!("TopicProfile", "topic_profile", async {
+        let caller = caller_of(&app, &headers).await?;
+        run_topic_profile(&app, &caller, path_id(&id)?, path_id(&topic)?, parse(body)?).await
+    }))
+}
+
+/// The body of `PUT /api/v1/chats/{id}/topics/{topic}/members/{account}/role`.
+#[derive(Deserialize)]
+struct TopicRoleBody {
+    role: ChatRole,
+}
+
+async fn put_topic_role(
+    State(app): Shared,
+    headers: HeaderMap,
+    Path((id, topic, account)): Path<(String, String, String)>,
+    body: Body,
+) -> Response {
+    respond(operation!("TopicRole", "topic_role", async {
+        let caller = caller_of(&app, &headers).await?;
+        let input: TopicRoleBody = parse(body)?;
+        run_topic_role(
+            &app,
+            &caller,
+            path_id(&id)?,
+            path_id(&topic)?,
+            path_id(&account)?,
+            input.role,
+        )
+        .await
+    }))
+}
+
+async fn put_findable(
+    State(app): Shared,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Body,
+) -> Response {
+    respond(operation!("Findable", "findable", async {
+        let caller = caller_of(&app, &headers).await?;
+        run_findable(&app, &caller, path_id(&id)?, parse(body)?).await
     }))
 }
 
@@ -3407,14 +5184,25 @@ async fn chat_devices(State(app): Shared, headers: HeaderMap, Path(id): Path<Str
     }))
 }
 
+#[derive(Deserialize)]
+struct TimesQuery {
+    after: Option<String>,
+}
+
 async fn message_times(
     State(app): Shared,
     headers: HeaderMap,
     Path((id, seq)): Path<(String, String)>,
+    Query(query): Query<TimesQuery>,
 ) -> Response {
     respond(operation!("MessageTimes", "message_times", async {
         let caller = caller_of(&app, &headers).await?;
-        run_message_times(&app, &caller, path_id(&id)?, chunk_number(&seq)?).await
+        let after = match query.after.as_deref().map(Ulid::parse) {
+            None => None,
+            Some(Ok(account)) => Some(account),
+            Some(Err(_)) => return Err(refused(400, "bad_body", "after is not an account id")),
+        };
+        run_message_times(&app, &caller, path_id(&id)?, chunk_number(&seq)?, after).await
     }))
 }
 
@@ -3966,6 +5754,8 @@ fn bad_frame(text: &str) -> Option<Message> {
             call_seq: None,
             version: None,
             kv_list: None,
+            seconds: None,
+            account_list: None,
         };
         if let Some(text) = encode(&answer) {
             return Some(Message::Text(text));
@@ -4086,6 +5876,37 @@ fn router(app: Arc<App>, www: &FilePath) -> Router {
             post(claim_key_packages),
         )
         .route("/api/v1/chats", post(create_chat))
+        .route("/api/v1/chats/{id}", delete(chat_remove))
+        .route("/api/v1/chats/{id}/leave", post(leave))
+        .route("/api/v1/chats/{id}/members/{account}/role", put(chat_role))
+        .route(
+            "/api/v1/chats/{id}/requests",
+            get(requests).post(join_request).delete(join_cancel),
+        )
+        .route(
+            "/api/v1/chats/{id}/requests/{account}/decline",
+            post(join_decline),
+        )
+        .route("/api/v1/chats/{id}/invitations", post(invite))
+        .route("/api/v1/chats/{id}/invitation", post(invite_answer))
+        .route("/api/v1/chats/{id}/topics/id", post(topic_id))
+        .route("/api/v1/chats/{id}/members", get(members))
+        .route("/api/v1/chats/{id}/topics", put(put_topics))
+        .route("/api/v1/chats/{id}/profile", put(put_chat_profile))
+        .route("/api/v1/chats/{id}/options", put(put_chat_options))
+        .route(
+            "/api/v1/chats/{id}/topics/{topic}/options",
+            put(put_topic_options),
+        )
+        .route(
+            "/api/v1/chats/{id}/topics/{topic}/profile",
+            put(put_topic_profile),
+        )
+        .route(
+            "/api/v1/chats/{id}/topics/{topic}/members/{account}/role",
+            put(put_topic_role),
+        )
+        .route("/api/v1/chats/{id}/findable", put(put_findable))
         .route("/api/v1/chats/{id}/group_info", get(group_info))
         .route("/api/v1/chats/{id}/devices", get(chat_devices))
         .route(
@@ -4294,35 +6115,66 @@ pub async fn serve(settings: Settings) -> Result<(), ServeError> {
             });
         }
     };
+    // The server's built-ins hold the server-wide names, and a chat's the in-chat ones, chosen by
+    // the author: the admin all, and everyone else all but the admin's own.
     let mut role_list = Vec::with_capacity(6);
-    for scope in [0, 1] {
-        for name in ["admin", "moderator", "member"] {
-            let mut permission_list = Vec::with_capacity(PERMISSION_LIST.len());
-            for permission in PERMISSION_LIST {
-                if name == "admin" || !ADMIN_ONLY.contains(permission) {
-                    permission_list.push(*permission);
+    for (scope, name) in [
+        (0, "admin"),
+        (0, "moderator"),
+        (0, "member"),
+        (1, "owner"),
+        (1, "moderator"),
+        (1, "member"),
+    ] {
+        let mut permission_list = Vec::new();
+        if scope == 0 {
+            for permission in SERVER_PERMISSION_LIST {
+                if name == "admin" || !SERVER_ADMIN_ONLY.contains(permission) {
+                    permission_list.push(permission.to_string());
                 }
             }
-            let id = match Ulid::new() {
-                Ok(id) => id,
-                Err(source) => return Err(ServeError::Id(source)),
-            };
-            role_list.push(BuiltInRole {
-                id,
-                scope,
-                name,
-                permission_list,
-            });
+        } else {
+            for prefix in ["direct", "group", "channel"] {
+                for permission in CHAT_PERMISSION_LIST {
+                    let members_lack = prefix != "direct"
+                        && name == "member"
+                        && VIEWS_OF_OTHERS.contains(permission);
+                    if *permission != SEND_UNENCRYPTED && !members_lack {
+                        permission_list.push(format!("{prefix}.{permission}"));
+                    }
+                }
+                if prefix == "direct" || name == "member" {
+                    continue;
+                }
+                for permission in GROUP_PERMISSION_LIST {
+                    if name == "owner" || !OWNER_ONLY.contains(permission) {
+                        permission_list.push(format!("{prefix}.{permission}"));
+                    }
+                }
+            }
+            if name != "member" {
+                permission_list.push(format!("channel.{MESSAGE_POST}"));
+            }
         }
+        let id = match Ulid::new() {
+            Ok(id) => id,
+            Err(source) => return Err(ServeError::Id(source)),
+        };
+        role_list.push(BuiltInRole {
+            id,
+            scope,
+            name,
+            permission_list,
+        });
     }
     if let Err(source) = storage.seed_roles(role_list).await {
         return Err(ServeError::Prepare(source));
     }
-    let known: HashSet<&str> = PERMISSION_LIST.iter().copied().collect();
+    let known: HashSet<String> = permission_list().into_iter().collect();
     match storage.permission_names().await {
         Ok(name_list) => {
             for name in name_list {
-                if !known.contains(name.as_str()) {
+                if !known.contains(&name) {
                     return Err(ServeError::UnknownPermission { name });
                 }
             }

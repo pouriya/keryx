@@ -433,6 +433,16 @@ fn keys_are_set_once_and_their_stamp_must_verify() {
         reply["data"]["account_stamp"],
         json!(Bytes(sara.key.stamp.to_vec()))
     );
+    let sara_keys = keryx_core::seed::derive(SARA_WORDS).unwrap();
+    let invite_stamp = keryx_core::mls::stamp_invite_key(&sara_keys, &sara.id);
+    assert_eq!(
+        reply["data"]["invite_public"],
+        json!(Bytes(sara_keys.invite_public().to_vec()))
+    );
+    assert_eq!(
+        reply["data"]["invite_stamp"],
+        json!(Bytes(invite_stamp.to_vec()))
+    );
     refused(
         server.call(
             "GET",
@@ -448,6 +458,8 @@ fn keys_are_set_once_and_their_stamp_must_verify() {
         "master_public": Bytes(sara.key.master_public.to_vec()),
         "account_public": Bytes(sara.key.account_public.to_vec()),
         "account_stamp": Bytes(sara.key.stamp.to_vec()),
+        "invite_public": Bytes(sara_keys.invite_public().to_vec()),
+        "invite_stamp": Bytes(invite_stamp.to_vec()),
     });
     refused(
         server.call(
@@ -479,7 +491,28 @@ fn keys_are_set_once_and_their_stamp_must_verify() {
         403,
         "bad_signature",
     );
-    let short = json!({"master_public": "AQ==", "account_public": "AQ==", "account_stamp": "AQ=="});
+    // The account key's stamp holds, and the invite key's is another account's.
+    let third_id = ulid_of(&third["data"]["account"]);
+    let third_keys = keryx_core::seed::derive(BABAK_WORDS).unwrap();
+    let body = json!({
+        "master_public": Bytes(third_keys.master_public().to_vec()),
+        "account_public": Bytes(third_keys.account_public().to_vec()),
+        "account_stamp": Bytes(keryx_core::mls::stamp_account_key(&third_keys, &third_id).to_vec()),
+        "invite_public": Bytes(third_keys.invite_public().to_vec()),
+        "invite_stamp": Bytes(keryx_core::mls::stamp_invite_key(&third_keys, &babak.id).to_vec()),
+    });
+    refused(
+        server.call(
+            "PUT",
+            "/api/v1/account/keys",
+            Some(&third_token),
+            Some(&body),
+        ),
+        403,
+        "bad_signature",
+    );
+    let short = json!({"master_public": "AQ==", "account_public": "AQ==", "account_stamp": "AQ==",
+        "invite_public": "AQ==", "invite_stamp": "AQ=="});
     refused(
         server.call(
             "PUT",

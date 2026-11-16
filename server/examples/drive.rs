@@ -4,6 +4,19 @@
 //! `many <n>`, `seen`, `call`, `question`, `bio <text>`, `link <name> <url>`, `photo <file.jpg>`,
 //! `app <on|off>`, `kv <key> <json>`, `react <seq> <emoji>`, `delete <seq>`, `sticker [n]`,
 //! `suggest move|copy <folder> [text]`, `pump <ms>` and `quit`.
+//!
+//! Groups and channels, on the chat in use, which `group`, `channel` and `use` set:
+//! `group <name> [username ...] [-- note]`, `channel <name> [username ...] [-- note]`, `use <chat id>`,
+//! `add <username ...> [-- note]`, `remove <username ...>`, `role <username> owner|moderator|member`, `leave`,
+//! `removechat`, `findchat <text>`, `ask <chat id> [note]`, `cancelask <chat id>`, `requests`,
+//! `letin <username>`, `decline <username>`, `invite yes|no`, `topics on|off`, `topic <name>`,
+//! `in <topic name>|main`, `thread <seq>|off`, `mention <username> <text>`, `chatprofile <name>`,
+//! `options <json>`, `findable on <name>|off`, and on the topic in use, General when none,
+//! `topicbio <text> [-- rules]`, `topicphoto <file.jpg>`, `topicopts <json>` and
+//! `topicmod <username> on|off`. `chatprofile <name> [-- rules]` sets the chat's rules too. `say`, `sticker` and `seen` go to the topic and
+//! thread in use. A note after a lone `--` goes in the invitation of anyone added by invitation only.
+//! What arrives for groups is printed as it comes: `ready`, `left`, `line`, `request`, `invited`,
+//! `topics`, `profile` and `findable`, with ids and counts only.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
@@ -13,7 +26,10 @@ use std::time::{Duration, Instant};
 use keryx_core::client::{
     Auth, Client, Command, Event, Input, Output, Platform, Pointer, Secret, Setting, Thumbnail,
 };
-use keryx_core::protocol::{ChatType, FolderSuggestion, MessageFrame, ProfileLink, Suggestion};
+use keryx_core::protocol::{
+    ChatOptions, ChatRole, ChatType, FolderSuggestion, GENERAL_TOPIC, MessageFrame, ProfileLink,
+    Suggestion, TopicName,
+};
 use keryx_core::ulid::Ulid;
 use serde_json::{Value, json};
 use tungstenite::stream::MaybeTlsStream;
@@ -33,6 +49,13 @@ struct App {
     /// This account's bio and links as last saved here, since saving one sends both.
     bio: Option<String>,
     link_list: Vec<ProfileLink>,
+    /// Each group's topics as last shown, and whether they are on, since `topics` sends them all.
+    topics: BTreeMap<Ulid, (bool, Vec<TopicName>)>,
+    /// Where `say`, `sticker` and `seen` go inside the chat in use.
+    topic: Option<Ulid>,
+    thread: Option<u64>,
+    /// The newest invitation, which `invite yes|no` answers.
+    invited: Option<Ulid>,
 }
 
 fn agent() -> ureq::Agent {
@@ -94,6 +117,10 @@ impl App {
             chat: None,
             bio: None,
             link_list: Vec::new(),
+            topics: BTreeMap::new(),
+            topic: None,
+            thread: None,
+            invited: None,
         }
     }
 
@@ -223,10 +250,9 @@ impl App {
                 | Output::CallKey { .. }
                 | Output::LeaveCall { .. }
                 | Output::CallText { .. } => None,
+                // Nothing here shows a chat's history, so its call rows and events are not kept.
                 Output::SaveRows {
-                    id,
-                    message_list,
-                    call_list: _,
+                    id, message_list, ..
                 } => {
                     for message in message_list {
                         let key = (message.chat, message.seq);
@@ -253,6 +279,7 @@ impl App {
                         id,
                         message_list,
                         call_list: Vec::new(),
+                        chat_event_list: Vec::new(),
                     })
                 }
                 // Nothing here searches its archive.
@@ -262,6 +289,7 @@ impl App {
                     total: 0,
                 }),
                 Output::Event { event } => {
+                    let event = *event;
                     if let Event::Chats { chat_list } = &event {
                         for item in chat_list {
                             if item.chat_type == ChatType::Direct {
@@ -285,6 +313,23 @@ impl App {
                             ack.left
                         );
                     }
+                    // Another account's message, by seq and where it sits, never its words.
+                    if let Event::Message { message } = &event
+                        && !message.mine
+                    {
+                        println!(
+                            "msg {} {} kind={:?} thread={:?} topic={:?} reply={:?} on={:?} mentions={}",
+                            message.chat,
+                            message.seq,
+                            message.content_kind,
+                            message.thread_seq,
+                            message.topic,
+                            message.reply,
+                            message.on,
+                            message.mentions.len()
+                        );
+                    }
+                    self.print_group(&event);
                     self.events.push(event);
                     None
                 }
@@ -362,6 +407,157 @@ impl App {
         }
     }
 
+    /// Prints what arrives for groups and channels, with ids and counts and never their content.
+    fn print_group(&mut self, event: &Event) {
+        match event {
+            Event::ChatReady { chat } => println!("ready {chat}"),
+            Event::ChatLeft { chat } => println!("left {chat}"),
+            Event::ChatEvent { event, copy_list } => {
+                let target = event.target.map(|target| target.to_string());
+                let topic = event.topic.map(|topic| topic.to_string());
+                println!(
+                    "event {} {:?} actor={} target={} topic={} copies={}",
+                    event.chat,
+                    event.action,
+                    event.actor,
+                    target.as_deref().unwrap_or("-"),
+                    topic.as_deref().unwrap_or("-"),
+                    copy_list.len()
+                );
+            }
+            Event::TopicOptions {
+                chat,
+                topic,
+                options,
+                mod_list,
+            } => println!(
+                "topicopts {chat} {topic} closed={} hidden={} write={:?} mods={}",
+                options.closed,
+                options.hidden,
+                options.write,
+                mod_list.len()
+            ),
+            Event::TopicProfile {
+                chat,
+                topic,
+                profile,
+            } => println!(
+                "topicprofile {chat} {topic} version={} photo={} rules={}",
+                profile.version,
+                profile.photo.is_some(),
+                profile.rules.is_some()
+            ),
+            Event::Line {
+                chat,
+                seq,
+                account,
+                action,
+                account_list,
+                ..
+            } => {
+                let list: Vec<String> = account_list.iter().map(Ulid::to_string).collect();
+                println!(
+                    "line {chat} {seq} {action:?} actor={account} accounts={}",
+                    list.join(",")
+                );
+            }
+            Event::JoinRequest { request } => {
+                println!(
+                    "request {} {} {:?}",
+                    request.chat, request.account, request.state
+                );
+            }
+            Event::Asked { chat, state, .. } => println!("asked {chat} {state:?}"),
+            Event::Invitation {
+                chat,
+                invitation: Some(invitation),
+            } => {
+                self.invited = Some(*chat);
+                // Whether its sealed name opened and it has a note, never either itself.
+                println!(
+                    "invited {chat} by {} named={} note={}",
+                    invitation.inviter,
+                    invitation.name.is_some(),
+                    invitation.note.is_some()
+                );
+            }
+            Event::Invitation {
+                chat,
+                invitation: None,
+            } => println!("invitation gone {chat}"),
+            Event::Findable { chat, findable } => {
+                println!("findable {chat} on={}", findable.is_some());
+            }
+            Event::Topics {
+                chat,
+                on,
+                topic_list,
+            } => {
+                self.topics.insert(*chat, (*on, topic_list.clone()));
+                println!("topics {chat} on={on} count={}", topic_list.len());
+            }
+            Event::ChatProfile { chat, profile } => {
+                // Topic names live in the profile, which a new device opens only after joining.
+                if let Some((_, list)) = self.topics.get_mut(chat) {
+                    for topic in list.iter_mut() {
+                        if let Some(named) = profile.topic_list.iter().find(|t| t.id == topic.id) {
+                            topic.name = named.name.clone();
+                        }
+                    }
+                }
+                println!(
+                    "profile {chat} version={} photo={}",
+                    profile.version,
+                    profile.photo.is_some()
+                );
+            }
+            _ => {}
+        }
+        let _ = std::io::stdout().flush();
+    }
+
+    /// Lets what a group command started finish, printing any refusal instead of stopping.
+    fn settle(&mut self) {
+        self.pump(1500);
+        let mut kept = Vec::new();
+        for event in std::mem::take(&mut self.events) {
+            match event {
+                Event::Error { code, .. } => println!("refused {code}"),
+                other => kept.push(other),
+            }
+        }
+        self.events = kept;
+    }
+
+    /// The account with exactly this username, from the directory.
+    fn account(&mut self, username: &str) -> Option<Ulid> {
+        self.events
+            .retain(|event| !matches!(event, Event::SearchResults { .. }));
+        self.command(Command::Search {
+            text: username.to_string(),
+        });
+        let Event::SearchResults { account_list, .. } =
+            self.wait(|event| matches!(event, Event::SearchResults { .. }))
+        else {
+            unreachable!()
+        };
+        let found = account_list
+            .iter()
+            .find(|item| item.username == username)
+            .map(|item| item.id);
+        if found.is_none() {
+            println!("missing {username}");
+        }
+        found
+    }
+
+    fn accounts(&mut self, usernames: &str) -> Vec<Ulid> {
+        usernames
+            .split_whitespace()
+            .filter_map(|username| self.account(username))
+            .collect()
+    }
+
     fn pump(&mut self, ms: u64) {
         let started = Instant::now();
         while started.elapsed() < Duration::from_millis(ms) {
@@ -424,7 +620,7 @@ fn main() {
                     text: rest.to_string(),
                 });
                 let event = app.wait(|event| matches!(event, Event::SearchResults { .. }));
-                let Event::SearchResults { account_list } = event else {
+                let Event::SearchResults { account_list, .. } = event else {
                     unreachable!()
                 };
                 let Some(account) = account_list.iter().find(|item| item.username == rest) else {
@@ -441,18 +637,29 @@ fn main() {
             "say" => {
                 let chat = app.chat.expect("no chat");
                 app.command(Command::SendText {
+                    mentions: Vec::new(),
+                    thread: app.thread,
+                    topic: app.topic,
                     chat,
                     text: Secret(rest.to_string()),
                     reply: None,
                 });
-                app.wait(|event| matches!(event, Event::Sent { .. }));
-                println!("sent");
+                match app.wait(|event| matches!(event, Event::Sent { .. } | Event::Failed { .. })) {
+                    Event::Failed { code, seconds, .. } => match seconds {
+                        Some(seconds) => println!("refused {code} {seconds}s"),
+                        None => println!("refused {code}"),
+                    },
+                    _ => println!("sent"),
+                }
             }
             "many" => {
                 let n: u32 = rest.parse().unwrap();
                 let chat = app.chat.expect("no chat");
                 for i in 1..=n {
                     app.command(Command::SendText {
+                        mentions: Vec::new(),
+                        thread: None,
+                        topic: None,
                         chat,
                         text: Secret(format!("note {i}")),
                         reply: None,
@@ -475,6 +682,8 @@ fn main() {
                     .map(|(_, message)| message.seq)
                     .unwrap_or(1);
                 app.command(Command::Seen {
+                    thread: app.thread,
+                    topic: app.topic,
                     chat,
                     up_to_seq: up_to,
                 });
@@ -598,6 +807,8 @@ fn main() {
                     chat,
                     emoji: emoji.to_string(),
                     on: Pointer::Seq(on.parse().unwrap()),
+                    topic: app.topic,
+                    thread: app.thread,
                 });
                 let Event::Sent { seq, .. } = app.wait(|event| matches!(event, Event::Sent { .. }))
                 else {
@@ -643,6 +854,8 @@ fn main() {
                     continue;
                 };
                 app.command(Command::SendSticker {
+                    thread: app.thread,
+                    topic: app.topic,
                     chat,
                     sticker: sticker.id,
                     reply: None,
@@ -652,6 +865,374 @@ fn main() {
                     unreachable!()
                 };
                 println!("sticker {seq}");
+            }
+            // A group or channel with this name and these people, which becomes the chat in use.
+            "group" | "channel" => {
+                let (rest, note) = with_note(rest);
+                let mut words = rest.split_whitespace();
+                let name = words
+                    .next()
+                    .expect("group <name> [username ...]")
+                    .to_string();
+                let usernames = words.collect::<Vec<_>>().join(" ");
+                let account_list = app.accounts(&usernames);
+                app.command(Command::CreateChat {
+                    chat_type: if verb == "group" {
+                        ChatType::Group
+                    } else {
+                        ChatType::Channel
+                    },
+                    name,
+                    bio: None,
+                    link_list: Vec::new(),
+                    account_list,
+                    topics: None,
+                    findable: false,
+                    options: ChatOptions::default(),
+                    photo: None,
+                    note,
+                });
+                let Event::Started { chat, .. } =
+                    app.wait(|event| matches!(event, Event::Started { .. }))
+                else {
+                    unreachable!()
+                };
+                app.chat = Some(chat);
+                app.settle();
+                println!("chat {chat}");
+            }
+            "use" => {
+                app.chat = Some(Ulid::parse(rest).expect("use <chat id>"));
+                app.topic = None;
+                app.thread = None;
+                println!("using {rest}");
+            }
+            "add" | "remove" => {
+                let chat = app.chat.expect("no chat");
+                let (rest, note) = with_note(rest);
+                let account_list = app.accounts(rest);
+                app.command(if verb == "add" {
+                    Command::AddMembers {
+                        chat,
+                        account_list,
+                        note,
+                    }
+                } else {
+                    Command::RemoveMembers { chat, account_list }
+                });
+                app.settle();
+                println!("{verb} asked");
+            }
+            "role" => {
+                let chat = app.chat.expect("no chat");
+                let (username, role) = rest.split_once(' ').expect("role <username> <role>");
+                let role = match role {
+                    "owner" => ChatRole::Owner,
+                    "moderator" => ChatRole::Moderator,
+                    _ => ChatRole::Member,
+                };
+                if let Some(account) = app.account(username) {
+                    app.command(Command::SetRole {
+                        chat,
+                        account,
+                        role,
+                    });
+                    app.settle();
+                    println!("role asked");
+                }
+            }
+            "leave" => {
+                let chat = app.chat.expect("no chat");
+                app.command(Command::Leave { chat });
+                app.settle();
+            }
+            "removechat" => {
+                let chat = app.chat.expect("no chat");
+                app.command(Command::RemoveChat { chat });
+                app.settle();
+            }
+            // Findable groups and channels whose name holds the text.
+            "findchat" => {
+                app.events
+                    .retain(|event| !matches!(event, Event::SearchResults { .. }));
+                app.command(Command::Search {
+                    text: rest.to_string(),
+                });
+                let Event::SearchResults { chat_list, .. } =
+                    app.wait(|event| matches!(event, Event::SearchResults { .. }))
+                else {
+                    unreachable!()
+                };
+                for found in &chat_list {
+                    println!(
+                        "found chat {} {:?} members={}",
+                        found.chat, found.chat_type, found.member_count
+                    );
+                }
+                println!("found {}", chat_list.len());
+            }
+            "ask" => {
+                let (chat, note) = match rest.split_once(' ') {
+                    Some((chat, note)) => (chat, Some(note.to_string())),
+                    None => (rest, None),
+                };
+                app.command(Command::AskToJoin {
+                    chat: Ulid::parse(chat).expect("ask <chat id> [note]"),
+                    note,
+                });
+                app.settle();
+                println!("asked");
+            }
+            "cancelask" => {
+                app.command(Command::CancelAsk {
+                    chat: Ulid::parse(rest).expect("cancelask <chat id>"),
+                });
+                app.settle();
+                println!("cancelled");
+            }
+            "requests" => {
+                let chat = app.chat.expect("no chat");
+                app.command(Command::Requests { chat });
+                let Event::Requests { request_list, .. } =
+                    app.wait(|event| matches!(event, Event::Requests { .. }))
+                else {
+                    unreachable!()
+                };
+                for request in &request_list {
+                    println!("waiting {}", request.account);
+                }
+                println!("requests {}", request_list.len());
+            }
+            "letin" | "decline" => {
+                let chat = app.chat.expect("no chat");
+                if let Some(account) = app.account(rest) {
+                    app.command(if verb == "letin" {
+                        Command::LetIn { chat, account }
+                    } else {
+                        Command::DeclineAsk { chat, account }
+                    });
+                    app.settle();
+                    println!("{verb} done");
+                }
+            }
+            // Answers the newest invitation; accepting joins it and makes it the chat in use.
+            "invite" => {
+                let chat = app.invited.take().expect("no invitation");
+                let accept = rest == "yes";
+                app.command(Command::AnswerInvite { chat, accept });
+                if accept {
+                    app.wait(
+                        |event| matches!(event, Event::ChatReady { chat: ready } if *ready == chat),
+                    );
+                    app.chat = Some(chat);
+                }
+                app.settle();
+                println!("answered {chat}");
+            }
+            "topics" => {
+                let chat = app.chat.expect("no chat");
+                let topic_list = app
+                    .topics
+                    .get(&chat)
+                    .map(|(_, list)| list.clone())
+                    .unwrap_or_default();
+                app.command(Command::Topics {
+                    chat,
+                    on: rest == "on",
+                    topic_list,
+                });
+                app.settle();
+                println!("topics {rest}");
+            }
+            // A new topic after the others, keeping whether topics are on.
+            "topic" => {
+                let chat = app.chat.expect("no chat");
+                app.command(Command::TopicId { chat });
+                let Event::TopicId { topic, .. } =
+                    app.wait(|event| matches!(event, Event::TopicId { .. }))
+                else {
+                    unreachable!()
+                };
+                let (on, mut topic_list) = app.topics.get(&chat).cloned().unwrap_or_default();
+                let place = topic_list.len() as u64;
+                topic_list.push(TopicName {
+                    id: topic,
+                    name: rest.to_string(),
+                    place,
+                });
+                app.command(Command::Topics {
+                    chat,
+                    on,
+                    topic_list,
+                });
+                app.settle();
+                println!("topic {topic}");
+            }
+            "in" => {
+                let chat = app.chat.expect("no chat");
+                app.topic = if rest == "main" {
+                    None
+                } else {
+                    app.topics.get(&chat).and_then(|(_, list)| {
+                        list.iter()
+                            .find(|topic| topic.name == rest)
+                            .map(|topic| topic.id)
+                    })
+                };
+                match app.topic {
+                    Some(topic) => println!("in {topic}"),
+                    None => println!("in main"),
+                }
+            }
+            "thread" => {
+                app.thread = rest.parse().ok();
+                println!("thread {rest}");
+            }
+            "mention" => {
+                let chat = app.chat.expect("no chat");
+                let (username, text) = rest.split_once(' ').expect("mention <username> <text>");
+                let Some(account) = app.account(username) else {
+                    continue;
+                };
+                app.command(Command::SendText {
+                    chat,
+                    text: Secret(format!("@{username} {text}")),
+                    reply: None,
+                    topic: app.topic,
+                    thread: app.thread,
+                    mentions: vec![account],
+                });
+                app.wait(|event| matches!(event, Event::Sent { .. }));
+                println!("sent");
+            }
+            "chatprofile" => {
+                let chat = app.chat.expect("no chat");
+                // A name, then rules after a lone `--`.
+                let (name, rules) = match rest.split_once(" -- ") {
+                    Some((name, rules)) => (name, Some(rules.to_string())),
+                    None => (rest, None),
+                };
+                app.command(Command::ChatProfile {
+                    chat,
+                    name: name.to_string(),
+                    bio: None,
+                    link_list: Vec::new(),
+                    rules,
+                });
+                app.settle();
+                println!("saved");
+            }
+            // A photo for the chat in use, from a JPEG file. Its BlurHash is a flat colour, as the
+            // account's is, since this program decodes no images.
+            "chatphoto" => {
+                let chat = app.chat.expect("no chat");
+                let jpeg = std::fs::read(rest).unwrap();
+                let mut rgba = Vec::new();
+                for _ in 0..16 {
+                    rgba.extend_from_slice(&[0x45, 0x76, 0xC4, 0xFF]);
+                }
+                app.command(Command::ChatPhoto {
+                    chat,
+                    jpeg,
+                    thumbnail: Thumbnail {
+                        width: 4,
+                        height: 4,
+                        rgba,
+                    },
+                });
+                app.settle();
+                println!("saved");
+            }
+            // The topic in use's bio, then rules after a lone `--`; General when none is in use.
+            "topicbio" => {
+                let chat = app.chat.expect("no chat");
+                let (bio, rules) = match rest.split_once(" -- ") {
+                    Some((bio, rules)) => (bio, Some(rules.to_string())),
+                    None => (rest, None),
+                };
+                app.command(Command::TopicProfile {
+                    chat,
+                    topic: app.topic.unwrap_or(GENERAL_TOPIC),
+                    bio: Some(bio.to_string()),
+                    link_list: Vec::new(),
+                    rules,
+                });
+                app.settle();
+                println!("saved");
+            }
+            // A photo for the topic in use, from a JPEG file, with a flat BlurHash as `chatphoto`.
+            "topicphoto" => {
+                let chat = app.chat.expect("no chat");
+                let jpeg = std::fs::read(rest).unwrap();
+                let mut rgba = Vec::new();
+                for _ in 0..16 {
+                    rgba.extend_from_slice(&[0xC4, 0x76, 0x45, 0xFF]);
+                }
+                app.command(Command::TopicPhoto {
+                    chat,
+                    topic: app.topic.unwrap_or(GENERAL_TOPIC),
+                    jpeg,
+                    thumbnail: Thumbnail {
+                        width: 4,
+                        height: 4,
+                        rgba,
+                    },
+                });
+                app.settle();
+                println!("saved");
+            }
+            // The topic in use's own options as JSON, such as {"closed": true, "write": "moderators",
+            // "deny": ["message.send.reaction"]}.
+            "topicopts" => {
+                let chat = app.chat.expect("no chat");
+                app.command(Command::TopicOptions {
+                    chat,
+                    topic: app.topic.unwrap_or(GENERAL_TOPIC),
+                    options: serde_json::from_str(rest).expect("topicopts <json>"),
+                });
+                app.settle();
+                println!("saved");
+            }
+            // Makes someone the topic in use's moderator, or a member there again.
+            "topicmod" => {
+                let chat = app.chat.expect("no chat");
+                let (username, on) = rest.split_once(' ').expect("topicmod <username> on|off");
+                if let Some(account) = app.account(username) {
+                    app.command(Command::TopicRole {
+                        chat,
+                        topic: app.topic.unwrap_or(GENERAL_TOPIC),
+                        account,
+                        role: if on == "on" {
+                            ChatRole::Moderator
+                        } else {
+                            ChatRole::Member
+                        },
+                    });
+                    app.settle();
+                    println!("role asked");
+                }
+            }
+            // The chat's options as JSON, such as {"deny": ["message.send.sticker"], "slow_mode": 10}.
+            "options" => {
+                let chat = app.chat.expect("no chat");
+                app.command(Command::ChatOptions {
+                    chat,
+                    options: serde_json::from_str(rest).expect("options <json>"),
+                });
+                app.settle();
+                println!("saved");
+            }
+            "findable" => {
+                let chat = app.chat.expect("no chat");
+                let name = rest.strip_prefix("on ").map(str::to_string);
+                app.command(Command::Findable {
+                    chat,
+                    findable: name.is_some(),
+                    name,
+                    bio: None,
+                });
+                app.settle();
+                println!("saved");
             }
             "pump" => {
                 let ms: u64 = rest.parse().unwrap_or(1000);
@@ -667,6 +1248,14 @@ fn main() {
 
 /// A tree that takes every branch a form can: a single choice whose pick, written-in text or skip each
 /// lead somewhere else, a multi-select, and a number in halves whose range decides what comes next.
+/// The usernames before a lone `--`, and the invitation's note after it.
+fn with_note(rest: &str) -> (&str, Option<String>) {
+    match rest.split_once(" -- ") {
+        Some((names, note)) => (names, Some(note.to_string())),
+        None => (rest.strip_suffix(" --").unwrap_or(rest), None),
+    }
+}
+
 fn sample_question() -> Value {
     json!({
         "first": "where",

@@ -14,9 +14,10 @@ use std::time::Duration;
 
 use axum::extract::ws::Utf8Bytes;
 use keryx_core::protocol::{
-    Bytes, CallEvent, CallEventKind, CallOutcome, CallText, ChatMode, ChatType, ClientFrame,
-    ContentKind, Kind, MessageFrame, PresenceState, ProfileKeyShare, SendFrame, ServerFrame,
-    WelcomeItem, WrapItem,
+    ActionKind, Audience, Bytes, CallEvent, CallEventKind, CallOutcome, CallText, ChatAction,
+    ChatEvent, ChatOptions, ChatProfileBody, ChatRole, ChatType, ClientFrame, CommitAction,
+    ContentKind, GENERAL_TOPIC, Kind, MessageFrame, PresenceState, ProfileKeyShare, SendFrame,
+    ServerFrame, TopicWrite, WelcomeItem, WrapItem,
 };
 use keryx_core::ulid::Ulid;
 use tokio::sync::{Notify, mpsc, oneshot};
@@ -24,14 +25,16 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::api::{
-    App, Caller, DELETE_OWN, EDIT_OWN, MESSAGE_COMMIT, Need, Refused, SEND_UNENCRYPTED, TRACE,
-    check, current_trace, new_id, operation, presence_moved, refused, send_permission,
+    App, CHAT_PROFILE_EDIT, Caller, DELETE_OTHERS, DELETE_OWN, EDIT_OWN, MEMBER_ADD, MEMBER_REMOVE,
+    MESSAGE_COMMIT, MESSAGE_POST, Need, OPTIONS_EDIT, Refused, SEND_UNENCRYPTED, TRACE,
+    chat_profile_kept, check, current_trace, invite_only, new_chat_options, new_chat_profile,
+    new_id, no_such_photo, operation, presence_moved, refused, send_permission, topic_says,
 };
 use crate::file;
 use crate::moq::{self, Closer, Joined};
 use crate::storage::{
-    Appended, GroupInfoPut, NewMessage, NewWelcome, NewWrap, Position, PositionReport, Session,
-    Storage,
+    Appended, GroupInfoPut, NewAction, NewGroupStart, NewMessage, NewWelcome, NewWrap, Place,
+    Position, PositionReport, Session, Storage,
 };
 
 /// How many events may wait for a chat's task before their senders wait in turn.
@@ -624,6 +627,8 @@ async fn handle(app: &Arc<App>, state: &mut ChatState, job: Job) {
                     chat,
                     up_to_seq,
                     client_seen_at,
+                    topic,
+                    thread_seq,
                 } => {
                     let result = operation!(
                         "Seen",
@@ -631,20 +636,25 @@ async fn handle(app: &Arc<App>, state: &mut ChatState, job: Job) {
                         run_position(
                             app,
                             session,
-                            reference,
                             Position::Seen,
                             chat,
+                            (topic, thread_seq),
                             up_to_seq,
                             client_seen_at
                         )
                     );
-                    Some(answer_of(reference, result))
+                    Some(answer_of(
+                        reference,
+                        result.map(|()| ServerFrame::Done { reference }),
+                    ))
                 }
                 ClientFrame::Received {
                     reference,
                     chat,
                     up_to_seq,
                     client_received_at,
+                    topic,
+                    thread_seq,
                 } => {
                     let result = operation!(
                         "Received",
@@ -652,17 +662,29 @@ async fn handle(app: &Arc<App>, state: &mut ChatState, job: Job) {
                         run_position(
                             app,
                             session,
-                            reference,
                             Position::Received,
                             chat,
+                            (topic, thread_seq),
                             up_to_seq,
                             client_received_at
                         )
                     );
-                    Some(answer_of(reference, result))
+                    Some(answer_of(
+                        reference,
+                        result.map(|()| ServerFrame::Done { reference }),
+                    ))
                 }
-                ClientFrame::Typing { chat, on } => {
-                    let result = operation!("Typing", "typing", run_typing(app, session, chat, on));
+                ClientFrame::Typing {
+                    chat,
+                    on,
+                    topic,
+                    thread_seq,
+                } => {
+                    let result = operation!(
+                        "Typing",
+                        "typing",
+                        run_typing(app, session, chat, on, topic, thread_seq)
+                    );
                     if let Err(refusal) = result {
                         tracing::debug!(msg = "Dropped a typing event", code = refusal.code);
                     }
@@ -673,11 +695,19 @@ async fn handle(app: &Arc<App>, state: &mut ChatState, job: Job) {
                     chat,
                     epoch,
                     body,
+                    chat_profile,
+                    chat_key,
+                    chat_options,
                 } => {
+                    let start = GroupInfoStart {
+                        chat_profile,
+                        chat_key,
+                        chat_options,
+                    };
                     let result = operation!(
                         "GroupInfo",
                         "group_info",
-                        run_group_info(app, session, reference, chat, epoch, body)
+                        run_group_info(app, session, reference, chat, epoch, body, start)
                     );
                     Some(answer_of(reference, result))
                 }
@@ -730,6 +760,23 @@ async fn handle(app: &Arc<App>, state: &mut ChatState, job: Job) {
                 | ClientFrame::Kv { reference, .. }
                 | ClientFrame::KvSet { reference, .. }
                 | ClientFrame::Times { reference, .. }
+                | ClientFrame::ChatRemove { reference, .. }
+                | ClientFrame::Leave { reference, .. }
+                | ClientFrame::ChatRole { reference, .. }
+                | ClientFrame::JoinRequest { reference, .. }
+                | ClientFrame::JoinCancel { reference, .. }
+                | ClientFrame::JoinDecline { reference, .. }
+                | ClientFrame::Invite { reference, .. }
+                | ClientFrame::InviteAnswer { reference, .. }
+                | ClientFrame::TopicId { reference, .. }
+                | ClientFrame::Members { reference, .. }
+                | ClientFrame::Topics { reference, .. }
+                | ClientFrame::ChatProfile { reference, .. }
+                | ClientFrame::ChatOptions { reference, .. }
+                | ClientFrame::TopicOptions { reference, .. }
+                | ClientFrame::TopicProfile { reference, .. }
+                | ClientFrame::TopicRole { reference, .. }
+                | ClientFrame::Findable { reference, .. }
                 | ClientFrame::Ping { reference } => Some(answer_of(
                     reference,
                     Err(refused(500, "internal", "This event has no chat's task")),
@@ -755,12 +802,19 @@ pub fn answer_of(reference: Ulid, result: Result<ServerFrame, Refused>) -> Serve
             call_seq: refusal.call_seq,
             version: refusal.kv.as_ref().map(|kv| kv.version),
             kv_list: refusal.kv.and_then(|kv| kv.kv_list),
+            seconds: refusal.seconds,
+            account_list: refusal.account_list,
         },
     }
 }
 
 fn bad(message: &str) -> Refused {
     refused(400, "bad_message", message)
+}
+
+/// A commit whose MLS changes are not what the server allowed, or that cannot be read.
+fn bad_commit(message: &str) -> Refused {
+    refused(403, "bad_commit", message)
 }
 
 async fn run_send(
@@ -771,9 +825,12 @@ async fn run_send(
 ) -> Result<ServerFrame, Refused> {
     let caller = Caller::Session(session);
     let chat = frame.chat;
-    check(app, &caller, Need::Member(chat)).await?;
+    let Some(access) = app.storage.chat_access(chat, session.account).await? else {
+        return Err(refused(404, "not_member", "You are not in that chat"));
+    };
     let device = session.device()?;
-    let frame = *frame;
+    let mut frame = *frame;
+    let grouped = matches!(access.chat_type, ChatType::Group | ChatType::Channel);
 
     // What the schema's checks would refuse is refused here first, with a reason.
     if frame.kind == Kind::Content && frame.content_kind.is_none() {
@@ -809,35 +866,131 @@ async fn run_send(
         && !(frame.wrap_list.is_empty()
             && frame.welcome_list.is_empty()
             && frame.group_info.is_none()
-            && frame.profile_key_list.is_empty())
+            && frame.profile_key_list.is_empty()
+            && frame.action.is_none()
+            && frame.chat_key.is_none())
     {
         return Err(bad(
-            "Only a commit carries wraps, welcomes, group info and profile keys",
+            "Only a commit carries wraps, welcomes, group info, profile keys, an action and a \
+             chat's profile key",
         ));
     }
+    if frame.chat_key.is_some() && !grouped {
+        return Err(bad("Only groups and channels have a profile key"));
+    }
+    if (frame.topic.is_some() || frame.thread_seq.is_some()) && frame.kind != Kind::Content {
+        return Err(bad("Only content goes in a topic or thread"));
+    }
+    if (frame.topic.is_some() || frame.thread_seq.is_some()) && !grouped {
+        return Err(bad("Only groups and channels have topics and threads"));
+    }
+    if frame.action.is_some() && !grouped {
+        return Err(bad("Only a group's or channel's commit has an action"));
+    }
 
-    check_files(app, session, &frame).await?;
+    // A thread is one level deep, under a main-list message of the same topic.
+    if let Some(parent) = frame.thread_seq {
+        let Some(brief) = app.storage.message_brief(chat, parent).await? else {
+            return Err(refused(
+                404,
+                "no_such_message",
+                "That message does not exist",
+            ));
+        };
+        if !matches!(brief.kind, Kind::Content | Kind::Line) || brief.thread_seq.is_some() {
+            return Err(bad("Only a main-list message opens a thread"));
+        }
+        if brief.topic != frame.topic {
+            return Err(bad("A thread is in its message's topic"));
+        }
+    } else if frame.topic.is_some() && !access.topics_on {
+        return Err(refused(409, "topics_off", "This chat has topics off"));
+    }
+
+    // A topic's own rules, General's included: hidden from all but its moderators, closed to all but
+    // them, its main list perhaps theirs alone, and its own permissions and slow mode. Owners and
+    // moderators of the chat moderate every topic.
+    let mut topic_rules = None;
+    let mut rules_topic = GENERAL_TOPIC;
+    if grouped {
+        let topic = match (frame.kind, frame.pointer_seq) {
+            (Kind::Content, _) => Some(frame.topic.unwrap_or(GENERAL_TOPIC)),
+            (Kind::Edit | Kind::Delete, Some(seq)) => app
+                .storage
+                .message_brief(chat, seq)
+                .await?
+                .map(|brief| brief.topic.unwrap_or(GENERAL_TOPIC)),
+            _ => None,
+        };
+        if let Some(topic) = topic
+            && let Some(rules) = app
+                .storage
+                .topic_access(chat, topic, session.account)
+                .await?
+        {
+            let moderator = access.role != ChatRole::Member || rules.moderator;
+            if rules.hidden && !moderator {
+                return Err(refused(409, "topic_gone", "That topic was removed"));
+            }
+            if rules.closed && !moderator && frame.kind != Kind::Delete {
+                return Err(refused(403, "topic_closed", "This topic is closed"));
+            }
+            if frame.kind == Kind::Content
+                && frame.thread_seq.is_none()
+                && rules.write == TopicWrite::Moderators
+                && !moderator
+                && !matches!(
+                    frame.content_kind,
+                    Some(ContentKind::Reaction | ContentKind::Answer | ContentKind::Ack)
+                )
+            {
+                return Err(refused(
+                    403,
+                    "moderators_only",
+                    "Only moderators write in this topic",
+                ));
+            }
+            topic_rules = Some((rules, moderator));
+            rules_topic = topic;
+        }
+    }
+    let topic_moderator = topic_rules
+        .as_ref()
+        .is_some_and(|(rules, _)| rules.moderator);
 
     let mut body_limit = None;
+    let mut others = false;
+    let mut history = None;
     match frame.kind {
         Kind::Content => {
             if let Some(content_kind) = frame.content_kind {
-                check(
-                    app,
-                    &caller,
-                    Need::MemberWith(chat, send_permission(content_kind)),
-                )
-                .await?;
+                let name = send_permission(content_kind);
+                match topic_says(&topic_rules, access.chat_type, name) {
+                    Some(true) => {}
+                    Some(false) => {
+                        return Err(refused(
+                            403,
+                            "no_permission",
+                            "This topic does not allow that",
+                        ));
+                    }
+                    None => check(app, &caller, Need::MemberWith(chat, name)).await?,
+                }
                 body_limit = Some(app.settings.limits.body.of(content_kind));
+                // A channel's main list is a broadcast: subscribers react, answer and ack there,
+                // and write only in threads.
+                if access.chat_type == ChatType::Channel
+                    && frame.thread_seq.is_none()
+                    && !matches!(
+                        content_kind,
+                        ContentKind::Reaction | ContentKind::Answer | ContentKind::Ack
+                    )
+                {
+                    check(app, &caller, Need::MemberWith(chat, MESSAGE_POST)).await?;
+                }
             }
         }
         Kind::Edit | Kind::Delete => {
-            let permission = if frame.kind == Kind::Edit {
-                EDIT_OWN
-            } else {
-                DELETE_OWN
-            };
-            check(app, &caller, Need::MemberWith(chat, permission)).await?;
             let mut target = None;
             if let Some(seq) = frame.pointer_seq {
                 target = app.storage.message_brief(chat, seq).await?;
@@ -849,8 +1002,47 @@ async fn run_send(
                     "That message does not exist",
                 ));
             };
-            if target.account != session.account {
-                return Err(refused(403, "not_yours", "That message is someone else's"));
+            // Only the sender edits, so nobody's words can be made to look like theirs. In a group
+            // or channel a role may delete others' messages, but a moderator never an owner's. A
+            // membership line is nobody's own, so owners and moderators remove it, whoever acted.
+            if target.kind == Kind::Line {
+                if frame.kind == Kind::Edit {
+                    return Err(refused(409, "cannot_edit", "Only content can be edited"));
+                }
+                check(app, &caller, Need::MemberWith(chat, DELETE_OTHERS)).await?;
+                others = true;
+            } else if target.account != session.account {
+                if frame.kind == Kind::Edit || !grouped {
+                    return Err(refused(403, "not_yours", "That message is someone else's"));
+                }
+                // A topic's own moderators delete others' messages there.
+                if !topic_moderator {
+                    check(app, &caller, Need::MemberWith(chat, DELETE_OTHERS)).await?;
+                }
+                if access.role != ChatRole::Owner {
+                    for (account, role) in app.storage.member_roles(chat).await? {
+                        if account == target.account && role == ChatRole::Owner {
+                            return Err(refused(
+                                403,
+                                "no_permission",
+                                "An owner's message is the owners' to delete",
+                            ));
+                        }
+                    }
+                }
+                others = true;
+            } else {
+                let permission = if frame.kind == Kind::Edit {
+                    EDIT_OWN
+                } else {
+                    DELETE_OWN
+                };
+                check(app, &caller, Need::MemberWith(chat, permission)).await?;
+            }
+            // Every delete and edit in a group or channel goes into its history with what it
+            // removed or changed, chosen by the author.
+            if grouped {
+                history = Some(target.account);
             }
             if frame.kind == Kind::Edit {
                 let Some(content_kind) = target.content_kind else {
@@ -871,7 +1063,7 @@ async fn run_send(
                 }
                 body_limit = Some(app.settings.limits.body.of(content_kind));
             } else {
-                if !matches!(target.kind, Kind::Content | Kind::DeviceNotice) {
+                if !matches!(target.kind, Kind::Content | Kind::DeviceNotice | Kind::Line) {
                     return Err(refused(409, "cannot_delete", "Only content can be deleted"));
                 }
                 if target.kind == Kind::DeviceNotice
@@ -895,11 +1087,11 @@ async fn run_send(
             }
         }
         Kind::Commit => check(app, &caller, Need::MemberWith(chat, MESSAGE_COMMIT)).await?,
-        Kind::DeviceNotice => {
+        Kind::DeviceNotice | Kind::Line => {
             return Err(refused(
                 403,
                 "server_only",
-                "Only the server writes notices",
+                "Only the server writes notices and lines",
             ));
         }
     }
@@ -909,51 +1101,174 @@ async fn run_send(
         return Err(refused(413, "body_too_large", "That message is too large"));
     }
 
-    if frame.kind != Kind::Commit {
-        let Some(access) = app.storage.chat_access(chat, session.account).await? else {
-            return Err(refused(404, "not_member", "You are not in that chat"));
-        };
-        match (access.mode, frame.encrypted) {
-            (ChatMode::Private, false) => {
-                return Err(refused(
-                    403,
-                    "unencrypted_refused",
-                    "This chat refuses unencrypted messages",
-                ));
-            }
-            (ChatMode::Open, true) => {
-                return Err(refused(
-                    403,
-                    "encrypted_refused",
-                    "Everything in this chat is unencrypted",
-                ));
-            }
-            (ChatMode::Mixed, false) => {
-                check(app, &caller, Need::MemberWith(chat, SEND_UNENCRYPTED)).await?;
-            }
-            _ => {}
+    check_files(app, session, &frame, others).await?;
+
+    // Unencrypted is a property of a message, chosen by the author, and sending one is a
+    // permission in any chat.
+    if frame.kind != Kind::Commit && !frame.encrypted {
+        check(app, &caller, Need::MemberWith(chat, SEND_UNENCRYPTED)).await?;
+    }
+    if frame.kind == Kind::Content && frame.content_kind == Some(ContentKind::Call) {
+        if access.chat_type != ChatType::Direct {
+            return Err(refused(
+                403,
+                "call_not_allowed",
+                "Calls are for direct chats only",
+            ));
         }
-        if frame.kind == Kind::Content && frame.content_kind == Some(ContentKind::Call) {
-            if access.chat_type != ChatType::Direct {
-                return Err(refused(
-                    403,
-                    "call_not_allowed",
-                    "Calls are for direct chats only",
-                ));
-            }
-            if let Some(call) = &state.call {
-                return Err(Refused {
-                    status: 409,
-                    code: "call_open",
-                    message: "This chat already has an open call".to_string(),
-                    call_seq: Some(call.seq),
-                    kv: None,
-                });
-            }
+        if let Some(call) = &state.call {
+            return Err(Refused {
+                status: 409,
+                code: "call_open",
+                message: "This chat already has an open call".to_string(),
+                call_seq: Some(call.seq),
+                kv: None,
+                seconds: None,
+                account_list: None,
+            });
         }
     }
 
-    let member_list = app.storage.member_accounts(chat).await?;
+    // Slow mode counts a member's messages in the main list or a topic, never in threads, and never
+    // a reaction or an ack. Owners and moderators are exempt.
+    let slow = grouped
+        && frame.kind == Kind::Content
+        && frame.thread_seq.is_none()
+        && !matches!(
+            frame.content_kind,
+            Some(ContentKind::Reaction | ContentKind::Ack)
+        );
+    // A topic's own value wins, its 0 being off; with none it follows the chat's.
+    let slow_mode = topic_rules
+        .as_ref()
+        .and_then(|(rules, _)| rules.slow_mode)
+        .or(access.slow_mode)
+        .filter(|seconds| *seconds > 0);
+    let last_sent_at = topic_rules
+        .as_ref()
+        .and_then(|(rules, _)| rules.last_sent_at);
+    let exempt = topic_rules
+        .as_ref()
+        .map_or(access.role != ChatRole::Member, |(_, moderator)| *moderator);
+    if slow
+        && !exempt
+        && let (Some(seconds), Some(last)) = (slow_mode, last_sent_at)
+    {
+        let waited = Ulid::now() - last;
+        let gap = seconds as i64 * 1000;
+        if waited < gap {
+            let left = (gap - waited + 999) / 1000;
+            return Err(Refused {
+                status: 429,
+                code: "slow_mode",
+                message: format!("This chat allows one message every {seconds} seconds"),
+                call_seq: None,
+                kv: None,
+                seconds: Some(left as u64),
+                account_list: None,
+            });
+        }
+    }
+
+    let mut member_list = app.storage.member_accounts(chat).await?;
+    // A commit with no action that shares the profile key is a device joining by invitation.
+    let joined = frame.kind == Kind::Commit && frame.action.is_none();
+    // A group's or channel's commit may change who is in it, checked here and applied with it.
+    let mut action = None;
+    let mut added_list = Vec::new();
+    if let Some(CommitAction { kind, account_list }) = frame.action {
+        if frame.kind != Kind::Commit {
+            return Err(bad("Only a commit has an action"));
+        }
+        if account_list.is_empty() {
+            return Err(bad("An action names its accounts"));
+        }
+        for (index, account) in account_list.iter().enumerate() {
+            if account_list[..index].contains(account) {
+                return Err(bad("An account is named twice"));
+            }
+        }
+        let role_list = app.storage.member_roles(chat).await?;
+        match kind {
+            ActionKind::Add => {
+                check(app, &caller, Need::MemberWith(chat, MEMBER_ADD)).await?;
+                // Everyone added by invitation only is named, so the client invites them.
+                let mut invite_list = Vec::new();
+                for account in &account_list {
+                    if member_list.contains(account) {
+                        return Err(refused(
+                            409,
+                            "already_member",
+                            "That account is already in this chat",
+                        ));
+                    }
+                    if app.storage.account_by_id(*account).await?.is_none() {
+                        return Err(refused(
+                            404,
+                            "no_such_account",
+                            "That account does not exist",
+                        ));
+                    }
+                    if invite_only(app, chat, *account, access.chat_type).await? {
+                        invite_list.push(*account);
+                    }
+                }
+                if !invite_list.is_empty() {
+                    let mut refusal = refused(
+                        403,
+                        "invite_needed",
+                        "Some of these accounts are added by invitation only",
+                    );
+                    refusal.account_list = Some(invite_list);
+                    return Err(refusal);
+                }
+                added_list = account_list.clone();
+            }
+            ActionKind::Remove => {
+                check(app, &caller, Need::MemberWith(chat, MEMBER_REMOVE)).await?;
+                for account in &account_list {
+                    if *account == session.account {
+                        return Err(bad("Leaving is its own frame"));
+                    }
+                    let mut found = None;
+                    for (member, member_role) in &role_list {
+                        if member == account {
+                            found = Some(*member_role);
+                        }
+                    }
+                    let Some(target_role) = found else {
+                        return Err(refused(
+                            404,
+                            "not_member",
+                            "That account is not in this chat",
+                        ));
+                    };
+                    if target_role == ChatRole::Owner && access.role != ChatRole::Owner {
+                        return Err(refused(
+                            403,
+                            "no_permission",
+                            "Only an owner removes an owner",
+                        ));
+                    }
+                }
+            }
+        }
+        let limit = if access.chat_type == ChatType::Group {
+            app.settings.limits.group_members
+        } else {
+            app.settings.limits.channel_members
+        };
+        action = Some(NewAction {
+            kind,
+            account_list,
+            actor: session.account,
+            limit,
+        });
+    }
+    // Who hears of it: the members, and those it adds, whose keys it carries.
+    let members_before = member_list.len();
+    member_list.extend(added_list.iter().copied());
+
     let wrap_list = check_wraps(&member_list, frame.wrap_list)?;
     let profile_key_list = check_profile_keys(&member_list, frame.profile_key_list)?;
     let shared_list: Vec<Ulid> = profile_key_list
@@ -963,12 +1278,24 @@ async fn run_send(
     let mut welcome_list = Vec::with_capacity(frame.welcome_list.len());
     let mut welcome_devices = Vec::with_capacity(frame.welcome_list.len());
     if !frame.welcome_list.is_empty() {
-        let device_list = app.storage.chat_devices(chat).await?;
+        let mut device_list = Vec::new();
+        for known in app.storage.chat_devices(chat).await? {
+            if known.statement.is_none() {
+                device_list.push((known.account, known.device));
+            }
+        }
+        for account in &added_list {
+            for item in app.storage.list_devices(*account).await? {
+                if item.terminated_at.is_none() {
+                    device_list.push((*account, item.id));
+                }
+            }
+        }
         for WelcomeItem { device, body } in frame.welcome_list {
             let mut account = None;
-            for known in &device_list {
-                if known.device == device && known.statement.is_none() {
-                    account = Some(known.account);
+            for (known_account, known_device) in &device_list {
+                if *known_device == device {
+                    account = Some(*known_account);
                 }
             }
             let Some(account) = account else {
@@ -987,6 +1314,76 @@ async fn run_send(
         }
     }
 
+    // A commit is read against the chat's public group, so what it changes in MLS is what the
+    // server allowed: a device joining by itself is the device sending it, an add brings in
+    // devices of the action's accounts or of accounts already in, and a removal takes out the
+    // action's accounts, ended devices or accounts no longer in.
+    let mut public_group = None;
+    if frame.kind == Kind::Commit {
+        let Some(state) = app.storage.public_group(chat).await? else {
+            return Err(refused(
+                409,
+                "commit_lost",
+                "Another commit got this epoch, or the group is not started",
+            ));
+        };
+        let body = frame.body.0.clone();
+        let read = tokio::task::spawn_blocking(move || {
+            keryx_core::mls::public_group_commit(chat, &state, &body)
+        })
+        .await;
+        let read = match read {
+            Ok(Ok(read)) => read,
+            Ok(Err(keryx_core::mls::MlsError::StaleCommit { .. })) => {
+                return Err(refused(
+                    409,
+                    "commit_lost",
+                    "Another commit got this epoch, or the group is not started",
+                ));
+            }
+            Ok(Err(_)) => return Err(bad_commit("That commit cannot be read")),
+            Err(error) => {
+                tracing::error!(msg = "Could not read a commit", error = %error);
+                return Err(refused(500, "internal", "Something failed on the server"));
+            }
+        };
+        if let Some(leaf) = read.joined
+            && (leaf.account != session.account || leaf.device != device)
+        {
+            return Err(bad_commit("A device joins only as itself"));
+        }
+        let removing = match &action {
+            Some(NewAction {
+                kind: ActionKind::Remove,
+                account_list,
+                ..
+            }) => account_list.clone(),
+            _ => Vec::new(),
+        };
+        for leaf in &read.added {
+            if !member_list.contains(&leaf.account) {
+                return Err(bad_commit("That commit adds someone it does not name"));
+            }
+        }
+        if !read.removed.is_empty() {
+            let mut ended = Vec::new();
+            for known in app.storage.chat_devices(chat).await? {
+                if known.statement.is_some() {
+                    ended.push(known.device);
+                }
+            }
+            for leaf in &read.removed {
+                if !removing.contains(&leaf.account)
+                    && !ended.contains(&leaf.device)
+                    && member_list[..members_before].contains(&leaf.account)
+                {
+                    return Err(bad_commit("That commit removes someone it does not name"));
+                }
+            }
+        }
+        public_group = Some(read.state);
+    }
+
     // Deleting an open call ends it first, so its devices see the end before the message goes.
     if frame.kind == Kind::Delete
         && let Some(call) = &state.call
@@ -1001,6 +1398,7 @@ async fn run_send(
         .append_message(NewMessage {
             chat,
             device,
+            account: session.account,
             kind: frame.kind,
             content_kind: frame.content_kind,
             encrypted: frame.encrypted,
@@ -1014,18 +1412,44 @@ async fn run_send(
             welcome_list,
             profile_key_list,
             group_info: frame.group_info.map(|group_info| group_info.0),
+            public_group,
             persist: frame.persist,
             remove: frame.remove.clone(),
+            topic: frame.topic,
+            thread_seq: frame.thread_seq,
+            slow,
+            history,
+            action,
+            chat_key: frame.chat_key.take().map(|key| key.0),
         })
         .await?;
-    let seq = match appended {
-        Appended::Saved(seq) => seq,
+    let (seq, event_list, line_list, gone_list, profile) = match appended {
+        Appended::Saved {
+            seq,
+            event_list,
+            line_list,
+            gone_list,
+            profile,
+        } => (seq, event_list, line_list, gone_list, profile),
+        Appended::StaleEpoch => {
+            return Err(refused(
+                409,
+                "stale_epoch",
+                "That is sealed under an older key than this chat's",
+            ));
+        }
         Appended::CommitLost => {
             return Err(refused(
                 409,
                 "commit_lost",
                 "Another commit got this epoch, or the group is not started",
             ));
+        }
+        Appended::TopicGone => {
+            return Err(refused(409, "topic_gone", "That topic was removed"));
+        }
+        Appended::Full => {
+            return Err(refused(409, "chat_full", "This chat has no room for them"));
         }
     };
     if frame.kind == Kind::Content && frame.content_kind == Some(ContentKind::Call) {
@@ -1069,8 +1493,27 @@ async fn run_send(
             });
         }
     }
+    // A hidden topic's messages reach only the chat's owners and moderators and its own.
+    let mut seen_by = member_list.clone();
+    if let Some((rules, _)) = &topic_rules
+        && rules.hidden
+    {
+        let mut mod_list = Vec::new();
+        for mods in app.storage.topic_moderators(chat).await? {
+            if mods.topic == rules_topic {
+                mod_list.extend(mods.mod_list);
+            }
+        }
+        let roles = app.storage.member_roles(chat).await?;
+        seen_by.retain(|account| {
+            mod_list.contains(account)
+                || roles
+                    .iter()
+                    .any(|(member, role)| member == account && *role != ChatRole::Member)
+        });
+    }
     app.hub.deliver(
-        &member_list,
+        &seen_by,
         Some(device),
         &ServerFrame::Message(Box::new(MessageFrame {
             chat,
@@ -1081,6 +1524,8 @@ async fn run_send(
             encrypted: Some(frame.encrypted),
             epoch: frame.epoch,
             pointer_seq: frame.pointer_seq,
+            topic: frame.topic,
+            thread_seq: frame.thread_seq,
             client_sent_at: Some(frame.client_sent_at),
             server_saved_at: Some(now),
             body: Some(frame.body),
@@ -1089,6 +1534,20 @@ async fn run_send(
     );
     // After the commit itself, so a device has reached its epoch before opening them.
     push_profile_keys(app, chat, &member_list, device, shared_list).await?;
+    // A device joining by invitation has never had the profile, so it gets it too.
+    if let Some(item) = profile {
+        let from = (!joined).then_some(device);
+        chat_profile_kept(app, chat, &member_list, from, item, Vec::new()).await;
+    }
+    push_events(app, chat, &member_list, event_list).await?;
+    // Those it took out are told live, but their chat is gone, so its lines are not theirs.
+    let line_to: Vec<Ulid> = member_list
+        .iter()
+        .filter(|account| !gone_list.contains(account))
+        .copied()
+        .collect();
+    push_lines(app, &line_to, line_list);
+    push_folders(app, &gone_list).await?;
     for file in frame.remove {
         file::remove(app, chat, file).await;
     }
@@ -1100,6 +1559,104 @@ async fn run_send(
         seq,
         server_saved_at: now,
     })
+}
+
+/// Sends a group's or channel's chat events to whoever may see each: everyone in `member_list`, or its
+/// owners and moderators. A membership change also goes live to everyone else in `member_list`, as
+/// audience `Everyone`, never saved, so every device keeps its member list current.
+pub async fn push_events(
+    app: &App,
+    chat: Ulid,
+    member_list: &[Ulid],
+    event_list: Vec<ChatEvent>,
+) -> Result<(), Refused> {
+    let mut moderator_list = None;
+    for event in event_list {
+        match event.audience {
+            Audience::Everyone => {
+                app.hub
+                    .deliver(member_list, None, &ServerFrame::ChatEvent(Box::new(event)));
+            }
+            Audience::Moderators => {
+                if moderator_list.is_none() {
+                    let mut list = Vec::new();
+                    for (account, role) in app.storage.member_roles(chat).await? {
+                        if role != ChatRole::Member {
+                            list.push(account);
+                        }
+                    }
+                    moderator_list = Some(list);
+                }
+                let Some(list) = &moderator_list else {
+                    continue;
+                };
+                // A topic's history reaches its own moderators too.
+                let mut list = list.clone();
+                if let Some(topic) = event.topic {
+                    for mods in app.storage.topic_moderators(chat).await? {
+                        if mods.topic == topic {
+                            for account in mods.mod_list {
+                                if !list.contains(&account) {
+                                    list.push(account);
+                                }
+                            }
+                        }
+                    }
+                }
+                let list = &list;
+                let membership = matches!(
+                    event.action,
+                    ChatAction::Created
+                        | ChatAction::Added
+                        | ChatAction::Removed
+                        | ChatAction::Left
+                        | ChatAction::LetIn
+                        | ChatAction::Joined
+                        | ChatAction::MadeOwner
+                        | ChatAction::MadeModerator
+                        | ChatAction::MadeMember
+                );
+                if membership {
+                    let rest: Vec<Ulid> = member_list
+                        .iter()
+                        .filter(|account| !list.contains(account))
+                        .copied()
+                        .collect();
+                    let mut live = event.clone();
+                    live.audience = Audience::Everyone;
+                    app.hub
+                        .deliver(&rest, None, &ServerFrame::ChatEvent(Box::new(live)));
+                }
+                app.hub
+                    .deliver(list, None, &ServerFrame::ChatEvent(Box::new(event)));
+            }
+            // Its one viewer is not on the event, so whoever wrote it sends it.
+            Audience::One => {}
+        }
+    }
+    Ok(())
+}
+
+/// Sends a group's membership lines to every device of its members, the acting one too, which has
+/// no `sent` for them.
+pub fn push_lines(app: &App, member_list: &[Ulid], line_list: Vec<MessageFrame>) {
+    for line in line_list {
+        app.hub
+            .deliver(member_list, None, &ServerFrame::Message(Box::new(line)));
+    }
+}
+
+/// Pushes each account's folders to its online devices, once a chat left them.
+pub async fn push_folders(app: &App, account_list: &[Ulid]) -> Result<(), Refused> {
+    for account in account_list {
+        let (folders, _) = app.storage.chat_folders(*account).await?;
+        app.hub.deliver(
+            &[*account],
+            None,
+            &ServerFrame::ChatFolders(Box::new(folders)),
+        );
+    }
+    Ok(())
 }
 
 /// A decline, from the other account's device, while the call rings. In a direct chat it ends the call
@@ -1411,7 +1968,13 @@ const BUNDLE_FILES: usize = 20;
 
 /// A content message keeps its own complete, unsent uploads in this chat: one for a file kind and up
 /// to 20 for a bundle. An edit or delete removes this account's files in this chat.
-async fn check_files(app: &App, session: Session, frame: &SendFrame) -> Result<(), Refused> {
+/// `others` is a delete of someone else's message by a role that may, whose files it may drop too.
+async fn check_files(
+    app: &App,
+    session: Session,
+    frame: &SendFrame,
+    others: bool,
+) -> Result<(), Refused> {
     let most = match (frame.kind, frame.content_kind) {
         (Kind::Content, Some(ContentKind::MediaBundle)) => BUNDLE_FILES,
         (
@@ -1450,7 +2013,7 @@ async fn check_files(app: &App, session: Session, frame: &SendFrame) -> Result<(
         if stored.chat != frame.chat || stored.removed {
             return Err(refused(404, "no_such_file", "That file does not exist"));
         }
-        if stored.account != session.account {
+        if stored.account != session.account && (keeping || !others) {
             return Err(refused(403, "not_yours", "That file is someone else's"));
         }
         if keeping && stored.used {
@@ -1529,17 +2092,26 @@ pub async fn hand_welcomes(app: &App, account: Ulid, device: Ulid) -> Result<(),
 async fn run_position(
     app: &Arc<App>,
     session: Session,
-    reference: Ulid,
     position: Position,
     chat: Ulid,
+    (topic, thread_seq): (Option<Ulid>, Option<u64>),
     up_to_seq: u64,
     client_at: i64,
-) -> Result<ServerFrame, Refused> {
+) -> Result<(), Refused> {
     check(app, &Caller::Session(session), Need::Member(chat)).await?;
     let device = session.device()?;
     let Some(access) = app.storage.chat_access(chat, session.account).await? else {
         return Err(refused(404, "not_member", "You are not in that chat"));
     };
+    // A thread's position is its own, wherever its topic is.
+    let place = match (thread_seq, topic) {
+        (Some(seq), _) => Place::Thread(seq),
+        (None, Some(topic)) => Place::Topic(topic),
+        (None, None) => Place::Main,
+    };
+    if place != Place::Main && !matches!(access.chat_type, ChatType::Group | ChatType::Channel) {
+        return Err(bad("Only groups and channels have topics and threads"));
+    }
     if up_to_seq > access.last_seq {
         let code = match position {
             Position::Received => "bad_received",
@@ -1554,12 +2126,15 @@ async fn run_position(
             chat,
             account: session.account,
             device,
+            place,
             up_to_seq,
             client_at,
             now: Ulid::now(),
         })
         .await?;
+    // Marks are for the main list, which senders draw them on.
     if let Some(mark) = mark
+        && place == Place::Main
         && access.chat_type != ChatType::Channel
     {
         let mut member_list = app.storage.member_accounts(chat).await?;
@@ -1567,11 +2142,28 @@ async fn run_position(
         app.hub
             .deliver(&member_list, None, &ServerFrame::Marks { chat, mark });
     }
-    Ok(ServerFrame::Done { reference })
+    Ok(())
 }
 
-async fn run_typing(app: &Arc<App>, session: Session, chat: Ulid, on: bool) -> Result<(), Refused> {
-    check(app, &Caller::Session(session), Need::Member(chat)).await?;
+async fn run_typing(
+    app: &Arc<App>,
+    session: Session,
+    chat: Ulid,
+    on: bool,
+    topic: Option<Ulid>,
+    thread_seq: Option<u64>,
+) -> Result<(), Refused> {
+    let Some(access) = app.storage.chat_access(chat, session.account).await? else {
+        return Err(refused(404, "not_member", "You are not in that chat"));
+    };
+    let grouped = matches!(access.chat_type, ChatType::Group | ChatType::Channel);
+    if (topic.is_some() || thread_seq.is_some()) && !grouped {
+        return Err(bad("Only groups and channels have topics and threads"));
+    }
+    // A channel's main list is a broadcast, so typing shows only inside a thread.
+    if access.chat_type == ChatType::Channel && thread_seq.is_none() {
+        return Ok(());
+    }
     let member_list = app.storage.member_accounts(chat).await?;
     app.hub.deliver(
         &member_list,
@@ -1580,9 +2172,18 @@ async fn run_typing(app: &Arc<App>, session: Session, chat: Ulid, on: bool) -> R
             chat,
             account: session.account,
             on,
+            topic,
+            thread_seq,
         },
     );
     Ok(())
+}
+
+/// What a new group's or channel's epoch 0 may carry.
+struct GroupInfoStart {
+    chat_profile: Option<Box<ChatProfileBody>>,
+    chat_key: Option<Bytes>,
+    chat_options: Option<Box<ChatOptions>>,
 }
 
 async fn run_group_info(
@@ -1592,14 +2193,80 @@ async fn run_group_info(
     chat: Ulid,
     epoch: u64,
     body: Bytes,
+    start: GroupInfoStart,
 ) -> Result<ServerFrame, Refused> {
-    check(app, &Caller::Session(session), Need::Member(chat)).await?;
+    let caller = Caller::Session(session);
+    check(app, &caller, Need::Member(chat)).await?;
+    // A new group's or channel's first profile and options, saved with its epoch 0 so it is never
+    // left nameless, by its owner, who alone is in it.
+    let mut new_start = None;
+    if let Some(profile) = start.chat_profile {
+        let Some(access) = app.storage.chat_access(chat, session.account).await? else {
+            return Err(refused(404, "not_member", "You are not in that chat"));
+        };
+        if !matches!(access.chat_type, ChatType::Group | ChatType::Channel) {
+            return Err(bad("Only a group or channel has a profile"));
+        }
+        if epoch != 0 {
+            return Err(bad("A first profile goes with epoch 0"));
+        }
+        let Some(key) = start.chat_key else {
+            return Err(bad("A first profile goes with the chat's profile key"));
+        };
+        check(app, &caller, Need::MemberWith(chat, CHAT_PROFILE_EDIT)).await?;
+        let mut options = None;
+        if let Some(chat_options) = &start.chat_options {
+            check(app, &caller, Need::MemberWith(chat, OPTIONS_EDIT)).await?;
+            options = Some(new_chat_options(access.chat_type, chat_options)?);
+        }
+        new_start = Some(NewGroupStart {
+            profile: new_chat_profile(app, &session, chat, *profile)?,
+            key: key.0,
+            options,
+        });
+    } else if start.chat_options.is_some() || start.chat_key.is_some() {
+        return Err(bad(
+            "First options and a profile key go with a first profile",
+        ));
+    }
+    // Epoch 0 starts the public group every later commit is read against, while its keys are new.
+    // A chat already started answers as before, with nothing to read.
+    let mut public_group = None;
+    if epoch == 0 && app.storage.public_group(chat).await?.is_none() {
+        let group_info = body.0.clone();
+        let started = tokio::task::spawn_blocking(move || {
+            keryx_core::mls::public_group_start(chat, &group_info)
+        })
+        .await;
+        let Ok(Ok(started)) = started else {
+            return Err(bad("That is not this chat's group info"));
+        };
+        public_group = Some(started);
+    }
     match app
         .storage
-        .put_group_info(chat, epoch, body.0, Ulid::now())
+        .put_group_info(chat, epoch, body.0, Ulid::now(), new_start, public_group)
         .await?
     {
-        GroupInfoPut::Saved => Ok(ServerFrame::Done { reference }),
+        GroupInfoPut::Saved { profile } => {
+            // Only its owner's other devices are in it yet.
+            if let Some(item) = profile {
+                let member_list = [session.account];
+                chat_profile_kept(app, chat, &member_list, session.device, item, Vec::new()).await;
+                if let Some(options) = start.chat_options {
+                    app.hub.deliver(
+                        &member_list,
+                        session.device,
+                        &ServerFrame::ChatOptions {
+                            chat,
+                            options: *options,
+                        },
+                    );
+                }
+            }
+            Ok(ServerFrame::Done { reference })
+        }
+        GroupInfoPut::NoSuchPhoto => Err(no_such_photo()),
         GroupInfoPut::AlreadyStarted => Err(refused(
             409,
             "chat_started",

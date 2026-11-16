@@ -40,6 +40,8 @@ lifetime = "30d"
 [chat]
 # A chat's task ends after this long with nothing to do, and restarts on the next event.
 idle_after = "5m"
+# Whether a new group or channel has topics on, when its creator does not say.
+topics = false
 
 [www]
 # The web client's files. A path with no file gets index.html.
@@ -67,6 +69,10 @@ call_frame = "256KiB"     # one frame on a call's state, audio or video track. L
 call_cache = "16MiB"      # the relay's room for older groups. Newest groups are always kept
 folders = 20              # an account's folders, not counting all
 kv_keys = 64              # how many settings an account may keep
+group_members = 200       # a group's member accounts
+channel_members = 1000    # a channel's member accounts
+topics = 100              # a group's or channel's topics, General not counted
+invitation_lifetime = "30d" # an invitation or a join request waits this long, then goes
 
 [limits.body]             # one message's body. A file's bytes upload separately
 text = "64KiB"
@@ -96,7 +102,7 @@ video = "2GiB"
 doc = "100MiB"
 file = "2GiB"
 sticker = "256KiB"        # one sticker's WebP. Not encrypted: everyone on the server sees it
-photo = "1MiB"            # one profile photo, sealed. An account's file, not a chat's
+photo = "1MiB"            # one profile photo, sealed: an account's, or a group's or channel's
 
 # Without this section the server speaks plain HTTP, for local use or behind a reverse proxy.
 [tcp]

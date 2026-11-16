@@ -211,7 +211,9 @@ fn read_configuration(path: &Path) -> anyhow::Result<Settings> {
         )
         .optional(
             "chat",
-            StaticMap::new().optional("idle_after", DurationValue::new().to_int()),
+            StaticMap::new()
+                .optional("idle_after", DurationValue::new().to_int())
+                .optional_any("topics"),
         )
         .optional(
             "calls",
@@ -236,6 +238,10 @@ fn read_configuration(path: &Path) -> anyhow::Result<Settings> {
                 .optional("call_cache", ByteSize::new())
                 .optional_any("folders")
                 .optional_any("kv_keys")
+                .optional_any("group_members")
+                .optional_any("channel_members")
+                .optional_any("topics")
+                .optional("invitation_lifetime", DurationValue::new().to_int())
                 .optional("body", body)
                 .optional("upload", upload),
         )
@@ -294,6 +300,10 @@ fn read_configuration(path: &Path) -> anyhow::Result<Settings> {
         ("limits.ping_after", Some(settings.limits.ping_after)),
         ("limits.ping_every", Some(settings.limits.ping_every)),
         ("limits.ping_timeout", Some(settings.limits.ping_timeout)),
+        (
+            "limits.invitation_lifetime",
+            Some(settings.limits.invitation_lifetime),
+        ),
         ("tcp.send_timeout", Some(settings.tcp.send_timeout)),
         ("tcp.user_timeout", settings.tcp.user_timeout),
         ("tcp.keepalive_idle", settings.tcp.keepalive_idle),
