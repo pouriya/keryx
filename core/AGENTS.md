@@ -217,7 +217,11 @@ then enough are uploaded to reach 10. No server change.
 **A dead connection is retried after a growing wait, chosen by the author:** 1 s, then 2, 4 and 8, up
 to 30 s, each with a little randomness so clients do not retry together. It resets once a connection
 works, and the platform can say "the network is back" to retry at once. The numbers are fixed here,
-so every platform behaves the same.
+so every platform behaves the same. **When the network comes back while the socket is still up, core
+sends `Online` again and runs one `sync`, chosen by the author** after the phone test: a socket can
+outlive the network's loss, as one through `adb reverse` does, and a platform that left its connected
+title on that loss would otherwise wait for a new connection that never comes. The `sync` brings the
+list that tells a platform the server answered, as after any connect, and anything the flap cost.
 
 **It sends `received` when the device holds the message, chosen by the author:** when a message frame
 arrives live, or a page holding it is fetched and opened. A higher last sequence id in the chat list

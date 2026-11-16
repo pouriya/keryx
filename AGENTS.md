@@ -67,6 +67,9 @@ error paths, are still to do:** see [core/tests/AGENTS.md](core/tests/AGENTS.md)
   the other person: hits newest first with the match tinted, "10" finding "۱۰", a hit opening its chat at
   the message, the tabs and their counts, See all and Show older, and a message deleted on another device
   gone from the archive at once.
+- **Groups and channels are built in core, the server and Android, and their phone test is under way**,
+  with `drive.rs` as the other people. What it has not covered yet is under To fix, Not yet tested on the
+  phone.
 - **Next, chosen by the author: calls, then Android for files and calls.** Both clients stay as they
   are and grow only what testing needs; standard screens and a full redesign come after.
 
@@ -124,7 +127,7 @@ the WASM build, because there is one `Cargo.lock`. Make targets stay inside
 | Part | Decision |
 |------|----------|
 | Topology | One self-hosted server. One instance is one community. No federation |
-| Encryption | End-to-end, unless a message or chat is explicitly unencrypted. Unencrypted is governed by roles and permissions and flagged in the `message` table, so the client knows. In an unencrypted chat, action messages are unencrypted too. For encrypted content the server stores ciphertext only |
+| Encryption | End-to-end, unless a message is explicitly unencrypted. Unencrypted is governed by roles and permissions and flagged in the `message` table, so the client knows. For encrypted content the server stores ciphertext only |
 | E2EE protocol | MLS (RFC 9420) via `openmls`, suite `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`, the RFC's mandatory one. Each device is a group member. MLS manages membership and keys; see Restoring history. **The backend is `openmls_rust_crypto`:** in WASM under Node it took 5.3 ms against libcrux's 12.8 ms for the same flow, at 645 KB against 727 KB gzipped, and its crates can serve keryx's own formats too. It is not formally verified, which was libcrux's advantage |
 | Ciphers | **AES everywhere, so there is one cipher to audit.** Calls use SFrame (RFC 9605) with AES-GCM and its MLS exporter key scheme. Messages, voice notes and files use AES-GCM with MLS-derived keys. Browsers use their hardware AES for large data. Low-end phones without AES hardware will be slower on video; revisit that with Android |
 | Chat transport | WebSocket, with a REST fallback |
@@ -148,13 +151,14 @@ the WASM build, because there is one `Cargo.lock`. Make targets stay inside
 ### RBAC
 
 - **Custom roles at two scopes, server and per chat.** Named permissions are grouped
-  into roles. Admin, moderator and member are the built-in defaults, and operators and
-  chat owners can define more. A new feature adds permissions, not a new mechanism.
+  into roles. Admin, moderator and member are the server's built-in defaults, owner, moderator and
+  member a chat's, as Groups and channels says, and operators and chat owners can define more. A new feature adds permissions, not a new mechanism.
 - **The server enforces, and MLS guards.** The server knows who holds which role and
   rejects forbidden actions, so it sees roles but never content. Membership is guarded
   by the clients: they reject any device not stamped by the master key of an account
-  already in the chat, or added by a member's signed commit. A malicious server could
-  block actions or lie about roles, but could not read messages.
+  already in the chat, or added by a member's signed commit, or joining with an invitation
+  signed by a device in the chat. A malicious server could block actions or lie about roles,
+  but could not read messages.
 - **The core is in the first slice:** permissions, roles and one check that every
   operation in `api.rs` passes through, using only the defaults, with no management
   UI. **No operation exists without its check.**
@@ -166,11 +170,12 @@ the WASM build, because there is one `Cargo.lock`. Make targets stay inside
   command line.
 - **Permission names are one closed list in `server/src/api.rs`, with unknown names refused,** so
   a typo in a role cannot silently grant nothing. They are dot-separated, with one name per content
-  kind: `chat.create_direct`, `directory.search`, `account.create`, and in a chat
-  `message.send.text` and so on through every kind, `message.send.unencrypted`,
-  `message.commit`, `message.edit.own` and `message.delete.own`. The closed list comes from
-  activeplano. Member, moderator and admin hold all of
-  them, except that `account.create`, `message.send.unencrypted` and `sticker.manage` are admin's alone. A 1:1 chat
+  kind: `direct.create`, `directory.search`, `account.create`, and in a chat, under its type's prefix
+  as Groups and channels says, `direct.message.send.text` and so on through every kind,
+  `direct.message.send.unencrypted`, `direct.message.commit`, `direct.message.edit.own` and
+  `direct.message.delete.own`. The closed list comes from activeplano. Each role holds only its own
+  scope's names, and member, moderator and admin hold all of them, except that `account.create`, every `*.message.send.unencrypted` and `sticker.manage` are
+  admin's alone, and the group and channel ones Groups and channels gives to owners and moderators. A 1:1 chat
   has no chat-role rows: both people hold the built-in member role there.
 - **The check reads the role tables on every operation**, so a role change applies at once.
 - **`seen`, `typing` and reading history need chat membership and no named permission.** Being admin
@@ -262,9 +267,11 @@ the WASM build, because there is one `Cargo.lock`. Make targets stay inside
 - **Folders, all chosen by the author, built in the server, core and Android; designs in
   `tmp/design/folders.html`.** Each account
   arranges its chats into folders, kept on the server and following it to every device.
-  - **`all`** holds every chat. It can be moved and made default, never renamed or removed. Its row is
-    written when the account is made, and clients show it as any folder from the server, minus rename and
-    remove. A new chat goes into `all` only.
+  - **`all`** holds every chat. It can be made default, never renamed or removed. **It is always first,
+    and the server refuses an arrangement with `all` anywhere else as `bad_body`, chosen by the author**
+    when the tabs moved to the top, so every client agrees; it used to be movable. Its row is written when
+    the account is made, and clients show it as any folder from the server, minus rename, remove and
+    moving. A new chat goes into `all` only.
   - **A chat can be in several folders**, moved or copied between them. **Each folder has its own pins**,
     under `all`'s rules: new pins go under the pinned, an unpinned chat goes back by its time, handles
     show at two or more pinned.
@@ -295,8 +302,8 @@ the WASM build, because there is one `Cargo.lock`. Make targets stay inside
     server's arrangement and says why.
   - **Refusals, chosen by the author**: a change not permitted is `no_permission`; more than 20 folders
     `too_many_folders`; an id that is neither a folder of this account nor one issued to it
-    `unknown_folder`; a sealed name over its limit `body_too_large`; a broken shape (`all` missing or
-    twice, an id or a chat twice, a pin outside its folder, a default that is not a folder) `bad_body`.
+    `unknown_folder`; a sealed name over its limit `body_too_large`; a broken shape (`all` missing,
+    twice or not first, an id or a chat twice, a pin outside its folder, a default that is not a folder) `bad_body`.
   - **Core, chosen by the author**: `FolderId` asks for a new folder's id and hands it back as
     `Event::FolderId {folder}`, so it needs a connection, and saves nothing; `Folders {folder_list,
     default}` takes plain names, seals a new folder's name and reseals only changed ones;
@@ -314,8 +321,9 @@ the WASM build, because there is one `Cargo.lock`. Make targets stay inside
     removed for yourself, the server takes it out of that account's folders and pins in the same step and
     pushes the result. The client sends nothing more. None of these is built yet, so this comes with the
     first of them.
-  - **Tabs** sit at the bottom of the chat list, by the thumb. Each counts its unread chats up to 99, then
-    shows +99.
+  - **Tabs sit at the top of the chat list, under its title row, chosen by the author**, moved from the
+    bottom: All stays fixed at the row's start and the rest scroll beside it. Each counts its unread chats
+    up to 99, then shows +99. The server's check that `all` is first is built.
   - **Building**: existing files only: the server's `api.rs`, `storage.rs`, `storage/sqlite.rs`,
     `sqlite.sql` and `guide.md`, and core's `protocol.rs`, `mls.rs` and `client.rs`, replacing pins
     there. Server and core first, tested by the server's integration tests driving core, then Android,
@@ -390,6 +398,9 @@ the WASM build, because there is one `Cargo.lock`. Make targets stay inside
 - **A device wipes a deleted message from its archive as soon as the server confirms the delete, chosen
   by the author:** by the `sent` reply to its own delete, or by the delete arriving from another device,
   and not only at the next `sync`. Only a device that is offline keeps it until the delete reaches it.
+- **In a group or channel a delete hides a message from the chat, not from its owners and moderators,
+  chosen by the author:** the server keeps its original in the history, as Groups and channels says, until
+  the chat's retention.
 - **The notice's 7 days give a thief a way out:** after that, stolen words can erase it. The
   device list still shows the device, and contacts saw the join.
 - **One owner can destroy a whole group's history**, for everyone, with no undo, and a sole
@@ -406,12 +417,11 @@ key and value.** Groups and channels also have a name, and accounts their displa
 Direct and self chats have no profile of their own.
 
 - **An encrypted group or channel's name, bio, links and image info are encrypted**, as
-  one sealed blob under the chat's current key. Whoever adds a member re-encrypts it, since
-  a new member has only the current key. **Someone invited but not yet joined cannot see the
-  name.** It cannot go inside MLS itself, because the server stores `group_info` in the
-  clear so new devices can join.
-- **An unencrypted group or channel's profile is readable by the server.** Switching a
-  chat's mode rewrites its profile.
+  one sealed blob under the chat's own profile key: see Groups and channels. **Someone invited but
+  not yet joined sees only the name and the photo's BlurHash their invitation carries.** It cannot go
+  inside MLS itself, because the server stores `group_info` in the clear so new devices can join.
+- **A findable group or channel's name and bio are readable by the server**, as Groups and channels
+  says.
 - **An account's display name stays readable**, because the directory searches it. **Its
   image, bio and links are encrypted to people who share a chat with that account:** one
   sealed blob per account, with its key shared per chat, so changing a profile rewrites one
@@ -522,8 +532,9 @@ own and others' shown wherever a person is. Groups and channels come with them.
 **Files are encrypted, each with its own random AES-GCM key, in chunks** because a browser's
 AES cannot stream one large file. The file's name, type and key are inside the encrypted
 message or profile, so a new device with only the words gets files too, and the server sees
-an unnamed blob, its **exact size**, and who uploaded it. In an unencrypted chat, files are
-not encrypted.
+an unnamed blob, its **exact size**, and who uploaded it. An unencrypted message's files are
+not encrypted. **An upload declares it, chosen by the author:** the create-file body's `encrypted`, true
+by default, and false needs `*.message.send.unencrypted`, as an unencrypted message does.
 
 **On a delete or edit, the client sends the file ids, and the server removes them** if the
 asker is the file's uploader, or holds that permission in the chat, such as a group's or
@@ -926,9 +937,18 @@ Whatever is saved to show later gets the next number. Whatever is not saved gets
   and 👍🏽 are two.
 - **A message's times are server times only, chosen by the author.** A `times` frame {ref, chat, seq} is
   answered with `times` {ref, chat, seq, member_list: [{account, received_at?, seen_at?}]}, and REST has the same
-  at `GET /api/v1/chats/{id}/messages/{seq}/times`. It needs a registered device and membership, with no new
-  named permission. It lists every member but the sender, and hides `seen_at` for an account with receipts off.
-  An unknown message is `not_found`, and a stranger gets `not_member`.
+  at `GET /api/v1/chats/{id}/messages/{seq}/times`. It needs a registered device and membership, and lists
+  every member but the sender, keeping only what the asker's permissions show: see Groups and channels'
+  four times permissions. Someone who may see neither time on that message gets `no_permission`. An unknown
+  message is `not_found`, and a stranger gets `not_member`. **The answer comes in pages of 50 members, chosen by
+  the author**, so a large group or channel never answers with every member at once: **ordered seen first, newest
+  first, then received only, newest first, then neither, each by account id within the same time, chosen by the
+  author.** **The next page is asked with `after`, the last account listed, chosen by the author:** `times {ref,
+  chat, seq, after?}` and `GET .../times?after=<account>`, the server working out that account's place from its
+  own times on the message, and the answer gains `more`. Core's `Command::Times` takes `after?` and
+  `Event::Times` carries `more`. Android's times sheet in a group or channel is one row per member and asks for
+  the next page when scrolled to its end. **In a channel, subscribers keep the `.own` pair and owners and
+  moderators the `.others` pair, as in a group, chosen by the author** when paging was asked.
 - **Seen is sent only while the list is at its end, chosen by the author.** A message arriving while the
   reader is scrolled up does not move the view or send `seen`: a down button with a count shows it.
 - **A draft belongs to the conversation, not to messages, chosen by the author.** It is one blob per account
@@ -970,7 +990,7 @@ Whatever is saved to show later gets the next number. Whatever is not saved gets
 - **An answer points at its question and is one live answer per account, chosen by the author.** Answering
   again means removing the old answer, which is an ordinary delete. An answer can be edited. The answer
   message always shows the question and each answer. On a question, tapping it shows a "show answer" key that
-  moves the chat to the answer. **Direct chats only for now**: groups, with many answers, are designed later.
+  moves the chat to the answer. **In groups and channels each account answers once**, as Groups and channels says.
 - **A question with an answer cannot be edited, enforced by clients only, chosen by the author**, so the
   pointer stays encrypted and the server learns no answer graph. It can be deleted, and then its answer shows
   "Message unavailable" for the question.
@@ -1132,6 +1152,526 @@ suggestions and cannot build them, as with questions.
   the author's phone, chosen by the author**, with `server/examples/drive.rs`'s `suggest move|copy
   <folder> [text]` sending one and printing the ack it gets back.
 
+### Groups and channels
+
+**Being asked now, part by part.** What Removal, Profiles, Read state and Unencrypted messages already say
+about groups and channels stands; this section adds what the author decides as the Q/A goes.
+
+- **Groups and channels are designed and built together, chosen by the author**, so what a channel is
+  compared with a group is settled in this Q/A.
+- **Creating a group needs a new server permission, now `group.create`, chosen by the author**, held by
+  member, moderator and admin as creating a direct chat is, so an operator can turn it off for some people.
+- **A person gets into a group by being added by a member, or by asking to join and being let in, chosen by
+  the author.** No invite links for now.
+- **A group has at most `[limits] group_members = 200` member accounts, chosen by the author**, changeable
+  in `server.toml`, which keeps a key change's wraps and every device's wrap check small until larger
+  groups are measured.
+- **A channel has at most `[limits] channel_members = 1000` member accounts, chosen by the author**,
+  encrypted like a group, so a key change's wraps stay about 64 KB; larger channels wait for a measured
+  design.
+- **An owner can mark a group or channel findable, chosen by the author:** its name and bio then become
+  readable to the server, and it shows in the directory search beside accounts, where anyone can ask to
+  join it. One not marked stays hidden, its profile sealed as Profiles says. **Changing it is pushed to
+  the chat's online devices as a `findable` frame `{chat, findable, name?, bio?}`, chosen by the author**,
+  and offline ones read it in their next `chats` list. **Core hands it on as `Event::Findable {chat,
+  findable?: {name, bio?}}`, chosen by the author**, the item a `chats` entry carries, none meaning no
+  longer findable.
+- **Adding people and letting join requests in is a chat permission, `group.member.add` and `channel.member.add`, held by the chat's
+  owner and moderator roles and not by plain members, chosen by the author**, so owners can change it per
+  chat later.
+- **Groups and channels have threads of both kinds, built in this same build, chosen by the author:**
+  topics, which split a chat into named message lists, and per-message threads, where any message can
+  open a small chat under it, shown in the main list with its reply count.
+- **A channel is a broadcast whose people talk in threads, chosen by the author:** only owners and those
+  with a post permission write in the main list; subscribers read, react, and write only inside a post's
+  thread. In a group every member writes in the main list too.
+- **A thread's pointer is readable, chosen by the author:** a message in a thread carries the seq of the
+  message that opened it in the signed header, as delete and edit pointers are, so the server enforces a
+  channel's rule, counts replies and can sync one thread. It learns which messages have threads and how
+  busy they are, never their text. Reply and reaction pointers stay encrypted.
+- **A message's topic is readable, chosen by the author:** the topic's id is in the signed header, so the
+  server keeps a seen position and unread count per topic and can limit a role to some topics. Topic names
+  stay sealed under the chat's key.
+- **Topics are switched on or off per group and per channel, chosen by the author:** `server.toml` holds
+  the default for new ones, the client lets the creator choose when making one, and it can be turned on or
+  off later. **Channels have topics too, chosen by the author**, each a broadcast list with its own threads.
+  **The default is off, `[chat] topics = false`, chosen by the author.**
+- **A topic is like a small group inside its group, chosen by the author:** its own profile, settings and
+  moderators, each answered as follows. **The group's switch turning topics on and off stays, chosen by the
+  author.**
+  - **Its profile is a photo, a bio of at most 140 characters and up to 3 links, as a group's, chosen by the
+    author**, the photo shown in place of its coloured letter. **It is one sealed blob per topic under the group's
+    profile key, with its own frame and route, chosen by the author**, so a topic's moderator edits it without
+    rewriting the group's profile; topic names stay in the group's sealed topic list.
+  - **Each topic has its own value for reactions, stickers, files, slow mode, who may write and the four times
+    permissions, starting from the group's, chosen by the author**; anything else, such as adding people, stays
+    group-wide. **Who may write is everyone, or only moderators in the topic's main list, members still reacting
+    and talking in threads, as in a channel, chosen by the author.**
+  - **A topic can be closed, which freezes it, chosen by the author:** nobody but moderators writes, reacts or
+    replies in its threads, it stays readable, and the list shows a lock.
+  - **A topic can be hidden, chosen by the author:** only group owners, group moderators and that topic's
+    moderators still see it, and the server stops delivering and syncing its messages to everyone else until it
+    is shown again.
+  - **Each topic has its own moderators, appointed by group owners, chosen by the author;** a topic moderator
+    moderates that topic only, and group owners and moderators stay moderators in every topic.
+  - **A topic's moderators, group moderators and group owners change its settings, chosen by the author:** its
+    options, closing, hiding, its photo, bio and links.
+  - **A group or channel and each of its topics have their own rules, chosen by the author**, useful once agents
+    take part: at most 2,000 characters, counted as Unicode characters as a bio is, never bytes, checked by core.
+    **They sit in the same sealed profile as the bio, as `rules`, chosen by the author**, so the server never reads
+    them and whoever may edit the bio edits them.
+  - **General gets all of it but hiding, chosen by the author**, as it cannot be removed either.
+  - **Each topic has its own history, chosen by the author:** everything done in it, its profile, options,
+    closing, hiding, its moderators, and every delete and edit of a message in it. **Its moderators and the
+    group's owners and moderators read it, chosen by the author.** **The group's own history page shows
+    group-wide rows only, and a topic's rows show on that topic's page, chosen by the author**, so neither
+    list is cluttered.
+  - **The wire, schema and permissions, approved by the author:**
+    - `topic` gains `closed`, `hidden`, `write` (0 everyone, 1 moderators only in the main list), `slow_mode` and the
+      topic's sealed profile: `sealed`, `signature`, `photo_id`, `updated_by`, `version`, `updated_at`. **General's
+      settings live in a `topic` row under the all-zero ULID, made with the chat**, while its messages still carry no
+      topic in their header.
+    - `topic_permission (conversation_id, topic, permission, allowed)` overrides a topic on top of the chat's own
+      override, for the reaction, sticker and file kinds and the four times permissions; `topic_moderator
+      (conversation_id, topic, account_id)`.
+    - **`group.topic.edit` and `channel.topic.edit`**, held by the owner and moderator roles, cover a topic's profile,
+      options, closing and hiding; a topic's moderators hold them in that topic only, with deleting others' messages,
+      writing when it is closed, the slow-mode exemption and seeing everyone's times there. Appointing them is
+      `member.role`, owners'.
+    - Frames, each answered with `done`, pushed live and caught up through `chats`: `topic_profile {ref, chat, topic,
+      sealed, signature, photo?}` and `PUT /chats/{id}/topics/{topic}/profile`, sealed under the group's profile key with
+      `keryx v1 topic profile`, the chat and the topic as associated data, its photo one of the chat's files;
+      `topic_options {ref, chat, topic, allow, deny, slow_mode, write, closed, hidden}` and `PUT
+      /chats/{id}/topics/{topic}/options`; `topic_role {ref, chat, topic, account, role}` and `PUT
+      /chats/{id}/topics/{topic}/members/{account}/role`.
+    - Each `chats` entry gains `topic_list: [{topic, closed, hidden, write, slow_mode, allow, deny, mod_list,
+      profile_version}]`, leaving hidden topics out for those who may not see them; showing a hidden topic again makes
+      core sync that chat, as removing one does.
+    - Refusals: `topic_closed` for writing, reacting or replying in a closed topic, `moderators_only` for writing in a
+      moderators-only topic's main list, and a hidden topic answered as one that does not exist.
+    - Each change writes a history row, and none writes a membership line.
+    - Core: `TopicProfile`, `TopicPhoto`, `TopicPhotoGet`, `TopicOptions`, `TopicRole`; events `TopicProfile`,
+      `TopicPhoto`, `TopicOptions`. `drive.rs`: `topicbio`, `topicphoto`, `topicopts`, `topicmod`.
+    - **As built, settled while building and open to the author's change:** each `chats` entry's list is
+      `topic_setting_list`, General's first, and carries each topic's sealed profile itself rather than a
+      version; a change is pushed as one `topic` frame `{chat, topic, ...options, mod_list, profile?}`, and
+      to those who may not see a hidden topic as `{chat, topic, hidden: true}` alone; **it goes to the
+      device that made the change too, chosen by the author** after the phone test showed a closed
+      topic with no lock on the phone that closed it, so that device shows the server's own copy; a reaction carries
+      its message's `topic` and `thread_seq` in its signed header, so a closed topic and a topic's own
+      reaction rule can be enforced; `chat_event` gains `topic_id`, the topic whose history a row is in;
+      when a topic shows again, core syncs the chat from its start and opens that topic's withheld
+      messages and every edit, though they sit below the last sequence id it knew; a topic's rules are
+      checked by core at 2,000 characters, as a chat's are. `drive.rs`'s `topicbio <text> [-- rules]`
+      and `chatprofile <name> [-- rules]` set rules.
+    - **Creating a topic shows on the group's History page as "added a topic" and on the topic's own page
+      as "created the topic", and the topic's first profile, set by the account that added it, writes no
+      "edited" row, chosen by the author** after the phone test showed "pari edited the topic" on a topic
+      New topic had just made. A first profile set later by someone else still writes "edited".
+    - **A topic's slow mode is "same as group", off, or one of the group's steps, chosen by the author**
+      after the phone test showed a topic could not turn slow mode off while its group had it on:
+      `topic_options`' `slow_mode` is none for the group's own and 0 for off.
+    - **The history's copies sit in one `copy` column on `chat_event`, chosen by the author** over a table
+      of their own: the JSON list of message frames the wire carries, NULL for every other row, removed
+      with its row. `ChatEvent` gains `copy_list`, and action 20, edited; core opens and checks each copy and hands it on in `Event::ChatEvent`'s `copy_list`, never
+      the ciphertext. A deleted file message's copy keeps its name, type and size, while its bytes still
+      go with the delete. **A History page read from the archive has core open its copies, chosen by the author:**
+      `Command::OpenHistory {chat, event_list}`, the platform handing over the rows it read and core
+      answering with one `Event::ChatEvent` per row, its copies opened, so nothing opened is ever written
+      to disk.
+  - **Built as before, chosen by the author:** the wire, schema and permission names written here for the
+    author's approval first, the topic list and page drawn in `tmp/design/groups.html`, approved as drawn by the author, then the
+    server and core with their tests and `server/examples/drive.rs`, then Android.
+- **Turning topics off shows every message in one list by its seq, and each keeps its topic id, chosen by
+  the author**, so turning them on again puts everything back where it was.
+- **Turning topics on or off, and making, renaming and removing topics, is a chat permission,
+  `group.topic.manage` and `channel.topic.manage`, held by the owner and moderator roles, chosen by the author.**
+- **Removing a topic deletes it and all its messages and threads for everyone, after a warning, chosen by
+  the author**, wiped as a delete wipes. General cannot be removed. **No delete is sent for the wiped
+  messages, so core syncs that chat as soon as a topic is gone, chosen by the author:** when a pushed
+  `topics` list drops one, and on the remover's own device once its `topics` frame is answered, so the
+  wiped rows come back empty and every online archive drops them at once.
+- **Threads are one level deep, chosen by the author:** only a main-list message opens a thread, and inside
+  one, replies quote as they do today.
+- **Each thread keeps its own seen position, chosen by the author:** the message that opened it shows the
+  thread's unread count, and the chat's unread number counts main-list messages only.
+- **This build has the built-in chat roles only, chosen by the author:** owner, moderator and member, with
+  owners making someone a moderator or an owner. Custom roles and a screen to manage them stay open.
+- **A moderator holds, beyond a member, chosen by the author:** `member.add` and `topic.manage`, removing
+  members who are not owners, deleting others' messages except owners', and posting in a channel's main
+  list. **Owners and moderators see a history of who did what, chosen by the author.**
+- **Every delete and edit in a group or channel goes into the history with what it removed or changed,
+  chosen by the author**, people's own included, since a row saying only "someone removed a message" means
+  nothing. **The server keeps the original, chosen by the author:** before a delete wipes a message, it
+  copies the message and its edits, ciphertext, header and signature, into the history row, and an edit's
+  row holds the message and every edit so far, so before and after both show. Owners and moderators open
+  them on their devices with the chat keys they hold, and the author's signature proves who wrote them, so
+  nobody can fake what was removed. **Direct chats stay as they are, chosen by the author:** they have no
+  history, and a delete there still wipes for good.
+- **The history is rows the server writes, chosen by the author:** each add, removal, role change, delete
+  of someone else's message and topic change, with the actor, the action, the target account or seq and
+  the time, readable as a call's joins are, so a modified client cannot leave one out. Only owners and
+  moderators can read them. **They are kept under the chat's own retention, chosen by the author**, so
+  unset means for as long as the chat. This is a chat's history, apart from server-wide refusals and
+  management, which stay log lines with no audit table.
+- **Every member sees membership changes as lines in the chat, chosen by the author:** added, removed,
+  left, let in by request, made moderator or owner, such as "Sara added Babak". Deletes of others'
+  messages are in the history only.
+- **A membership line is a message, chosen by the author:** the chat's task writes it in the same step as
+  the action, taking the chat's next seq, readable and written by the server as the self chat's new-device
+  notice is. So it can be replied to, reacted to, removed and opened as a thread like any message.
+  **Owners and moderators remove it, through `message.delete.others`, chosen by the author**, since it is
+  nobody's own. **It counts as unread, moves the chat up and is the preview, like text, chosen by the
+  author**, except for the account whose action it was, as its own messages are. **It carries no topic,
+  so it shows in General, chosen by the author.** `chat_event` keeps only the history and lines for one
+  account, such as the inviter told of a decline. **It is a message kind of its own, `Line` = 5 beside
+  `DeviceNotice` = 4, chosen by the author:** unencrypted, with no content kind, so no permission and no
+  body limit, and a client sending one is refused with `server_only`, as the notice is. **Clients trust
+  the server for it, chosen by the author**, as for roles, leaving and removals: it carries no signature,
+  and its device is the actor's. A breached server could write a false line, but could not really add
+  anyone, since MLS still guards who gets in. **One action writes one line, however many people it names,
+  chosen by the author**, such as "Sara added Babak and Mina". **Its body is readable JSON with the action
+  as a word, chosen by the author:** `{"action", "account_list"?}`, the action one of `created`, `added`,
+  `let_in`, `joined`, `removed`, `left`, `made_owner`, `made_moderator` and `made_member`, the actor being
+  its device's account. **Every one of those writes a line, "created" too, chosen by the author**, so a
+  new group's first message says who made it. **Channels get no lines, chosen by the author:** a channel's
+  main list holds posts only, and its joins, leaves and role changes go to the history alone. **Each
+  action also writes its history row, chosen by the author**, which owners and moderators read, so
+  removing a line never erases the history. **Built in the server and core:** core hands each line on as
+  `Event::Line`.
+- **A join request may carry a short note, and the person asking is told the outcome, chosen by the
+  author.** Anyone holding `member.add` sees the pending requests and lets each in or declines it. A
+  declined person may ask again.
+- **Making a group or channel needs only a name, chosen by the author:** a photo, a bio, up to 3 links,
+  the people in it and the chat's options are optional.
+- **A chat's options in this build, chosen by the author:** whether reactions are allowed, whether
+  stickers are allowed, whether files and media are allowed, and whether plain members may add people.
+  **Each is kept as a per-chat override of the member role, chosen by the author:** the chat stores
+  permission names added to and removed from its member role, as activeplano's per-organization override,
+  so the server's one check enforces every option and a later one is just a permission name. **Changing
+  them after the chat is made is a chat permission, `group.options.edit` and `channel.options.edit`, held by owners only, chosen by the
+  author**, since options change what moderators and members may do.
+- **Unencrypted is a property of a message, not of a chat, chosen by the author**, in groups and channels
+  as everywhere: see Unencrypted messages.
+- **Clients trust the server for roles, leaving and removals, and guard only who gets in, chosen by the
+  author** over keeping roles inside MLS, which would have been about half of core's MLS work for groups.
+  Owners and moderators live on the server alone, as `member.is_owner` and the member roles, and changing
+  one is a plain frame, not a key change. Clients accept any member's add or removal commit, since the
+  server checks its permission, and could cut anyone off by not delivering anyway. **The one check kept:**
+  an account not already in the group gets in only through a member's add commit, or by an external join
+  carrying an invitation signed by a device already in the group, so a breached server cannot slip in an
+  account of its own to read a group or channel.
+- **Commits are sent as MLS public messages and the server checks what each adds and removes, chosen by
+  the author**, so a plain member's modified client cannot quietly take someone out of the group, who
+  could then neither read nor rejoin by themselves. Only the handshake goes in the clear: message content
+  is keryx's own AES-GCM anyway, and the update path stays HPKE-encrypted. The server, which already links
+  openmls through `keryx-core` and keeps each epoch's group info, maps each added and removed leaf to its
+  device and refuses a commit whose adds are not the action's accounts or devices of accounts already in
+  the chat, or whose removals are not the action's accounts, ended devices or accounts that left. It
+  learns nothing it did not already know. It costs one parse per commit in the chat's task.
+  **The server keeps openmls's public group for each chat, chosen by the author:** it is built once from
+  epoch 0's group info, while every key in it is new, and moved on by each accepted commit, in a
+  `public_group` column on `mls_group`. It is never rebuilt from group info, because openmls checks
+  every member's key lifetime when it builds one, at most 12 weeks, and a member quiet for longer would
+  fail that. openmls also checks each commit's signature and shape. It costs about 0.3 KB per member,
+  rewritten on each commit. **A refused commit gets `bad_commit`, chosen by the author**, a 403 of its own.
+  **Every chat type's commits are checked, chosen by the author**, so there is one path. **A device
+  joining by itself must be the device sending the commit, chosen by the author**, so a device only
+  ever joins as itself. Epoch 0's group info that is not the chat's own is `bad_message`.
+- **Content sealed under an older key than the chat's current one is refused with `stale_epoch`, in every
+  chat type, chosen by the author:** core applies the commits it missed and seals it again. Nothing new
+  is ever sealed under a key a removed person still holds, and someone who joins reads everything after
+  their join, at the cost of one more round trip during the race.
+- **Leaving takes effect on the server at once, and members commit the MLS removal, chosen by the
+  author:** no more delivery, out of the account's folders, and a "left" line, then the next online
+  member's device commits the removal, the first winning, as a terminated device is removed today, with
+  no signed statement, since clients trust the server for removals.
+- **Whoever adds someone, or lets a request in, does the MLS work on their own device, chosen by the
+  author:** a key package claimed for each of the new account's devices, the add committed with its wraps
+  and the chat's profile key, as starting a direct chat does. A device with no key package left joins by
+  itself later.
+- **A group's or channel's profile is sealed under its own profile key, chosen by the author**, so
+  someone joining by invitation reads it, and every later change, with nobody else online. The key is 16
+  random bytes its creator makes, kept in each device's snapshot, and **it never changes, chosen by the
+  author**, as an account's profile key does not: the server stops sending the profile to someone who
+  left, so they could read later changes only from a breached server's copy. The profile is AES-GCM under
+  it with `keryx v1 chat profile` and the chat as associated data, signed by its device over those and
+  the sealed bytes. **The key itself travels sealed at an epoch**, under that epoch's key with `keryx v1
+  chat profile key`, the chat and the epoch as associated data: at epoch 0 with the first profile, in
+  each add commit at the epoch it moves to, and in the commit of a device joining by invitation, which
+  read the key in its invitation. The server keeps the newest share, which every member holds the key
+  of, since every way in shares it again, and hands it out beside the profile.
+- **The first profile, its key and the options travel inside epoch 0's `group_info`, and an add's key
+  share inside its commit, chosen by the author**, each saved in the same step, so a crash between two
+  requests can never leave new members, or a whole new group, without a name. After a commit carrying
+  a share, the server pushes the profile with the new share, as it pushes profile keys, and to the
+  joining device too when it is a join. It costs about 45 bytes per add commit.
+- **The claim refuses first, chosen by the author:** claiming key packages for an add names the chat,
+  and the server answers `invite_needed` for an account whose switch says nobody before handing out any
+  of its packages, so an invitation-only account's one-use packages are never wasted.
+- **Every member sees the member list, channel subscribers too, chosen by the author** over hiding a
+  channel's subscribers from each other: every device is a leaf in the channel's MLS group, and the tree
+  every member and joiner holds names each leaf's account and device, so hiding it would only pretend.
+  "This is the thing for security, and people using secure messaging should accept it." The apps show it.
+- **The member list with roles comes from its own route, chosen by the author:** `GET
+  /api/v1/chats/{id}/members` and a `members` frame `{ref, chat}`, answered with `members` `{ref, chat,
+  member_list: [{account, role}]}`, for any member. Core's `Command::Members {chat}` hands back
+  `Event::Members`, and the platform keeps it current from the role and membership lines. It is asked
+  only when the screen opens, so `sync` stays light.
+- **Questions work in groups and channels, one answer per account, chosen by the author:** each member
+  answers for themselves, the question shows how many answered, and its sender sees each answer.
+- **Android's screens are drawn first in `tmp/design/groups.html` and approved before any Android code,
+  chosen by the author, and approved as drawn by the author:** the create sheet, the chat with topics and threads, the members and requests
+  screens and the history, in English and Persian.
+- **Built server and core first, tested by the server's integration tests driving core with
+  `server/examples/drive.rs` as the other side, then Android on the author's phone, chosen by the
+  author.**
+- **`server/examples/drive.rs` gets a command for everything groups and channels do, chosen by the
+  author**, so it can be every other side of the phone test.
+- **A person can refuse to be added straight in, chosen by the author:** a switch in their account says
+  whether others may add them. With it off, being added becomes an invitation they see inside the chat
+  they are invited to, and accepting it joins. **Its choices are Everyone and Nobody, Everyone by default,
+  chosen by the author:** Everyone puts an added person straight in, and Nobody turns every add into an
+  invitation. **It is `kv` keys the server reads, left unsealed because the server acts on them, chosen by
+  the author**, one for groups and one for channels, named below, as the `kv` design foresaw, synced to every device like `lang` and `theme`.
+- **An invitation shows who invited them and the group's name and photo, sealed to the invited account,
+  chosen by the author:** the inviter's device seals them so the server still sees neither.
+- **It is sealed to a new invite key, chosen by the author**, since a running device drops the account
+  key and could never open anything sealed to it: one more HKDF label from the words, `keryx v1 invite
+  key`, giving an X25519 key that running devices keep in their snapshot, as the profile key is kept. The
+  master key stamps its public half, over `keryx v1 invite key`, the account id and the key, and it is
+  published with the account's keys through `PUT /api/v1/account/keys` and `GET /api/v1/accounts/{id}`. A
+  stolen phone can open invitations only, never history. One HPKE seal per invitation, with the label,
+  the chat and the account as its info.
+- **The invitation shows the photo's BlurHash only, chosen by the author:** its sealed part is the group's
+  name and the photo's BlurHash, and the photo itself shows once they join, so who may read a chat's
+  files does not change. **It also carries the chat's profile key, chosen by the author**, which opens
+  the whole profile once they join: JSON `{name, blurhash?, key, note?}`, HPKE-sealed as its X25519 KEM output
+  then its ciphertext. The inviter checks the invite key's stamp against the pinned master key first,
+  and an invitation waits for the account's keys when they are not known yet. **An invitation may carry
+  a note from the inviter, sealed in that part, chosen by the author**, so the server never reads it, at
+  most 500 characters, checked by core. `AddMembers` takes one `note?` for every invitation it turns
+  into, and `Event::Invitation` shows it.
+- **Accepting an invitation lets the invited device join by itself, by external commit stamped by its
+  master key, chosen by the author:** the server checks the invitation, clients check that the inviting
+  device was in the group, and nobody else must be online.
+- **A chat keeps one sequence across its topics and threads, chosen by the author:** every message takes
+  the chat's next seq, so pointers, sync, deletes and the archive stay as they are, and a topic or thread
+  is a filter on them, with gaps inside one topic normal.
+- **A topic's id is a ULID the server issues first, as a folder's is, and General has none, chosen by the
+  author**, so its sealed name can name it, and a chat with topics off needs nothing in its headers.
+- **Seen positions per topic and per thread are sparse, chosen by the author:** written only when a
+  member reads there, so a thread nobody opened costs nothing. They are rows in the existing `seen` and
+  `received` tables, as the schema below says.
+- **`sync` still returns the whole chat, every topic and thread, chosen by the author**, so the archive
+  holds all of it and search finds thread text too. Topics and threads are views on the archive.
+- **Someone removed by an owner or moderator sees what someone who left sees, chosen by the author:** the
+  chat leaves their list, and rejoining later shows what they had before.
+- **Who sees when each member got and saw a message is four chat permissions per chat type, chosen by the
+  author:** `message.view_received.own` and `message.view_seen.own` for your own messages, and
+  `message.view_received.others` and `message.view_seen.others` for everyone else's, under `direct.`,
+  `group.` and `channel.`, replacing `message.view_seen`. **By default, as the rule was, chosen by the
+  author:** every role holds the `.own` pair in every chat type; in a direct chat members hold the
+  `.others` pair too, and in groups and channels owners and moderators do. A chat's options can add or
+  take away any of the four for its members. A `times` answer keeps only the times the asker may see, and
+  someone who may see neither on that message is refused with `no_permission`.
+- **Mentions and slow mode are in this build, chosen by the author**, pinned messages not.
+- **A mention lives inside the ciphertext, chosen by the author:** `@username` in the encrypted text, with
+  the mentioned accounts listed inside too, so the server never learns who was mentioned. The client marks
+  a message mentioning you, and the chat list shows an @ badge.
+- **Slow mode is a chat option under `options.edit`, enforced by the server, chosen by the author:** off,
+  10 s, 30 s, 1 m, 5 m, 15 m or 1 h between one member's messages in the main list or a topic, not in
+  threads. Owners and moderators are exempt. An earlier send is refused with `slow_mode` and the seconds
+  left. **Each topic, General included, keeps its own last-sent time per member, chosen by the author**
+  after the phone test, so a topic's slow mode counts only messages in that topic. **Core hands the seconds on in `Event::Failed`'s optional `seconds`, chosen by the author**, so an
+  app can count down.
+- **Typing shows names in a group, in its topic or thread, such as "Sara is typing" or "Sara and 2
+  others", and a channel shows typing only inside a thread, chosen by the author.**
+- **Every permission used inside a chat is split by chat type, chosen by the author:** `direct.*`,
+  `group.*` and `channel.*`, such as `direct.message.send.text`, `group.message.send.text` and
+  `channel.message.send.text`, for every in-chat one, the existing `message.*` included. Server-wide ones,
+  `folder.*`, `profile.edit`, `presence.*`, `sticker.manage` and the like, stay as they are. **The names,
+  chosen by the author:** each of `direct.`, `group.` and `channel.` has `message.send.text` through
+  `message.send.ack`, `message.send.unencrypted`, `message.commit`, `message.edit.own` and
+  `message.delete.own`, `message.view_received.own`, `message.view_seen.own`,
+  `message.view_received.others` and `message.view_seen.others`; `group.` and `channel.` also have
+  `member.add`, `member.remove`, `member.role`, `message.delete.others`, `topic.manage`, `profile.edit`
+  and `options.edit`; and
+  `channel.message.post` is writing in a channel's main list. So `group.member.add` and
+  `channel.member.add` are what this section calls `member.add`, and so on.
+- **Creating chats is `direct.create`, `group.create` and `channel.create`, chosen by the author**, each
+  held by member, moderator and admin; `chat.create_direct` is renamed and `chat.create_group` becomes
+  `group.create`.
+- **Only owners make or unmake moderators and owners, another owner included, chosen by the author**, and
+  the last owner cannot step down without making someone else owner first.
+- **The "may others add me" switch is two `kv` keys, `privacy.add.group` and `privacy.add.channel`,
+  chosen by the author**, each `"everyone"` or `"nobody"`, everyone by default.
+- **Direct chats stay as they are, chosen by the author:** topics, threads, mentions, slow mode, options
+  and roles are for groups and channels only. Sections above still write the unprefixed names, such as
+  `message.send.call`; in a chat they mean that chat type's prefixed one.
+- **A channel's main-list post shows the channel's name, chosen by the author**; owners and moderators
+  still see who posted in the history, and subscribers' thread comments show their own names.
+- **A group or channel has at most `[limits] topics = 100`, General not counted, chosen by the author**,
+  and a topic's name is 1 to 32 characters, as a folder's.
+- **The chat list's row for a chat with topics adds up every topic's unread main-list messages, and its
+  preview is the newest message in any topic with its topic's name before it, chosen by the author.**
+- **Any owner may remove a whole group or channel for everyone, with no named permission, chosen by the
+  author**, the server checking `is_owner`. Admin can too, as admin passes every check.
+- **A findable chat's photo stays sealed, chosen by the author:** the directory shows its name's letter
+  until the person joins.
+- **A pending join request is a row in the asker's chat list, chosen by the author:** the chat's name and
+  "Request sent", which they can open to cancel it. It becomes the chat when they are let in, or says
+  declined. **Asking and taking it back push `join_request` to every device of the asker, the asking one
+  too, chosen by the author**, so the asking device's row gets the name the server keeps. **Removing the
+  chat deletes its join requests and invitations and pushes `join_request` with no request, and
+  `invitation` with none, to each asker's and invitee's devices, chosen by the author**, so the row goes;
+  offline ones no longer find it in `asked_list` or `invitation_list`.
+- **Owners and moderators who were offline learn of pending join requests from a count on each chat, chosen by
+  the author:** each `chats` entry gains `request_count`, set only for accounts that may let people in, and the
+  requests themselves are fetched when the Requests page opens. Online ones already get each `join_request` live.
+  Built in the server, with 0 sent too, so a device back from being away knows when none wait.
+- **Invitations and join requests expire after `[limits] invitation_lifetime = "30d"`, chosen by the
+  author**, changeable in `server.toml`. An expired one goes from both sides, and the person can be invited
+  or ask again. **It is a duration, not a count of days, and 0 stops startup, chosen by the author**, as
+  the ping keys do: a count of days let 0 mean every invitation expires the moment it is saved, and a
+  duration lets the tests use `"1s"` with no test-only key.
+- **Core shows an invitation or a request gone when a first `chats` page leaves it out, chosen by the
+  author:** it keeps those it showed, in the snapshot too, and sends `Invitation` with none and `Asked`
+  gone for each missing one, so one that expired, or whose chat was removed while the device was away,
+  never stays on screen. An invitation being accepted stays, as its join still carries the signature.
+  **Nothing tells an online device the moment one expires, chosen by the author:** the server has no
+  timer, so the row goes at the next reconnect, and accepting it meanwhile is refused with
+  `no_invitation`.
+- **When an invited person declines, the inviter alone sees a line, such as "Babak declined your
+  invitation", chosen by the author**; other members see nothing.
+- **The signed header gains two optional fields after `call_seq`, `topic` (a 16-byte ULID) and
+  `thread_seq`, each with the presence byte the others use, chosen by the author.** No version moves, as
+  there is no production, and `core/tests/protocol.rs` pins the new bytes. Mentions stay inside the
+  ciphertext.
+- **Creating one extends `POST /api/v1/chats`, chosen by the author:** `{type: "group"|"channel",
+  topics?, findable?}` -> `{chat}`. The creator's device builds the MLS group and uploads epoch 0's group
+  info as a direct chat's start does, then adds the chosen people in one add commit, with the sealed
+  profile and options.
+- **A membership change that touches MLS is a commit carrying a readable action, chosen by the author:**
+  a commit (`send`, kind 3) gains `action` `{add|remove, account_list}`, letting a request in
+  being an add. A commit that only finishes in MLS what a leave or an ended device already did carries
+  none. The chat's task checks the permission and the targets, saves the commit, updates the
+  member rows and writes the history row and the line in the same step, so there is one path, as commits
+  already have.
+- **The history and the membership lines were one `chat_event` table, chosen by the author**, until lines
+  became messages, above: a row per
+  action, with the chat, `n`, the actor, the action, the target, the seq where one applies, the server
+  time and whether everyone or only owners and moderators see it, sent live as a `chat_event` frame and
+  through `sync` as call rows are. Clients draw lines from the ones they may see, and retention is the
+  chat's.
+- **A join request's note is plain text the server can read, at most 140 characters, chosen by the
+  author**, and the client says so under the box, as it is meant for outsiders like a findable chat's
+  name.
+- **Topic names live inside the chat's sealed profile, chosen by the author:** one blob with the name,
+  bio, links, photo and the topic list `{id, name, place}`, under the chat's profile key, so a new member
+  reads every topic name. Changing topics rewrites the blob.
+- **Actions that do not touch MLS each have a frame answered with `done` and a matching REST route,
+  chosen by the author**, as folders and `kv` do: leaving, a join request and its answer, an invitation
+  and its answer, role changes, topic changes, options and findable. The server pushes the result to the online devices
+  it concerns, and offline ones get it at `sync`.
+- **A mention's plaintext is `{"text", "mentions": [account]}`, chosen by the author:** the text holds
+  `@username` as typed and `mentions` the account ids, so a later username change still points at the
+  right person. Core checks that each is a member.
+- **The frames and routes, chosen by the author as listed.** Each frame is answered with `done` unless
+  noted, with its REST route beside it, all under `/api/v1`:
+
+  ```
+  POST /chats {type, topics?, findable?} -> chat
+  chat_remove {ref, chat}                     DEL  /chats/{id}                       owners
+  leave {ref, chat}                           POST /chats/{id}/leave
+  chat_role {ref, chat, account, role}        PUT  /chats/{id}/members/{account}/role   owners
+  join_request {ref, chat, note?}             POST /chats/{id}/requests
+  join_cancel {ref, chat}                     DEL  /chats/{id}/requests
+  join_decline {ref, chat, account}           POST /chats/{id}/requests/{account}/decline
+                                              GET  /chats/{id}/requests  member.add -> request_list
+  invite {ref, chat, account, sealed}         POST /chats/{id}/invitations
+  members {ref, chat} -> members {ref, chat, member_list}   GET /chats/{id}/members
+  invite_answer {ref, chat, accept}           POST /chats/{id}/invitation
+  topic_id {ref, chat} -> topic_id {ref, chat, topic}   POST /chats/{id}/topics/id
+  topics {ref, chat, on, topic_list}          PUT  /chats/{id}/topics
+  chat_profile {ref, chat, sealed, signature, photo?}  PUT  /chats/{id}/profile
+  chat_options {ref, chat, allow, deny, slow_mode}      PUT /chats/{id}/options
+  findable {ref, chat, findable, name?, bio?} PUT  /chats/{id}/findable
+  ```
+
+  Letting a request in is a commit with action `add`. An add naming someone whose switch is `nobody` is
+  refused with `invite_needed`, and the client sends `invite` instead. `GET /api/v1/accounts?search=`
+  also lists findable chats. The server pushes `chat_event`, `topics`, `chat_profile`, `chat_options`,
+  `join_request` and `invitation`.
+- **The schema changes, chosen by the author**, with no migrations, the database deleted and made anew:
+  `conversation` loses `mode` and gains `topics_on`, `findable`, `find_name`, `find_bio` and `slow_mode`
+  (seconds, NULL for off); `message` gains `topic_id` and `thread_seq`. **Slow mode's last-sent times are a
+  table, `slow_sent (conversation_id, account_id, topic_id, at)`, General under the all-zero ULID as its
+  `topic` row is, chosen by the author** in place of `member.last_sent_at`, so each topic keeps its own. New tables: `topic (conversation_id, id, issued_at, removed)`, its names living in the sealed
+  profile; `chat_permission (conversation_id, permission, allowed)`, the member role's per-chat override;
+  **no table of its own for topics' and threads' positions, chosen by the author:** the existing `seen`
+  and `received` tables gain `kind` and `place` columns, empty for the main list, so a topic's or
+  thread's marks are rows in the same two tables and its positions are read from them; `join_request (conversation_id, account_id, note, at)`;
+  `invitation (conversation_id, account_id, inviter, sealed, at)`; and `chat_event (conversation_id, n,
+  actor, action, target?, seq?, audience, viewer?, server_at)`. `is_owner` stays, and a moderator is a
+  `member_role` row.
+- **Core's commands and events, chosen by the author as listed**, core doing the MLS work, sealing and
+  queueing, and the platforms showing it: `CreateChat {type, name, bio?, link_list?, photo?,
+  account_list, topics, findable, options}`, `AddMembers {chat, account_list, note?}`, which sends `invite`
+  itself for anyone refused with `invite_needed`, `RemoveMembers {chat, account_list}`, `SetRole {chat,
+  account, role}`, `Leave`, `RemoveChat`, `AskToJoin {chat, note?}`, `CancelAsk`, `LetIn {chat,
+  account}`, `DeclineAsk {chat, account}`, `Requests {chat}`, `AnswerInvite {chat, accept}`, `TopicId`,
+  `Topics {chat, on, topic_list}`, `ChatProfile`, `ChatPhoto`, `ChatPhotoGet`, `ChatOptions`, `Findable` and `Members`, with
+  `SendText` and the other sends gaining `topic?`, `thread?` and `mentions?`. Events: `ChatEvent`,
+  `Requests`, `Invitation {chat, invitation?: {type, inviter, name?, blurhash?, note?, at}}`, with no
+  `invitation` once it is gone and no `name` when its sealed part does not open, `Topics`,
+  `ChatProfile`, `ChatPhoto`, `ChatOptions`, `Members` and `Asked {chat, name?, state, at}`, kept as built by the author, and
+  `chats` entries gain the type, this account's role, `topics_on` and unread per place.
+- **Changing a group's or channel's name, photo, bio and links is a chat permission, `group.profile.edit` and `channel.profile.edit`,
+  held by the owner and moderator roles, with an account's limits, chosen by the author:** a name of 1 to
+  64 characters after trimming, a bio of at most 140, at most 3 links, and one 640x640 JPEG of at most
+  1 MiB. **An edited profile is pushed to the device that saved it too, chosen by the author** after the
+  phone test showed Edit group's saved rules missing from the saving phone until it restarted, so that
+  device shows the server's copy, as a topic's change does.
+- **Calls stay refused in groups and channels in this build, chosen by the author**, with `call_not_allowed`;
+  group calls get their own Q/A after it.
+- **The chat-scope built-in roles become owner, moderator and member, chosen by the author**, replacing
+  the chat-scope admin. Every member of any chat holds member, a `member_role` row adds moderator, and
+  `is_owner` gives owner. `chat_permission` overrides the member role only.
+- **Roles hold the names of their own scope, chosen by the author:** server roles only server-wide names,
+  such as `group.create`, `folder.*` and `profile.edit`, and chat roles only the `direct.`, `group.` and
+  `channel.` ones. Admin still passes every check.
+- **`conversation_profile` keeps only `sealed`, `key`, `key_epoch`, `photo_id`, `signature`, `updated_by`,
+  `version` and `updated_at`, the key being the newest share of the chat's profile key, and
+  `conversation_link` goes, chosen by the author**, since no chat is unencrypted any more. A findable chat's
+  readable name and bio sit on `conversation`.
+- **A group's or channel's photo goes up as one of the chat's files, chosen by the author:** `POST
+  /api/v1/chats/{id}/files` with kind image, kept by the `chat_profile` that names it in `persist`, the old
+  one removed once no profile names it, under `[limits.upload] photo`.
+- **Creating with a photo uploads it before people are added, chosen by the author**, so the first
+  profile everyone gets already names it. **If it fails, the group is still made without it, and the
+  person is only shown the error, chosen by the author**, `photo_failed`; they set it again later from the
+  group's settings, with `Command::ChatPhoto {chat, jpeg, thumbnail}`, which mirrors the account's
+  `SetPhoto`. A photo the server refuses at the start, such as one over `[limits.upload] photo`, counts
+  as failing too: core seals the first profile again without it and sends epoch 0 again.
+- **Apps get a group's or channel's photo as they get an account's, chosen by the author:** the opened
+  profile shows `photo {id, blurhash}`, and `Command::ChatPhotoGet {chat}` fetches its one chunk from
+  `GET /api/v1/files/{id}/chunks/0`, opens it in core and answers with `Event::ChatPhoto {chat, photo,
+  bytes}`, so the photo's key never leaves core.
+- **An invitation is signed, chosen by the author:** the inviter's device signs `keryx v1 invite`, the
+  chat and the invited account, and the joiner puts it in its external commit's authenticated data, JSON
+  like every plaintext: `{"invite": {account, device, signature}}`. Clients accept that external join from
+  an account not yet in the chat only when the signing device is in the group at that epoch.
+- **A `chat_event` row has an `audience` and a `viewer`, chosen by the author**, replacing `owners_only`:
+  0 everyone, 1 owners and moderators, 2 the one account in `viewer`, such as the inviter told of a
+  decline. **0 is now for live frames only, never saved, chosen by the author:** a whole chat removed, and
+  each membership change, pushed to the chat's online devices and the person removed, so every device, a
+  channel's subscribers too, keeps its member list current; offline ones catch up from the chats list and
+  the device list.
+- **Pending requests and invitations come in the first `chats` page, chosen by the author:** `asked_list`
+  `[{chat, name, at, state}]` and `invitation_list` `[{chat, inviter, sealed, signature, at}]`, and live as
+  `join_request` and `invitation`.
+
 ### Read state
 
 - **`seen` is not per message.** A client sends one at some point in time, and it covers
@@ -1157,13 +1697,11 @@ suggestions and cannot build them, as with questions.
 - **A `seen` stores the client's time and the server's time**, like messages do. Show
   the client's time unless it is later than the server's or far from it, so reading
   offline is accurate and a lying client stays detectable.
-- **Who can see seen times depends on the chat type and role.** Direct: the other
-  person. Group: anyone with a "view seen" permission, by default each message's sender
-  and admins. Channel: a permission for owners and admins, while subscribers see counts
-  only.
-- **A person may turn receipts off, default on.** That hides their times from others,
-  and they then cannot see other people's. A group's owner can forbid it by permission.
-  The server still stores the times either way.
+- **Who can see received and seen times is four permissions per chat type**, as Groups and channels
+  says: by default, in a direct chat both people see all of them, and in a group or channel each
+  sender sees them on their own messages, and owners and moderators on everyone's.
+- **There is no switch to turn receipts off, chosen by the author.** Who sees the times is the
+  permissions' alone, and the server stores them either way.
 - **Delivery works like `seen`, chosen by the author for the web client's ticks.** A device that now
   holds messages sends `received` with "received up to N", and the server keeps the highest per
   member, beside `seen_seq`. It is real delivery, not the server handing a message to a socket, and
@@ -1176,13 +1714,13 @@ suggestions and cannot build them, as with questions.
   its chat and "up to N", as it does `seen`. When a member's received or seen position rises, the
   server sends `marks` with the chat, the account, `received_seq` and `seen_seq` to the online
   devices of that chat's other members. Each entry of the `chats` list carries the other members'
-  positions too, so a reload draws the marks at once. Someone with receipts off shows no seen
-  position, under the rule above. **The entry's field is `mark_list`, chosen by the author:**
-  `[{account, received_seq, seen_seq}]`, one per other member, the same fields as `marks`, with no
-  `seen_seq` for someone with receipts off, and empty in a channel. No `marks` go out in a channel
-  either.
+  positions too, so a reload draws the marks at once. **The entry's field is `mark_list`, chosen by
+  the author:** `[{account, received_seq, seen_seq}]`, one per other member, the same fields as
+  `marks`, and empty in a channel. No `marks` go out in a channel either.
 - **Each `chats` entry carries its newest content message, chosen by the author**, as a full message
-  frame, still ciphertext, so one request gives every preview. Its field is `last_content`.
+  frame, still ciphertext, so one request gives every preview. Its field is `last_content`. **A self
+  chat's new-device notice counts as its last content, chosen by the author** after the phone test showed
+  a later commit in Saved messages leaving "No messages yet", since a notice already moves `last_at`.
 - **Each `chats` entry carries the chat's current `epoch`, chosen by the author:** the epoch of the
   last accepted commit, which the server already keeps for ordering commits. A device back from
   being away compares it with its own and catches up or rejoins at once, rather than noticing only
@@ -1190,8 +1728,10 @@ suggestions and cannot build them, as with questions.
 - **What a sender sees, as drawn by the web client.** A message in the queue, or sent but not yet
   answered with its sequence id, shows as waiting. In a direct chat it gets one mark with its
   sequence id, two once the other person's device has received it, and both marks change colour
-  once they have seen it. In a group it gets one mark, which changes colour at the first `seen`. In a
-  channel only the waiting sign goes away.
+  once they have seen it. **In a group it is drawn as in a direct chat, chosen by the author:** two marks
+  once the first other member's device has received it, and both change colour at the first other
+  member's `seen`. **In a channel it gets one mark, saying the server has it, shown to its sender only,
+  chosen by the author**, as a channel has no `marks`.
 
 ### Devices
 
@@ -1367,29 +1907,21 @@ stay on the platform side and call into it.
   sent while a large file uploads goes at once, and the file's message lands after it, at its own
   sequence id. One big upload never blocks a chat.
 
-### Unencrypted messages and chats
+### Unencrypted messages
 
-- **A chat has one of three settings.** Private: everything encrypted, and unencrypted is
-  refused. Mixed: encrypted, but permitted people may send unencrypted messages, such as
-  announcements. Open: everything unencrypted. New chats start as private.
-- **Who decides:** in a direct chat, both members must accept before unencrypted things
-  can be sent. In a group or channel, an owner decides and can change it at any time.
-- **A chat can switch between encrypted and unencrypted after creation.** Messages
-  already sent stay as they were.
-- **That decision is signed inside MLS, so a server cannot downgrade a chat.** The
-  chat's owner accounts are recorded in the MLS group, and a switch is a change signed by
-  an owner's device, or by both members in a direct chat. Clients refuse anything
-  else. Transferring ownership must be signed too. This is the one place a server
-  cannot simply lie about a role.
+- **Unencrypted is a property of a message, not of a chat, chosen by the author.** Every chat takes
+  encrypted and unencrypted messages, and each message's flag says which, so clients know. There is no
+  private, mixed or open setting on a chat, no `mode` column and no signed switch. It is useful because,
+  with it, the server can write messages on behalf of people.
+- **Sending one needs `message.send.unencrypted`, admin's alone by default, chosen by the author**, in
+  groups and channels as everywhere.
 - **Unencrypted messages are always signed by the sending device**, the same as
   encrypted ones, so clients detect a server altering or forging them.
-- **Every chat always has an MLS group, even while unencrypted.** Switching on is
-  instant and there is one code path. A large unencrypted channel pays the full MLS and
-  key-wrapping cost for encryption it is not using.
+- **Every chat always has an MLS group**, so there is one code path.
 - **The server may store and deliver unencrypted content, and whoever holds a named
   permission may read it**, including through admin MCP and server search. Encrypted
   content stays unreadable to the server either way. Clients must make clear when a
-  chat or message is not private.
+  message is not private.
 
 ### The first build's REST routes
 
@@ -1422,8 +1954,9 @@ POST /api/v1/password/reset         username, challenge, new_password, signature
 Any session
 GET  /api/v1/sessions               -> session_list
 DEL  /api/v1/sessions/{id}
-PUT  /api/v1/account/keys           master_public, account_public, account_stamp -> self_chat
-GET  /api/v1/accounts/{id}          -> id, username, display_name, and the three keys
+PUT  /api/v1/account/keys           master_public, account_public, account_stamp, invite_public,
+                                    invite_stamp -> self_chat
+GET  /api/v1/accounts/{id}          -> id, username, display_name, and the keys with their stamps
 GET  /api/v1/devices                -> device_list, reduced if the session has no device
 POST /api/v1/devices/id             -> device, the id its stamp signs
 POST /api/v1/devices                device, public_key, stamp, platform, os, os_version,
@@ -1626,7 +2159,7 @@ accepts the first for each step. The loser gets a rejection, catches up and retr
   doc = "100MiB"
   file = "2GiB"
   sticker = "256KiB"        # one sticker's WebP. Not encrypted: everyone on the server sees it
-  photo = "1MiB"            # one profile photo, sealed. An account's file, not a chat's
+  photo = "1MiB"            # one profile photo, sealed: an account's, or a group's or channel's
 
   [tcp]
   send_timeout = "15s"      # no byte taken for this long: the connection closes. WebSocket and REST
@@ -1739,7 +2272,8 @@ accepts the first for each step. The loser gets a rejection, catches up and retr
   seed (PBKDF2 of the words, with no passphrase), then one HKDF-SHA256 step per key. The label
   `keryx v1 master key` gives the Ed25519 master key that stamps devices, and
   `keryx v1 account key` gives the X25519 account key that epoch keys are wrapped to, through
-  HPKE's `DeriveKeyPair`. Another key later is just another label. Wallet-style SLIP-0010 paths
+  HPKE's `DeriveKeyPair`. `keryx v1 invite key` gives the X25519 key invitations are sealed to, the same
+  way: see Groups and channels. Another key later is just another label. Wallet-style SLIP-0010 paths
   were rejected: more to audit, and keryx has no use for a tree of keys. Words are handled by
   the `bip39` crate rather than by hand, as a one-byte bug here locks people out.
 - **The same words work on every device, through one master key.** The words derive
@@ -1762,7 +2296,7 @@ accepts the first for each step. The loser gets a rejection, catches up and retr
   as an unencrypted event**, in the same step that registers the device, so a thief's modified client cannot
   skip it. It reveals nothing new, since the server already knows a device joined. The
   message's sender is the new device, which is how the server applies that rule, and it carries
-  the device's master stamp, so a server cannot invent one. Clients accept this one kind of unencrypted event in a self chat whatever its mode, and it holds
+  the device's master stamp, so a server cannot invent one. Clients accept this one kind of unencrypted event in a self chat, and it holds
   no free text. Each other chat's notice comes from the device's signed MLS join.
 - **A browser keeps its keys in IndexedDB between visits, one database per username.**
   The database is named for that username. There is no production data, so a database that has
@@ -1894,6 +2428,9 @@ another device still holding the key.
 - **File sizes, counts and timing stay visible**, and a size can hint at what a file is.
 - **Account profiles cost more than their blob:** adding a member means re-sharing every
   member's profile key under the new chat key, about 60 bytes each.
+- **Nothing written in a group or channel can be taken back from its owners and moderators.** A delete or
+  edit keeps the original ciphertext in the history until retention, so a stolen database holds it too, and
+  anyone who later becomes a moderator, holding the keys of the epochs they were in, can read it.
 - **Exact message lengths are visible**, so the server and a stolen database can tell a "yes"
   from a paragraph, because plaintext is not padded.
 - **First contact trusts the server, unless people compare safety numbers.** A server handing
@@ -1903,7 +2440,7 @@ another device still holding the key.
   text, voice, reaction, image, call and so on. So can a stolen database. It cannot read
   the content, but this is a detailed record of how each person uses each chat.
 - **The server keeps a reading history per person**, for as long as the messages last.
-  Turning receipts off hides it from other people, not from the server or a stolen
+  The times permissions hide it from other people, not from the server or a stolen
   database.
 - **Device logs are a location and activity history**, kept without limit unless
   configured, and readable by the server and from a stolen database.
@@ -1957,6 +2494,11 @@ first, as everywhere.
   phone seals under the old epoch and a device that joined with only the new key cannot hear or see it.
 - **`a_frame_over_call_frame_closes_its_socket_as_a_leave` is flaky.** Once under `make coverage` it saw
   `(1, "")` where it wanted `(4403, "frame_too_large")`, and passed on the next run. Not chased yet.
+- **`drive.rs` loses a command sent after it sat idle.** It reads its socket only while a command runs, so
+  the server's pings go unanswered and the socket is closed; the next command goes out on the dead socket
+  and is lost, though it still prints `saved`. Sending `pump 2000` first works around it.
+- **A topic's row in the topics list previews only from messages already loaded on the phone.**
+- **A search hit in a thread opens the chat, not the reply inside its thread.**
 
 **Not yet tested on the phone**
 
@@ -1964,6 +2506,16 @@ first, as everywhere.
   of its own messages with `delete <seq>`, chosen by the author with reactions. Receiving a sticker from
   another account passed, sent by `drive.rs`'s `sticker [n]`, the nth of the Default pack, chosen by the
   author.
+- **Groups and channels, what is left of their phone test.** Passed so far: Saved messages' notice as its
+  preview, a new group's row tinted, the night switch's blue, the member tabs' counts, rules not shown to
+  their writer, Read all only on cut rules, and an edited profile showing at once on the phone that saved
+  it. Left: "created the topic" on a topic's History page with no "edited" row; Pick an owner; a topic's
+  slow mode picker, "Same as group" first and Off; slow mode counting per topic, with a member who is not a
+  moderator; the new row's tint clearing once opened or the list is left; the night text colour
+  `#C5D4E8`; setting a topic's photo. The author's "back arrow" note from this test is still to be asked
+  about.
+- **`make coverage` in `server/` and `core/` has not run since the groups work**, so the coverage tables
+  in their `tests/AGENTS.md` are behind.
 
 **Access**
 
@@ -2026,21 +2578,18 @@ first, as everywhere.
   runs before Argon2, and a server without one can be guessed against at Argon2's speed
 - RBAC: the management UI, and what stops a non-admin who may manage roles from granting themselves
   more. Decide them together
-- RBAC: what moderator holds beyond member, once groups exist. Activeplano's per-organization
-  override, stored as added and removed names, may fit a group changing a role for itself
+- RBAC: custom chat roles. Activeplano's per-organization override, stored as added and removed names,
+  may fit a group changing a role for itself
 
 **Chat**
 
 - What the REST fallback looks like: how a client receives without a socket
-- Profiles of groups and channels: who may change them, and their limits. Accounts' are decided above
 - Files: quotas, by the author's choice none for now
 - A call chosen as recorded when neither device can encode H.264: the client should say so
   before it starts
 - Mute
 - The client queue on disk, so unsent messages and unfinished uploads survive a restart: where it is
   kept on each platform and how it is locked
-- Whether a group or channel can be found and joined from outside, and how
-- What a channel is compared with a group
 
 **Calls**
 
