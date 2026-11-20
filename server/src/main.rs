@@ -176,6 +176,7 @@ fn read_configuration(path: &Path) -> anyhow::Result<Settings> {
         .optional("sticker", ByteSize::new())
         .optional("suggestion", ByteSize::new())
         .optional("ack", ByteSize::new())
+        .optional("activity", ByteSize::new())
         .optional("draft", ByteSize::new())
         .optional("folder_name", ByteSize::new())
         .optional("kv_value", ByteSize::new());
@@ -198,6 +199,7 @@ fn read_configuration(path: &Path) -> anyhow::Result<Settings> {
             StaticMap::new().required_any("type").required_any("path"),
         )
         .optional("operator", StaticMap::new().required_any("token"))
+        .optional("agents", StaticMap::new().required_any("secret"))
         .optional(
             "registration",
             StaticMap::new()
@@ -242,6 +244,7 @@ fn read_configuration(path: &Path) -> anyhow::Result<Settings> {
                 .optional_any("channel_members")
                 .optional_any("topics")
                 .optional("invitation_lifetime", DurationValue::new().to_int())
+                .optional_any("agents")
                 .optional("body", body)
                 .optional("upload", upload),
         )
@@ -295,6 +298,11 @@ fn read_configuration(path: &Path) -> anyhow::Result<Settings> {
     }
     if !settings.public_url.starts_with("http://") && !settings.public_url.starts_with("https://") {
         anyhow::bail!("public_url must start with http:// or https://");
+    }
+    if let Some(agents) = &settings.agents
+        && agents.secret.chars().count() < 32
+    {
+        anyhow::bail!("agents.secret must be at least 32 characters");
     }
     let time_list = [
         ("limits.ping_after", Some(settings.limits.ping_after)),

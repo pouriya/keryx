@@ -4,11 +4,11 @@
 use std::future::Future;
 
 use keryx_core::protocol::{
-    AccountBrief, ActionKind, CallEvent, ChatDevice, ChatEvent, ChatFolders, ChatItem, ChatOptions,
-    ChatProfileItem, ChatRole, ChatType, ContentKind, DeviceItem, DraftItem, FindableItem,
-    FoundChat, InvitationItem, KeyPackageItem, Kind, KvChange, KvReply, MarkItem, MessageFrame,
-    ProfileKeyItem, ProfileReply, RequestItem, SessionItem, StickerItem, StickerPack, SyncPosition,
-    TimesItem, TopicItem, TopicWrite, WrapEntry,
+    AccountBrief, ActionKind, AgentItem, CallEvent, ChatDevice, ChatEvent, ChatFolders, ChatItem,
+    ChatOptions, ChatProfileItem, ChatRole, ChatType, ContentKind, DeviceItem, DraftItem,
+    FindableItem, FoundChat, InvitationItem, KeyPackageItem, Kind, KvChange, KvReply, MarkItem,
+    MessageFrame, ProfileKeyItem, ProfileReply, RequestItem, SessionItem, StickerItem, StickerPack,
+    SyncPosition, TimesItem, TopicItem, TopicWrite, WrapEntry,
 };
 use keryx_core::ulid::Ulid;
 
@@ -91,6 +91,10 @@ pub struct Account {
     pub invite_stamp: Option<Vec<u8>>,
     /// Moves on every change of the names, photo, bio or links.
     pub profile_version: u64,
+    /// An agent's owner. `None` for a person.
+    pub owner: Option<Ulid>,
+    /// An agent its owner disabled.
+    pub disabled: bool,
 }
 
 /// The words' public keys and their stamps, checked before they reach storage.
@@ -113,6 +117,36 @@ pub struct NewAccount {
     /// The one-time link's token hash and when it stops working.
     pub setup: Option<([u8; 32], i64)>,
     pub now: i64,
+}
+
+/// An agent account, made by its owner. It has no password: its token is how it logs in.
+pub struct NewAgent {
+    pub id: Ulid,
+    pub owner: Ulid,
+    pub username: String,
+    pub display_name: String,
+    pub admin: bool,
+    /// The server permissions its owner ticked.
+    pub permission_list: Vec<String>,
+    /// Its token's id.
+    pub jti: [u8; 16],
+    pub all_folder: Ulid,
+    /// `[limits] agents`: how many running agents one owner may have.
+    pub limit: u64,
+    pub now: i64,
+}
+
+pub enum AgentCreated {
+    Saved,
+    UsernameTaken,
+    /// The owner already has `[limits] agents` running agents.
+    TooMany,
+}
+
+/// What an owner changes of its agent. `None` leaves it.
+pub struct AgentChange {
+    pub permission_list: Option<Vec<String>>,
+    pub admin: Option<bool>,
 }
 
 /// A one-time setup link, looked up by the hash of the part after `#`.
@@ -616,6 +650,26 @@ pub trait Storage: Send + Sync + 'static {
         username: String,
     ) -> impl Future<Output = Result<Option<Account>>> + Send;
     fn account_by_id(&self, id: Ulid) -> impl Future<Output = Result<Option<Account>>> + Send;
+    /// The agent, its server role, its ticks, its token and its folder, in one step.
+    fn create_agent(&self, agent: NewAgent) -> impl Future<Output = Result<AgentCreated>> + Send;
+    /// An owner's agents, disabled ones too.
+    fn agents(&self, owner: Ulid) -> impl Future<Output = Result<Vec<AgentItem>>> + Send;
+    fn change_agent(
+        &self,
+        agent: Ulid,
+        change: AgentChange,
+    ) -> impl Future<Output = Result<()>> + Send;
+    /// The id of an agent's live token, `None` once revoked.
+    fn agent_jti(&self, agent: Ulid) -> impl Future<Output = Result<Option<[u8; 16]>>> + Send;
+    /// Replaces an agent's token with `jti`, or removes it with `None`, and ends its sessions, in one
+    /// step. `disable` also marks it disabled. Answers the groups and channels it is in.
+    fn end_agent_token(
+        &self,
+        agent: Ulid,
+        jti: Option<[u8; 16]>,
+        disable: bool,
+        now: i64,
+    ) -> impl Future<Output = Result<Vec<Ulid>>> + Send;
     /// Partial usernames and display names. An empty term lists everyone.
     fn search_accounts(
         &self,

@@ -1,5 +1,6 @@
 //! Drives core as a real client against a running server, for the phone test: it sends what a phone
-//! cannot, such as a question. Not part of the server, and not a test. Reads one command per line on
+//! cannot, such as a question. Not part of the server, and not a test. Its one argument is the server,
+//! `http://127.0.0.1:7778` when left out, which agent/tests give their own. Reads one command per line on
 //! stdin: `signup` or `login` with a username, password and words, `find <username>`, `say <text>`,
 //! `many <n>`, `seen`, `call`, `question`, `bio <text>`, `link <name> <url>`, `photo <file.jpg>`,
 //! `app <on|off>`, `kv <key> <json>`, `react <seq> <emoji>`, `delete <seq>`, `sticker [n]`,
@@ -17,10 +18,16 @@
 //! thread in use. A note after a lone `--` goes in the invitation of anyone added by invitation only.
 //! What arrives for groups is printed as it comes: `ready`, `left`, `line`, `request`, `invited`,
 //! `topics`, `profile` and `findable`, with ids and counts only.
+//!
+//! As an agent's owner: `agent add <username> [--admin] [permission ...]`, which prints its token and
+//! words once, `agent list`, `agent perms <username> [permission ...]`, `agent token renew|revoke
+//! <username> -- <words>`, `agent profile <username> [bio] [-- photo.jpg]` and `agent disable
+//! <username> -- <words>`. A renew, revoke or disable signs the agent's device's end with its words.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
 use std::net::TcpStream;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use keryx_core::client::{
@@ -35,7 +42,16 @@ use serde_json::{Value, json};
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{ClientRequestBuilder, Message, WebSocket};
 
-const ORIGIN: &str = "http://127.0.0.1:7778";
+/// The server: the first argument, or the phone test's, which `adb reverse` reaches.
+static ORIGIN: OnceLock<String> = OnceLock::new();
+
+fn origin() -> &'static str {
+    ORIGIN.get_or_init(|| {
+        std::env::args()
+            .nth(1)
+            .unwrap_or_else(|| "http://127.0.0.1:7778".to_string())
+    })
+}
 
 struct App {
     client: Client,
@@ -58,6 +74,184 @@ struct App {
     invited: Option<Ulid>,
 }
 
+/// The owner's agent with this username, from a fresh list.
+fn agent_named(app: &mut App, username: &str) -> Option<Ulid> {
+    app.events
+        .retain(|event| !matches!(event, Event::Agents { .. }));
+    app.command(Command::Agents);
+    let Event::Agents { agent_list } = app.wait(|event| matches!(event, Event::Agents { .. }))
+    else {
+        unreachable!()
+    };
+    let found = agent_list
+        .iter()
+        .find(|item| item.username == username)
+        .map(|item| item.id);
+    if found.is_none() {
+        println!("missing {username}");
+    }
+    found
+}
+
+/// `agent ...`: what an agent's owner does.
+fn agent_command(app: &mut App, rest: &str) {
+    let (verb, rest) = rest.split_once(' ').unwrap_or((rest, ""));
+    match verb {
+        "add" => {
+            let mut bits = rest.split_whitespace();
+            let Some(username) = bits.next() else {
+                return println!("agent add <username> [--admin] [permission ...]");
+            };
+            let mut admin = false;
+            let mut permission_list = Vec::new();
+            for bit in bits {
+                if bit == "--admin" {
+                    admin = true;
+                } else {
+                    permission_list.push(bit.to_string());
+                }
+            }
+            app.command(Command::CreateAgent {
+                username: username.to_string(),
+                display_name: username.to_string(),
+                permission_list,
+                admin,
+            });
+            app.pump_until(|event| matches!(event, Event::AgentCreated { .. }));
+            for event in std::mem::take(&mut app.events) {
+                match event {
+                    // Shown once, for the agent's own agent.toml: nothing here keeps them.
+                    Event::AgentCreated {
+                        account,
+                        token,
+                        words,
+                        ..
+                    } => {
+                        println!("agent {account}");
+                        println!("token {}", token.0);
+                        println!("words {}", words.0);
+                    }
+                    Event::Error { code, .. } => println!("refused {code}"),
+                    other => app.events.push(other),
+                }
+            }
+        }
+        "list" => {
+            app.command(Command::Agents);
+            let Event::Agents { agent_list } =
+                app.wait(|event| matches!(event, Event::Agents { .. }))
+            else {
+                unreachable!()
+            };
+            for item in agent_list {
+                println!(
+                    "agent {} {} admin={} disabled={} token={} device={} perms={}",
+                    item.id,
+                    item.username,
+                    item.admin,
+                    item.disabled,
+                    item.token_at.is_some(),
+                    item.device.is_some(),
+                    item.permission_list.join(",")
+                );
+            }
+        }
+        "perms" => {
+            let mut bits = rest.split_whitespace();
+            let Some(agent) = bits.next().and_then(|name| agent_named(app, name)) else {
+                return;
+            };
+            app.command(Command::UpdateAgent {
+                agent,
+                display_name: None,
+                permission_list: Some(bits.map(str::to_string).collect()),
+                admin: None,
+            });
+            app.settle();
+            println!("saved");
+        }
+        "token" | "disable" => {
+            let (head, words) = match rest.split_once(" -- ") {
+                Some((head, words)) => (head, words.to_string()),
+                None => return println!("agent token|disable ... -- <words>"),
+            };
+            let (action, username) = if verb == "disable" {
+                ("disable", head.trim())
+            } else {
+                head.split_once(' ').unwrap_or((head, ""))
+            };
+            let Some(agent) = agent_named(app, username.trim()) else {
+                return;
+            };
+            let words = Secret(words);
+            match action {
+                "renew" => {
+                    app.command(Command::RenewAgentToken { agent, words });
+                    app.pump_until(|event| matches!(event, Event::AgentToken { .. }));
+                    for event in std::mem::take(&mut app.events) {
+                        match event {
+                            Event::AgentToken { token, .. } => println!("token {}", token.0),
+                            Event::Error { code, .. } => println!("refused {code}"),
+                            other => app.events.push(other),
+                        }
+                    }
+                }
+                "revoke" => {
+                    app.command(Command::RevokeAgentToken { agent, words });
+                    app.settle();
+                    println!("revoked");
+                }
+                "disable" => {
+                    app.command(Command::DisableAgent { agent, words });
+                    app.settle();
+                    println!("disabled");
+                }
+                other => println!("unknown {other}"),
+            }
+        }
+        "profile" => {
+            let (head, photo) = match rest.split_once(" -- ") {
+                Some((head, photo)) => (head, Some(photo.trim().to_string())),
+                None => (rest, None),
+            };
+            let (username, bio) = head.split_once(' ').unwrap_or((head, ""));
+            let Some(agent) = agent_named(app, username.trim()) else {
+                return;
+            };
+            app.pump(1000);
+            if let Some(path) = photo {
+                let jpeg = std::fs::read(path).unwrap();
+                let mut rgba = Vec::new();
+                for _ in 0..16 {
+                    rgba.extend_from_slice(&[0x45, 0x76, 0xC4, 0xFF]);
+                }
+                app.command(Command::AgentPhoto {
+                    agent,
+                    jpeg,
+                    thumbnail: Thumbnail {
+                        width: 4,
+                        height: 4,
+                        rgba,
+                    },
+                });
+                app.pump_until(|event| matches!(event, Event::ProfileSaved));
+            }
+            let bio = bio.trim();
+            if !bio.is_empty() {
+                app.command(Command::AgentProfile {
+                    agent,
+                    bio: Some(bio.to_string()),
+                    link_list: Vec::new(),
+                });
+                app.pump_until(|event| matches!(event, Event::ProfileSaved));
+            }
+            app.settle();
+            println!("saved");
+        }
+        other => println!("unknown agent {other}"),
+    }
+}
+
 fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .http_status_as_error(false)
@@ -66,9 +260,9 @@ fn agent() -> ureq::Agent {
 }
 
 fn call(method: &str, route: &str, token: Option<&str>, body: Option<&Value>) -> (u16, String) {
-    let url = format!("{ORIGIN}{route}");
+    let url = format!("{}{route}", origin());
     let authorization = token.map(|token| format!("Bearer {token}"));
-    let mut response = if method == "GET" || method == "DELETE" {
+    let mut response = if method == "GET" || (method == "DELETE" && body.is_none()) {
         let mut request = if method == "DELETE" {
             agent().delete(&url)
         } else {
@@ -79,10 +273,11 @@ fn call(method: &str, route: &str, token: Option<&str>, body: Option<&Value>) ->
         }
         request.call().unwrap()
     } else {
-        let mut request = if method == "PUT" {
-            agent().put(&url)
-        } else {
-            agent().post(&url)
+        // A revoke's DELETE carries the agent's device's end.
+        let mut request = match method {
+            "PUT" => agent().put(&url),
+            "DELETE" => agent().delete(&url).force_send_body(),
+            _ => agent().post(&url),
         };
         if let Some(authorization) = &authorization {
             request = request.header("Authorization", authorization);
@@ -173,7 +368,7 @@ impl App {
                     })
                 }
                 Output::Connect { bearer } => {
-                    let url = format!("{}/api/v1/ws", ORIGIN.replace("http://", "ws://"));
+                    let url = format!("{}/api/v1/ws", origin().replace("http://", "ws://"));
                     let mut request = ClientRequestBuilder::new(url.parse().unwrap())
                         .with_sub_protocol("keryx.v1");
                     if let Some(bearer) = &bearer {
@@ -228,7 +423,7 @@ impl App {
                     bearer,
                     bytes,
                 } => {
-                    let url = format!("{ORIGIN}{path}");
+                    let url = format!("{}{path}", origin());
                     let mut request = if method == "PUT" {
                         agent().put(&url)
                     } else {
@@ -407,6 +602,21 @@ impl App {
         }
     }
 
+    /// Reads until an event matches or a refusal arrives, leaving both in `events`.
+    fn pump_until(&mut self, wanted: impl Fn(&Event) -> bool) {
+        let started = Instant::now();
+        while !self
+            .events
+            .iter()
+            .any(|event| wanted(event) || matches!(event, Event::Error { .. }))
+        {
+            if started.elapsed() > Duration::from_secs(30) {
+                return println!("timed out");
+            }
+            self.read_once();
+        }
+    }
+
     /// Prints what arrives for groups and channels, with ids and counts and never their content.
     fn print_group(&mut self, event: &Event) {
         match event {
@@ -487,6 +697,24 @@ impl App {
             } => println!("invitation gone {chat}"),
             Event::Findable { chat, findable } => {
                 println!("findable {chat} on={}", findable.is_some());
+            }
+            Event::Marks { chat, mark } => println!(
+                "marks {chat} {} received={} seen={}",
+                mark.account,
+                mark.received_seq,
+                mark.seen_seq.unwrap_or(0)
+            ),
+            // An agent's trouble reason starts with its code, which is all printed here.
+            Event::Presence { presence, text } => {
+                let code = text
+                    .as_deref()
+                    .map(|text| text.split(':').next().unwrap_or_default().to_string());
+                println!(
+                    "presence {} {:?} code={}",
+                    presence.account,
+                    presence.state,
+                    code.as_deref().unwrap_or("-")
+                );
             }
             Event::Topics {
                 chat,
@@ -706,6 +934,9 @@ fn main() {
                     chat,
                     text: Some(Secret("A few questions about lunch".to_string())),
                     question: serde_json::from_value(sample_question()).unwrap(),
+                    reply: None,
+                    topic: None,
+                    thread: None,
                 });
                 let Event::Sent { seq, .. } = app.wait(|event| matches!(event, Event::Sent { .. }))
                 else {
@@ -728,6 +959,9 @@ fn main() {
                         name: name.to_string(),
                         r#move: how == "move",
                     }),
+                    reply: None,
+                    topic: None,
+                    thread: None,
                 });
                 let Event::Sent { seq, .. } = app.wait(|event| matches!(event, Event::Sent { .. }))
                 else {
@@ -779,6 +1013,8 @@ fn main() {
             "app" => {
                 app.command(Command::InApp {
                     in_app: rest == "on",
+                    trouble: false,
+                    text: None,
                 });
                 app.pump(500);
                 println!("app {rest}");
@@ -1234,6 +1470,7 @@ fn main() {
                 app.settle();
                 println!("saved");
             }
+            "agent" => agent_command(&mut app, rest),
             "pump" => {
                 let ms: u64 = rest.parse().unwrap_or(1000);
                 app.pump(ms);

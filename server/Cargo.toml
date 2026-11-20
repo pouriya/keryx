@@ -87,6 +87,10 @@ captcha = { version = "1.0.0", default-features = false }
 # Hashing session tokens and setup links, which are random and need no slow hash. Already in the tree.
 sha2 = "0.11.1"
 
+# Agents' tokens, JWTs under HS256 with `[agents] secret`, written by hand with this and sha2, chosen by
+# the author. 0.13 is the one on sha2 0.11's digest. Already in the tree.
+hmac = { version = "0.13.0", default-features = false }
+
 # Session tokens, setup links and ids, straight from the OS. Already in the tree.
 getrandom = "0.4.3"
 

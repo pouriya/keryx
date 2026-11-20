@@ -136,7 +136,7 @@ impl Server {
                 }
                 request.call().unwrap()
             }
-            ("DELETE", _) => {
+            ("DELETE", None) => {
                 let mut request = agent.delete(&url);
                 if token.is_some() {
                     request = request.header("Authorization", &authorization);
@@ -147,6 +147,8 @@ impl Server {
                 let mut request = match method {
                     "PUT" => agent.put(&url),
                     "PATCH" => agent.patch(&url),
+                    // A revoke's DELETE carries the agent's device's end.
+                    "DELETE" => agent.delete(&url).force_send_body(),
                     _ => agent.post(&url),
                 };
                 if token.is_some() {

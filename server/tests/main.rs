@@ -124,6 +124,11 @@ fn a_bad_configuration_stops_startup_and_says_where() {
             "bit-today.webp, which is over [limits.upload] sticker",
         ),
         (format!("{good}\n[stickers]\nnot_a_key = 1\n"), "not_a_key"),
+        (
+            format!("{good}\n[agents]\nsecret = \"too short\"\n"),
+            "agents.secret",
+        ),
+        (format!("{good}\n[agents]\n"), "secret"),
     ];
     for (bad, naming) in bad_list {
         fs::write(&path, bad).unwrap();

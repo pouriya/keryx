@@ -3659,6 +3659,7 @@ fn a_file_and_a_bundle_go_up_encrypted_and_come_down_whole() {
     sara.command(
         &server,
         Command::SendFiles {
+            reply: None,
             thread: None,
             topic: None,
             chat,
@@ -3738,6 +3739,7 @@ fn a_file_and_a_bundle_go_up_encrypted_and_come_down_whole() {
     sara.command(
         &server,
         Command::SendFiles {
+            reply: None,
             thread: None,
             topic: None,
             chat,
@@ -3797,6 +3799,7 @@ fn a_file_and_a_bundle_go_up_encrypted_and_come_down_whole() {
     sara.command(
         &server,
         Command::SendFiles {
+            reply: None,
             thread: None,
             topic: None,
             chat,
@@ -3812,6 +3815,7 @@ fn a_file_and_a_bundle_go_up_encrypted_and_come_down_whole() {
     sara.command(
         &server,
         Command::SendFiles {
+            reply: None,
             thread: None,
             topic: None,
             chat,
@@ -4553,6 +4557,9 @@ fn a_question_and_its_answer_are_sealed_checked_by_core_and_the_answer_can_chang
             chat,
             text: None,
             question: broken,
+            reply: None,
+            topic: None,
+            thread: None,
         },
     );
     let Event::Error { code, .. } =
@@ -4568,6 +4575,9 @@ fn a_question_and_its_answer_are_sealed_checked_by_core_and_the_answer_can_chang
             chat,
             text: Some(Secret("Lunch order".to_string())),
             question: question.clone(),
+            reply: None,
+            topic: None,
+            thread: None,
         },
     );
     let Event::Sent { seq, .. } = sara.wait(&server, |event| matches!(event, Event::Sent { .. }))
@@ -4752,6 +4762,9 @@ fn a_folder_suggestion_is_accepted_by_core_saving_the_folder_before_its_ack() {
                     name: name.to_string(),
                     r#move,
                 }),
+                reply: None,
+                topic: None,
+                thread: None,
             },
         );
     };
@@ -5179,7 +5192,11 @@ fn is_state(state: PresenceState) -> impl Fn(&PresenceItem) -> bool {
 
 /// This device's `presence`, an event with no answer.
 fn announce(socket: &mut Socket, in_app: bool) {
-    socket.send(&ClientFrame::Presence { in_app });
+    socket.send(&ClientFrame::Presence {
+        in_app,
+        trouble: false,
+        text: None,
+    });
 }
 
 fn presence_asked(socket: &mut Socket, account: Ulid) -> ServerFrame {
@@ -5647,10 +5664,17 @@ fn core_seals_settings_shows_them_on_every_device_and_hands_presence_back() {
     let (mut sara, mut babak, _chat) = apps_on(&server);
 
     // Presence: the platform says the app is on screen, and the other side's core shows it.
-    babak.command(&server, Command::InApp { in_app: true });
+    babak.command(
+        &server,
+        Command::InApp {
+            in_app: true,
+            trouble: false,
+            text: None,
+        },
+    );
     let babak_id = babak.id();
     sara.wait(&server, |event| {
-        matches!(event, Event::Presence { presence }
+        matches!(event, Event::Presence { presence, .. }
             if presence.account == babak_id && presence.state == Some(PresenceState::Online))
     });
     let stranger = App::sign_up(&server, "mina_x", SARA_WORDS);
@@ -5663,7 +5687,7 @@ fn core_seals_settings_shows_them_on_every_device_and_hands_presence_back() {
     );
     sara.wait(
         &server,
-        |event| matches!(event, Event::Presence { presence } if presence.account == stranger_id),
+        |event| matches!(event, Event::Presence { presence, .. } if presence.account == stranger_id),
     );
 
     // A setting shows at once, and only checked values are taken.
@@ -5928,6 +5952,7 @@ fn a_search_opens_the_archive_newest_first_by_newest_text_a_page_at_a_time() {
     sara.command(
         &server,
         Command::SendFiles {
+            reply: None,
             thread: None,
             topic: None,
             chat,
@@ -5939,6 +5964,7 @@ fn a_search_opens_the_archive_newest_first_by_newest_text_a_page_at_a_time() {
     sara.command(
         &server,
         Command::SendFiles {
+            reply: None,
             thread: None,
             topic: None,
             chat,
@@ -8478,4 +8504,558 @@ fn every_delete_and_edit_in_a_group_keeps_what_it_changed_for_owners_and_moderat
             if event.action == ChatAction::Deleted && event.topic == Some(topic))
     });
     assert_eq!(texts(&deleted), ["in launch"]);
+}
+
+// -------------------------------------------------------------------------------------------------
+// Agents
+// -------------------------------------------------------------------------------------------------
+
+const AGENT_SECRET: &str = "a secret for the tests' agent tokens, long enough";
+
+fn agent_server(limits: &str) -> Server {
+    Server::start(
+        "",
+        &format!("[registration]\nallow = true\n[agents]\nsecret = \"{AGENT_SECRET}\"\n{limits}"),
+    )
+}
+
+/// The owner makes an agent, answering its account, token and words.
+fn make_agent(
+    owner: &mut App,
+    server: &Server,
+    username: &str,
+    permission_list: &[&str],
+) -> (Ulid, String, String) {
+    owner.command(
+        server,
+        Command::CreateAgent {
+            username: username.to_string(),
+            display_name: "Helper".to_string(),
+            permission_list: permission_list
+                .iter()
+                .map(|name| name.to_string())
+                .collect(),
+            admin: false,
+        },
+    );
+    let Event::AgentCreated {
+        account,
+        username: made,
+        token,
+        words,
+    } = owner.wait(server, |event| matches!(event, Event::AgentCreated { .. }))
+    else {
+        unreachable!();
+    };
+    assert_eq!(made, username);
+    (account, token.0.clone(), words.0.clone())
+}
+
+/// What keryx-agent does: logs in with the token, then restores with the words.
+fn run_agent(server: &Server, token: &str, words: &str) -> App {
+    let mut agent = App::new();
+    agent.command(
+        server,
+        Command::LogInAgent {
+            token: Secret(token.to_string()),
+        },
+    );
+    agent.wait(server, |event| {
+        matches!(event, Event::NeedWords { restore: true })
+    });
+    agent.command(
+        server,
+        Command::Restore {
+            words: Secret(words.to_string()),
+        },
+    );
+    agent.wait(server, |event| matches!(event, Event::Online));
+    // Its self chat is ready before anything else is asked of it, so no later wait takes it for a
+    // new chat.
+    let started = std::time::Instant::now();
+    loop {
+        if let Some(self_chat) = agent.self_chat
+            && agent
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::ChatReady { chat } if *chat == self_chat))
+        {
+            return agent;
+        }
+        assert!(started.elapsed() < Duration::from_secs(20), "No self chat");
+        agent.read_once(server);
+    }
+}
+
+fn refused_with(app: &mut App, server: &Server, code: &str) {
+    let wanted = code.to_string();
+    app.wait(
+        server,
+        |event| matches!(event, Event::Error { code, .. } if *code == wanted),
+    );
+}
+
+fn agent_list(app: &mut App, server: &Server) -> Vec<keryx_core::protocol::AgentItem> {
+    app.command(server, Command::Agents);
+    let Event::Agents { agent_list } =
+        app.wait(server, |event| matches!(event, Event::Agents { .. }))
+    else {
+        unreachable!();
+    };
+    agent_list
+}
+
+/// The agent starts a direct chat with someone, answering the chat once both have it.
+fn agent_chat(agent: &mut App, other: &mut App, server: &Server) -> Ulid {
+    agent.command(
+        server,
+        Command::StartChat {
+            account: other.id(),
+        },
+    );
+    let chat = ready_chat(agent, server);
+    ready_in(other, server, chat);
+    chat
+}
+
+#[test]
+fn an_agent_made_by_its_owner_logs_in_with_its_token_and_its_words() {
+    let server = agent_server("");
+    let mut sara = App::sign_up(&server, "sara", SARA_WORDS);
+    let (agent_id, token, words) = make_agent(
+        &mut sara,
+        &server,
+        "helper_agent",
+        &["direct.create", "presence.in_app"],
+    );
+    assert_eq!(words.split_whitespace().count(), 12);
+    let mut agent = run_agent(&server, &token, &words);
+    assert_eq!(agent.id(), agent_id);
+
+    // The owner sees it with its device, and anyone sees whose agent it is.
+    let list = agent_list(&mut sara, &server);
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].id, agent_id);
+    assert!(list[0].device.is_some());
+    assert!(!list[0].admin && !list[0].disabled);
+    assert_eq!(
+        list[0].permission_list,
+        ["direct.create", "presence.in_app"]
+    );
+    let (status, reply) = server.call(
+        "GET",
+        &format!("/api/v1/accounts/{agent_id}"),
+        agent.token.as_deref(),
+        None,
+    );
+    assert_eq!(status, 200);
+    assert_eq!(reply["data"]["agent"], true);
+    assert_eq!(reply["data"]["owner"], sara.id().to_string());
+
+    // It holds only what was ticked: it starts a chat, and may not search the directory.
+    agent.command(
+        &server,
+        Command::Search {
+            text: "sara".to_string(),
+        },
+    );
+    refused_with(&mut agent, &server, "no_permission");
+    let chat = agent_chat(&mut agent, &mut sara, &server);
+
+    // Its activity is a message of its own, at most 140 characters, and cannot be edited.
+    agent.command(
+        &server,
+        Command::SendActivity {
+            chat,
+            text: "Reading the chat".to_string(),
+            topic: None,
+            thread: None,
+        },
+    );
+    agent.wait(
+        &server,
+        |event| matches!(event, Event::Sent { chat: sent, .. } if *sent == chat),
+    );
+    let message = shown(sara.wait(&server, |event| {
+        matches!(event, Event::Message { message }
+            if message.content_kind == Some(ContentKind::Activity))
+    }));
+    assert_eq!(text_of(&message), Some("Reading the chat"));
+    agent.command(
+        &server,
+        Command::SendActivity {
+            chat,
+            text: "x".repeat(141),
+            topic: None,
+            thread: None,
+        },
+    );
+    refused_with(&mut agent, &server, "bad_activity");
+    agent.command(
+        &server,
+        Command::Edit {
+            chat,
+            target: Pointer::Seq(message.seq),
+            text: Secret("changed".to_string()),
+            files: Vec::new(),
+            remove: Vec::new(),
+        },
+    );
+    agent.wait(
+        &server,
+        |event| matches!(event, Event::Failed { code, .. } if code == "cannot_edit"),
+    );
+
+    // Only its owner ends its device.
+    agent.command(&server, Command::LogOut);
+    refused_with(&mut agent, &server, "agent_device");
+}
+
+#[test]
+fn an_agent_never_holds_more_than_was_ticked_or_its_owner_holds() {
+    let server = agent_server("");
+    let mut sara = App::sign_up(&server, "sara", SARA_WORDS);
+    for (username, permission, admin, code) in [
+        ("helper", "direct.create", false, "bad_username"),
+        ("helper_agent", "agent.create", false, "bad_body"),
+        ("helper_agent", "no.such.thing", false, "bad_body"),
+        (
+            "helper_agent",
+            "direct.message.send.text",
+            false,
+            "bad_body",
+        ),
+        ("helper_agent", "direct.create", true, "not_held"),
+        ("sara_agent", "account.create", false, "not_held"),
+    ] {
+        sara.command(
+            &server,
+            Command::CreateAgent {
+                username: username.to_string(),
+                display_name: "Helper".to_string(),
+                permission_list: vec![permission.to_string()],
+                admin,
+            },
+        );
+        refused_with(&mut sara, &server, code);
+    }
+    // A person's username never ends in `_agent`.
+    let (status, reply) = server.call(
+        "POST",
+        "/api/v1/register",
+        None,
+        Some(&json!({"username": "mina_agent", "password": PASSWORD})),
+    );
+    assert_eq!(
+        (status, reply["code"].as_str()),
+        (400, Some("bad_username"))
+    );
+    // Nor does an agent's ever lose it in a rename.
+    let (agent_id, token, words) = make_agent(&mut sara, &server, "helper_agent", &[]);
+    let agent = run_agent(&server, &token, &words);
+    let (status, reply) = server.call(
+        "PUT",
+        &format!("/api/v1/accounts/{agent_id}/names"),
+        Some(OPERATOR_TOKEN),
+        Some(&json!({"username": "helper"})),
+    );
+    assert_eq!(
+        (status, reply["code"].as_str()),
+        (400, Some("bad_username"))
+    );
+    // An agent with no ticks may not even start a chat.
+    let mut agent = agent;
+    agent.command(&server, Command::StartChat { account: sara.id() });
+    refused_with(&mut agent, &server, "no_permission");
+}
+
+#[test]
+fn renewing_revoking_and_disabling_end_the_agents_device_and_token() {
+    let server = agent_server("[limits]\nagents = 1\n");
+    let mut sara = App::sign_up(&server, "sara", SARA_WORDS);
+    let (agent_id, token, words) = make_agent(&mut sara, &server, "helper_agent", &[]);
+    let mut agent = run_agent(&server, &token, &words);
+    let group = make_group(&mut sara, &server, ChatType::Group, vec![agent_id]);
+    ready_in(&mut agent, &server, group);
+
+    // One agent is the limit, and the words must be the agent's own.
+    sara.command(
+        &server,
+        Command::CreateAgent {
+            username: "second_agent".to_string(),
+            display_name: "Second".to_string(),
+            permission_list: Vec::new(),
+            admin: false,
+        },
+    );
+    refused_with(&mut sara, &server, "too_many_agents");
+    sara.command(
+        &server,
+        Command::RenewAgentToken {
+            agent: agent_id,
+            words: Secret(BABAK_WORDS.to_string()),
+        },
+    );
+    refused_with(&mut sara, &server, "bad_signature");
+
+    // A renew ends the old token and the device at once.
+    sara.command(
+        &server,
+        Command::RenewAgentToken {
+            agent: agent_id,
+            words: Secret(words.clone()),
+        },
+    );
+    let Event::AgentToken { token: renewed, .. } =
+        sara.wait(&server, |event| matches!(event, Event::AgentToken { .. }))
+    else {
+        unreachable!();
+    };
+    agent.wait(&server, |event| matches!(event, Event::LoggedOut));
+    let mut old = App::new();
+    old.command(
+        &server,
+        Command::LogInAgent {
+            token: Secret(token.clone()),
+        },
+    );
+    refused_with(&mut old, &server, "bad_login");
+    let mut agent = run_agent(&server, &renewed.0, &words);
+    // The new device joins the group by itself, and Sara's removal of the old one lands first.
+    ready_in(&mut agent, &server, group);
+    send_text(&mut sara, &server, group, "settled");
+
+    // Disabling ends it for good and takes it out of the group, and frees its place.
+    sara.command(
+        &server,
+        Command::DisableAgent {
+            agent: agent_id,
+            words: Secret(words.clone()),
+        },
+    );
+    sara.wait(&server, |event| {
+        matches!(event, Event::Line { chat, action: LineAction::Left, .. } if *chat == group)
+    });
+    // Its device ends, or its session goes first and logging in again is refused.
+    agent.wait(&server, |event| {
+        matches!(event, Event::LoggedOut)
+            || matches!(event, Event::Error { code, .. } if code == "agent_disabled")
+    });
+    let list = agent_list(&mut sara, &server);
+    assert!(list[0].disabled && list[0].token_at.is_none() && list[0].device.is_none());
+    let mut after = App::new();
+    after.command(
+        &server,
+        Command::LogInAgent {
+            token: Secret(renewed.0.clone()),
+        },
+    );
+    refused_with(&mut after, &server, "agent_disabled");
+    sara.command(
+        &server,
+        Command::UpdateAgent {
+            agent: agent_id,
+            display_name: Some("Back".to_string()),
+            permission_list: None,
+            admin: None,
+        },
+    );
+    refused_with(&mut sara, &server, "agent_disabled");
+
+    // A revoke of an agent that never ran needs no words that sign anything.
+    let (second, second_token, second_words) = make_agent(&mut sara, &server, "second_agent", &[]);
+    sara.command(
+        &server,
+        Command::RevokeAgentToken {
+            agent: second,
+            words: Secret(second_words),
+        },
+    );
+    sara.wait(&server, |event| {
+        matches!(event, Event::Agents { agent_list }
+            if agent_list.iter().any(|item| item.id == second && item.token_at.is_none()))
+    });
+    let mut revoked = App::new();
+    revoked.command(
+        &server,
+        Command::LogInAgent {
+            token: Secret(second_token),
+        },
+    );
+    refused_with(&mut revoked, &server, "bad_login");
+}
+
+#[test]
+fn an_owner_sets_its_agents_profile_and_people_sharing_a_chat_open_it() {
+    let server = agent_server("");
+    let mut sara = App::sign_up(&server, "sara", SARA_WORDS);
+    let mut babak = App::sign_up(&server, "babak", BABAK_WORDS);
+    let (agent_id, token, words) =
+        make_agent(&mut sara, &server, "helper_agent", &["direct.create"]);
+    let mut agent = run_agent(&server, &token, &words);
+    agent_chat(&mut agent, &mut babak, &server);
+
+    sara.command(
+        &server,
+        Command::AgentProfile {
+            agent: agent_id,
+            bio: Some("I keep the notes".to_string()),
+            link_list: Vec::new(),
+        },
+    );
+    sara.wait(&server, |event| matches!(event, Event::ProfileSaved));
+    babak.command(&server, Command::Profile { account: agent_id });
+    let profile = profile_of(babak.wait(&server, |event| {
+        matches!(event, Event::Profile { profile }
+            if profile.account == agent_id && profile.bio.is_some())
+    }));
+    assert_eq!(profile.bio.as_deref(), Some("I keep the notes"));
+    assert!(profile.agent);
+    assert_eq!(profile.owner, Some(sara.id()));
+}
+
+#[test]
+fn an_agents_trouble_shows_to_everyone_and_its_reason_to_its_owner_alone() {
+    let server = agent_server("");
+    let mut sara = App::sign_up(&server, "sara", SARA_WORDS);
+    let mut babak = App::sign_up(&server, "babak", BABAK_WORDS);
+    let (agent_id, token, words) = make_agent(
+        &mut sara,
+        &server,
+        "helper_agent",
+        &["direct.create", "presence.in_app"],
+    );
+    let mut agent = run_agent(&server, &token, &words);
+    agent_chat(&mut agent, &mut sara, &server);
+    agent_chat(&mut agent, &mut babak, &server);
+    for app in [&mut sara, &mut babak] {
+        app.command(
+            &server,
+            Command::InApp {
+                in_app: true,
+                trouble: false,
+                text: None,
+            },
+        );
+    }
+    agent.command(
+        &server,
+        Command::InApp {
+            in_app: true,
+            trouble: true,
+            text: Some("llm_failing".to_string()),
+        },
+    );
+    let trouble = |event: &Event| {
+        matches!(event, Event::Presence { presence, .. }
+            if presence.account == agent_id && presence.state == Some(PresenceState::Trouble))
+    };
+    let Event::Presence { text, .. } = sara.wait(&server, trouble) else {
+        unreachable!();
+    };
+    assert_eq!(text.as_deref(), Some("llm_failing"));
+    let Event::Presence { presence, text } = babak.wait(&server, trouble) else {
+        unreachable!();
+    };
+    assert_eq!(text, None);
+    assert_eq!(presence.text, None);
+
+    // Back to well, the reason goes with it.
+    agent.command(
+        &server,
+        Command::InApp {
+            in_app: true,
+            trouble: false,
+            text: None,
+        },
+    );
+    let Event::Presence { text, .. } = sara.wait(&server, |event| {
+        matches!(event, Event::Presence { presence, .. }
+            if presence.account == agent_id && presence.state == Some(PresenceState::Online))
+    }) else {
+        unreachable!();
+    };
+    assert_eq!(text, None);
+}
+
+#[test]
+fn an_agents_token_holds_only_as_this_server_signed_it() {
+    let server = agent_server("");
+    let mut sara = App::sign_up(&server, "sara", SARA_WORDS);
+    let (agent_id, token, _) = make_agent(&mut sara, &server, "helper_agent", &[]);
+    let (_, other, _) = make_agent(&mut sara, &server, "other_agent", &[]);
+    let login = |token: &str| {
+        server.call(
+            "POST",
+            "/api/v1/login/agent",
+            None,
+            Some(&json!({ "token": token })),
+        )
+    };
+    let part_list: Vec<&str> = token.split('.').collect();
+    let other_list: Vec<&str> = other.split('.').collect();
+    let mut tag = part_list[2].to_string();
+    let last = if tag.ends_with('A') { "B" } else { "A" };
+    tag.replace_range(tag.len() - 1.., last);
+    for forged in [
+        format!("{}.{}.{tag}", part_list[0], part_list[1]),
+        format!("{}.{}.{}", part_list[0], other_list[1], part_list[2]),
+        format!("{token}.more"),
+        format!("{}.{}.!!", part_list[0], part_list[1]),
+        "not a token".to_string(),
+    ] {
+        let (status, reply) = login(&forged);
+        assert_eq!(status, 401, "{forged}: {reply}");
+        assert_eq!(reply["code"], "bad_login");
+    }
+    let (status, reply) = login(&token);
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["data"]["account"], agent_id.to_string());
+
+    // Its device-login challenge is asked by account, read from the token.
+    let (status, reply) = server.call(
+        "POST",
+        "/api/v1/challenge",
+        None,
+        Some(&json!({"account": agent_id.to_string(), "purpose": "device_login"})),
+    );
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["data"]["account"], agent_id.to_string());
+    for body in [
+        json!({"purpose": "device_login"}),
+        json!({"username": "helper_agent", "account": agent_id.to_string(), "purpose": "device_login"}),
+    ] {
+        let (status, reply) = server.call("POST", "/api/v1/challenge", None, Some(&body));
+        assert_eq!(status, 400, "{reply}");
+        assert_eq!(reply["code"], "bad_body");
+    }
+    let (status, reply) = server.call(
+        "POST",
+        "/api/v1/challenge",
+        None,
+        Some(&json!({"account": "01JAAAAAAAAAAAAAAAAAAAAAAA", "purpose": "device_login"})),
+    );
+    assert_eq!(status, 404, "{reply}");
+
+    // A server with no `[agents] secret` has no agents.
+    let closed = Server::start("", "[registration]\nallow = true\n");
+    let mut mina = App::sign_up(&closed, "mina", BABAK_WORDS);
+    mina.command(
+        &closed,
+        Command::CreateAgent {
+            username: "mina_agent".to_string(),
+            display_name: "Helper".to_string(),
+            permission_list: Vec::new(),
+            admin: false,
+        },
+    );
+    refused_with(&mut mina, &closed, "agents_off");
+    let (status, reply) = closed.call(
+        "POST",
+        "/api/v1/login/agent",
+        None,
+        Some(&json!({ "token": token })),
+    );
+    assert_eq!(status, 403, "{reply}");
+    assert_eq!(reply["code"], "agents_off");
 }

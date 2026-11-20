@@ -57,8 +57,38 @@ CREATE TABLE account (
     -- [Settings] moves on every change to the account's `kv` rows, so a device that holds this
     -- version is answered with nothing, and a change based on an older one is refused.
     kv_version          INTEGER NOT NULL DEFAULT 0 CHECK (kv_version >= 0),
+    -- [Agents] the person who owns this agent. NULL for people. An owner is never an agent itself.
+    owner_id            BLOB REFERENCES account (id),
+    -- [Agents] when its owner disabled it. It stays for old signatures, and stops counting toward
+    -- `[limits] agents`. NULL for people and running agents.
+    disabled_at         INTEGER,
     -- [Admin] when the account was made.
     created_at          INTEGER NOT NULL
+) WITHOUT ROWID, STRICT;
+
+-- [Agents] counting an owner's agents, and listing them.
+CREATE INDEX account_owner ON account (owner_id) WHERE owner_id IS NOT NULL;
+
+-- [Agents] an agent's one token. A login's JWT must carry this row's jti, so a renew, which replaces
+-- it, or a revoke, which deletes it, ends the old token at once.
+CREATE TABLE agent_token (
+    -- [Agents] whose token.
+    account_id  BLOB PRIMARY KEY REFERENCES account (id) ON DELETE CASCADE,
+    -- [Agents] the token's id, 16 random bytes. Not secret: the JWT's signature is what the
+    -- secret in `[agents]` guards.
+    jti         BLOB NOT NULL CHECK (length(jti) = 16),
+    -- [Agents] when it was made, shown to its owner.
+    created_at  INTEGER NOT NULL
+) WITHOUT ROWID, STRICT;
+
+-- [Agents] the server permissions an owner ticked for its agent. The agent holds each only while its
+-- owner does too, checked on every operation, and never `agent.create`.
+CREATE TABLE agent_permission (
+    -- [Agents] which agent.
+    account_id  BLOB NOT NULL REFERENCES account (id) ON DELETE CASCADE,
+    -- [Agents] a server permission's name, from the closed list in `api.rs`.
+    permission  TEXT NOT NULL,
+    PRIMARY KEY (account_id, permission)
 ) WITHOUT ROWID, STRICT;
 
 -- [Account profile] one encrypted blob per account: the photo's id and file key, the bio, and
@@ -629,8 +659,8 @@ CREATE TABLE message (
     -- 10 question (a tree of questions), 11 answer (one account's answer to one), 12 sticker (names
     -- one of the server's stickers inside its encryption), 13 suggestion (what to do with its chat,
     -- such as its folder), 14 ack (one account's accepting or declining one; moves neither
-    -- `last_at` nor the preview).
-    content_kind       INTEGER CHECK (content_kind BETWEEN 0 AND 14),
+    -- `last_at` nor the preview), 15 activity (one step an agent says it is taking).
+    content_kind       INTEGER CHECK (content_kind BETWEEN 0 AND 15),
     -- [Unencrypted messages] the flag that tells a client how to read the body.
     encrypted          INTEGER CHECK (encrypted IN (0, 1)),
     -- [Restore, Commit order] the key this was encrypted under, and for a commit, the step it

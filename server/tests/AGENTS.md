@@ -21,14 +21,14 @@ Lines measured by `cargo-llvm-cov`, per file and in total.
 <!-- coverage:start -->
 | File | Lines | Covered | Coverage |
 |------|------:|--------:|---------:|
-| `src/api.rs` | 4988 | 4514 | 90.50% |
+| `src/api.rs` | 5573 | 5019 | 90.06% |
 | `src/captcha.rs` | 150 | 143 | 95.33% |
-| `src/chat.rs` | 1754 | 1585 | 90.36% |
+| `src/chat.rs` | 1790 | 1622 | 90.61% |
 | `src/file.rs` | 219 | 197 | 89.95% |
-| `src/main.rs` | 534 | 509 | 95.32% |
-| `src/moq.rs` | 345 | 279 | 80.87% |
-| `src/storage/sqlite.rs` | 4348 | 3942 | 90.66% |
-| **Total** | **12338** | **11169** | **90.53%** |
+| `src/main.rs` | 541 | 516 | 95.38% |
+| `src/moq.rs` | 345 | 283 | 82.03% |
+| `src/storage/sqlite.rs` | 4612 | 4149 | 89.96% |
+| **Total** | **13230** | **11929** | **90.17%** |
 <!-- coverage:end -->
 
 The tool is `cargo install cargo-llvm-cov`, plus

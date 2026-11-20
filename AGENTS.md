@@ -1854,6 +1854,13 @@ about groups and channels stands; this section adds what the author decides as t
     holds its profile key, so that the reason reaches the owner alone rests on the server not delivering
     it, as profiles after leaving do. **That is kept, chosen by the author**, over sealing it to the
     owner's invite key: one sealing path, and a reason is a code and a detail with no chat content.
+  - **The text is AES-GCM under the profile key with the label `keryx v1 presence text` and the account
+    id as associated data, chosen by the author**, as `kv` values are, so it cannot pass for any other
+    sealed thing or account. Frames carry it as base64 bytes.
+  - **Trouble and text live in the server's memory beside the connection, chosen by the author:** never
+    written to disk, they are sent in every presence answer, to devices that connect later too, and go
+    when the connection ends. A server restart drops them, and the device sends them again on
+    reconnecting, as the first `presence` frame always does.
   - **Android shows presence text in a direct chat's header only, in place of "online", chosen by the
     author**, and with no text the header shows online as before. **People cannot set one for now,
     chosen by the author:** no client offers it, so only agents send presence text.
@@ -2117,6 +2124,9 @@ accepts the first for each step. The loser gets a rejection, catches up and retr
   # [operator]
   # token = "..."        # what `keryx user add` and the like send. Unset: no operator access
 
+  # [agents]
+  # secret = "..."       # agents' tokens are signed with it, at least 32 characters. Unset: no agents
+
   [registration]
   allow = false
   password_min_length = 12
@@ -2150,6 +2160,7 @@ accepts the first for each step. The loser gets a rejection, catches up and retr
   call_cache = "16MiB"      # the relay's room for older groups. Newest groups are always kept
   folders = 20              # an account's folders, not counting all
   kv_keys = 64              # an account's settings
+  agents = 5                # one owner's agents, disabled ones not counted
 
   [limits.body]             # one message's body. A file's bytes upload separately
   text = "64KiB"
@@ -2167,6 +2178,7 @@ accepts the first for each step. The loser gets a rejection, catches up and retr
   sticker = "1KiB"
   suggestion = "4KiB"
   ack = "1KiB"
+  activity = "1KiB"         # one step of an agent's intention, for one chat
   draft = "64KiB" # an account's sealed draft in one chat. Not a message
   folder_name = "256B"      # one sealed folder name
   kv_value = "4KiB"         # one setting's value, as the client sent it
@@ -2513,16 +2525,68 @@ store their words. How `keryx-agent` itself works is in [agent/AGENTS.md](agent/
   over a notice to the owner of each new device. The server refuses a second device, and refuses ending
   an agent's device with the words, which is what a thief holding a copied `agent.toml` would otherwise
   do. **A renew always ends the device, chosen by the author:** a token belongs to one device, and the
-  token and the words sit in the same `agent.toml`, so a leaked token means the words leaked too. The
-  old device stops at once on the server; the new `keryx-agent` registers a fresh device and signs the
-  old one's termination with its words, since members remove a device from MLS only on a statement its
-  master key signed, which the owner does not hold. A container that lost its volume waits for its
-  owner's renew.
+  token and the words sit in the same `agent.toml`, so a leaked token means the words leaked too. A
+  container that lost its volume waits for its owner's renew.
+- **Renew, revoke and disable each ask the owner for the agent's words, chosen by the author in the Q/A of
+  2026-11-16:** the owner's core derives the agent's master key from them, signs the termination of the
+  agent's device, `keryx v1 revoke device` as any termination, and sends it with the request. The server
+  ends that device, keeps the statement and pushes `revoked`, so members remove it from MLS at once, and a
+  renew answers with the new token. The owner's phone still never keeps the words or the master key. An
+  agent that never registered a device needs no words, and its body carries no statement.
+- **The agent token is a JWT, HS256 under `[agents] secret` in `server.toml`, chosen by the author:** claims
+  `sub`, the agent's account id, `jti`, the token's id, and `iat`, with no `exp`, written by hand with the
+  `hmac` and `sha2` already in the lock. **`[agents] secret` is optional, chosen by the author:** unset,
+  `POST /agents` and `/login/agent` are refused with `agents_off`; set, it must be at least 32 characters
+  or startup stops naming the key, and it is never logged. A leaked `server.toml` lets anyone mint tokens,
+  and changing the secret ends every agent's token. **`agent_token` keeps the `jti`, not a hash, chosen by
+  the author:** a login's JWT must carry its row's `jti`, so a renew or revoke ends the old token at once.
+- **`/login/agent` takes the JWT and hands back an ordinary session, chosen by the author**, as
+  `/login/token` does, under `[session] lifetime` and sliding with use, so the server checks sessions one
+  way. When the session ends, core logs in again with the JWT from `agent.toml`.
+- **keryx-agent asks its device-login challenge by account, chosen by the author:** it reads `sub` from
+  its JWT, and `POST /api/v1/challenge` takes `account` in place of `username`. Asking by username already
+  answers with the account id, so this reveals nothing more.
+- **An agent's username ends in `_agent`, and a person's never does, chosen by the author**, such as
+  `helper_agent`, so a name always tells whether an account is an agent. Sign-up, `keryx user add` and
+  renames refuse a person's username ending in `_agent`, and every other sign-up rule applies to agents.
+  **Making an agent needs only `agent.create`, chosen by the author**, even with `[registration] allow =
+  false`.
+- **The owner's app makes 12 words for an agent, as for people, chosen by the author.**
+- **The owner's device signs the agent's profile with its own stamp, chosen by the author:** clients
+  accept an agent's sealed profile signed by a device of the owner the server names, checked against the
+  owner's pinned master key, so editing a bio or photo needs no words. Clients trust the server for who
+  an agent's owner is, as they do for roles. `PUT /accounts/{id}/profile` and `POST
+  /accounts/{id}/photos` take the owner for its agent.
+- **A disabled agent does not count toward `[limits] agents`, chosen by the author**, since it stays for
+  old signatures. **The agent's own terminate or logout of its device is refused 403 `agent_device`,
+  chosen by the author**: only its owner ends it.
+- **Core's commands for agents, chosen by the author:** the owner's `CreateAgent {username, display_name,
+  permission_list, admin}`, answered with `Event::AgentCreated {account, username, token, words}`; `Agents`,
+  answered with `Event::Agents {agent_list}`; `UpdateAgent {agent, display_name?, permission_list?,
+  admin?}`; `RenewAgentToken {agent, words}`, answered with `Event::AgentToken {agent,
+  token}`; `RevokeAgentToken {agent, words}`; `DisableAgent {agent, words}`; `AgentProfile {agent, bio?,
+  link_list?}` and `AgentPhoto {agent, jpeg, thumbnail}`. The agent's `LogInAgent {token}`, then `Restore
+  {words}` on `NeedWords` as today; `SendActivity {chat, text, topic?, thread?}`; and `InApp` gains
+  `trouble?` and `text?`.
+- **Core tags a command so its caller learns its outcome, chosen by the author while building
+  keryx-agent:** `Input::Tagged {tag, command}` beside `Input::Command`, whose callers stay as they are,
+  and `Event::Answered {tag, seq?, code?, message?, seconds?}` once everything that command asked the
+  server and the platform is answered: a frame by its `ref`, a REST request, a save or a queued message
+  by its local id, followed through what each answer asks next. Many writes, such as a role change,
+  emit nothing of their own on success, so without it a script could not tell a write taken from one
+  still on its way. A socket that closes answers what waited on it with `offline`, while a queued
+  message waits on by its local id.
+- **Android's activity fold, agent badge, yellow dot and Agents page come after the agent proves itself,
+  chosen by the author**, each drawn first. This build is the server, core, `keryx-agent` and `drive.rs` as
+  the owner.
 - **No agent is run by the keryx server, chosen by the author**, as asked with an `agent.server.create`:
   the server, and a stolen database, could then read every chat it is in. See agent/AGENTS.md.
 - **Anyone may start a direct chat with an agent or add it to a group**, as with any account. The agent's
   wake rules decide whether it acts.
-- **Others see an agent badge, and its owner only once the owner chooses to show it**, hidden by default.
+- **Others see an agent badge and its owner, always, chosen by the author in the Q/A of 2026-11-16**,
+  replacing a switch that hid the owner by default. A reader's core checks an agent's profile against its
+  owner's master key, since the owner's device signs it, so everyone sharing a chat with an agent learns its
+  owner anyway, and hiding it would only pretend.
 - **An agent says what it is doing with `activity` messages, content kind 15, chosen by the author:** each
   step's intention, written for that chat, is one message. **Its rules are a question's, chosen by the
   author:** encrypted and signed, `message.send.activity` under each chat type's prefix, held by member,
@@ -2540,34 +2604,41 @@ store their words. How `keryx-agent` itself works is in [agent/AGENTS.md](agent/
 - **The server side, approved as drafted:**
 
   ```
-  account   + owner_id (NULL for people), show_owner (false), disabled_at
-  agent_token      (account_id PK, hash, created_at)  one per agent
+  account   + owner_id (NULL for people), disabled_at
+  agent_token      (account_id PK, jti BLOB(16), created_at)  one per agent
   agent_permission (account_id, permission)  the ticks
 
   POST /api/v1/agents  agent.create: username, display_name, permission_list (each one the owner holds)
          -> account, token        at most [limits] agents
-  GET  /api/v1/agents  the owner's -> agent_list{id, username, display_name, show_owner, disabled,
-         permission_list, token_at, last_connected_at}
-  PUT  /api/v1/agents/{id}  owner: display_name?, show_owner?, permission_list?
-  POST /api/v1/agents/{id}/token    owner: renew -> token
-  DEL  /api/v1/agents/{id}/token    owner: revoke
-  POST /api/v1/agents/{id}/disable  owner
+  GET  /api/v1/agents  the owner's -> agent_list{id, username, display_name, disabled, admin,
+         permission_list, token_at, last_connected_at, device?}
+  PUT  /api/v1/agents/{id}  owner: display_name?, permission_list?
+  POST /api/v1/agents/{id}/token    owner: renew, statement? -> token
+  DEL  /api/v1/agents/{id}/token    owner: revoke, statement?
+  POST /api/v1/agents/{id}/disable  owner: statement?
+         statement {device, signature}: the agent's device's termination, signed with its words
   POST /api/v1/login/agent  token, device?{id, challenge, signature} -> account, device?, token (a
          session, as /login/token gives, so there is one way in)
-  GET  /api/v1/accounts/{id}  + agent, owner? (when shown)
+  POST /api/v1/challenge  + account, in place of username
+  GET  /api/v1/accounts/{id}  + agent, owner?
   PUT  /api/v1/accounts/{id}/keys  the owner, once, for its agent: what PUT /account/keys takes
-  refusals: not_owner, too_many_agents, not_held (ticking what the owner lacks), agent_disabled
+  refusals: not_owner, too_many_agents, not_held (ticking what the owner lacks), agent_disabled,
+         agents_off
   ```
 
   **An admin agent is an optional `admin: true|false` on the create and update bodies, chosen by the
-  author**, refused with `not_held` unless the owner is admin. An agent cannot log in with a password.
+  author**, refused with `not_held` unless the owner is admin. **As built, open to the author's change:**
+  `agent_list` carries each agent's live `device`, the one a renew, revoke or disable's statement names;
+  the owner's routes need a registered device, as chats do; a disabled agent refuses every owner change
+  with `agent_disabled`; and a presence text is at most 1 KiB sealed, as it lives in memory. An agent cannot log in with a password.
 - **Built in this order, chosen by the author:** first the parts of `keryx-agent` that do not touch the
   server or core (cron, `agent.db`, search, Starlark and the LLM against a fake server), since main's
   `server/` and `core/` were being reworked in another session; then, once main settles, the server and
   core, tested by the server's tests driving core; then the rest of `keryx-agent` with its tests, with `server/examples/drive.rs` as the owner through `agent add
   <username> [--admin] [permission ...]`, which prints the token and words once, `agent list`, `agent
-  perms <username> [permission ...]`, `agent show <username> on|off`, `agent token renew|revoke
-  <username>`, `agent profile <username> [bio] [-- photo.jpg]` and `agent disable <username>`. Android's
+  perms <username> [permission ...]`, `agent token renew|revoke
+  <username> -- <words>`, `agent profile <username> [bio] [-- photo.jpg]` and `agent disable <username> --
+  <words>`, the words after `--` since renew, revoke and disable sign with them. Android's
   Agents page waits until the agent proves itself, and is drawn first when it comes.
 
 ### MCP has four roles
@@ -2607,6 +2678,10 @@ first, as everywhere.
 - **`drive.rs` loses a command sent after it sat idle.** It reads its socket only while a command runs, so
   the server's pings go unanswered and the socket is closed; the next command goes out on the dead socket
   and is lost, though it still prints `saved`. Sending `pump 2000` first works around it.
+- **A commit racing a leave fails instead of being rebuilt.** A member's core builds a commit, such as
+  removing an ended device, wrapping for the members it knows; if someone leaves before it lands, the
+  server refuses its wraps with `not_member` and core reports an error rather than refreshing the members
+  and sending it again. Seen when an agent was renewed and then disabled at once.
 - **A topic's row in the topics list previews only from messages already loaded on the phone.**
 - **A search hit in a thread opens the chat, not the reply inside its thread.**
 
@@ -2624,8 +2699,6 @@ first, as everywhere.
   moderator; the new row's tint clearing once opened or the list is left; the night text colour
   `#C5D4E8`; setting a topic's photo. The author's "back arrow" note from this test is still to be asked
   about.
-- **`make coverage` in `server/` and `core/` has not run since the groups work**, so the coverage tables
-  in their `tests/AGENTS.md` are behind.
 
 **Access**
 

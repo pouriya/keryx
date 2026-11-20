@@ -13,7 +13,8 @@ never in a URL.
 
 A browser logs in with `POST /login`, which sets an `HttpOnly` cookie named `keryx_session`. Anything
 else logs in with `POST /login/token`, which returns a token, and sends it as
-`Authorization: Bearer <token>`.
+`Authorization: Bearer <token>`. An agent logs in with `POST /login/agent`, giving the token its owner
+was shown, and gets the same kind of session token back.
 
 ## Anyone
 
@@ -24,8 +25,9 @@ else logs in with `POST /login/token`, which returns a token, and sends it as
     POST /login                  username, password, captcha?, device?{id, challenge, signature}
                                  -> account, device?
     POST /login/token            the same -> account, device?, token
+    POST /login/agent            token, device?{id, challenge, signature} -> account, device?, token
     POST /setup                  token, password -> account, username
-    POST /challenge              username, purpose -> challenge, account
+    POST /challenge              username or account, purpose -> challenge, account
     POST /password/reset         username, challenge, new_password, signature
 
 `purpose` is `password_reset` or `device_login`. A challenge lasts 5 minutes and works once. A
@@ -34,6 +36,10 @@ device. A reset is signed by the master key, and ends all of the account's sessi
 
 Registering and the one-time link do not log you in.
 
+An agent's token is a JWT naming its account in `sub`, so an agent asks its challenge by `account`. It
+has no password and never logs in with one. A renewed or revoked token is refused with `bad_login`, and
+a disabled agent's with `agent_disabled`. Without an `[agents]` section, agents are off: `agents_off`.
+
 ## Any session
 
     GET  /sessions               -> session_list
@@ -41,7 +47,7 @@ Registering and the one-time link do not log you in.
     PUT  /account/keys           master_public, account_public, account_stamp, invite_public,
                                  invite_stamp -> self_chat
     GET  /accounts/{id}          -> id, username, display_name?, master_public?, account_public?,
-                                    account_stamp?, invite_public?, invite_stamp?
+                                    account_stamp?, invite_public?, invite_stamp?, agent?, owner?
     GET  /devices                -> device_list
     POST /devices/id             -> device
     POST /devices                device, public_key, stamp, platform, os, os_version,
@@ -57,7 +63,10 @@ with the master key, then `POST /devices`. `platform` is 0 for desktop and 1 for
 then belongs to that device, and the device's notice appears in the account's self chat.
 
 `terminate` is signed by the master key, and `logout` by the device's own key. Both end the device for
-good.
+good. An agent's device is ended only by its owner, so both are refused for it with `agent_device`.
+An agent has one device: a second is refused with `device_limit`.
+
+`agent` says the account is an agent, run by keryx-agent, and `owner` names its owner. An agent's username ends in `_agent`, and a person's never does.
 
 ## With a named permission
 
@@ -71,6 +80,30 @@ good.
                                  (account.rename), for yourself -> version. Admin: anyone's, with no
                                  password
     DEL  /accounts/{id}/photo    admin: removes the account's photo
+
+## Your agents, from a registered device
+
+    POST /agents                 agent.create: username, display_name, permission_list, admin?
+                                 -> account, token
+    GET  /agents                 -> agent_list{id, username, display_name?, disabled, admin,
+                                    permission_list, token_at?, last_connected_at?, device?}
+    PUT  /agents/{id}            display_name?, permission_list?, admin?
+    POST /agents/{id}/token      statement?{device, signature} -> token: a new token
+    DEL  /agents/{id}/token      statement?{device, signature}: no token until a renew
+    POST /agents/{id}/disable    statement?{device, signature}
+    PUT  /accounts/{id}/keys     your agent's keys, once, as `PUT /account/keys` takes them
+
+The token is shown once. Making an agent needs `agent.create` even while registration is closed, and
+you may have `[limits] agents` agents that are not disabled, or `too_many_agents`. Each ticked name in
+`permission_list` is a server permission you hold, or `not_held`, and never `agent.create`; `admin`
+needs you to be admin. The agent holds each ticked permission only while you do. Someone else's agent
+is `not_owner`, and a disabled one `agent_disabled`.
+
+A renew, a revoke and disabling end the agent's sessions and its device at once. When it has a device,
+`statement` is that device's termination, signed with the agent's master key over `keryx v1 revoke
+device`, the agent and the device, as `terminate` is: so each needs the agent's words, or
+`bad_signature`. Disabling also takes it out of every group and channel, as leaving does. Its profile
+and photo are yours to set, through the routes below, signed by your own device.
 
 ## With a registered device, under the account's device limit
 
@@ -86,7 +119,8 @@ good.
     PUT  /chats/{id}/draft                {draft?: {epoch, body}}: keeps your sealed draft, or clears it
     POST /chat_folders/id                 -> folder: a new folder's id, yours for 5 minutes
     PUT  /chat_folders                    {folder_list, default}: your whole arrangement of folders
-    PUT  /devices/{id}/presence           this session's device: {in_app} -> presence_list
+    PUT  /devices/{id}/presence           this session's device: {in_app, trouble?, text?}
+                                          -> presence_list
     GET  /accounts/{id}/presence          presence.in_app or presence.connected -> account, state?,
                                           in_app_at?, connected_at?
     GET  /kv?version=                     -> version, and kv_list{key, value} when yours differs
@@ -94,10 +128,10 @@ good.
     GET  /accounts/{id}/profile           yourself, or sharing a chat -> account, username,
                                           display_name?, version, profile?{sealed, signature,
                                           device, device_public, stamp}, photo?
-    PUT  /accounts/{id}/profile           profile.edit, yourself: sealed?, signature?, photo?
-                                          -> version
-    POST /accounts/{id}/photos            profile.edit, yourself: the sealed photo's raw bytes,
-                                          one chunk -> photo
+    PUT  /accounts/{id}/profile           profile.edit, yourself or your agent: sealed?, signature?,
+                                          photo? -> version
+    POST /accounts/{id}/photos            profile.edit, yourself or your agent: the sealed photo's
+                                          raw bytes, one chunk -> photo
     GET  /photos/{id}                     yourself, or sharing a chat -> the sealed bytes
     POST /chats/{id}/files                kind, size, chunks -> file
     PUT  /files/{id}/chunks/{n}           the encrypted chunk's raw bytes -> size, chunks, received
@@ -127,7 +161,8 @@ its stickers are always served, and it cannot be changed, removed or named again
 message, kind 10, holds a tree of questions, and an answer, kind 11, one account's answer to it, both
 sealed like text, so the server reads neither. A suggestion, kind 13, suggests what to do with its chat,
 such as the folder it goes in, and an ack, kind 14, is one account's accepting or declining it. Neither
-can be edited, and an ack moves neither the chat's time nor its preview.
+can be edited, and an ack moves neither the chat's time nor its preview. An activity, kind 15, is one
+step an agent says it is taking, `{"text"}` of 1 to 140 characters, and cannot be edited either.
 
 ## The WebSocket
 
@@ -180,11 +215,14 @@ first page of `chats` carries yours in `chat_folders`. A change you may not make
 more than `folders` folders `too_many_folders`, an id neither yours nor issued to you
 `unknown_folder`, a sealed name over its limit `body_too_large`, and a broken shape `bad_body`; any
 of them refuses the whole arrangement.
-`presence` carries `in_app`, whether your app is on screen. Like `typing`, it is an event with no `ref`,
+`presence` carries `in_app`, whether your app is on screen, and may carry `trouble`, true while the
+device is having trouble, and `text`, sealed under your profile key, at most 1 KiB. Like `typing`, it is an event with no `ref`,
 and nothing answers it. Until a connection sends one, its device is not there to anyone. After the first,
 you get one `presence` per person sharing a chat with you. Send another on every open and close. Each
-`presence` is one account: `state` (`online`, `call`, `away` or `offline`) and `in_app_at` under
-`presence.in_app`, `connected_at` under `presence.connected`, the server merging its devices. Whenever it changes, everyone sharing a chat gets it
+`presence` is one account: `state` (`online`, `call`, `trouble`, `away` or `offline`), `in_app_at` and
+`text?` under `presence.in_app`, `connected_at` under `presence.connected`, the server merging its
+devices. An agent's `text` goes to its owner alone. `trouble` and `text` are kept only while the
+connection lasts, so send them again after reconnecting. Whenever it changes, everyone sharing a chat gets it
 on their devices that sent theirs, and so does each person of a direct chat when it is made. `presence_of` carries `account`, anyone's, and is answered with
 `presence_of` and `presence`, once.
 `kv` carries `version?` and is answered with `kv`: `version`, and `kv_list`, your whole set, when yours

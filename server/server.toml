@@ -24,6 +24,11 @@ path = "/var/lib/keryx/keryx.db"
 # [operator]
 # token = "..."
 
+# The secret agents' tokens are signed with, at least 32 characters. Whoever reads it can make an
+# agent's token, and changing it ends every agent's token. Unset: no agents.
+# [agents]
+# secret = "..."
+
 [registration]
 # Whether people may sign up themselves. Off: only `keryx user add` makes accounts.
 allow = false
@@ -73,6 +78,7 @@ group_members = 200       # a group's member accounts
 channel_members = 1000    # a channel's member accounts
 topics = 100              # a group's or channel's topics, General not counted
 invitation_lifetime = "30d" # an invitation or a join request waits this long, then goes
+agents = 5                # one owner's agents, disabled ones not counted
 
 [limits.body]             # one message's body. A file's bytes upload separately
 text = "64KiB"
@@ -90,6 +96,7 @@ answer = "16KiB"
 sticker = "1KiB"
 suggestion = "4KiB"
 ack = "1KiB"
+activity = "1KiB"         # one step of an agent's intention, for one chat
 draft = "64KiB"            # an account's sealed draft in one chat. Not a message
 folder_name = "256B"      # one sealed folder name
 kv_value = "4KiB"         # one setting's value, sealed or not as its client decides

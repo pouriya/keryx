@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use keryx_core::protocol::{
-    AccountBrief, ActionKind, Audience, Bytes, CallEvent, CallEventKind, ChatAction, ChatDevice,
-    ChatEvent, ChatFolders, ChatItem, ChatOptions, ChatProfileItem, ChatRole, ChatType,
+    AccountBrief, ActionKind, AgentItem, Audience, Bytes, CallEvent, CallEventKind, ChatAction,
+    ChatDevice, ChatEvent, ChatFolders, ChatItem, ChatOptions, ChatProfileItem, ChatRole, ChatType,
     ContentKind, DeviceItem, DeviceLogItem, DraftItem, FindableItem, FolderItem, FoundChat,
     GENERAL_TOPIC, InvitationItem, KeyPackageItem, Kind, KvChange, KvItem, KvReply, LineAction,
     LineBody, MarkItem, MessageFrame, PlaceSeen, ProfileKeyItem, ProfileReply, RequestItem,
@@ -24,13 +24,14 @@ use rusqlite::types::Type;
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
 use super::{
-    Account, Answered, Appended, Asked, BuiltInRole, ChatAccess, ChatProfileSaved, DeviceKey,
-    DeviceUsage, Error, GroupInfoPut, KvChanged, Left, MessageBrief, NamesSaved, NewAccount,
-    NewAccountKeys, NewChatOptions, NewChatProfile, NewDevice, NewFile, NewGroup, NewGroupStart,
-    NewInvitation, NewMessage, NewNames, NewPhoto, NewProfile, NewSession, NewSticker,
-    NewTopicOptions, NewTopicProfile, NewWrap, Place, Position, PositionReport, PresenceTimes,
-    ProfileSaved, Registered, Removed, Result, RoleSet, Session, SetupLink, Storage, StoredFile,
-    SyncFrom, SyncPage, TimesShown, TopicAccess, TopicMods, TopicSaved, TopicsPut,
+    Account, AgentChange, AgentCreated, Answered, Appended, Asked, BuiltInRole, ChatAccess,
+    ChatProfileSaved, DeviceKey, DeviceUsage, Error, GroupInfoPut, KvChanged, Left, MessageBrief,
+    NamesSaved, NewAccount, NewAccountKeys, NewAgent, NewChatOptions, NewChatProfile, NewDevice,
+    NewFile, NewGroup, NewGroupStart, NewInvitation, NewMessage, NewNames, NewPhoto, NewProfile,
+    NewSession, NewSticker, NewTopicOptions, NewTopicProfile, NewWrap, Place, Position,
+    PositionReport, PresenceTimes, ProfileSaved, Registered, Removed, Result, RoleSet, Session,
+    SetupLink, Storage, StoredFile, SyncFrom, SyncPage, TimesShown, TopicAccess, TopicMods,
+    TopicSaved, TopicsPut,
 };
 
 /// How long a connection waits for a lock another process holds, such as a backup.
@@ -1082,6 +1083,8 @@ fn account_row(row: &Row<'_>) -> rusqlite::Result<Account> {
         profile_version: unsigned(row.get(7)?),
         invite_public: row.get(8)?,
         invite_stamp: row.get(9)?,
+        owner: row.get::<_, Option<[u8; 16]>>(10)?.map(Ulid::from_bytes),
+        disabled: row.get::<_, Option<i64>>(11)?.is_some(),
     })
 }
 
@@ -1140,6 +1143,12 @@ fn usage(
         params![account.bytes()],
         |row| row.get(0),
     )?;
+    if agent_of(connection, *account)?.is_some() {
+        return Ok(DeviceUsage {
+            count: unsigned(count),
+            limit: Some(1),
+        });
+    }
     let by_role: Option<i64> = connection.query_row(
         "SELECT MAX(r.max_devices) FROM account_role a JOIN role r ON r.id = a.role_id
          WHERE a.account_id = ?1",
@@ -1153,6 +1162,78 @@ fn usage(
             None => configured_limit,
         },
     })
+}
+
+/// An agent's ticked server permissions, written fresh.
+fn put_ticks(
+    connection: &Connection,
+    agent: Ulid,
+    permission_list: &[String],
+) -> rusqlite::Result<()> {
+    for permission in permission_list {
+        connection.execute(
+            "INSERT OR IGNORE INTO agent_permission (account_id, permission) VALUES (?1, ?2)",
+            params![agent.bytes(), permission],
+        )?;
+    }
+    Ok(())
+}
+
+/// Whether an account holds the built-in server admin role. An agent holds it only while it runs and
+/// its owner holds it too.
+fn admin_now(connection: &Connection, account: Ulid) -> rusqlite::Result<bool> {
+    if !admin_held(connection, account)? {
+        return Ok(false);
+    }
+    match agent_of(connection, account)? {
+        None => Ok(true),
+        Some((_, true)) => Ok(false),
+        Some((owner, false)) => admin_held(connection, owner),
+    }
+}
+
+fn admin_held(connection: &Connection, account: Ulid) -> rusqlite::Result<bool> {
+    connection.query_row(
+        "SELECT EXISTS (
+             SELECT 1 FROM account_role a JOIN role r ON r.id = a.role_id
+             WHERE a.account_id = ?1 AND r.scope = 0 AND r.built_in = 1 AND r.name = 'admin'
+         )",
+        params![account.bytes()],
+        |row| row.get(0),
+    )
+}
+
+/// An agent's owner and whether it is disabled, or `None` for a person.
+fn agent_of(connection: &Connection, account: Ulid) -> rusqlite::Result<Option<(Ulid, bool)>> {
+    let row: Option<(Option<[u8; 16]>, Option<i64>)> = connection
+        .query_row(
+            "SELECT owner_id, disabled_at FROM account WHERE id = ?1",
+            params![account.bytes()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    Ok(match row {
+        Some((Some(owner), disabled_at)) => Some((Ulid::from_bytes(owner), disabled_at.is_some())),
+        _ => None,
+    })
+}
+
+/// A person's server permission through their roles. The admin role holds them all.
+fn person_permitted(
+    connection: &Connection,
+    account: Ulid,
+    permission: &str,
+) -> rusqlite::Result<bool> {
+    connection.query_row(
+        "SELECT EXISTS (
+             SELECT 1 FROM account_role a JOIN role r ON r.id = a.role_id
+             LEFT JOIN role_permission p ON p.role_id = r.id AND p.permission = ?2
+             WHERE a.account_id = ?1
+             AND ((r.built_in = 1 AND r.name = 'admin') OR p.permission IS NOT NULL)
+         )",
+        params![account.bytes(), permission],
+        |row| row.get(0),
+    )
 }
 
 impl Storage for Sqlite {
@@ -1249,7 +1330,7 @@ impl Storage for Sqlite {
                 .query_row(
                     "SELECT id, username, display_name, password_hash, master_public_key,
                      account_public_key, account_key_stamp, profile_version, invite_public_key,
-                     invite_key_stamp
+                     invite_key_stamp, owner_id, disabled_at
                      FROM account WHERE username = ?1",
                     params![username],
                     account_row,
@@ -1265,12 +1346,188 @@ impl Storage for Sqlite {
                 .query_row(
                     "SELECT id, username, display_name, password_hash, master_public_key,
                      account_public_key, account_key_stamp, profile_version, invite_public_key,
-                     invite_key_stamp
+                     invite_key_stamp, owner_id, disabled_at
                      FROM account WHERE id = ?1",
                     params![id.bytes()],
                     account_row,
                 )
                 .optional()
+        })
+        .await
+    }
+
+    async fn create_agent(&self, agent: NewAgent) -> Result<AgentCreated> {
+        self.write(move |connection| {
+            let taken: bool = connection.query_row(
+                "SELECT EXISTS (SELECT 1 FROM account WHERE username = ?1)",
+                params![agent.username],
+                |row| row.get(0),
+            )?;
+            if taken {
+                return Ok(AgentCreated::UsernameTaken);
+            }
+            let running: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM account WHERE owner_id = ?1 AND disabled_at IS NULL",
+                params![agent.owner.bytes()],
+                |row| row.get(0),
+            )?;
+            if unsigned(running) >= agent.limit {
+                return Ok(AgentCreated::TooMany);
+            }
+            connection.execute(
+                "INSERT INTO account (id, username, display_name, owner_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    agent.id.bytes(),
+                    agent.username,
+                    agent.display_name,
+                    agent.owner.bytes(),
+                    agent.now
+                ],
+            )?;
+            if agent.admin {
+                connection.execute(
+                    "INSERT INTO account_role (account_id, role_id)
+                     SELECT ?1, id FROM role WHERE scope = 0 AND built_in = 1 AND name = 'admin'",
+                    params![agent.id.bytes()],
+                )?;
+            }
+            put_ticks(connection, agent.id, &agent.permission_list)?;
+            connection.execute(
+                "INSERT INTO agent_token (account_id, jti, created_at) VALUES (?1, ?2, ?3)",
+                params![agent.id.bytes(), agent.jti, agent.now],
+            )?;
+            connection.execute(
+                "INSERT INTO folder (id, account_id, place, name, chats, pins, is_default)
+                 VALUES (?1, ?2, 0, NULL, NULL, x'', 1)",
+                params![agent.all_folder.bytes(), agent.id.bytes()],
+            )?;
+            Ok(AgentCreated::Saved)
+        })
+        .await
+    }
+
+    async fn agents(&self, owner: Ulid) -> Result<Vec<AgentItem>> {
+        self.read(move |connection| {
+            let mut statement = connection.prepare(
+                "SELECT a.id, a.username, a.display_name, a.disabled_at, t.created_at,
+                 (SELECT MAX(last_connected_at) FROM device WHERE account_id = a.id),
+                 (SELECT id FROM device WHERE account_id = a.id AND terminated_at IS NULL)
+                 FROM account a LEFT JOIN agent_token t ON t.account_id = a.id
+                 WHERE a.owner_id = ?1 ORDER BY a.username",
+            )?;
+            let rows = statement.query_map(params![owner.bytes()], |row| {
+                Ok(AgentItem {
+                    id: Ulid::from_bytes(row.get(0)?),
+                    username: row.get(1)?,
+                    display_name: row.get(2)?,
+                    disabled: row.get::<_, Option<i64>>(3)?.is_some(),
+                    admin: false,
+                    permission_list: Vec::new(),
+                    token_at: row.get(4)?,
+                    last_connected_at: row.get(5)?,
+                    device: row.get::<_, Option<[u8; 16]>>(6)?.map(Ulid::from_bytes),
+                })
+            })?;
+            let mut agent_list = Vec::new();
+            for row in rows {
+                agent_list.push(row?);
+            }
+            let mut ticks = connection.prepare(
+                "SELECT permission FROM agent_permission WHERE account_id = ?1 ORDER BY permission",
+            )?;
+            for agent in &mut agent_list {
+                agent.admin = admin_held(connection, agent.id)?;
+                for name in ticks.query_map(params![agent.id.bytes()], |row| row.get(0))? {
+                    agent.permission_list.push(name?);
+                }
+            }
+            Ok(agent_list)
+        })
+        .await
+    }
+
+    async fn change_agent(&self, agent: Ulid, change: AgentChange) -> Result<()> {
+        self.write(move |connection| {
+            if let Some(permission_list) = &change.permission_list {
+                connection.execute(
+                    "DELETE FROM agent_permission WHERE account_id = ?1",
+                    params![agent.bytes()],
+                )?;
+                put_ticks(connection, agent, permission_list)?;
+            }
+            if let Some(admin) = change.admin {
+                connection.execute(
+                    "DELETE FROM account_role WHERE account_id = ?1",
+                    params![agent.bytes()],
+                )?;
+                if admin {
+                    connection.execute(
+                        "INSERT INTO account_role (account_id, role_id)
+                         SELECT ?1, id FROM role
+                         WHERE scope = 0 AND built_in = 1 AND name = 'admin'",
+                        params![agent.bytes()],
+                    )?;
+                }
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    async fn agent_jti(&self, agent: Ulid) -> Result<Option<[u8; 16]>> {
+        self.read(move |connection| {
+            connection
+                .query_row(
+                    "SELECT t.jti FROM agent_token t JOIN account a ON a.id = t.account_id
+                     WHERE t.account_id = ?1 AND a.disabled_at IS NULL",
+                    params![agent.bytes()],
+                    |row| row.get(0),
+                )
+                .optional()
+        })
+        .await
+    }
+
+    async fn end_agent_token(
+        &self,
+        agent: Ulid,
+        jti: Option<[u8; 16]>,
+        disable: bool,
+        now: i64,
+    ) -> Result<Vec<Ulid>> {
+        self.write(move |connection| {
+            connection.execute(
+                "DELETE FROM agent_token WHERE account_id = ?1",
+                params![agent.bytes()],
+            )?;
+            if let Some(jti) = jti {
+                connection.execute(
+                    "INSERT INTO agent_token (account_id, jti, created_at) VALUES (?1, ?2, ?3)",
+                    params![agent.bytes(), jti, now],
+                )?;
+            }
+            connection.execute(
+                "DELETE FROM login_session WHERE account_id = ?1",
+                params![agent.bytes()],
+            )?;
+            if !disable {
+                return Ok(Vec::new());
+            }
+            connection.execute(
+                "UPDATE account SET disabled_at = ?2 WHERE id = ?1 AND disabled_at IS NULL",
+                params![agent.bytes(), now],
+            )?;
+            let mut statement = connection.prepare(
+                "SELECT m.conversation_id FROM member m
+                 JOIN conversation c ON c.id = m.conversation_id
+                 WHERE m.account_id = ?1 AND m.removed_seq IS NULL AND c.type IN (2, 3)",
+            )?;
+            let mut chat_list = Vec::new();
+            for chat in statement.query_map(params![agent.bytes()], |row| row.get(0))? {
+                chat_list.push(Ulid::from_bytes(chat?));
+            }
+            Ok(chat_list)
         })
         .await
     }
@@ -1582,42 +1839,39 @@ impl Storage for Sqlite {
     }
 
     async fn is_admin(&self, account: Ulid) -> Result<bool> {
-        self.read(move |connection| {
-            connection.query_row(
-                "SELECT EXISTS (
-                     SELECT 1 FROM account_role a JOIN role r ON r.id = a.role_id
-                     WHERE a.account_id = ?1 AND r.scope = 0 AND r.built_in = 1 AND r.name = 'admin'
-                 )",
-                params![account.bytes()],
-                |row| row.get(0),
-            )
-        })
-        .await
+        self.read(move |connection| admin_now(connection, account))
+            .await
     }
 
     async fn server_permitted(&self, account: Ulid, permission: &'static str) -> Result<bool> {
         self.read(move |connection| {
-            connection.query_row(
-                "SELECT EXISTS (
-                     SELECT 1 FROM account_role a JOIN role r ON r.id = a.role_id
-                     LEFT JOIN role_permission p ON p.role_id = r.id AND p.permission = ?2
-                     WHERE a.account_id = ?1
-                     AND ((r.built_in = 1 AND r.name = 'admin') OR p.permission IS NOT NULL)
-                 )",
+            let Some((owner, disabled)) = agent_of(connection, account)? else {
+                return person_permitted(connection, account, permission);
+            };
+            if disabled || permission == "agent.create" {
+                return Ok(false);
+            }
+            if admin_now(connection, account)? {
+                return Ok(true);
+            }
+            let ticked: bool = connection.query_row(
+                "SELECT EXISTS (SELECT 1 FROM agent_permission
+                 WHERE account_id = ?1 AND permission = ?2)",
                 params![account.bytes(), permission],
                 |row| row.get(0),
-            )
+            )?;
+            Ok(ticked && person_permitted(connection, owner, permission)?)
         })
         .await
     }
 
     async fn chat_permitted(&self, chat: Ulid, account: Ulid, permission: String) -> Result<bool> {
         self.read(move |connection| {
+            if admin_now(connection, account)? {
+                return Ok(true);
+            }
             connection.query_row(
                 "SELECT EXISTS (
-                     SELECT 1 FROM account_role a JOIN role r ON r.id = a.role_id
-                     WHERE a.account_id = ?2 AND r.scope = 0 AND r.built_in = 1 AND r.name = 'admin'
-                 ) OR EXISTS (
                      SELECT 1 FROM member m
                      JOIN role r ON r.scope = 1 AND r.built_in = 1 AND r.name = 'owner'
                      JOIN role_permission p ON p.role_id = r.id AND p.permission = ?3

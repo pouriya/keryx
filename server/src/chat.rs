@@ -65,6 +65,21 @@ struct Connection {
     /// `None` until the device sends its first `presence`, XMPP's way: until then it is not there
     /// to anyone. Then whether its app is open.
     in_app: Option<bool>,
+    /// Whether the device said it is having trouble, and its sealed text. Kept here only, never on
+    /// disk, and gone with the connection.
+    trouble: bool,
+    text: Option<Vec<u8>>,
+}
+
+/// One connection's own state, before its account's devices are merged: having trouble ranks over
+/// online, and only a call over it.
+fn connection_state(connection: &Connection) -> PresenceState {
+    match connection.in_app {
+        None => PresenceState::Offline,
+        Some(_) if connection.trouble => PresenceState::Trouble,
+        Some(true) => PresenceState::Online,
+        Some(false) => PresenceState::Away,
+    }
 }
 
 struct ChatTask {
@@ -160,6 +175,8 @@ impl Hub {
             outgoing,
             kill,
             in_app: None,
+            trouble: false,
+            text: None,
         };
         match devices.insert(device, connection) {
             Some(old) => {
@@ -190,10 +207,34 @@ impl Hub {
 
     /// The device's connection announces itself, or its app opened or closed. `None` if it has no
     /// connection; otherwise what it had announced before, `None` for its first.
-    pub fn announce(&self, account: Ulid, device: Ulid, in_app: bool) -> Option<Option<bool>> {
+    pub fn announce(
+        &self,
+        account: Ulid,
+        device: Ulid,
+        in_app: bool,
+        trouble: bool,
+        text: Option<Vec<u8>>,
+    ) -> Option<Option<bool>> {
         let mut connections = locked(&self.connections);
         let connection = connections.get_mut(&account)?.get_mut(&device)?;
+        connection.trouble = trouble;
+        connection.text = text;
         Some(connection.in_app.replace(in_app))
+    }
+
+    /// The sealed presence text of the account's best-placed announced connection that has one.
+    pub fn presence_text(&self, account: Ulid) -> Option<Vec<u8>> {
+        let connections = locked(&self.connections);
+        connections
+            .get(&account)?
+            .values()
+            .filter(|connection| connection.in_app.is_some())
+            .filter_map(|connection| {
+                let text = connection.text.clone()?;
+                Some((connection_state(connection), text))
+            })
+            .max_by_key(|(state, _)| *state)
+            .map(|(_, text)| text)
     }
 
     /// Whether any of this account's connections has announced itself, so it gets presence.
@@ -207,7 +248,8 @@ impl Hub {
         }
     }
 
-    /// Where an account is now, its devices merged: in a call over in the app over connected with
+    /// Where an account is now, its devices merged: in a call over having trouble over in the app over
+    /// connected with
     /// the app in the background. A connection that has not announced itself counts for nothing.
     pub fn presence_state(&self, account: Ulid) -> PresenceState {
         if locked(&self.calls)
@@ -222,11 +264,7 @@ impl Hub {
         };
         devices
             .values()
-            .map(|connection| match connection.in_app {
-                Some(true) => PresenceState::Online,
-                Some(false) => PresenceState::Away,
-                None => PresenceState::Offline,
-            })
+            .map(connection_state)
             .max()
             .unwrap_or(PresenceState::Offline)
     }
@@ -1060,6 +1098,9 @@ async fn run_send(
                 }
                 if content_kind == ContentKind::Ack {
                     return Err(refused(409, "cannot_edit", "An ack cannot be edited"));
+                }
+                if content_kind == ContentKind::Activity {
+                    return Err(refused(409, "cannot_edit", "An activity cannot be edited"));
                 }
                 body_limit = Some(app.settings.limits.body.of(content_kind));
             } else {

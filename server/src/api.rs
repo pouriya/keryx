@@ -31,25 +31,28 @@ use axum::routing::{any, delete, get, post, put};
 use axum_server::accept::Accept;
 use axum_server::tls_rustls::{RustlsAcceptor, RustlsConfig};
 use base64ct::{Base64UrlUnpadded, Encoding};
+use hmac::{Hmac, KeyInit, Mac};
 use keryx_core::mls::{
     verify_account_key, verify_device_login, verify_device_stamp, verify_invite, verify_invite_key,
     verify_logout, verify_password_reset, verify_revocation,
 };
 use keryx_core::protocol::{
-    AccountInfo, AccountKeysBody, AccountListReply, AccountReply, Audience, Bytes, ChallengeBody,
-    ChallengeReply, ChatAction, ChatDeviceListReply, ChatEvent, ChatFolders, ChatOptions,
-    ChatProfileBody, ChatProfileItem, ChatReply, ChatRole, ChatType, ClaimBody, ClientFrame,
-    ContentKind, CountReply, CreateAccountBody, CreateChatBody, CreateFileBody, CreatePackBody,
-    CreatedAccountReply, DeviceListReply, DeviceReply, DevicesReply, DraftBody, DraftRequest,
-    EmptyReply, FeaturesReply, FileReply, FileStatusReply, FindableBody, FindableItem, FolderReply,
-    GENERAL_TOPIC, GroupInfoReply, InvitationItem, InviteAnswerBody, InviteBody,
-    KeyPackageListReply, KeyPackagesBody, KvChange, KvReply, LoginBody, LoginReply, MemberItem,
-    MemberListReply, NamesBody, PackReply, PhotoReply, PresenceBody, PresenceItem,
-    PresenceListReply, ProfileReply, PutProfileBody, ReducedDeviceItem, ReducedDeviceListReply,
-    RegisterBody, RegisterDeviceBody, RequestBody, RequestItem, RequestListReply, RequestState,
-    ResetBody, RoleBody, SelfChatReply, ServerFrame, SessionListReply, SetupBody, SetupReply,
-    SignedBody, StickerItem, StickerListReply, StickerReply, TimesReply, TopicItem,
-    TopicOptionsBody, TopicReply, TopicsBody, VersionReply, WrapListReply,
+    AccountInfo, AccountKeysBody, AccountListReply, AccountReply, AgentClaims, AgentEndBody,
+    AgentListReply, AgentLoginBody, AgentStatement, AgentTokenReply, Audience, Bytes,
+    ChallengeBody, ChallengeReply, ChatAction, ChatDeviceListReply, ChatEvent, ChatFolders,
+    ChatOptions, ChatProfileBody, ChatProfileItem, ChatReply, ChatRole, ChatType, ClaimBody,
+    ClientFrame, ContentKind, CountReply, CreateAccountBody, CreateAgentBody, CreateChatBody,
+    CreateFileBody, CreatePackBody, CreatedAccountReply, CreatedAgentReply, DeviceListReply,
+    DeviceProof, DeviceReply, DevicesReply, DraftBody, DraftRequest, EmptyReply, FeaturesReply,
+    FileReply, FileStatusReply, FindableBody, FindableItem, FolderReply, GENERAL_TOPIC,
+    GroupInfoReply, InvitationItem, InviteAnswerBody, InviteBody, KeyPackageListReply,
+    KeyPackagesBody, KvChange, KvReply, LoginBody, LoginReply, MemberItem, MemberListReply,
+    NamesBody, PackReply, PhotoReply, PresenceBody, PresenceItem, PresenceListReply, ProfileReply,
+    PutProfileBody, ReducedDeviceItem, ReducedDeviceListReply, RegisterBody, RegisterDeviceBody,
+    RequestBody, RequestItem, RequestListReply, RequestState, ResetBody, RoleBody, SelfChatReply,
+    ServerFrame, SessionListReply, SetupBody, SetupReply, SignedBody, StickerItem,
+    StickerListReply, StickerReply, TimesReply, TopicItem, TopicOptionsBody, TopicReply,
+    TopicsBody, UpdateAgentBody, VersionReply, WrapListReply,
 };
 use keryx_core::ulid::Ulid;
 use serde::de::DeserializeOwned;
@@ -72,11 +75,12 @@ use crate::file;
 use crate::moq;
 use crate::storage::sqlite::Sqlite;
 use crate::storage::{
-    self, Answered, Asked, BuiltInRole, ChatAccess, ChatProfileSaved, KvChanged, Left, NamesSaved,
-    NewAccount, NewAccountKeys, NewChatOptions, NewChatProfile, NewDevice, NewFile, NewGroup,
-    NewInvitation, NewNames, NewPhoto, NewProfile, NewSession, NewSticker, NewTopicOptions,
-    NewTopicProfile, ProfileSaved, Registered, Removed, RoleSet, Session, Storage, StoredFile,
-    SyncFrom, TimesShown, TopicAccess, TopicSaved, TopicsPut,
+    self, AgentChange, AgentCreated, Answered, Asked, BuiltInRole, ChatAccess, ChatProfileSaved,
+    KvChanged, Left, NamesSaved, NewAccount, NewAccountKeys, NewAgent, NewChatOptions,
+    NewChatProfile, NewDevice, NewFile, NewGroup, NewInvitation, NewNames, NewPhoto, NewProfile,
+    NewSession, NewSticker, NewTopicOptions, NewTopicProfile, ProfileSaved, Registered, Removed,
+    RoleSet, Session, Storage, StoredFile, SyncFrom, TimesShown, TopicAccess, TopicSaved,
+    TopicsPut,
 };
 
 pub const DIRECT_CREATE: &str = "direct.create";
@@ -96,6 +100,7 @@ pub const FOLDER_CHATS: &str = "folder.chats";
 pub const CHAT_PIN: &str = "chat.pin";
 pub const PRESENCE_IN_APP: &str = "presence.in_app";
 pub const PRESENCE_CONNECTED: &str = "presence.connected";
+pub const AGENT_CREATE: &str = "agent.create";
 
 /// The server-wide permission names, which server roles hold.
 const SERVER_PERMISSION_LIST: &[&str] = &[
@@ -116,6 +121,7 @@ const SERVER_PERMISSION_LIST: &[&str] = &[
     CHAT_PIN,
     PRESENCE_IN_APP,
     PRESENCE_CONNECTED,
+    AGENT_CREATE,
 ];
 
 /// Server names the built-in admin alone holds.
@@ -163,6 +169,7 @@ const CHAT_PERMISSION_LIST: &[&str] = &[
     "message.send.sticker",
     "message.send.suggestion",
     "message.send.ack",
+    "message.send.activity",
     SEND_UNENCRYPTED,
     MESSAGE_COMMIT,
     EDIT_OWN,
@@ -274,6 +281,7 @@ pub fn send_permission(content_kind: ContentKind) -> &'static str {
         ContentKind::Sticker => "message.send.sticker",
         ContentKind::Suggestion => "message.send.suggestion",
         ContentKind::Ack => "message.send.ack",
+        ContentKind::Activity => "message.send.activity",
     }
 }
 
@@ -302,6 +310,16 @@ const DEVICE_LOG_GRACE_MS: i64 = 60 * 1000;
 const SHUTDOWN_CONNECTIONS: Duration = Duration::from_secs(6);
 const SHUTDOWN_CHATS: Duration = Duration::from_secs(2);
 
+/// The most a sealed presence text may be: 140 characters of up to 4 bytes each, sealed, with room to
+/// spare. It is kept in memory beside the connection, so it is held small.
+const PRESENCE_TEXT_BYTES: usize = 1024;
+
+/// An agent's username ends in this, and a person's never does.
+const AGENT_SUFFIX: &str = "_agent";
+
+/// Every agent token's header, so a token naming another algorithm is refused.
+const JWT_HEADER: &[u8] = br#"{"alg":"HS256","typ":"JWT"}"#;
+
 /// How many frames of one connection may wait to be handled.
 const REQUEST_QUEUE: usize = 64;
 
@@ -316,6 +334,7 @@ pub struct Settings {
     pub max_devices: Option<u64>,
     pub database: DatabaseSettings,
     pub operator: Option<OperatorSettings>,
+    pub agents: Option<AgentSettings>,
     #[serde(default)]
     pub registration: RegistrationSettings,
     #[serde(default)]
@@ -361,6 +380,12 @@ pub struct DatabaseSettings {
 #[derive(Deserialize)]
 pub struct OperatorSettings {
     pub token: String,
+}
+
+/// `[agents]`: the secret agents' tokens are signed with. Unset, agents are off.
+#[derive(Deserialize)]
+pub struct AgentSettings {
+    pub secret: String,
 }
 
 #[derive(Deserialize)]
@@ -459,6 +484,8 @@ pub struct Limits {
     pub topics: u64,
     /// Seconds an invitation or a join request waits before it goes.
     pub invitation_lifetime: u64,
+    /// The agents one owner may have, disabled ones not counted.
+    pub agents: u64,
     pub body: BodyLimits,
     pub upload: UploadLimits,
 }
@@ -482,6 +509,7 @@ impl Default for Limits {
             channel_members: 1000,
             topics: 100,
             invitation_lifetime: 30 * 24 * 60 * 60,
+            agents: 5,
             body: BodyLimits::default(),
             upload: UploadLimits::default(),
         }
@@ -506,6 +534,8 @@ pub struct BodyLimits {
     pub sticker: u64,
     pub suggestion: u64,
     pub ack: u64,
+    /// One step's intention, an agent's activity.
+    pub activity: u64,
     /// An account's sealed draft in one chat, which is not a message.
     pub draft: u64,
     /// One sealed folder name.
@@ -532,6 +562,7 @@ impl Default for BodyLimits {
             sticker: 1024,
             suggestion: 4 * 1024,
             ack: 1024,
+            activity: 1024,
             draft: 64 * 1024,
             folder_name: 256,
             kv_value: 4 * 1024,
@@ -557,6 +588,7 @@ impl BodyLimits {
             ContentKind::Sticker => self.sticker,
             ContentKind::Suggestion => self.suggestion,
             ContentKind::Ack => self.ack,
+            ContentKind::Activity => self.activity,
         }
     }
 }
@@ -941,8 +973,10 @@ fn stored_key<const N: usize>(bytes: &[u8]) -> Result<[u8; N], Refused> {
     }
 }
 
-fn check_username(username: &str, min_length: Option<usize>) -> Result<(), Refused> {
-    let mut valid = !username.is_empty();
+/// An agent's username ends in `_agent`, and a person's never does, chosen by the author, so a name
+/// always tells whether an account is an agent.
+fn check_username(username: &str, min_length: Option<usize>, agent: bool) -> Result<(), Refused> {
+    let mut valid = !username.is_empty() && username.ends_with(AGENT_SUFFIX) == agent;
     for (index, character) in username.chars().enumerate() {
         let allowed = character.is_ascii_lowercase()
             || character == '_'
@@ -1026,6 +1060,7 @@ pub async fn run_register(
     check_username(
         &input.username,
         Some(app.settings.registration.username_min_length),
+        false,
     )?;
     check_password(app, &input.password)?;
     let id = new_id()?;
@@ -1056,7 +1091,7 @@ pub async fn run_create_account(
     input: CreateAccountBody,
 ) -> Result<CreatedAccountReply, Refused> {
     check(app, caller, Need::Server(ACCOUNT_CREATE)).await?;
-    check_username(&input.username, None)?;
+    check_username(&input.username, None, false)?;
     let id = new_id()?;
     let (token, token_hash) = new_token()?;
     let now = Ulid::now();
@@ -1154,14 +1189,23 @@ pub async fn run_login(
     if !matches!(verified, Ok(true)) {
         return Err(wrong);
     }
+    start_session(app, account.id, input.device).await
+}
+
+/// A session for an account whose credentials held, on the returning device it proved, if any.
+async fn start_session(
+    app: &App,
+    account: Ulid,
+    proof: Option<DeviceProof>,
+) -> Result<(LoginReply, String), Refused> {
     let now = Ulid::now();
     let mut device = None;
-    if let Some(proof) = input.device {
+    if let Some(proof) = proof {
         let refused_proof = refused(403, "bad_device_proof", "That device could not be proven");
         let Some(key) = app.storage.device_key(proof.id).await? else {
             return Err(refused_proof);
         };
-        if key.account != account.id {
+        if key.account != account {
             return Err(refused_proof);
         }
         if key.ended {
@@ -1171,13 +1215,13 @@ pub async fn run_login(
         let signature: [u8; 64] = fixed(&proof.signature, "signature")?;
         if !app
             .storage
-            .take_challenge(challenge.to_vec(), account.id, PURPOSE_DEVICE_LOGIN, now)
+            .take_challenge(challenge.to_vec(), account, PURPOSE_DEVICE_LOGIN, now)
             .await?
         {
             return Err(refused_proof);
         }
         let public: [u8; 32] = stored_key(&key.public_key)?;
-        if verify_device_login(&public, &account.id, &proof.id, &challenge, &signature).is_err() {
+        if verify_device_login(&public, &account, &proof.id, &challenge, &signature).is_err() {
             return Err(refused_proof);
         }
         device = Some(proof.id);
@@ -1187,14 +1231,14 @@ pub async fn run_login(
         .create_session(NewSession {
             id: new_id()?,
             token_hash,
-            account: account.id,
+            account,
             device,
             now,
             expires_at: now.saturating_add(millis(app.settings.session.lifetime)),
         })
         .await?;
     let reply = LoginReply {
-        account: account.id,
+        account,
         device,
         token: None,
     };
@@ -1218,7 +1262,19 @@ pub async fn run_challenge(
             ));
         }
     };
-    let Some(account) = app.storage.account_by_username(input.username).await? else {
+    // By username, or by account, which an agent reads from its token, chosen by the author.
+    let found = match (input.username, input.account) {
+        (Some(username), None) => app.storage.account_by_username(username).await?,
+        (None, Some(account)) => app.storage.account_by_id(account).await?,
+        _ => {
+            return Err(refused(
+                400,
+                "bad_body",
+                "A challenge names a username or an account",
+            ));
+        }
+    };
+    let Some(account) = found else {
         return Err(refused(
             404,
             "no_such_account",
@@ -1320,13 +1376,33 @@ pub async fn run_account_keys(
 ) -> Result<SelfChatReply, Refused> {
     check(app, caller, Need::Session).await?;
     let session = caller.session()?;
+    save_account_keys(app, session.account, input).await
+}
+
+/// `PUT /api/v1/accounts/{id}/keys`: the owner publishes its agent's keys, once, which its own core
+/// made from the agent's words.
+pub async fn run_agent_keys(
+    app: &App,
+    caller: &Caller,
+    id: Ulid,
+    input: AccountKeysBody,
+) -> Result<SelfChatReply, Refused> {
+    let (_, agent) = own_agent(app, caller, id).await?;
+    save_account_keys(app, agent.id, input).await
+}
+
+async fn save_account_keys(
+    app: &App,
+    account: Ulid,
+    input: AccountKeysBody,
+) -> Result<SelfChatReply, Refused> {
     let master: [u8; 32] = fixed(&input.master_public, "master_public")?;
     let public: [u8; 32] = fixed(&input.account_public, "account_public")?;
     let stamp: [u8; 64] = fixed(&input.account_stamp, "account_stamp")?;
     let invite_public: [u8; 32] = fixed(&input.invite_public, "invite_public")?;
     let invite_stamp: [u8; 64] = fixed(&input.invite_stamp, "invite_stamp")?;
-    if verify_account_key(&master, &session.account, &public, &stamp).is_err()
-        || verify_invite_key(&master, &session.account, &invite_public, &invite_stamp).is_err()
+    if verify_account_key(&master, &account, &public, &stamp).is_err()
+        || verify_invite_key(&master, &account, &invite_public, &invite_stamp).is_err()
     {
         return Err(refused(403, "bad_signature", "That stamp does not verify"));
     }
@@ -1340,7 +1416,7 @@ pub async fn run_account_keys(
     };
     let saved = app
         .storage
-        .set_account_keys(session.account, keys, chat, Ulid::now())
+        .set_account_keys(account, keys, chat, Ulid::now())
         .await?;
     if !saved {
         return Err(refused(
@@ -1370,6 +1446,8 @@ pub async fn run_account(app: &App, caller: &Caller, id: Ulid) -> Result<Account
         account_stamp: None,
         invite_public: None,
         invite_stamp: None,
+        agent: account.owner.is_some(),
+        owner: account.owner,
     };
     if let (Some(master), Some(public), Some(stamp), Some(invite_public), Some(invite_stamp)) = (
         account.master_public,
@@ -1406,6 +1484,471 @@ pub async fn run_directory(
         account_list,
         chat_list,
     })
+}
+
+// -------------------------------------------------------------------------------------------------
+// Agents
+// -------------------------------------------------------------------------------------------------
+
+/// The `[agents]` secret, or `agents_off` when the server has none.
+fn agent_secret(app: &App) -> Result<&str, Refused> {
+    match &app.settings.agents {
+        Some(agents) => Ok(agents.secret.as_str()),
+        None => Err(refused(403, "agents_off", "This server has no agents")),
+    }
+}
+
+fn hs256(secret: &str, bytes: &[u8]) -> Result<Hmac<Sha256>, Refused> {
+    match Hmac::<Sha256>::new_from_slice(secret.as_bytes()) {
+        Ok(mut mac) => {
+            mac.update(bytes);
+            Ok(mac)
+        }
+        Err(_) => Err(refused(500, "internal", "Something failed on the server")),
+    }
+}
+
+/// An agent's token: a JWT under HS256 with `[agents] secret`, chosen by the author, with no `exp`.
+fn agent_jwt(secret: &str, agent: Ulid, jti: &[u8; 16], now: i64) -> Result<String, Refused> {
+    let claims = AgentClaims {
+        sub: agent,
+        jti: Base64UrlUnpadded::encode_string(jti),
+        iat: now / 1000,
+    };
+    let Ok(payload) = serde_json::to_vec(&claims) else {
+        return Err(refused(500, "internal", "Something failed on the server"));
+    };
+    let signed = format!(
+        "{}.{}",
+        Base64UrlUnpadded::encode_string(JWT_HEADER),
+        Base64UrlUnpadded::encode_string(&payload)
+    );
+    let tag = hs256(secret, signed.as_bytes())?.finalize().into_bytes();
+    Ok(format!(
+        "{signed}.{}",
+        Base64UrlUnpadded::encode_string(&tag)
+    ))
+}
+
+/// The agent and token id a JWT names, once its header and signature hold.
+fn read_agent_jwt(secret: &str, token: &str) -> Result<Option<(Ulid, [u8; 16])>, Refused> {
+    let mut part_list = token.split('.');
+    let (Some(header), Some(payload), Some(tag), None) = (
+        part_list.next(),
+        part_list.next(),
+        part_list.next(),
+        part_list.next(),
+    ) else {
+        return Ok(None);
+    };
+    let Ok(tag) = Base64UrlUnpadded::decode_vec(tag) else {
+        return Ok(None);
+    };
+    let signed_length = header.len() + 1 + payload.len();
+    let mac = hs256(secret, &token.as_bytes()[..signed_length])?;
+    if mac.verify_slice(&tag).is_err() {
+        return Ok(None);
+    }
+    if Base64UrlUnpadded::decode_vec(header).ok().as_deref() != Some(JWT_HEADER) {
+        return Ok(None);
+    }
+    let Ok(payload) = Base64UrlUnpadded::decode_vec(payload) else {
+        return Ok(None);
+    };
+    let Ok(claims) = serde_json::from_slice::<AgentClaims>(&payload) else {
+        return Ok(None);
+    };
+    let Ok(jti) = Base64UrlUnpadded::decode_vec(&claims.jti) else {
+        return Ok(None);
+    };
+    match <[u8; 16]>::try_from(jti.as_slice()) {
+        Ok(jti) => Ok(Some((claims.sub, jti))),
+        Err(_) => Ok(None),
+    }
+}
+
+/// 16 random bytes for a token's id.
+fn new_jti() -> Result<[u8; 16], Refused> {
+    let mut jti = [0u8; 16];
+    if let Err(error) = getrandom::fill(&mut jti) {
+        tracing::error!(msg = "Could not read random bytes", error = %error);
+        return Err(refused(500, "internal", "Something failed on the server"));
+    }
+    Ok(jti)
+}
+
+/// The caller's session and one of its agents, from a registered device of the owner.
+async fn own_agent(
+    app: &App,
+    caller: &Caller,
+    id: Ulid,
+) -> Result<(Session, storage::Account), Refused> {
+    check(app, caller, Need::Device).await?;
+    let session = caller.session()?;
+    let Some(agent) = app.storage.account_by_id(id).await? else {
+        return Err(refused(
+            404,
+            "no_such_account",
+            "That account does not exist",
+        ));
+    };
+    if agent.owner != Some(session.account) {
+        return Err(refused(403, "not_owner", "That is not your agent"));
+    }
+    Ok((session, agent))
+}
+
+/// The same, refusing an agent its owner disabled.
+async fn running_agent(
+    app: &App,
+    caller: &Caller,
+    id: Ulid,
+) -> Result<(Session, storage::Account), Refused> {
+    let (session, agent) = own_agent(app, caller, id).await?;
+    if agent.disabled {
+        return Err(refused(403, "agent_disabled", "That agent is disabled"));
+    }
+    Ok((session, agent))
+}
+
+/// Each ticked name is a server permission the owner holds, never `agent.create`, and `admin` needs
+/// an admin owner.
+async fn check_ticks(
+    app: &App,
+    owner: Ulid,
+    permission_list: Option<&[String]>,
+    admin: Option<bool>,
+) -> Result<(), Refused> {
+    for name in permission_list.unwrap_or_default() {
+        if name == AGENT_CREATE || !SERVER_PERMISSION_LIST.contains(&name.as_str()) {
+            return Err(refused(
+                400,
+                "bad_body",
+                "An agent may be given only server permissions, never agent.create",
+            ));
+        }
+        let Some(known) = SERVER_PERMISSION_LIST.iter().find(|known| **known == name) else {
+            continue;
+        };
+        if !app.storage.server_permitted(owner, known).await? {
+            return Err(refused(403, "not_held", "You do not hold that permission"));
+        }
+    }
+    if admin == Some(true) && !app.storage.is_admin(owner).await? {
+        return Err(refused(403, "not_held", "You are not admin"));
+    }
+    Ok(())
+}
+
+/// `POST /api/v1/agents`: an agent the caller owns, with no password, and its token shown once. Its
+/// words are made by the owner's own core, never here.
+pub async fn run_create_agent(
+    app: &App,
+    caller: &Caller,
+    input: CreateAgentBody,
+) -> Result<CreatedAgentReply, Refused> {
+    let secret = agent_secret(app)?;
+    check(app, caller, Need::Device).await?;
+    check(app, caller, Need::Server(AGENT_CREATE)).await?;
+    let session = caller.session()?;
+    check_username(
+        &input.username,
+        Some(app.settings.registration.username_min_length),
+        true,
+    )?;
+    let display_name = input.display_name.trim().to_string();
+    let length = display_name.chars().count();
+    if length == 0 || length > DISPLAY_NAME_CHARS {
+        return Err(refused(
+            400,
+            "bad_display_name",
+            "A display name is 1 to 64 characters",
+        ));
+    }
+    check_ticks(
+        app,
+        session.account,
+        Some(&input.permission_list),
+        Some(input.admin),
+    )
+    .await?;
+    let id = new_id()?;
+    let jti = new_jti()?;
+    let now = Ulid::now();
+    let created = app
+        .storage
+        .create_agent(NewAgent {
+            id,
+            owner: session.account,
+            username: input.username,
+            display_name,
+            admin: input.admin,
+            permission_list: input.permission_list,
+            jti,
+            all_folder: new_id()?,
+            limit: app.settings.limits.agents,
+            now,
+        })
+        .await?;
+    match created {
+        AgentCreated::Saved => {}
+        AgentCreated::UsernameTaken => {
+            return Err(refused(409, "username_taken", "That username is taken"));
+        }
+        AgentCreated::TooMany => {
+            return Err(Refused {
+                status: 409,
+                code: "too_many_agents",
+                message: format!("One person may have {} agents", app.settings.limits.agents),
+                call_seq: None,
+                kv: None,
+                seconds: None,
+                account_list: None,
+            });
+        }
+    }
+    tracing::info!(msg = "Created an agent", account = %id, owner = %session.account);
+    Ok(CreatedAgentReply {
+        account: id,
+        token: agent_jwt(secret, id, &jti, now)?,
+    })
+}
+
+/// `GET /api/v1/agents`: the caller's own agents.
+pub async fn run_agents(app: &App, caller: &Caller) -> Result<AgentListReply, Refused> {
+    check(app, caller, Need::Device).await?;
+    let session = caller.session()?;
+    Ok(AgentListReply {
+        agent_list: app.storage.agents(session.account).await?,
+    })
+}
+
+/// `PUT /api/v1/agents/{id}`: its display name, its ticks and whether it is admin.
+pub async fn run_update_agent(
+    app: &App,
+    caller: &Caller,
+    id: Ulid,
+    input: UpdateAgentBody,
+) -> Result<EmptyReply, Refused> {
+    let (session, agent) = running_agent(app, caller, id).await?;
+    check_ticks(
+        app,
+        session.account,
+        input.permission_list.as_deref(),
+        input.admin,
+    )
+    .await?;
+    let display_name = match input.display_name {
+        Some(name) => {
+            let name = name.trim().to_string();
+            let length = name.chars().count();
+            if length == 0 || length > DISPLAY_NAME_CHARS {
+                return Err(refused(
+                    400,
+                    "bad_display_name",
+                    "A display name is 1 to 64 characters",
+                ));
+            }
+            Some(name)
+        }
+        None => None,
+    };
+    app.storage
+        .change_agent(
+            agent.id,
+            AgentChange {
+                permission_list: input.permission_list,
+                admin: input.admin,
+            },
+        )
+        .await?;
+    if display_name.is_some() {
+        let saved = app
+            .storage
+            .set_names(NewNames {
+                account: agent.id,
+                display_name,
+                username: None,
+            })
+            .await?;
+        if let NamesSaved::Saved {
+            version,
+            username,
+            display_name,
+        } = saved
+        {
+            profile_changed(app, agent.id, version, username, display_name).await?;
+        }
+    }
+    tracing::info!(msg = "Changed an agent", account = %agent.id);
+    Ok(EmptyReply {})
+}
+
+/// Checks the termination of the agent's one device, which its owner's core signed with the agent's
+/// words, chosen by the author, answering the device and signature to end it with. An agent that
+/// never registered a device needs no statement.
+async fn agent_statement(
+    app: &App,
+    agent: &storage::Account,
+    statement: Option<AgentStatement>,
+) -> Result<Option<(Ulid, [u8; 64])>, Refused> {
+    let live = app
+        .storage
+        .list_devices(agent.id)
+        .await?
+        .into_iter()
+        .find(|device| device.terminated_at.is_none());
+    let Some(device) = live else {
+        return Ok(None);
+    };
+    let unproven = refused(
+        403,
+        "bad_signature",
+        "Ending the agent's device needs its words",
+    );
+    let (Some(statement), Some(master)) = (statement, &agent.master_public) else {
+        return Err(unproven);
+    };
+    if statement.device != device.id {
+        return Err(unproven);
+    }
+    let signature: [u8; 64] = fixed(&statement.signature, "signature")?;
+    let master: [u8; 32] = stored_key(master)?;
+    if verify_revocation(&master, &agent.id, &device.id, &signature).is_err() {
+        return Err(unproven);
+    }
+    Ok(Some((device.id, signature)))
+}
+
+/// Ends the agent's device, so its members remove it from MLS at once.
+async fn end_agent_device(
+    app: &App,
+    agent: Ulid,
+    ended: Option<(Ulid, [u8; 64])>,
+) -> Result<(), Refused> {
+    match ended {
+        Some((device, signature)) => end_device(app, agent, device, signature).await,
+        None => Ok(()),
+    }
+}
+
+/// `POST /api/v1/agents/{id}/token`: a new token, which ends the old one, its sessions and its device
+/// at once.
+pub async fn run_renew_agent_token(
+    app: &App,
+    caller: &Caller,
+    id: Ulid,
+    input: AgentEndBody,
+) -> Result<AgentTokenReply, Refused> {
+    let secret = agent_secret(app)?;
+    let (_, agent) = running_agent(app, caller, id).await?;
+    let ended = agent_statement(app, &agent, input.statement).await?;
+    end_agent_device(app, agent.id, ended).await?;
+    let jti = new_jti()?;
+    let now = Ulid::now();
+    app.storage
+        .end_agent_token(agent.id, Some(jti), false, now)
+        .await?;
+    tracing::info!(msg = "Renewed an agent's token", account = %agent.id);
+    Ok(AgentTokenReply {
+        token: agent_jwt(secret, agent.id, &jti, now)?,
+    })
+}
+
+/// `DEL /api/v1/agents/{id}/token`: no token at all until a renew.
+pub async fn run_revoke_agent_token(
+    app: &App,
+    caller: &Caller,
+    id: Ulid,
+    input: AgentEndBody,
+) -> Result<EmptyReply, Refused> {
+    let (_, agent) = running_agent(app, caller, id).await?;
+    let ended = agent_statement(app, &agent, input.statement).await?;
+    end_agent_device(app, agent.id, ended).await?;
+    app.storage
+        .end_agent_token(agent.id, None, false, Ulid::now())
+        .await?;
+    tracing::info!(msg = "Revoked an agent's token", account = %agent.id);
+    Ok(EmptyReply {})
+}
+
+/// `POST /api/v1/agents/{id}/disable`: the token goes, its sessions and device end, and it leaves
+/// every group and channel as a leave does. The account and device stay for old signatures.
+pub async fn run_disable_agent(
+    app: &App,
+    caller: &Caller,
+    id: Ulid,
+    input: AgentEndBody,
+) -> Result<EmptyReply, Refused> {
+    let (_, agent) = running_agent(app, caller, id).await?;
+    let ended = agent_statement(app, &agent, input.statement).await?;
+    let chat_list = app
+        .storage
+        .end_agent_token(agent.id, None, true, Ulid::now())
+        .await?;
+    // A line names the device that left. An agent that never had one holds no keys, so it stays a
+    // member of what it was added to, reading nothing.
+    let newest = app
+        .storage
+        .list_devices(agent.id)
+        .await?
+        .into_iter()
+        .max_by_key(|device| device.created_at);
+    if let Some(device) = newest {
+        for chat in chat_list {
+            leave_as(app, chat, agent.id, device.id).await?;
+        }
+    }
+    // After the leaves, so a member's commit removing the device no longer wraps for the agent.
+    end_agent_device(app, agent.id, ended).await?;
+    presence_moved(app, agent.id).await;
+    tracing::info!(msg = "Disabled an agent", account = %agent.id);
+    Ok(EmptyReply {})
+}
+
+/// `POST /api/v1/login/agent`: the agent's JWT in, an ordinary session out, chosen by the author, so
+/// sessions are checked one way.
+pub async fn run_login_agent(
+    app: &App,
+    caller: &Caller,
+    input: AgentLoginBody,
+) -> Result<(LoginReply, String), Refused> {
+    check(app, caller, Need::Anyone).await?;
+    let secret = agent_secret(app)?;
+    let wrong = refused(401, "bad_login", "That token is not valid");
+    let Some((agent, jti)) = read_agent_jwt(secret, &input.token)? else {
+        return Err(wrong);
+    };
+    let Some(account) = app.storage.account_by_id(agent).await? else {
+        return Err(wrong);
+    };
+    if account.owner.is_none() {
+        return Err(wrong);
+    }
+    if account.disabled {
+        return Err(refused(403, "agent_disabled", "That agent is disabled"));
+    }
+    let Some(live) = app.storage.agent_jti(agent).await? else {
+        return Err(wrong);
+    };
+    // The id is not secret, so a plain comparison: the signature is what the secret guards.
+    if live != jti {
+        return Err(wrong);
+    }
+    start_session(app, agent, input.device).await
+}
+
+/// Only its owner ends an agent's device, through a renew, a revoke or disabling, chosen by the
+/// author, so a thief holding a copied `agent.toml` cannot.
+async fn refuse_agent_device(app: &App, account: Ulid) -> Result<(), Refused> {
+    match app.storage.account_by_id(account).await? {
+        Some(found) if found.owner.is_some() => Err(refused(
+            403,
+            "agent_device",
+            "Only the agent's owner ends its device",
+        )),
+        _ => Ok(()),
+    }
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -1584,6 +2127,7 @@ pub async fn run_terminate(
 ) -> Result<EmptyReply, Refused> {
     check(app, caller, Need::Session).await?;
     let session = caller.session()?;
+    refuse_agent_device(app, session.account).await?;
     let signature: [u8; 64] = fixed(&input.signature, "signature")?;
     let mine = app.storage.device_key(device).await?;
     let Some(key) = mine else {
@@ -1627,6 +2171,7 @@ pub async fn run_logout(
 ) -> Result<EmptyReply, Refused> {
     check(app, caller, Need::Session).await?;
     let session = caller.session()?;
+    refuse_agent_device(app, session.account).await?;
     let signature: [u8; 64] = fixed(&input.signature, "signature")?;
     let Some(key) = app.storage.device_key(device).await? else {
         return Err(refused(404, "no_such_device", "That device does not exist"));
@@ -1855,7 +2400,9 @@ pub async fn run_create_chat(
                 if !app.hub.announced(viewer) {
                     continue;
                 }
-                if let Some(seen) = seen_by(&item, sight_of(app, viewer).await?) {
+                if let Some(seen) =
+                    seen_by(app, &item, sight_of(app, viewer).await?, viewer).await?
+                {
                     app.hub
                         .deliver_announced(viewer, &ServerFrame::Presence(Box::new(seen)));
                 }
@@ -1984,10 +2531,15 @@ pub async fn run_chat_remove(
 /// whole chat.
 pub async fn run_leave(app: &App, caller: &Caller, chat: Ulid) -> Result<EmptyReply, Refused> {
     let (session, _) = group_access(app, caller, chat).await?;
-    let device = session.device()?;
+    leave_as(app, chat, session.account, session.device()?).await?;
+    Ok(EmptyReply {})
+}
+
+/// One account leaves a group or channel, as the device named.
+async fn leave_as(app: &App, chat: Ulid, account: Ulid, device: Ulid) -> Result<(), Refused> {
     match app
         .storage
-        .leave_chat(chat, session.account, device, Ulid::now())
+        .leave_chat(chat, account, device, Ulid::now())
         .await?
     {
         Left::NotMember => Err(refused(404, "not_member", "You are not in that chat")),
@@ -2001,15 +2553,12 @@ pub async fn run_leave(app: &App, caller: &Caller, chat: Ulid) -> Result<EmptyRe
                 &member_list,
                 line.into_iter().map(|line| *line).collect(),
             );
-            member_list.push(session.account);
+            member_list.push(account);
             push_events(app, chat, &member_list, vec![*event]).await?;
-            push_folders(app, &[session.account]).await?;
-            Ok(EmptyReply {})
+            push_folders(app, &[account]).await?;
+            Ok(())
         }
-        Left::Removed(removed) => {
-            chat_gone(app, chat, session.account, removed).await?;
-            Ok(EmptyReply {})
-        }
+        Left::Removed(removed) => chat_gone(app, chat, account, removed).await,
     }
 }
 
@@ -3494,7 +4043,7 @@ pub async fn run_remove_sticker(
 
 /// Whether `other` is this account or shares a chat with it, as profiles and photos need.
 async fn shares_or_self(app: &App, account: Ulid, other: Ulid) -> Result<bool, Refused> {
-    if account == other {
+    if profile_of_own(app, account, other).await? {
         return Ok(true);
     }
     Ok(app
@@ -3502,6 +4051,18 @@ async fn shares_or_self(app: &App, account: Ulid, other: Ulid) -> Result<bool, R
         .accounts_sharing(account)
         .await?
         .contains(&other))
+}
+
+/// Whether `account` keeps `other`'s profile: its own, or an agent it owns, whose profile its owner's
+/// device signs, chosen by the author.
+async fn profile_of_own(app: &App, account: Ulid, other: Ulid) -> Result<bool, Refused> {
+    if account == other {
+        return Ok(true);
+    }
+    Ok(match app.storage.account_by_id(other).await? {
+        Some(found) => found.owner == Some(account),
+        None => false,
+    })
 }
 
 /// Tells the online devices of everyone sharing a chat with the account, and its own, that its
@@ -3570,7 +4131,7 @@ pub async fn run_put_profile(
     check(app, caller, Need::Server(PROFILE_EDIT)).await?;
     let session = caller.session()?;
     let device = session.device()?;
-    if id != session.account {
+    if !profile_of_own(app, session.account, id).await? {
         return Err(refused(
             403,
             "no_permission",
@@ -3663,7 +4224,11 @@ pub async fn run_names(
         } else {
             None
         };
-        check_username(username, min_length)?;
+        let agent = match app.storage.account_by_id(id).await? {
+            Some(account) => account.owner.is_some(),
+            None => false,
+        };
+        check_username(username, min_length, agent)?;
         if own {
             let wrong = refused(401, "bad_password", "That password is wrong");
             let Some(password) = input.password else {
@@ -3727,7 +4292,7 @@ pub async fn run_add_photo(
     check(app, caller, Need::Server(PROFILE_EDIT)).await?;
     let session = caller.session()?;
     let device = session.device()?;
-    if id != session.account {
+    if !profile_of_own(app, session.account, id).await? {
         return Err(refused(
             403,
             "no_permission",
@@ -3831,21 +4396,37 @@ async fn presence_now(app: &App, account_list: Vec<Ulid>) -> Result<Vec<Presence
             state: Some(app.hub.presence_state(times.account)),
             in_app_at: times.in_app_at,
             connected_at: times.connected_at,
+            text: app.hub.presence_text(times.account).map(Bytes),
         })
         .collect())
 }
 
-/// What a viewer sees of one presence, or nothing when it may see none of it.
-fn seen_by(item: &PresenceItem, sight: Sight) -> Option<PresenceItem> {
+/// What a viewer sees of one presence, or nothing when it may see none of it. The text goes with the
+/// state, and an agent's, its trouble reason, to its owner alone.
+async fn seen_by(
+    app: &App,
+    item: &PresenceItem,
+    sight: Sight,
+    viewer: Ulid,
+) -> Result<Option<PresenceItem>, Refused> {
     if !sight.in_app && !sight.connected {
-        return None;
+        return Ok(None);
     }
-    Some(PresenceItem {
+    let mut text = item.text.clone().filter(|_| sight.in_app);
+    if text.is_some()
+        && let Some(account) = app.storage.account_by_id(item.account).await?
+        && let Some(owner) = account.owner
+        && owner != viewer
+    {
+        text = None;
+    }
+    Ok(Some(PresenceItem {
         account: item.account,
         state: item.state.filter(|_| sight.in_app),
         in_app_at: item.in_app_at.filter(|_| sight.in_app),
         connected_at: item.connected_at.filter(|_| sight.connected),
-    })
+        text,
+    }))
 }
 
 /// Everyone sharing a chat with this account, not the account itself.
@@ -3865,7 +4446,7 @@ async fn presence_changed(app: &App, account: Ulid) -> Result<(), Refused> {
         if !app.hub.announced(viewer) {
             continue;
         }
-        if let Some(seen) = seen_by(&item, sight_of(app, viewer).await?) {
+        if let Some(seen) = seen_by(app, &item, sight_of(app, viewer).await?, viewer).await? {
             app.hub
                 .deliver_announced(viewer, &ServerFrame::Presence(Box::new(seen)));
         }
@@ -3887,20 +4468,40 @@ pub async fn presence_moved(app: &App, account: Ulid) {
 /// Everyone sharing a chat with the viewer, as it may see them.
 async fn presence_for(app: &App, viewer: Ulid) -> Result<Vec<PresenceItem>, Refused> {
     let sight = sight_of(app, viewer).await?;
-    Ok(presence_now(app, sharing(app, viewer).await?)
-        .await?
-        .iter()
-        .filter_map(|item| seen_by(item, sight))
-        .collect())
+    let mut seen_list = Vec::new();
+    for item in presence_now(app, sharing(app, viewer).await?).await? {
+        if let Some(seen) = seen_by(app, &item, sight, viewer).await? {
+            seen_list.push(seen);
+        }
+    }
+    Ok(seen_list)
 }
 
 /// A device's presence: its first on a connection announces it, XMPP's way, and every later one is
 /// its app opening or closing. Writes its times and tells everyone sharing a chat. `true` if this was
 /// the connection's first, so the device is owed everyone else's.
-async fn announce(app: &App, session: Session, in_app: bool) -> Result<bool, Refused> {
+async fn announce(app: &App, session: Session, input: PresenceBody) -> Result<bool, Refused> {
     let device = session.device()?;
+    let in_app = input.in_app;
+    if input
+        .text
+        .as_ref()
+        .is_some_and(|text| text.0.len() > PRESENCE_TEXT_BYTES)
+    {
+        return Err(refused(
+            413,
+            "body_too_large",
+            "That presence text is too large",
+        ));
+    }
     let now = Ulid::now();
-    let before = app.hub.announce(session.account, device, in_app);
+    let before = app.hub.announce(
+        session.account,
+        device,
+        in_app,
+        input.trouble,
+        input.text.map(|text| text.0),
+    );
     let first = matches!(before, None | Some(None));
     let was_in_app = matches!(before, Some(Some(true)));
     // With no live connection, as over REST, the device is there for this moment only.
@@ -3915,11 +4516,11 @@ async fn announce(app: &App, session: Session, in_app: bool) -> Result<bool, Ref
 
 /// The `presence` frame: an event with no answer, and the first on a connection is followed by one
 /// `presence` per person sharing a chat.
-pub async fn run_presence(app: &App, caller: &Caller, in_app: bool) -> Result<(), Refused> {
+pub async fn run_presence(app: &App, caller: &Caller, input: PresenceBody) -> Result<(), Refused> {
     check(app, caller, Need::Device).await?;
     let session = caller.session()?;
     let device = session.device()?;
-    if announce(app, session, in_app).await? {
+    if announce(app, session, input).await? {
         for item in presence_for(app, session.account).await? {
             app.hub.deliver_to_device(
                 session.account,
@@ -3944,7 +4545,7 @@ pub async fn run_put_presence(
     if session.device()? != device {
         return Err(refused(404, "no_such_device", "That device does not exist"));
     }
-    announce(app, session, input.in_app).await?;
+    announce(app, session, input).await?;
     Ok(PresenceListReply {
         presence_list: presence_for(app, session.account).await?,
     })
@@ -3970,7 +4571,8 @@ pub async fn run_presence_of(
         ));
     }
     match presence_now(app, vec![account]).await?.pop() {
-        Some(item) => seen_by(&item, sight)
+        Some(item) => seen_by(app, &item, sight, session.account)
+            .await?
             .ok_or_else(|| refused(403, "no_permission", "You may not do this")),
         None => Err(refused(
             404,
@@ -4131,9 +4733,17 @@ pub async fn run_frame(
             });
             return Some(answer_of(reference, result));
         }
-        ClientFrame::Presence { in_app } => {
-            let in_app = *in_app;
-            let result = operation!("Presence", "presence", run_presence(app, &caller, in_app));
+        ClientFrame::Presence {
+            in_app,
+            trouble,
+            text,
+        } => {
+            let input = PresenceBody {
+                in_app: *in_app,
+                trouble: *trouble,
+                text: text.clone(),
+            };
+            let result = operation!("Presence", "presence", run_presence(app, &caller, input));
             if let Err(refusal) = result {
                 tracing::debug!(msg = "Dropped a presence event", code = refusal.code);
             }
@@ -4734,6 +5344,93 @@ async fn login_token(State(app): Shared, headers: HeaderMap, body: Body) -> Resp
         let (mut data, token) = run_login(&app, &caller, parse(body)?).await?;
         data.token = Some(token);
         Ok(data)
+    }))
+}
+
+async fn login_agent(State(app): Shared, headers: HeaderMap, body: Body) -> Response {
+    respond(operation!("LoginAgent", "login_agent", async {
+        let caller = caller_of(&app, &headers).await?;
+        let (mut data, token) = run_login_agent(&app, &caller, parse(body)?).await?;
+        data.token = Some(token);
+        Ok(data)
+    }))
+}
+
+async fn agents(State(app): Shared, headers: HeaderMap) -> Response {
+    respond(operation!("Agents", "agents", async {
+        let caller = caller_of(&app, &headers).await?;
+        run_agents(&app, &caller).await
+    }))
+}
+
+async fn create_agent(State(app): Shared, headers: HeaderMap, body: Body) -> Response {
+    respond(operation!("CreateAgent", "create_agent", async {
+        let caller = caller_of(&app, &headers).await?;
+        run_create_agent(&app, &caller, parse(body)?).await
+    }))
+}
+
+async fn update_agent(
+    State(app): Shared,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Body,
+) -> Response {
+    respond(operation!("UpdateAgent", "update_agent", async {
+        let caller = caller_of(&app, &headers).await?;
+        run_update_agent(&app, &caller, path_id(&id)?, parse(body)?).await
+    }))
+}
+
+async fn renew_agent_token(
+    State(app): Shared,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Body,
+) -> Response {
+    respond(operation!("RenewAgentToken", "renew_agent_token", async {
+        let caller = caller_of(&app, &headers).await?;
+        run_renew_agent_token(&app, &caller, path_id(&id)?, parse(body)?).await
+    }))
+}
+
+async fn revoke_agent_token(
+    State(app): Shared,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Body,
+) -> Response {
+    respond(operation!(
+        "RevokeAgentToken",
+        "revoke_agent_token",
+        async {
+            let caller = caller_of(&app, &headers).await?;
+            run_revoke_agent_token(&app, &caller, path_id(&id)?, parse(body)?).await
+        }
+    ))
+}
+
+async fn disable_agent(
+    State(app): Shared,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Body,
+) -> Response {
+    respond(operation!("DisableAgent", "disable_agent", async {
+        let caller = caller_of(&app, &headers).await?;
+        run_disable_agent(&app, &caller, path_id(&id)?, parse(body)?).await
+    }))
+}
+
+async fn agent_keys(
+    State(app): Shared,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Body,
+) -> Response {
+    respond(operation!("AgentKeys", "agent_keys", async {
+        let caller = caller_of(&app, &headers).await?;
+        run_agent_keys(&app, &caller, path_id(&id)?, parse(body)?).await
     }))
 }
 
@@ -5844,6 +6541,15 @@ fn router(app: Arc<App>, www: &FilePath) -> Router {
         .route("/api/v1/register", post(register))
         .route("/api/v1/login", post(login))
         .route("/api/v1/login/token", post(login_token))
+        .route("/api/v1/login/agent", post(login_agent))
+        .route("/api/v1/agents", get(agents).post(create_agent))
+        .route("/api/v1/agents/{id}", put(update_agent))
+        .route(
+            "/api/v1/agents/{id}/token",
+            post(renew_agent_token).delete(revoke_agent_token),
+        )
+        .route("/api/v1/agents/{id}/disable", post(disable_agent))
+        .route("/api/v1/accounts/{id}/keys", put(agent_keys))
         .route("/api/v1/setup", post(setup))
         .route("/api/v1/challenge", post(challenge))
         .route("/api/v1/password/reset", post(password_reset))

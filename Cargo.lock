@@ -1770,6 +1770,7 @@ dependencies = [
  "clap",
  "futures",
  "getrandom 0.4.3",
+ "hmac 0.13.0",
  "keryx-core",
  "keryx-moq",
  "moq-net",
