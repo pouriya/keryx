@@ -5208,6 +5208,7 @@ fn a_file_goes_up_in_chunks_after_text_sent_meanwhile_and_comes_down_whole() {
     world.command(
         omid,
         Command::SendFiles {
+            reply: None,
             thread: None,
             topic: None,
             chat,
@@ -5275,6 +5276,7 @@ fn a_bundle_holds_images_and_videos_and_an_edit_and_a_delete_name_the_files_they
     world.command(
         omid,
         Command::SendFiles {
+            reply: None,
             thread: None,
             topic: None,
             chat,
@@ -5371,6 +5373,7 @@ fn music_carries_its_tags_and_cover_and_other_files_do_not() {
         world.command(
             omid,
             Command::SendFiles {
+                reply: None,
                 thread: None,
                 topic: None,
                 chat,
@@ -5416,6 +5419,7 @@ fn a_message_holds_one_file_or_a_bundle_and_a_client_with_no_device_sends_none()
     let out = command(
         &mut client,
         Command::SendFiles {
+            reply: None,
             thread: None,
             topic: None,
             chat: id(),
@@ -5441,6 +5445,7 @@ fn a_message_holds_one_file_or_a_bundle_and_a_client_with_no_device_sends_none()
         world.command(
             omid,
             Command::SendFiles {
+                reply: None,
                 thread: None,
                 topic: None,
                 chat,
@@ -5467,6 +5472,7 @@ fn an_upload_that_is_refused_or_read_short_stops_and_its_message_is_never_sent()
         world.command(
             omid,
             Command::SendFiles {
+                reply: None,
                 thread: None,
                 topic: None,
                 chat,
@@ -5539,6 +5545,7 @@ fn a_download_that_is_changed_cut_or_unreadable_stops_with_its_reason() {
     world.command(
         omid,
         Command::SendFiles {
+            reply: None,
             thread: None,
             topic: None,
             chat,

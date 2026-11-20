@@ -48,6 +48,7 @@ const PROFILE_KEY_LABEL: &[u8] = b"keryx v1 profile key";
 const PROFILE_LABEL: &[u8] = b"keryx v1 profile";
 const FOLDER_NAME_LABEL: &[u8] = b"keryx v1 folder name";
 const KV_LABEL: &[u8] = b"keryx v1 kv";
+const PRESENCE_TEXT_LABEL: &[u8] = b"keryx v1 presence text";
 const CHAT_PROFILE_LABEL: &[u8] = b"keryx v1 chat profile";
 const CHAT_KEY_LABEL: &[u8] = b"keryx v1 chat profile key";
 const TOPIC_PROFILE_LABEL: &[u8] = b"keryx v1 topic profile";
@@ -574,6 +575,14 @@ fn kv_data(account: Ulid, key: &str) -> Vec<u8> {
     data.extend_from_slice(KV_LABEL);
     data.extend_from_slice(account.bytes());
     data.extend_from_slice(key.as_bytes());
+    data
+}
+
+/// **Permanent:** a presence text's associated data, binding it to its account.
+fn presence_text_data(account: Ulid) -> Vec<u8> {
+    let mut data = Vec::with_capacity(PRESENCE_TEXT_LABEL.len() + 16);
+    data.extend_from_slice(PRESENCE_TEXT_LABEL);
+    data.extend_from_slice(account.bytes());
     data
 }
 
@@ -1859,10 +1868,19 @@ impl Device {
         Ok(())
     }
 
-    /// This account's profile, sealed under its profile key and signed by this device over the
-    /// label, the account and the sealed bytes.
-    pub fn seal_profile(&self, plaintext: &[u8]) -> Result<(Vec<u8>, [u8; 64]), MlsError> {
-        let account = self.record.account;
+    /// Keeps an agent's profile key, which its owner's core derived from the agent's words, so this
+    /// device can seal the agent's profile. Never its master key.
+    pub fn keep_profile_key(&mut self, account: Ulid, key: &[u8; 16]) {
+        self.profile_keys.insert(account, Zeroizing::new(*key));
+    }
+
+    /// An account's profile, this one's or an agent's it owns, sealed under that account's profile
+    /// key and signed by this device over the label, the account and the sealed bytes.
+    pub fn seal_profile(
+        &self,
+        account: Ulid,
+        plaintext: &[u8],
+    ) -> Result<(Vec<u8>, [u8; 64]), MlsError> {
         let Some(profile_key) = self.profile_keys.get(&account) else {
             return Err(MlsError::NoProfileKey { account });
         };
@@ -1874,26 +1892,26 @@ impl Device {
         Ok((sealed, signature))
     }
 
-    /// Checks a profile's device against the account's pinned master key, its signature against
-    /// that device, then opens it with the account's profile key.
+    /// Checks a profile's device against its account's pinned master key, its signature against
+    /// that device, then opens it with `account`'s profile key. The device is `account`'s own, or,
+    /// for an agent, one of its owner's.
     pub fn open_profile(
-        &self,
+        &mut self,
+        account: Ulid,
         record: &DeviceRecord,
         sealed: &[u8],
         signature: &[u8; 64],
     ) -> Result<Zeroizing<Vec<u8>>, MlsError> {
-        let account = record.account;
-        match self.pins.get(&account) {
-            Some(pinned) if *pinned == record.master_public => {}
-            Some(_) => return Err(MlsError::MasterKeyChanged { account }),
-            None => return Err(MlsError::BadStamp { account }),
-        }
+        let signer = record.account;
+        // An agent's owner may share no chat with this account, so its key is pinned at first
+        // sight here, as a device's is.
+        pin(&mut self.pins, signer, &record.master_public)?;
         let bytes = device_stamp_bytes(&record.account, &record.device, &record.device_public);
         verify(
             &record.master_public,
             &bytes,
             &record.stamp,
-            MlsError::BadStamp { account },
+            MlsError::BadStamp { account: signer },
         )?;
         let data = profile_data(account);
         let mut signed = data.clone();
@@ -1952,6 +1970,27 @@ impl Device {
             return Err(MlsError::NoProfileKey { account });
         };
         open_under(profile_key, &kv_data(account, key), sealed)
+    }
+
+    /// This account's presence text, sealed under its profile key, so only those holding it read it.
+    pub fn seal_presence_text(&self, text: &str) -> Result<Vec<u8>, MlsError> {
+        let account = self.record.account;
+        let Some(profile_key) = self.profile_keys.get(&account) else {
+            return Err(MlsError::NoProfileKey { account });
+        };
+        seal_under(profile_key, &presence_text_data(account), text.as_bytes())
+    }
+
+    /// Another account's presence text, with its profile key, which sharing a chat gave.
+    pub fn open_presence_text(
+        &self,
+        account: Ulid,
+        sealed: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>, MlsError> {
+        let Some(profile_key) = self.profile_keys.get(&account) else {
+            return Err(MlsError::NoProfileKey { account });
+        };
+        open_under(profile_key, &presence_text_data(account), sealed)
     }
 
     /// Sign an unencrypted message, whose body is its content.

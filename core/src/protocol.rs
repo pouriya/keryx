@@ -95,7 +95,7 @@ numbered!(
     /// an MP3, apart from `Voice`, which is a recorded note. `Question` is a tree of questions and
     /// `Answer` one account's answer to it. `Sticker` names one of the server's stickers.
     /// `Suggestion` suggests what to do with its chat, and `Ack` is one account's accepting or
-    /// declining it.
+    /// declining it. `Activity` is what an agent is doing, one step's intention for this chat.
     ContentKind {
         Text = 0,
         Voice = 1,
@@ -112,6 +112,7 @@ numbered!(
         Sticker = 12,
         Suggestion = 13,
         Ack = 14,
+        Activity = 15,
     }
 );
 
@@ -444,6 +445,12 @@ pub enum ClientFrame {
     /// person sharing a chat.
     Presence {
         in_app: bool,
+        /// Having trouble: yellow, which agents send while something needs their owner.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        trouble: bool,
+        /// Sealed under the account's profile key: an agent's trouble reason.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<Bytes>,
     },
     /// Someone's presence, asked once, for a person sharing no chat. Answered with `presence_of`.
     PresenceOf {
@@ -609,7 +616,9 @@ pub enum ClientFrame {
     },
 }
 
-/// Where someone is: on a call, in the app, connected with the app in the background, or not there.
+/// Where someone is: on a call, having trouble, in the app, connected with the app in the
+/// background, or not there. Ordered by rank: a problem shows over a healthy device but never hides a
+/// call.
 #[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -617,6 +626,7 @@ pub enum PresenceState {
     Offline,
     Away,
     Online,
+    Trouble,
     Call,
 }
 
@@ -632,12 +642,20 @@ pub struct PresenceItem {
     pub in_app_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connected_at: Option<i64>,
+    /// Sealed under the account's profile key, to whoever may see it: an agent's goes to its owner
+    /// alone. Kept in the server's memory beside the connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<Bytes>,
 }
 
 /// `PUT /api/v1/devices/{id}/presence`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PresenceBody {
     pub in_app: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub trouble: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<Bytes>,
 }
 
 /// `PUT /api/v1/devices/{id}/presence`'s answer: everyone sharing a chat.
@@ -2216,6 +2234,26 @@ pub enum ServerFrame {
     },
 }
 
+impl ServerFrame {
+    /// The `ref` of the request this frame answers, if it answers one, so a platform's tagged
+    /// command learns when what it asked was answered.
+    pub fn reference(&self) -> Option<Ulid> {
+        match self {
+            Self::Sent { reference, .. }
+            | Self::Done { reference }
+            | Self::Refused { reference, .. }
+            | Self::Times { reference, .. }
+            | Self::Chats { reference, .. }
+            | Self::FolderId { reference, .. }
+            | Self::TopicId { reference, .. }
+            | Self::Members { reference, .. }
+            | Self::PresenceOf { reference, .. } => Some(*reference),
+            Self::Kv { reference, .. } => *reference,
+            _ => None,
+        }
+    }
+}
+
 // -------------------------------------------------------------------------------------------------
 // REST: each route's body and reply, read and written by the server and clients alike, so a renamed
 // field breaks both sides at compile time. Every reply is wrapped as `{"ok": true, "data": ...}`.
@@ -2321,7 +2359,11 @@ pub struct LoginReply {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChallengeBody {
-    pub username: String,
+    /// The account by username, or by its id, as an agent reads it from its token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<Ulid>,
     /// `password_reset` or `device_login`.
     pub purpose: String,
 }
@@ -2388,6 +2430,104 @@ pub struct AccountInfo {
     pub invite_public: Option<Bytes>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invite_stamp: Option<Bytes>,
+    /// An agent account, run by keryx-agent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub agent: bool,
+    /// An agent's owner, always shown, since its profile is checked against the owner's key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<Ulid>,
+}
+
+/// `POST /api/v1/agents`: an agent account for the caller to own. Each permission is a server-wide
+/// one the owner holds, and `admin` needs an admin owner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateAgentBody {
+    pub username: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub permission_list: Vec<String>,
+    #[serde(default)]
+    pub admin: bool,
+}
+
+/// The new agent and its token, a JWT, shown once.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreatedAgentReply {
+    pub account: Ulid,
+    pub token: String,
+}
+
+/// One of the caller's agents.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentItem {
+    pub id: Ulid,
+    pub username: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    pub disabled: bool,
+    pub admin: bool,
+    pub permission_list: Vec<String>,
+    /// When its token was made, none once revoked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_connected_at: Option<i64>,
+    /// Its live device, the one a renew, revoke or disable's statement names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<Ulid>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentListReply {
+    pub agent_list: Vec<AgentItem>,
+}
+
+/// `PUT /api/v1/agents/{id}`: what is given changes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateAgentBody {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_list: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin: Option<bool>,
+}
+
+/// The termination of an agent's device, signed by the owner's core with the agent's words.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentStatement {
+    pub device: Ulid,
+    pub signature: Bytes,
+}
+
+/// A renew, revoke or disable, with the agent's device's termination when it has one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentEndBody {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub statement: Option<AgentStatement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTokenReply {
+    pub token: String,
+}
+
+/// An agent token's claims, the JWT's middle part: the agent's account, the token's id as base64url
+/// of 16 bytes, and when it was made in seconds. No `exp`: a renew or a revoke ends it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentClaims {
+    pub sub: Ulid,
+    pub jti: String,
+    pub iat: i64,
+}
+
+/// `POST /api/v1/login/agent`: the agent's JWT, and its device's proof as a returning device's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentLoginBody {
+    pub token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<DeviceProof>,
 }
 
 /// What anyone logged in can see of an account.

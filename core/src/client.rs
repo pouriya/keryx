@@ -26,28 +26,32 @@ use zeroize::Zeroize;
 
 use crate::call::{CallIndex, CallKey};
 use crate::file::{self, FileInfo};
+use base64ct::{Base64UrlUnpadded, Encoding};
+
 use crate::mls::{
     AccountKey, Device, DeviceRecord, InviteKey, MlsError, sign_revocation, stamp_account_key,
     stamp_invite_key, verify_logout, verify_message, verify_revocation,
 };
 use crate::protocol::{
     AccountBrief, AccountInfo, AccountKeysBody, AccountListReply, AccountReply, Ack, ActionKind,
-    Answer, Bytes, CallBody, CallEvent, CallEventKind, CallOutcome, CallText, CaptchaAnswer,
-    CaptchaReply, ChallengeBody, ChallengeReply, ChatAction, ChatDevice, ChatDeviceListReply,
-    ChatEvent, ChatFolders, ChatItem, ChatOptions, ChatProfileBody, ChatProfileItem,
-    ChatProfilePlain, ChatReply, ChatRole, ChatType, ClaimBody, ClientFrame, CommitAction,
-    ContentKind, CountReply, CreateChatBody, CreateFileBody, DeviceProof, DeviceReply,
-    DevicesReply, DraftBody, DraftItem, EmptyReply, FeaturesReply, FileReply, FindableBody,
-    FindableItem, FolderItem, FolderSuggestion, FoundChat, GroupInfoReply, Header, InvitationItem,
-    InvitationPlain, InvitationShown, InviteStatement, KeyPackageItem, KeyPackageListReply,
-    KeyPackagesBody, Kind, KvChange, KvItem, LineAction, LineBody, LoginBody, LoginReply, MarkItem,
-    MemberItem, MessageFrame, NamesBody, PhotoReply, PresenceItem, ProfileBody, ProfileKeyItem,
-    ProfileKeyShare, ProfileLink, ProfilePhoto, ProfileReply, PutProfileBody, Question,
-    RefusedReply, RegisterBody, RegisterDeviceBody, RequestItem, RequestListReply, RequestState,
-    SendFrame, ServerFrame, SetupBody, SetupReply, SignedBody, SignedProfile, StickerListReply,
-    StickerPack, Suggestion, SyncPosition, TimesItem, TopicItem, TopicName, TopicOptionsBody,
-    TopicProfileItem, TopicProfilePlain, TopicsBody, VersionReply, WelcomeItem, WrapEntry,
-    WrapItem, WrapListReply, call_text_header,
+    AgentClaims, AgentEndBody, AgentItem, AgentListReply, AgentLoginBody, AgentStatement,
+    AgentTokenReply, Answer, Bytes, CallBody, CallEvent, CallEventKind, CallOutcome, CallText,
+    CaptchaAnswer, CaptchaReply, ChallengeBody, ChallengeReply, ChatAction, ChatDevice,
+    ChatDeviceListReply, ChatEvent, ChatFolders, ChatItem, ChatOptions, ChatProfileBody,
+    ChatProfileItem, ChatProfilePlain, ChatReply, ChatRole, ChatType, ClaimBody, ClientFrame,
+    CommitAction, ContentKind, CountReply, CreateAgentBody, CreateChatBody, CreateFileBody,
+    CreatedAgentReply, DeviceProof, DeviceReply, DevicesReply, DraftBody, DraftItem, EmptyReply,
+    FeaturesReply, FileReply, FindableBody, FindableItem, FolderItem, FolderSuggestion, FoundChat,
+    GroupInfoReply, Header, InvitationItem, InvitationPlain, InvitationShown, InviteStatement,
+    KeyPackageItem, KeyPackageListReply, KeyPackagesBody, Kind, KvChange, KvItem, LineAction,
+    LineBody, LoginBody, LoginReply, MarkItem, MemberItem, MessageFrame, NamesBody, PhotoReply,
+    PresenceItem, ProfileBody, ProfileKeyItem, ProfileKeyShare, ProfileLink, ProfilePhoto,
+    ProfileReply, PutProfileBody, Question, RefusedReply, RegisterBody, RegisterDeviceBody,
+    RequestItem, RequestListReply, RequestState, SelfChatReply, SendFrame, ServerFrame, SetupBody,
+    SetupReply, SignedBody, SignedProfile, StickerListReply, StickerPack, Suggestion, SyncPosition,
+    TimesItem, TopicItem, TopicName, TopicOptionsBody, TopicProfileItem, TopicProfilePlain,
+    TopicsBody, UpdateAgentBody, VersionReply, WelcomeItem, WrapEntry, WrapItem, WrapListReply,
+    call_text_header,
 };
 use crate::queue::{Level, Queue, Target};
 use crate::seed::{self, AccountKeys};
@@ -68,6 +72,8 @@ const SEARCH_HITS: usize = 20;
 /// A profile's bio, in characters, and its links, each name and address in characters. See the
 /// root AGENTS.md.
 const BIO_CHARS: usize = 140;
+/// An agent's activity text, chosen by the author, so a modified sender cannot flood the folded list.
+const ACTIVITY_CHARS: usize = 140;
 const LINKS: usize = 3;
 const LINK_NAME_CHARS: usize = 32;
 const LINK_URL_CHARS: usize = 512;
@@ -321,6 +327,66 @@ pub enum Command {
         #[serde(default)]
         captcha: Option<CaptchaAnswer>,
     },
+    /// An agent logs in with the token its owner was shown, then answers [`Event::NeedWords`] with
+    /// [`Command::Restore`]. A session that ends logs in again with it, by itself.
+    LogInAgent {
+        token: Secret,
+    },
+    /// The owner makes an agent: 12 new words, the account, and the agent's keys published from
+    /// them. Answered with [`Event::AgentCreated`], whose token and words are shown once.
+    CreateAgent {
+        username: String,
+        display_name: String,
+        #[serde(default)]
+        permission_list: Vec<String>,
+        #[serde(default)]
+        admin: bool,
+    },
+    /// The owner's agents, answered with [`Event::Agents`].
+    Agents,
+    /// Changes an agent's display name, ticks or admin, then answers with [`Event::Agents`].
+    UpdateAgent {
+        agent: Ulid,
+        #[serde(default)]
+        display_name: Option<String>,
+        #[serde(default)]
+        permission_list: Option<Vec<String>>,
+        #[serde(default)]
+        admin: Option<bool>,
+    },
+    /// A new token for an agent, its device ended with a statement signed with the agent's words,
+    /// which are never kept. Answered with [`Event::AgentToken`].
+    RenewAgentToken {
+        agent: Ulid,
+        words: Secret,
+    },
+    /// No token for an agent until a renew, its device ended the same way.
+    RevokeAgentToken {
+        agent: Ulid,
+        words: Secret,
+    },
+    /// Disables an agent for good: its token and device end, and it leaves every group and channel.
+    DisableAgent {
+        agent: Ulid,
+        words: Secret,
+    },
+    /// An agent's bio and links, keeping its photo, signed by this device. Its profile must have
+    /// loaded, which [`Command::Agents`] asks for.
+    AgentProfile {
+        agent: Ulid,
+        #[serde(default)]
+        bio: Option<String>,
+        #[serde(default)]
+        link_list: Vec<ProfileLink>,
+    },
+    /// A new photo for an agent, as [`Command::SetPhoto`] is for this account.
+    AgentPhoto {
+        agent: Ulid,
+        #[serde(with = "serde_bytes")]
+        #[cfg_attr(feature = "wasm", tsify(type = "Uint8Array"))]
+        jpeg: Vec<u8>,
+        thumbnail: Thumbnail,
+    },
     /// A new captcha image, for the one under the password.
     Captcha,
     /// The one-time link's token, from after the `#`, then logs in.
@@ -393,6 +459,9 @@ pub enum Command {
         topic: Option<Ulid>,
         #[serde(default)]
         thread: Option<u64>,
+        /// The message it answers.
+        #[serde(default)]
+        reply: Option<Pointer>,
     },
     /// Fetches a file into the platform's `handle`, chunk by chunk, each opened here.
     Download {
@@ -459,10 +528,15 @@ pub enum Command {
         seq: u64,
         after: Option<Ulid>,
     },
-    /// The app came on screen or left it. Kept, sent as `presence` now if connected, and on every
-    /// connection as its first frame.
+    /// The app came on screen or left it, or an agent's trouble began or cleared. Kept, sent as
+    /// `presence` now if connected, and on every connection as its first frame. `text` is sealed
+    /// here under the account's profile key.
     InApp {
         in_app: bool,
+        #[serde(default)]
+        trouble: bool,
+        #[serde(default)]
+        text: Option<String>,
     },
     /// Someone's presence, asked once, for a person sharing no chat: answered as
     /// [`Event::Presence`].
@@ -525,6 +599,15 @@ pub enum Command {
         #[serde(default)]
         thread: Option<u64>,
     },
+    /// What an agent is doing, one step's intention for this chat: `{"text"}`, 1 to 140 characters.
+    SendActivity {
+        chat: Ulid,
+        text: String,
+        #[serde(default)]
+        topic: Option<Ulid>,
+        #[serde(default)]
+        thread: Option<u64>,
+    },
     /// A reaction on a message, refused here unless `emoji` is one the `emojis` crate knows. `on`
     /// is inside the encryption, as a reply's is, and it waits for a pending message's sequence id.
     SendReaction {
@@ -548,6 +631,13 @@ pub enum Command {
         #[serde(default)]
         text: Option<Secret>,
         question: Question,
+        /// The message it answers, a group's or channel's topic, and the thread it goes in.
+        #[serde(default)]
+        reply: Option<Pointer>,
+        #[serde(default)]
+        topic: Option<Ulid>,
+        #[serde(default)]
+        thread: Option<u64>,
     },
     /// This account's answer. `question` is the question as shown, checked here against the answer
     /// before it goes.
@@ -570,6 +660,13 @@ pub enum Command {
         #[serde(default)]
         text: Option<Secret>,
         suggestion: Suggestion,
+        /// The message it answers, a group's or channel's topic, and the thread it goes in.
+        #[serde(default)]
+        reply: Option<Pointer>,
+        #[serde(default)]
+        topic: Option<Ulid>,
+        #[serde(default)]
+        thread: Option<u64>,
     },
     /// Accepts the suggestion at `seq`, as shown. Its folder is found by its name folded as search
     /// folds, the first in tab order, or made last among the tabs, which needs a connection for its
@@ -822,6 +919,13 @@ pub enum Command {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Input {
     Command {
+        command: Command,
+    },
+    /// A command whose outcome the platform wants told: once everything it asked the server and
+    /// the platform has been answered, [`Event::Answered`] comes with the same `tag`. Chosen by the
+    /// author for keryx-agent, whose scripts wait for each write's answer.
+    Tagged {
+        tag: u64,
         command: Command,
     },
     /// The two snapshot slots, once, when the platform starts. `resume` connects a cookie
@@ -1383,6 +1487,9 @@ pub enum Event {
     /// missing.
     Presence {
         presence: PresenceItem,
+        /// Its text, opened. Left out when it does not open.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
     },
     /// This account's settings, opened, whenever they change here or on the server.
     Kv {
@@ -1417,6 +1524,23 @@ pub enum Event {
     },
     /// This account's profile, photo or names were saved.
     ProfileSaved,
+    /// A new agent, its token and its 12 words, to be put in its `agent.toml`. Shown once: nothing
+    /// here keeps the words.
+    AgentCreated {
+        account: Ulid,
+        username: String,
+        token: Secret,
+        words: Secret,
+    },
+    /// The owner's agents.
+    Agents {
+        agent_list: Vec<AgentItem>,
+    },
+    /// An agent's renewed token, shown once.
+    AgentToken {
+        agent: Ulid,
+        token: Secret,
+    },
     Typing {
         chat: Ulid,
         account: Ulid,
@@ -1572,6 +1696,15 @@ pub enum Event {
         chat: Ulid,
         findable: Option<FindableItem>,
     },
+    /// Everything an [`Input::Tagged`] command asked has been answered: `seq` when it stored a
+    /// message, and `code`, with `message` and a slow mode's `seconds`, when something refused it.
+    Answered {
+        tag: u64,
+        seq: Option<u64>,
+        code: Option<String>,
+        message: Option<String>,
+        seconds: Option<u64>,
+    },
     Online,
     Offline,
     LoggedOut,
@@ -1627,6 +1760,9 @@ pub struct ShownProfile {
     pub link_list: Vec<ProfileLink>,
     /// What to draw while [`Command::Photo`] fetches it.
     pub photo: Option<ShownPhoto>,
+    /// An agent account, with its owner, for its badge.
+    pub agent: bool,
+    pub owner: Option<Ulid>,
 }
 
 #[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
@@ -1777,14 +1913,70 @@ impl Rows {
     }
 }
 
+/// What a tagged command asked that is answered later: a frame by its `ref`, a REST request or a
+/// save by its id, or a message by its local id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum TagKey {
+    Frame(Ulid),
+    Request(u64),
+    Save(u64),
+    Rows(u64),
+    Local(u64),
+}
+
+/// A tagged command not yet answered: how much it still waits for, and what was answered so far.
+#[derive(Default)]
+struct TagState {
+    open: usize,
+    seq: Option<u64>,
+    code: Option<String>,
+    message: Option<String>,
+    seconds: Option<u64>,
+}
+
+/// One thing a step's outputs say about tagged commands.
+enum Tagging {
+    Open(TagKey),
+    Sent(u64, u64),
+    Failed(u64, String, Option<u64>),
+    Error(String, String),
+}
+
 /// What a REST request was for.
 /// A login that found its account and waits for the platform to load that account's slots.
 struct Opening {
     account: Ulid,
-    username: String,
-    password: Secret,
-    captcha: Option<CaptchaAnswer>,
+    credentials: Credentials,
     challenge: Bytes,
+}
+
+/// What an owner does to an agent's token, each ending its device first.
+#[derive(Clone, Copy)]
+enum AgentEnd {
+    Renew,
+    Revoke,
+    Disable,
+}
+
+/// The account an agent's token names, read from its claims without checking them: the server does.
+fn agent_of_token(token: &str) -> Option<Ulid> {
+    let payload = token.split('.').nth(1)?;
+    let bytes = Base64UrlUnpadded::decode_vec(payload).ok()?;
+    let claims: AgentClaims = serde_json::from_slice(&bytes).ok()?;
+    Some(claims.sub)
+}
+
+/// What a login proves itself with: a person's password, or an agent's token.
+#[derive(Clone)]
+enum Credentials {
+    Password {
+        username: String,
+        password: Secret,
+        captcha: Option<CaptchaAnswer>,
+    },
+    Agent {
+        token: Secret,
+    },
 }
 
 enum Asked {
@@ -1799,16 +1991,17 @@ enum Asked {
     },
     Captcha,
     Challenge {
-        username: String,
-        password: Secret,
-        captcha: Option<CaptchaAnswer>,
+        credentials: Credentials,
     },
     Login {
-        username: String,
-        password: Secret,
+        credentials: Credentials,
         with_device: bool,
     },
-    Me,
+    /// This account's own info. `signed_in` holds the login's device while [`Event::SignedIn`] is
+    /// still owed, as an agent's login does not know its username until here.
+    Me {
+        signed_in: Option<Option<Ulid>>,
+    },
     Account {
         account: Ulid,
     },
@@ -1887,6 +2080,30 @@ enum Asked {
         device: Ulid,
     },
     LogOut,
+    /// The new agent's account, with its words to publish keys from and show once.
+    CreateAgent {
+        username: String,
+        words: Secret,
+    },
+    AgentKeys {
+        account: Ulid,
+        username: String,
+        token: Secret,
+        words: Secret,
+    },
+    Agents,
+    /// An agent was changed, so the list is asked again.
+    AgentChanged,
+    /// The list, to find the agent's device a renew, revoke or disable must end.
+    AgentDevice {
+        agent: Ulid,
+        words: Secret,
+        end: AgentEnd,
+    },
+    AgentEnded {
+        agent: Ulid,
+        end: AgentEnd,
+    },
     CreateFile {
         upload: u64,
     },
@@ -1907,9 +2124,11 @@ enum Asked {
         account: Ulid,
     },
     PutProfile {
+        account: Ulid,
         body: Box<ProfileBody>,
     },
     AddPhoto {
+        account: Ulid,
         key: zeroize::Zeroizing<[u8; 16]>,
         size: u64,
         blurhash: String,
@@ -1983,6 +2202,8 @@ struct Upload {
     files: Vec<UpFile>,
     /// The file going up now.
     current: usize,
+    /// The message it answers.
+    reply: Option<Pointer>,
     topic: Option<Ulid>,
     thread_seq: Option<u64>,
 }
@@ -2309,6 +2530,13 @@ pub struct Client {
     /// Chats still restoring with the words' keys.
     restoring: HashSet<Ulid>,
     next_id: u64,
+    /// The tag of the [`Input::Tagged`] command this step works for, taken from the input or from
+    /// what the input answers.
+    tagging: Option<u64>,
+    /// What tagged commands asked and wait for, each with its command's tag.
+    tag_keys: HashMap<TagKey, u64>,
+    /// Each tagged command not yet answered.
+    tagged: HashMap<u64, TagState>,
     asked: HashMap<u64, Request>,
     /// Background requests to send again, with when.
     later: Vec<(i64, Request)>,
@@ -2321,6 +2549,8 @@ pub struct Client {
     stopped: bool,
     /// Asked to log in again, and not since logged in.
     session_lost: bool,
+    /// An agent's token, so a lost session logs in again by itself.
+    agent_token: Option<Secret>,
     /// Over the device limit, until a device is terminated.
     limited: bool,
     /// A device registration refused at the limit, to try again once one is terminated.
@@ -2362,6 +2592,9 @@ pub struct Client {
     acks_waiting: Vec<WaitingAck>,
     /// Whether the app is on screen, as the platform last said, sent as `presence`.
     in_app: bool,
+    /// Having trouble, and its text, as the platform last said, sent with `in_app`.
+    trouble: bool,
+    presence_text: Option<String>,
     /// This account's settings, still sealed, sorted by name, with this device's changes on top.
     kv: Vec<KvItem>,
     /// The server's version of them, once it has said.
@@ -2574,6 +2807,12 @@ fn background(asked: &Asked) -> bool {
             | Asked::ChatPhotoFile { .. }
             | Asked::ChatPhotoChunk { .. }
             | Asked::Names
+            | Asked::CreateAgent { .. }
+            | Asked::AgentKeys { .. }
+            | Asked::Agents
+            | Asked::AgentChanged
+            | Asked::AgentDevice { .. }
+            | Asked::AgentEnded { .. }
     )
 }
 
@@ -2735,9 +2974,17 @@ fn content_of(plaintext: &[u8], content_kind: Option<ContentKind>) -> Opened {
                 (Some(emoji), Some(on)) => (Some(emoji.as_str().to_string()), Some(on)),
                 _ => (None, None),
             };
+            // An activity's text is 1 to 140 characters, or it is left out.
+            let mut text = plain.text;
+            if content_kind == Some(ContentKind::Activity)
+                && let Some(activity) = &text
+                && !(1..=ACTIVITY_CHARS).contains(&activity.chars().count())
+            {
+                text = None;
+            }
             Opened {
                 reply: plain.reply,
-                text: plain.text.map(Secret),
+                text: text.map(Secret),
                 files: plain.files,
                 call: match (plain.video, plain.voice) {
                     (Some(video), Some(voice)) => Some(CallBody { video, voice }),
@@ -2858,6 +3105,7 @@ impl Client {
             socket: Socket::Down,
             stopped: false,
             session_lost: false,
+            agent_token: None,
             limited: false,
             register_restore: None,
             starting: HashSet::new(),
@@ -2868,6 +3116,9 @@ impl Client {
             ping_sent_at: None,
             ping: None,
             waiting: HashMap::new(),
+            tagging: None,
+            tag_keys: HashMap::new(),
+            tagged: HashMap::new(),
             queue: Queue::default(),
             in_flight: HashMap::new(),
             commit_busy: false,
@@ -2883,6 +3134,8 @@ impl Client {
             folders_out: None,
             acks_waiting: Vec::new(),
             in_app: false,
+            trouble: false,
+            presence_text: None,
             kv: Vec::new(),
             kv_version: None,
             kv_out: None,
@@ -2935,8 +3188,18 @@ impl Client {
     /// The one door in: what happened, and the time in Unix milliseconds. Returns what to do.
     pub fn step(&mut self, input: Input, now: i64) -> Vec<Output> {
         self.now = now;
+        self.tagging = match &input {
+            Input::Tagged { tag, .. } => {
+                self.tagged.entry(*tag).or_default();
+                Some(*tag)
+            }
+            Input::Reply { id, .. } | Input::Fetched { id, .. } => self.untag(TagKey::Request(*id)),
+            Input::Saved { id } | Input::SaveFailed { id } => self.untag(TagKey::Save(*id)),
+            Input::RowsSaved { id } | Input::RowsSaveFailed { id } => self.untag(TagKey::Rows(*id)),
+            _ => None,
+        };
         match input {
-            Input::Command { command } => self.command(command),
+            Input::Command { command } | Input::Tagged { command, .. } => self.command(command),
             Input::Loaded {
                 first,
                 second,
@@ -2952,7 +3215,14 @@ impl Client {
                 self.last_heard = now;
                 self.ping_sent_at = None;
                 match serde_json::from_str::<ServerFrame>(&text) {
-                    Ok(frame) => self.frame(frame),
+                    Ok(frame) => {
+                        if let Some(reference) = frame.reference()
+                            && let Some(tag) = self.untag(TagKey::Frame(reference))
+                        {
+                            self.tagging = Some(tag);
+                        }
+                        self.frame(frame)
+                    }
                     Err(_) => self.error(
                         "bad_frame",
                         "The server sent a frame this client cannot read",
@@ -3000,7 +3270,111 @@ impl Client {
         }
         self.rekey_call();
         self.schedule();
+        self.tag_outputs();
         std::mem::take(&mut self.out)
+    }
+
+    /// Takes what a tagged command waited for off its list, and gives its tag.
+    fn untag(&mut self, key: TagKey) -> Option<u64> {
+        let tag = self.tag_keys.remove(&key)?;
+        if let Some(state) = self.tagged.get_mut(&tag) {
+            state.open = state.open.saturating_sub(1);
+        }
+        Some(tag)
+    }
+
+    /// Puts what this step asked on its tagged command's list.
+    fn tag_open(&mut self, key: TagKey) {
+        if let Some(tag) = self.tagging
+            && let Some(state) = self.tagged.get_mut(&tag)
+        {
+            state.open += 1;
+            self.tag_keys.insert(key, tag);
+        }
+    }
+
+    /// Reads this step's outputs for what tagged commands asked and how they were answered, then
+    /// tells each command whose list is empty.
+    fn tag_outputs(&mut self) {
+        let mut found = Vec::new();
+        for output in &self.out {
+            match output {
+                Output::Request { id, .. }
+                | Output::PutChunk { id, .. }
+                | Output::GetChunk { id, .. } => found.push(Tagging::Open(TagKey::Request(*id))),
+                Output::Save { id, .. } => found.push(Tagging::Open(TagKey::Save(*id))),
+                Output::SaveRows { id, .. } => found.push(Tagging::Open(TagKey::Rows(*id))),
+                Output::Event { event } => match event.as_ref() {
+                    Event::Pending { local, .. } => {
+                        found.push(Tagging::Open(TagKey::Local(*local)));
+                    }
+                    Event::Sent { local, seq, .. } => found.push(Tagging::Sent(*local, *seq)),
+                    Event::Failed {
+                        local,
+                        code,
+                        seconds,
+                        ..
+                    } => found.push(Tagging::Failed(*local, code.clone(), *seconds)),
+                    Event::Error { code, message } => {
+                        found.push(Tagging::Error(code.clone(), message.clone()));
+                    }
+                    Event::TransferFailed { code, .. } => {
+                        found.push(Tagging::Error(code.clone(), String::new()));
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+        for item in found {
+            match item {
+                Tagging::Open(key) => self.tag_open(key),
+                Tagging::Sent(local, seq) => {
+                    if let Some(tag) = self.untag(TagKey::Local(local))
+                        && let Some(state) = self.tagged.get_mut(&tag)
+                    {
+                        state.seq = Some(seq);
+                    }
+                }
+                Tagging::Failed(local, code, seconds) => {
+                    if let Some(tag) = self.untag(TagKey::Local(local))
+                        && let Some(state) = self.tagged.get_mut(&tag)
+                        && state.code.is_none()
+                    {
+                        state.code = Some(code);
+                        state.seconds = seconds;
+                    }
+                }
+                Tagging::Error(code, message) => {
+                    if let Some(tag) = self.tagging
+                        && let Some(state) = self.tagged.get_mut(&tag)
+                        && state.code.is_none()
+                    {
+                        state.code = Some(code);
+                        state.message = Some(message).filter(|message| !message.is_empty());
+                    }
+                }
+            }
+        }
+        self.tagging = None;
+        let mut answered: Vec<u64> = Vec::new();
+        for (tag, state) in &self.tagged {
+            if state.open == 0 {
+                answered.push(*tag);
+            }
+        }
+        answered.sort_unstable();
+        for tag in answered {
+            if let Some(state) = self.tagged.remove(&tag) {
+                self.event(Event::Answered {
+                    tag,
+                    seq: state.seq,
+                    code: state.code,
+                    message: state.message,
+                    seconds: state.seconds,
+                });
+            }
+        }
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -3102,6 +3476,7 @@ impl Client {
         let sent = self.send(&frame);
         if sent {
             self.waiting.insert(reference, waiting);
+            self.tag_open(TagKey::Frame(reference));
         }
         sent
     }
@@ -3237,6 +3612,69 @@ impl Client {
                 password,
                 captcha,
             } => self.log_in(username, password, captcha),
+            Command::LogInAgent { token } => self.log_in_agent(token),
+            Command::CreateAgent {
+                username,
+                display_name,
+                permission_list,
+                admin,
+            } => self.create_agent(username, display_name, permission_list, admin),
+            Command::Agents => self.get("/api/v1/agents".to_string(), Asked::Agents),
+            Command::UpdateAgent {
+                agent,
+                display_name,
+                permission_list,
+                admin,
+            } => {
+                let body = UpdateAgentBody {
+                    display_name,
+                    permission_list,
+                    admin,
+                };
+                self.request(
+                    "PUT",
+                    format!("/api/v1/agents/{agent}"),
+                    Some(&body),
+                    Asked::AgentChanged,
+                );
+            }
+            Command::RenewAgentToken { agent, words } => {
+                self.end_agent(agent, words, AgentEnd::Renew);
+            }
+            Command::RevokeAgentToken { agent, words } => {
+                self.end_agent(agent, words, AgentEnd::Revoke);
+            }
+            Command::DisableAgent { agent, words } => {
+                self.end_agent(agent, words, AgentEnd::Disable);
+            }
+            Command::AgentProfile {
+                agent,
+                bio,
+                link_list,
+            } => {
+                let Some(mut body) = self.profile_body(agent) else {
+                    return;
+                };
+                body.bio = bio
+                    .map(|bio| bio.trim().to_string())
+                    .filter(|bio| !bio.is_empty());
+                body.link_list = link_list
+                    .into_iter()
+                    .map(|link| ProfileLink {
+                        name: link.name.trim().to_string(),
+                        url: link.url.trim().to_string(),
+                    })
+                    .collect();
+                if let Err(message) = check_profile(&body) {
+                    return self.error("bad_profile", message);
+                }
+                self.put_profile(agent, body);
+            }
+            Command::AgentPhoto {
+                agent,
+                jpeg,
+                thumbnail,
+            } => self.set_photo(agent, &jpeg, &thumbnail),
             Command::Captcha => self.get("/api/v1/captcha".to_string(), Asked::Captcha),
             Command::Setup {
                 token,
@@ -3367,7 +3805,8 @@ impl Client {
                 text,
                 topic,
                 thread,
-            } => self.send_files(chat, files, text, (topic, thread)),
+                reply,
+            } => self.send_files(chat, files, text, reply, (topic, thread)),
             Command::Download { file, handle } => self.download(file, handle),
             Command::Edit {
                 chat,
@@ -3449,10 +3888,16 @@ impl Client {
             } => {
                 self.arrange(folder_list, default);
             }
-            Command::InApp { in_app } => {
+            Command::InApp {
+                in_app,
+                trouble,
+                text,
+            } => {
                 self.in_app = in_app;
+                self.trouble = trouble;
+                self.presence_text = text;
                 if self.socket == Socket::Up {
-                    self.send(&ClientFrame::Presence { in_app });
+                    self.send_presence();
                 }
             }
             Command::PresenceOf { account } => {
@@ -3540,6 +3985,30 @@ impl Client {
                     },
                 );
             }
+            Command::SendActivity {
+                chat,
+                text,
+                topic,
+                thread,
+            } => {
+                let count = text.chars().count();
+                if count == 0 || count > ACTIVITY_CHARS {
+                    return self.error("bad_activity", "An activity is 1 to 140 characters");
+                }
+                let fields = serde_json::json!({ "text": text }).to_string();
+                self.push_content(
+                    chat,
+                    Kind::Content,
+                    None,
+                    Content {
+                        content_kind: Some(ContentKind::Activity),
+                        fields: Some(Secret(fields)),
+                        topic,
+                        thread_seq: thread,
+                        ..Content::default()
+                    },
+                );
+            }
             Command::SendReaction {
                 chat,
                 emoji,
@@ -3604,6 +4073,9 @@ impl Client {
                 chat,
                 text,
                 question,
+                reply,
+                topic,
+                thread,
             } => {
                 if let Err(error) = question.check() {
                     return self.error("bad_question", &error.to_string());
@@ -3615,11 +4087,13 @@ impl Client {
                 self.push_content(
                     chat,
                     Kind::Content,
-                    None,
+                    reply,
                     Content {
                         content_kind: Some(ContentKind::Question),
                         text,
                         fields: Some(Secret(fields)),
+                        topic,
+                        thread_seq: thread,
                         ..Content::default()
                     },
                 );
@@ -3639,6 +4113,9 @@ impl Client {
                 chat,
                 text,
                 suggestion,
+                reply,
+                topic,
+                thread,
             } => {
                 if let Some(text) = &text
                     && text.0.chars().count() > crate::protocol::SUGGESTION_TEXT
@@ -3655,11 +4132,13 @@ impl Client {
                 self.push_content(
                     chat,
                     Kind::Content,
-                    None,
+                    reply,
                     Content {
                         content_kind: Some(ContentKind::Suggestion),
                         text,
                         fields: Some(Secret(fields)),
+                        topic,
+                        thread_seq: thread,
                         ..Content::default()
                     },
                 );
@@ -3775,7 +4254,10 @@ impl Client {
             }
             Command::Photo { account } => self.ask_photo(account),
             Command::SaveProfile { bio, link_list } => {
-                let Some(mut body) = self.own_body() else {
+                let Some(me) = self.account else {
+                    return self.error("not_logged_in", "Log in first");
+                };
+                let Some(mut body) = self.profile_body(me) else {
                     return;
                 };
                 body.bio = bio
@@ -3791,15 +4273,23 @@ impl Client {
                 if let Err(message) = check_profile(&body) {
                     return self.error("bad_profile", message);
                 }
-                self.put_profile(body);
+                self.put_profile(me, body);
             }
-            Command::SetPhoto { jpeg, thumbnail } => self.set_photo(&jpeg, &thumbnail),
+            Command::SetPhoto { jpeg, thumbnail } => {
+                let Some(me) = self.account else {
+                    return self.error("not_logged_in", "Log in first");
+                };
+                self.set_photo(me, &jpeg, &thumbnail);
+            }
             Command::RemovePhoto => {
-                let Some(mut body) = self.own_body() else {
+                let Some(me) = self.account else {
+                    return self.error("not_logged_in", "Log in first");
+                };
+                let Some(mut body) = self.profile_body(me) else {
                     return;
                 };
                 body.photo = None;
-                self.put_profile(body);
+                self.put_profile(me, body);
             }
             Command::SetNames {
                 display_name,
@@ -4132,7 +4622,34 @@ impl Client {
     fn log_in(&mut self, username: String, password: Secret, captcha: Option<CaptchaAnswer>) {
         self.opening = None;
         let body = ChallengeBody {
-            username: username.clone(),
+            username: Some(username.clone()),
+            account: None,
+            purpose: "device_login".to_string(),
+        };
+        let credentials = Credentials::Password {
+            username,
+            password,
+            captcha,
+        };
+        self.request(
+            "POST",
+            "/api/v1/challenge".to_string(),
+            Some(&body),
+            Asked::Challenge { credentials },
+        );
+    }
+
+    /// An agent logs in with its token, asking its challenge by the account the token names. It is
+    /// kept, so a lost session logs in again by itself.
+    fn log_in_agent(&mut self, token: Secret) {
+        self.opening = None;
+        let Some(account) = agent_of_token(&token.0) else {
+            return self.error("bad_token", "That is not an agent's token");
+        };
+        self.agent_token = Some(token.clone());
+        let body = ChallengeBody {
+            username: None,
+            account: Some(account),
             purpose: "device_login".to_string(),
         };
         self.request(
@@ -4140,23 +4657,15 @@ impl Client {
             "/api/v1/challenge".to_string(),
             Some(&body),
             Asked::Challenge {
-                username,
-                password,
-                captcha,
+                credentials: Credentials::Agent { token },
             },
         );
     }
 
     /// Logs in proving the loaded device with the challenge, or with no device.
-    fn prove_and_log_in(
-        &mut self,
-        username: String,
-        password: Secret,
-        captcha: Option<CaptchaAnswer>,
-        challenge: Bytes,
-    ) {
+    fn prove_and_log_in(&mut self, credentials: Credentials, challenge: Bytes) {
         let Some(device) = self.device.as_ref() else {
-            return self.post_login(username, password, captcha, None);
+            return self.post_login(credentials, None);
         };
         let Some(fixed_challenge) = fixed::<32>(&challenge.0) else {
             return self.error("bad_reply", "The challenge is not 32 bytes");
@@ -4170,7 +4679,7 @@ impl Client {
             challenge,
             signature: Bytes(signature.to_vec()),
         };
-        self.post_login(username, password, captcha, Some(proof));
+        self.post_login(credentials, Some(proof));
     }
 
     /// The slots for the account a login found. A device that does not load is reported, and
@@ -4178,9 +4687,7 @@ impl Client {
     fn opened(&mut self, first: Option<Vec<u8>>, second: Option<Vec<u8>>) {
         let Some(Opening {
             account,
-            username,
-            password,
-            captcha,
+            credentials,
             challenge,
         }) = self.opening.take()
         else {
@@ -4203,36 +4710,161 @@ impl Client {
                 Err(error) => self.error("load_failed", &error.to_string()),
             }
         }
-        self.prove_and_log_in(username, password, captcha, challenge);
+        self.prove_and_log_in(credentials, challenge);
     }
 
-    fn post_login(
+    fn post_login(&mut self, credentials: Credentials, device: Option<DeviceProof>) {
+        let with_device = device.is_some();
+        match &credentials {
+            Credentials::Password {
+                username,
+                password,
+                captcha,
+            } => {
+                let body = LoginBody {
+                    username: username.clone(),
+                    password: password.0.clone(),
+                    captcha: captcha.clone(),
+                    device,
+                };
+                let route = match self.auth {
+                    Auth::Cookie => "/api/v1/login",
+                    Auth::Token => "/api/v1/login/token",
+                };
+                self.request(
+                    "POST",
+                    route.to_string(),
+                    Some(&body),
+                    Asked::Login {
+                        credentials,
+                        with_device,
+                    },
+                );
+            }
+            Credentials::Agent { token } => {
+                let body = AgentLoginBody {
+                    token: token.0.clone(),
+                    device,
+                };
+                self.request(
+                    "POST",
+                    "/api/v1/login/agent".to_string(),
+                    Some(&body),
+                    Asked::Login {
+                        credentials,
+                        with_device,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Makes 12 words for the agent first, then its account. Its keys follow from the words once
+    /// the server gives its id.
+    fn create_agent(
         &mut self,
         username: String,
-        password: Secret,
-        captcha: Option<CaptchaAnswer>,
-        device: Option<DeviceProof>,
+        display_name: String,
+        permission_list: Vec<String>,
+        admin: bool,
     ) {
-        let body = LoginBody {
-            username: username.clone(),
-            password: password.0.clone(),
-            captcha,
-            device: device.clone(),
+        let words = match seed::generate(12) {
+            Ok(words) => Secret(words.to_string()),
+            Err(error) => return self.error("bad_words", &error.to_string()),
         };
-        let route = match self.auth {
-            Auth::Cookie => "/api/v1/login",
-            Auth::Token => "/api/v1/login/token",
+        let body = CreateAgentBody {
+            username: username.clone(),
+            display_name,
+            permission_list,
+            admin,
         };
         self.request(
             "POST",
-            route.to_string(),
+            "/api/v1/agents".to_string(),
             Some(&body),
-            Asked::Login {
-                username,
-                password,
-                with_device: device.is_some(),
+            Asked::CreateAgent { username, words },
+        );
+    }
+
+    /// The agent exists: publish its keys from its words, and keep only its profile key, so this
+    /// device can seal its bio and photo. Its master key is never kept.
+    fn agent_made(&mut self, account: Ulid, username: String, token: Secret, words: Secret) {
+        let keys = match seed::derive(&words.0) {
+            Ok(keys) => keys,
+            Err(error) => return self.error("bad_words", &error.to_string()),
+        };
+        let body = self.keys_body(&keys, account);
+        if let Some(device) = self.device.as_mut() {
+            device.keep_profile_key(account, keys.profile());
+            self.dirty = true;
+        }
+        self.profiles.insert(
+            account,
+            ProfileState {
+                account,
+                version: 0,
+                username: username.clone(),
+                display_name: None,
+                signed: None,
+                photo: None,
+                body: None,
             },
         );
+        self.request(
+            "PUT",
+            format!("/api/v1/accounts/{account}/keys"),
+            Some(&body),
+            Asked::AgentKeys {
+                account,
+                username,
+                token,
+                words,
+            },
+        );
+    }
+
+    /// A renew, revoke or disable asks for the agent's device first, whose termination the words
+    /// sign.
+    fn end_agent(&mut self, agent: Ulid, words: Secret, end: AgentEnd) {
+        if let Err(error) = seed::derive(&words.0) {
+            return self.error("bad_words", &error.to_string());
+        }
+        self.get(
+            "/api/v1/agents".to_string(),
+            Asked::AgentDevice { agent, words, end },
+        );
+    }
+
+    fn agent_device_known(
+        &mut self,
+        agent: Ulid,
+        words: Secret,
+        end: AgentEnd,
+        agent_list: Vec<AgentItem>,
+    ) {
+        let Some(item) = agent_list.into_iter().find(|item| item.id == agent) else {
+            return self.error("no_such_account", "That is not one of your agents");
+        };
+        let statement = match item.device {
+            Some(device) => {
+                let keys = match seed::derive(&words.0) {
+                    Ok(keys) => keys,
+                    Err(error) => return self.error("bad_words", &error.to_string()),
+                };
+                Some(AgentStatement {
+                    device,
+                    signature: Bytes(sign_revocation(&keys, &agent, &device).to_vec()),
+                })
+            }
+            None => None,
+        };
+        let body = AgentEndBody { statement };
+        let (method, path) = match end {
+            AgentEnd::Renew => ("POST", format!("/api/v1/agents/{agent}/token")),
+            AgentEnd::Revoke => ("DELETE", format!("/api/v1/agents/{agent}/token")),
+            AgentEnd::Disable => ("POST", format!("/api/v1/agents/{agent}/disable")),
+        };
+        self.request(method, path, Some(&body), Asked::AgentEnded { agent, end });
     }
 
     fn set_words(&mut self, words: &Secret, restore: bool) {
@@ -4614,6 +5246,7 @@ impl Client {
         chat: Ulid,
         specs: Vec<FileSpec>,
         text: Option<Secret>,
+        reply: Option<Pointer>,
         place: (Option<Ulid>, Option<u64>),
     ) {
         if self.device.is_none() {
@@ -4699,6 +5332,7 @@ impl Client {
                 text,
                 files,
                 current: 0,
+                reply,
                 topic: place.0,
                 thread_seq: place.1,
             },
@@ -4835,7 +5469,7 @@ impl Client {
         self.push_content(
             going.chat,
             Kind::Content,
-            None,
+            going.reply,
             Content {
                 content_kind: Some(going.content_kind),
                 text: going.text,
@@ -5143,15 +5777,9 @@ impl Client {
         else {
             return self.show_profile(account);
         };
-        let master = self
-            .accounts
-            .get(&account)
-            .and_then(|info| info.master_public.as_ref())
-            .and_then(|master| fixed::<32>(&master.0));
-        let Some(master_public) = master else {
-            self.ask_account(account);
-            return self.show_profile(account);
-        };
+        // Signed by one of its own devices, or, for an agent, by one of its owner's, chosen by the
+        // author, so its owner edits it without its words.
+        let owner = self.accounts.get(&account).and_then(|info| info.owner);
         let (Some(device_public), Some(stamp), Some(signature)) = (
             fixed::<32>(&signed.device_public.0),
             fixed::<64>(&signed.stamp.0),
@@ -5159,19 +5787,43 @@ impl Client {
         ) else {
             return self.show_profile(account);
         };
-        let record = DeviceRecord {
-            account,
-            device: signed.device,
-            device_public,
-            master_public,
-            stamp,
-        };
-        let opened = match self.device.as_ref() {
-            Some(device) => device.open_profile(&record, &signed.sealed.0, &signature),
-            None => return,
-        };
+        let mut opened = None;
+        let mut missing = Vec::new();
+        for signer in std::iter::once(account).chain(owner) {
+            let master = self
+                .accounts
+                .get(&signer)
+                .and_then(|info| info.master_public.as_ref())
+                .and_then(|master| fixed::<32>(&master.0));
+            let Some(master_public) = master else {
+                missing.push(signer);
+                continue;
+            };
+            let record = DeviceRecord {
+                account: signer,
+                device: signed.device,
+                device_public,
+                master_public,
+                stamp,
+            };
+            let Some(device) = self.device.as_mut() else {
+                return;
+            };
+            if let Ok(plaintext) =
+                device.open_profile(account, &record, &signed.sealed.0, &signature)
+            {
+                opened = Some(plaintext);
+                break;
+            }
+        }
+        if opened.is_none() && !missing.is_empty() {
+            for signer in missing {
+                self.ask_account(signer);
+            }
+            return self.show_profile(account);
+        }
         // Without its key, it opens once a `profile_keys` frame or a later list brings one.
-        if let Ok(plaintext) = opened
+        if let Some(plaintext) = opened
             && let Ok(body) = serde_json::from_slice::<ProfileBody>(&plaintext)
             && let Some(state) = self.profiles.get_mut(&account)
         {
@@ -5183,6 +5835,7 @@ impl Client {
     }
 
     fn show_profile(&mut self, account: Ulid) {
+        let owner = self.accounts.get(&account).and_then(|info| info.owner);
         let profile = match self.profiles.get(&account) {
             Some(state) => {
                 let body = state.body.clone().unwrap_or_default();
@@ -5200,6 +5853,8 @@ impl Client {
                             id: photo.id,
                             blurhash: photo.blurhash,
                         }),
+                    agent: owner.is_some(),
+                    owner,
                 }
             }
             None => match self.accounts.get(&account) {
@@ -5211,6 +5866,8 @@ impl Client {
                     bio: None,
                     link_list: Vec::new(),
                     photo: None,
+                    agent: owner.is_some(),
+                    owner,
                 },
                 None => return,
             },
@@ -5245,13 +5902,9 @@ impl Client {
         });
     }
 
-    /// What this account's profile holds now, to change one part of it. Its photo stays only if
-    /// the server still has it.
-    fn own_body(&mut self) -> Option<ProfileBody> {
-        let Some(me) = self.account else {
-            self.error("not_logged_in", "Log in first");
-            return None;
-        };
+    /// What this account's profile, or its agent's, holds now, to change one part of it. Its photo
+    /// stays only if the server still has it.
+    fn profile_body(&mut self, me: Ulid) -> Option<ProfileBody> {
         let Some(state) = self.profiles.get(&me) else {
             self.ask_profile(me);
             self.error("profile_loading", "Your profile has not loaded yet");
@@ -5272,10 +5925,7 @@ impl Client {
         Some(body)
     }
 
-    fn put_profile(&mut self, body: ProfileBody) {
-        let Some(me) = self.account else {
-            return self.error("not_logged_in", "Log in first");
-        };
+    fn put_profile(&mut self, me: Ulid, body: ProfileBody) {
         let Some(device) = self.device.as_ref() else {
             return self.error("no_device", "This client has no device");
         };
@@ -5283,7 +5933,7 @@ impl Client {
             Ok(plaintext) => zeroize::Zeroizing::new(plaintext),
             Err(_) => return self.error("internal", "Could not write the profile"),
         };
-        let (sealed, signature) = match device.seal_profile(&plaintext) {
+        let (sealed, signature) = match device.seal_profile(me, &plaintext) {
             Ok(sealed) => sealed,
             Err(error) => return self.error("seal_failed", &error.to_string()),
         };
@@ -5297,15 +5947,13 @@ impl Client {
             format!("/api/v1/accounts/{me}/profile"),
             Some(&put),
             Asked::PutProfile {
+                account: me,
                 body: Box::new(body),
             },
         );
     }
 
-    fn profile_saved(&mut self, version: u64, body: ProfileBody) {
-        let Some(me) = self.account else {
-            return;
-        };
+    fn profile_saved(&mut self, me: Ulid, version: u64, body: ProfileBody) {
         let (username, display_name) = match self.accounts.get(&me) {
             Some(info) => (info.username.clone(), info.display_name.clone()),
             None => (self.username.clone().unwrap_or_default(), None),
@@ -5330,10 +5978,7 @@ impl Client {
 
     /// Seals the JPEG as one chunk under its own key and sends it up. The profile names it once
     /// the server has it.
-    fn set_photo(&mut self, jpeg: &[u8], thumbnail: &Thumbnail) {
-        let Some(me) = self.account else {
-            return self.error("not_logged_in", "Log in first");
-        };
+    fn set_photo(&mut self, me: Ulid, jpeg: &[u8], thumbnail: &Thumbnail) {
         if jpeg.is_empty() || jpeg.len() as u64 > file::CHUNK {
             return self.error("file_too_large", "That photo is too large");
         }
@@ -5356,6 +6001,7 @@ impl Client {
             bytes: Some(sealed),
             raw: false,
             asked: Asked::AddPhoto {
+                account: me,
                 key,
                 size: jpeg.len() as u64,
                 blurhash,
@@ -5413,6 +6059,36 @@ impl Client {
     // The socket
     // ---------------------------------------------------------------------------------------------
 
+    /// This device's `presence`, its text sealed under the account's profile key. A text that cannot
+    /// be sealed is left out, and the state still goes.
+    fn send_presence(&mut self) {
+        let mut text = None;
+        if let (Some(plain), Some(device)) = (&self.presence_text, self.device.as_ref()) {
+            match device.seal_presence_text(plain) {
+                Ok(sealed) => text = Some(Bytes(sealed)),
+                Err(error) => self.error("seal_failed", &error.to_string()),
+            }
+        }
+        self.send(&ClientFrame::Presence {
+            in_app: self.in_app,
+            trouble: self.trouble,
+            text,
+        });
+    }
+
+    /// Someone's presence, its text opened with their profile key. One that does not open is left
+    /// out, as its key may not have come yet.
+    fn presence_shown(&mut self, mut presence: PresenceItem) {
+        let mut text = None;
+        if let (Some(sealed), Some(device)) = (presence.text.take(), self.device.as_ref())
+            && let Ok(plain) = device.open_presence_text(presence.account, &sealed.0)
+            && let Ok(plain) = String::from_utf8(plain.to_vec())
+        {
+            text = Some(plain);
+        }
+        self.event(Event::Presence { presence, text });
+    }
+
     fn connect(&mut self) {
         self.retry_at = None;
         self.socket = Socket::Connecting;
@@ -5428,9 +6104,7 @@ impl Client {
         self.ping_sent_at = None;
         self.event(Event::Online);
         // The first frame: until it, this device is not there to others.
-        self.send(&ClientFrame::Presence {
-            in_app: self.in_app,
-        });
+        self.send_presence();
         self.ask_kv(self.kv_version);
         let body = KeyPackagesBody {
             body_list: Vec::new(),
@@ -5476,6 +6150,23 @@ impl Client {
         self.verifying = 0;
         self.ping = None;
         self.waiting.clear();
+        // What tagged commands still waited for on this socket will never be answered: a message
+        // waits on in the queue by its local id, and the rest is told it went offline.
+        let lost: Vec<TagKey> = self
+            .tag_keys
+            .keys()
+            .filter(|key| matches!(key, TagKey::Frame(_)))
+            .copied()
+            .collect();
+        for key in lost {
+            if let Some(tag) = self.untag(key)
+                && let Some(state) = self.tagged.get_mut(&tag)
+                && state.code.is_none()
+                && !self.tag_keys.values().any(|other| *other == tag)
+            {
+                state.code = Some("offline".to_string());
+            }
+        }
         // A change whose answer never came goes again, under what was made since.
         self.kv_ready = false;
         if let Some(flight) = self.kv_flight.take() {
@@ -5532,7 +6223,11 @@ impl Client {
         }
         if !self.session_lost {
             self.session_lost = true;
-            self.show_login();
+            // An agent has nobody to type a password: it logs in again with its token.
+            match self.agent_token.clone() {
+                Some(token) => self.log_in_agent(token),
+                None => self.show_login(),
+            }
         }
     }
 
@@ -7919,15 +8614,13 @@ impl Client {
                 Some(waiting) => self.refused(waiting, &code, &message),
                 None => {}
             },
-            ServerFrame::Presence(presence) => self.event(Event::Presence {
-                presence: *presence,
-            }),
+            ServerFrame::Presence(presence) => self.presence_shown(*presence),
             ServerFrame::PresenceOf {
                 reference,
                 presence,
             } => {
                 if self.waiting.remove(&reference).is_some() {
-                    self.event(Event::Presence { presence });
+                    self.presence_shown(presence);
                 }
             }
             ServerFrame::Kv {
@@ -9964,28 +10657,22 @@ impl Client {
                     self.event(Event::Captcha { id, image });
                 }
             }
-            Asked::Challenge {
-                username,
-                password,
-                captcha,
-            } => {
+            Asked::Challenge { credentials } => {
                 let Some(ChallengeReply { challenge, account }) = self.data(body) else {
                     return;
                 };
                 if self.device.is_some() {
-                    return self.prove_and_log_in(username, password, captcha, challenge);
+                    return self.prove_and_log_in(credentials, challenge);
                 }
                 // The platform loads this account's slots, if it keeps any, and answers.
                 self.opening = Some(Opening {
                     account,
-                    username,
-                    password,
-                    captcha,
+                    credentials,
                     challenge,
                 });
                 self.out.push(Output::Open { account });
             }
-            Asked::Login { username, .. } => {
+            Asked::Login { credentials, .. } => {
                 let Some(LoginReply {
                     account,
                     device,
@@ -10004,25 +10691,43 @@ impl Client {
                     self.token = kept.clone();
                 }
                 self.account = Some(account);
-                self.username = Some(username.clone());
                 self.stopped = false;
                 self.session_lost = false;
                 self.limited = false;
-                self.event(Event::SignedIn {
-                    account,
-                    username,
-                    device,
-                });
+                // An agent learns its username from its own info, so its `SignedIn` waits for it.
+                let signed_in = match credentials {
+                    Credentials::Password { username, .. } => {
+                        self.username = Some(username.clone());
+                        self.event(Event::SignedIn {
+                            account,
+                            username,
+                            device,
+                        });
+                        None
+                    }
+                    Credentials::Agent { .. } => Some(device),
+                };
                 if kept.is_some() {
                     self.event(Event::Token { token: kept });
                 }
                 self.asked_accounts.insert(account);
-                self.get(format!("/api/v1/accounts/{account}"), Asked::Me);
+                self.get(
+                    format!("/api/v1/accounts/{account}"),
+                    Asked::Me { signed_in },
+                );
             }
-            Asked::Me => {
+            Asked::Me { signed_in } => {
                 let Some(info) = self.data::<AccountInfo>(body) else {
                     return;
                 };
+                if let Some(device) = signed_in {
+                    self.username = Some(info.username.clone());
+                    self.event(Event::SignedIn {
+                        account: info.id,
+                        username: info.username.clone(),
+                        device,
+                    });
+                }
                 let restore = info.master_public.is_some();
                 self.account_known(info);
                 if self.device.is_some() {
@@ -10275,12 +10980,16 @@ impl Client {
                     self.profile_got(reply);
                 }
             }
-            Asked::PutProfile { body: profile } => {
+            Asked::PutProfile {
+                account,
+                body: profile,
+            } => {
                 if let Some(VersionReply { version }) = self.data(body) {
-                    self.profile_saved(version, *profile);
+                    self.profile_saved(account, version, *profile);
                 }
             }
             Asked::AddPhoto {
+                account,
                 key,
                 size,
                 blurhash,
@@ -10288,7 +10997,7 @@ impl Client {
                 let Some(PhotoReply { photo }) = self.data(body) else {
                     return;
                 };
-                let Some(mut profile) = self.own_body() else {
+                let Some(mut profile) = self.profile_body(account) else {
                     return;
                 };
                 profile.photo = Some(ProfilePhoto {
@@ -10297,7 +11006,7 @@ impl Client {
                     size,
                     blurhash,
                 });
-                self.put_profile(profile);
+                self.put_profile(account, profile);
             }
             // The server's `profile` frame brings the names, and a moved version the rest.
             Asked::Names => self.event(Event::ProfileSaved),
@@ -10318,6 +11027,57 @@ impl Client {
                     self.event(Event::DeviceList { reply });
                 }
             }
+            Asked::CreateAgent { username, words } => {
+                if let Some(CreatedAgentReply { account, token }) = self.data(body) {
+                    self.agent_made(account, username, Secret(token), words);
+                }
+            }
+            Asked::AgentKeys {
+                account,
+                username,
+                token,
+                words,
+            } => {
+                if self.data::<SelfChatReply>(body).is_some() {
+                    self.event(Event::AgentCreated {
+                        account,
+                        username,
+                        token,
+                        words,
+                    });
+                }
+            }
+            Asked::Agents => {
+                if let Some(AgentListReply { agent_list }) = self.data(body) {
+                    for agent in &agent_list {
+                        if !self.profiles.contains_key(&agent.id) {
+                            self.ask_profile(agent.id);
+                        }
+                    }
+                    self.event(Event::Agents { agent_list });
+                }
+            }
+            Asked::AgentChanged => self.get("/api/v1/agents".to_string(), Asked::Agents),
+            Asked::AgentDevice { agent, words, end } => {
+                if let Some(AgentListReply { agent_list }) = self.data(body) {
+                    self.agent_device_known(agent, words, end, agent_list);
+                }
+            }
+            Asked::AgentEnded { agent, end } => match end {
+                AgentEnd::Renew => {
+                    if let Some(AgentTokenReply { token }) = self.data(body) {
+                        self.event(Event::AgentToken {
+                            agent,
+                            token: Secret(token),
+                        });
+                    }
+                }
+                AgentEnd::Revoke | AgentEnd::Disable => {
+                    if self.data::<EmptyReply>(body).is_some() {
+                        self.get("/api/v1/agents".to_string(), Asked::Agents);
+                    }
+                }
+            },
             Asked::Terminate { device } => {
                 self.event(Event::Terminated { device });
                 if !self.limited {
@@ -10472,13 +11232,22 @@ impl Client {
         let attempt = request.attempt;
         match request.asked {
             Asked::Login {
-                username,
-                password,
+                credentials,
                 with_device: true,
             } if code == "device_ended" => {
                 self.device = None;
                 self.out.push(Output::Wipe);
-                self.post_login(username, password, None, None);
+                let credentials = match credentials {
+                    Credentials::Password {
+                        username, password, ..
+                    } => Credentials::Password {
+                        username,
+                        password,
+                        captcha: None,
+                    },
+                    agent => agent,
+                };
+                self.post_login(credentials, None);
             }
             // Said as the login says it, so asking first shows the same as before.
             Asked::Challenge { .. } if code == "no_such_account" => {

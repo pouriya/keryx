@@ -129,6 +129,7 @@ fn kinds_match_the_schema() {
         ContentKind::Sticker,
         ContentKind::Suggestion,
         ContentKind::Ack,
+        ContentKind::Activity,
     ];
     for (number, content_kind) in content_kinds.iter().enumerate() {
         assert_eq!(*content_kind as usize, number);
@@ -529,7 +530,7 @@ fn bad_frames_are_refused() {
     let good = to_value(ClientFrame::Send(Box::new(send_frame()))).unwrap();
     for (field, value) in [
         ("kind", json!(99)),
-        ("content_kind", json!(15)),
+        ("content_kind", json!(16)),
         ("body", json!("not base64!")),
         ("chat", json!("not a ulid")),
         ("type", json!("no_such_type")),
