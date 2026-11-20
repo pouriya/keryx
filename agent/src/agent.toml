@@ -1,0 +1,94 @@
+# keryx-agent's configuration. Every path is absolute, and an unknown key stops startup.
+# Whoever can read this file holds the account: the token and the words are in it.
+
+url = "http://127.0.0.1:7777"        # the keryx server
+token = "..."                        # the agent account's token, from its owner's app
+words = "..."                        # the account's words, from its owner's app
+directory = "/var/lib/keryx-agent"   # agent.db, index/, tmp/, chats/<chat id>/
+timezone = "UTC"                     # IANA name: schedules' default tz, and the preamble's local time
+
+[llm]
+protocol = "chat_completions"        # later: "responses"
+url = "https://api.openai.com/v1"
+key = "..."
+model = "..."
+backoff_max = "5m"                   # the longest wait between failed LLM calls
+
+[prompt]
+system = """..."""
+# compact = """..."""                # unset: the built-in default
+# limit = """..."""                  # unset: the built-in default
+send_final = false                   # true: the final text is sent as a reply to the trigger
+
+[context]
+max = "256KiB"                       # input bytes before compaction
+around = 10                          # earlier messages per chat/topic/thread group
+around_bytes = "16KiB"               # total JSON bytes of that background
+
+[context_limits.schedule]
+count = 10
+bytes = "16KiB"
+
+[context_limits.wake_script]
+count = 10
+bytes = "16KiB"
+
+[search]
+plain = false                        # true: messages' plaintext is indexed on disk
+
+[memory]
+hint_words = 10                      # most common words per memory in the preamble. 0: counts only
+
+# [skills]
+# directory = "/var/lib/keryx-agent/skills"
+# writable = false
+
+[limits]
+script_time = "30s"
+script_output = "64KiB"
+tool_calls = 50                      # per wake
+wake_script = "1s"
+http_time = "30s"
+http_body = "10MiB"
+memory_notes = 10000                 # every memory's notes together
+memory_note = "16KiB"
+storage = "10GiB"                    # agent.db, index/, tmp/ and chats/
+storage_warn = 0.8
+runs_keep = "90d"                    # run logs older than this go. Unset: kept until removed
+
+# [http]
+# allow = ["api.github.com"]         # unset: any host. A list, even empty: only those
+
+# [secrets]
+# github = { value = "...", hosts = ["api.github.com"] }
+
+# Wake rules, in order: the first that matches an event decides. No match ignores it. Every condition
+# set must hold, any item of a list may match, and a rule with no conditions matches everything.
+[[wake]]
+chat_type = ["direct"]
+action = "wake"
+
+# [[wake]]
+# chat = ["01J..."]                  # chat ids
+# chat_type = ["group"]              # self | direct | group | channel
+# folder = ["Work"]                  # folder names, folded as search folds
+# topic = ["01J..."]                 # topic ids
+# thread = true                      # true: only in threads. false: only main lists
+# sender = ["sara"]                  # usernames
+# content_kind = ["text"]            # text | voice | reaction | image | music | video | doc | file |
+#                                    # call | media_bundle | question | answer | sticker |
+#                                    # suggestion | ack | activity
+# event = ["message"]                # message | reaction | answer | ack | added | removed |
+#                                    # invitation | join_request | edit | delete
+# mentions_me = true
+# replies_to_me = true
+# script = "/var/lib/keryx-agent/wake/sara.star"   # defines wake(event)
+# report_failure = false              # true: send each script failure to the owner in a direct chat
+# action = "wake"                    # wake | ignore
+#
+# [wake.prompt]                      # overrides [prompt] for this rule
+# system = """..."""
+#
+# [wake.context]                     # overrides [context] for this rule
+# around = 50
+# around_bytes = "32KiB"

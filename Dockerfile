@@ -5,8 +5,8 @@ ARG DOCKER_ALPINE_VERSION=latest
 # first against empty sources, from the manifests alone, so that a change in the sources reuses
 # their layer. Cargo reads every workspace member's manifest, so each member gets an empty source
 # here. The real sources are touched afterwards: COPY keeps their modification times, which can be
-# older than the empty build's, and cargo would then keep the empty binary. moq/, web/wasm/ and
-# android/ffi/ keep their empty sources: a release build of the server never compiles them.
+# older than the empty build's, and cargo would then keep the empty binary. moq/, web/wasm/,
+# android/ffi/ and agent/ keep their empty sources: a release build of the server never compiles them.
 FROM ${DOCKER_REGISTRY}rust:alpine${DOCKER_ALPINE_VERSION} AS builder
 RUN apk add --no-cache make gcc musl-dev
 WORKDIR /keryx
@@ -16,7 +16,8 @@ COPY core/Cargo.toml core/
 COPY moq/Cargo.toml moq/
 COPY web/wasm/Cargo.toml web/wasm/
 COPY android/ffi/Cargo.toml android/ffi/
-RUN for member in server core moq web/wasm android/ffi; do \
+COPY agent/Cargo.toml agent/
+RUN for member in server core moq web/wasm android/ffi agent; do \
         mkdir -p $member/src && touch $member/src/lib.rs; \
     done \
     && echo 'fn main() {}' > server/src/main.rs \

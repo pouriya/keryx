@@ -1,0 +1,119 @@
+[package]
+name = "keryx-agent"
+version = "0.1.0"
+edition = "2024"
+description = "An LLM agent that lives in keryx as its own account, with Starlark as its one tool"
+authors = ["Pouriya Jahanbakhsh <pouriya.jahanbakhsh@gmail.com>"]
+# openmls, through keryx-core, needs 1.91. Without this an older toolchain reports a wall of errors
+# instead of saying it is too old.
+rust-version = "1.91"
+license = "MIT"
+repository = "https://github.com/pouriya/keryx"
+
+[dependencies]
+# Sealing, opening, MLS and the queue, as every client, and Ulid for the chat and topic ids that
+# agent.toml names.
+keryx-core = { path = "../core" }
+
+# Times, durations and IANA zones for schedules and the preamble. `tzdb-bundle-always` compiles the
+# zone database in, so a bare alpine image needs no tzdata.
+jiff = { version = "0.2.46", default-features = false, features = ["std", "tzdb-bundle-always"] }
+
+# agent.toml. The file loader and TOML, and no environment variables. The validators turn "5m" and
+# "1MiB" into numbers and refuse unknown keys, with the line and caret; `list` is [[wake]] and the
+# wake lists, `dynamic_map` is [secrets]. The server's, chosen by the author.
+tanzim = { version = "0.28.0", default-features = false, features = [
+    "load-file",
+    "parse-toml",
+    "validate-static_map",
+    "validate-dynamic_map",
+    "validate-list",
+    "validate-duration",
+    "validate-bytesize",
+] }
+
+# The command line. The server's, chosen by the author.
+clap = { version = "4.6.6", default-features = false, features = [
+    "std",
+    "derive",
+    "help",
+    "usage",
+    "error-context",
+] }
+
+# The server's, chosen by the author: agent.toml into structs, errors at the binary's boundary and
+# inside modules, and the server's logging.
+serde = { version = "1.0.229", default-features = false, features = ["std", "derive"] }
+thiserror = "2.0.20"
+anyhow = "1.0"
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = [
+    "std",
+    "fmt",
+    "json",
+] }
+
+# One task drives core's Client; others run the socket, timers, schedules and the LLM. Scripts run on
+# blocking threads under their time limit, and `signal` ends it on SIGTERM and SIGINT. Chosen by the
+# author, in the lock.
+tokio = { version = "1.54.1", default-features = false, features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "sync",
+    "time",
+    "signal",
+] }
+
+# llm.attach's images as data URLs: the crate core and the wire already use, constant-time. Chosen by the
+# author while building.
+base64ct = { version = "1.8.3", default-features = false, features = ["alloc"] }
+
+# The keryx WebSocket, wss:// through rustls, with the connector built here on the ring provider.
+# Chosen by the author, the version moq and axum already pull in.
+tokio-tungstenite = { version = "0.29.0", default-features = false, features = [
+    "connect",
+    "__rustls-tls",
+] }
+
+# The Stream and Sink traits tokio-tungstenite's socket implements, to read and send on it, as moq
+# takes them. Chosen by the author, in the lock.
+futures = { version = "0.3.32", default-features = false, features = ["std"] }
+
+# The LLM API and scripts' http, on hyper, with rustls on the ring provider as the server uses, and
+# webpki-roots below as the trust. Chosen by the author.
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls-no-provider",
+    "json",
+    "form",
+] }
+
+# TLS for both, on ring as the server's, with Mozilla's roots compiled in, so a bare alpine image
+# needs no CA files. Chosen by the author, in the lock.
+rustls = { version = "0.23.37", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1.0.11"
+
+# facebook's Starlark, the one tool. Chosen by the author.
+starlark = "=0.14.2"
+
+# Messages and memory, searched as borhan searches. Pinned as borhan pins it, since the normalizer and
+# scoring are copied from borhan; mmap and the compressors as borhan has them.
+tantivy = { version = "=0.26.1", default-features = false, features = [
+    "mmap",
+    "lz4-compression",
+    "columnar-zstd-compression",
+] }
+
+# The copied normalizer's English stemming and NFC, as borhan has them. Chosen by the author.
+rust-stemmers = "1.2.0"
+unicode-normalization = "0.1.26"
+
+# agent.db. Chosen by the author, the server's.
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
+
+# Commands and events with core, the run log and the LLM's JSON. The server's.
+serde_json = { version = "1.0.154", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+# A directory per test, removed when the test ends. Already in the tree.
+tempfile = "3.27.0"

@@ -4,9 +4,20 @@ An LLM agent that lives in keryx as its own account. It holds that account's wor
 device, stays connected to one keryx server, keeps everything on disk, and wakes one LLM loop when
 configured events arrive. Its one tool is a Starlark script runner.
 
-**Planned, nothing built yet; every part below was answered in the author's Q/A of 2026-11-15 and
-2026-11-16**, so building can start. The server's side, agent accounts, is in the root
+**Every part below was answered in the author's Q/A of 2026-11-15 and 2026-11-16. Built so far: the
+crate, `check` reading `agent.toml`, and the cron parser, passing `make all`.** The server's side, agent accounts, is in the root
 [AGENTS.md](../AGENTS.md) under Agent accounts.
+
+## Same rules as core
+
+**[core/AGENTS.md](../core/AGENTS.md) binds this crate too, chosen by the author**, and through it
+[server/AGENTS.md](../server/AGENTS.md): no new files beyond the list under Files, inlining unless a
+second caller exists today, `make` rather than `cargo`, `make all` passing before anything is reported
+finished, the code style (plain `for` loops, `match` and `if let` over combinators, `anyhow` at the
+binary's boundary and `thiserror` inside modules), lint with no `#[allow]`, the logging format, the
+dependency rules (each with its reasoning in `Cargo.toml`, `default-features = false`, `rust-version`
+set, adding one asked first), the vendoring rule, and integration tests only. Where this file differs,
+it says so.
 
 ## Shape
 
@@ -29,8 +40,10 @@ configured events arrive. Its one tool is a Starlark script runner.
   encryption without choosing to. Its scripts would also reach the server's own network, and a runaway
   script or a panic in starlark or tantivy would take the messenger down for everyone. Revisited only
   once the standalone agent has proved itself, and then as unencrypted participants: a badge nobody can
-  hide, a warning before adding one, admin-only by default, each in its own process. Splitting the
-  crate into a library then is mechanical, so there is no `lib.rs` now.
+  hide, a warning before adding one, admin-only by default, each in its own process.
+- **Its `lib.rs` exists only so that `tests/` reaches its modules, as the server's does, chosen by the
+  author:** the cron parser, `store.rs` and the normalizer are tested directly, and the loop through the
+  binary. It is no API, and not the hosting library ruled out above.
 
 ### Crates, chosen by the author
 
@@ -44,11 +57,23 @@ configured events arrive. Its one tool is a Starlark script runner.
 | `starlark` | 0.14.2 | facebook's Starlark, the newest |
 | `tantivy` | 0.26.1 | As borhan pins it, since the normalizer and scoring are copied from borhan and proven against it |
 | `rusqlite` | 0.40.2, in the lock | `agent.db` |
+| `futures` | 0.3, in the lock | The Stream and Sink traits of tokio-tungstenite's socket, as moq takes them; chosen by the author while building |
+| `rust-stemmers` | 1.2 | English stemming in the copied normalizer, as borhan has it, so `errors` finds `error`; chosen by the author while building |
+| `unicode-normalization` | 0.1, in the lock | NFC in the copied normalizer, as borhan has it; chosen by the author while building |
 | `jiff` | 0.2 | Times, durations and IANA zones, with its zone database bundled so the image needs no tzdata. One time library |
 | `tracing`, `tracing-subscriber` | in the lock | Logging, by the server's rules |
+| `base64ct` | 1.8, in the lock | `llm.attach`'s images as data URLs, the crate core and the wire use; chosen by the author while building |
+
+**The server's own crates for the CLI, `agent.toml` and errors, chosen by the author:** `clap` (derive),
+`tanzim` with its `"5m"` and `"1MiB"` validators, `serde`, `serde_json`, `anyhow` and `thiserror`, all
+already in the lock.
 
 **Cron is parsed by keryx-agent's own small parser, chosen by the author:** five fields, minute, hour,
-day, month and weekday, with ranges, lists and steps, and jiff finding the next time.
+day, month and weekday, with ranges, lists and steps, and jiff finding the next time. **Names `JAN` to
+`DEC` and `SUN` to `SAT` in any case, and weekday 7 as Sunday beside 0; no `@` aliases, chosen by the
+author.** **With both day and weekday restricted, either matching fires, as Vixie cron and POSIX do,
+chosen by the author.** **A time a clock change skips fires right after the jump, and a time a fall-back
+repeats fires once, the first time, chosen by the author.**
 
 ### Files, chosen by the author
 
@@ -58,6 +83,7 @@ agent/Makefile
 agent/AGENTS.md
 agent/Dockerfile
 agent/src/main.rs       CLI, agent.toml, logging, startup
+agent/src/lib.rs        the modules, as a library only so that tests/ can reach them
 agent/src/agent.toml    the commented template, include_str!'d
 agent/src/agent.sql     agent.db's schema, include_str!'d by store.rs
 agent/src/connect.rs    the socket, driving core, both queues, presence, snapshot and archive saves
@@ -71,9 +97,17 @@ agent/src/schedule.rs   at, every, cron with its own parser, fires
 agent/tests/            integration tests, the fake LLM, and AGENTS.md with the coverage table
 ```
 
+- **SIGTERM and SIGINT end it at once, chosen by the author while building**, through tokio's `signal`
+  feature: it logs and exits with nothing to finish, since every phase of a step is already saved and a
+  restart continues from it. Without a handler it would run as PID 1 in Docker, ignore SIGTERM and be
+  killed 10 seconds later.
 - **Two commands, chosen by the author:** `keryx-agent --config <path> run` starts it, and `check` reads
   `agent.toml`, every wake script and the skills, says what is wrong and exits, so a bad config is caught
-  before deploying. `--config` is required, as on the server, with no environment variables.
+  before deploying. **Fine, it prints one line on stdout, such as `agent.toml is fine: 3 wake rules, 2
+  skills`, and exits 0; otherwise every problem goes to stderr and it exits 1, chosen by the author.** `--config` is required, as on the server, with no environment variables.
+- **Every path in `agent.toml` is absolute, and a relative one stops startup naming its key, chosen by
+  the author**, the server's rule, wake scripts and the skills directory included. An unknown key stops
+  startup too.
 - **The server's logging rules, chosen by the author:** `tracing` JSON to stderr, `--quiet`, `--info`,
   `--debug` and `--trace` as the server's, INFO by default for `run`. **No content is ever logged:**
   message text, prompts, LLM answers, scripts' output, secrets, the words and the token live in
@@ -90,9 +124,11 @@ agent/tests/            integration tests, the fake LLM, and AGENTS.md with the 
 - **One device, which only its owner's token renew ends, chosen by the author.** The server allows an
   agent one device and refuses ending it with the words, so whoever copied `agent.toml` cannot replace
   the running agent with their own. A container that lost its volume needs the owner to renew the token
-  and put the new one in `agent.toml`: the renew ends the old device on the server, and keryx-agent,
-  starting with no snapshot, registers a new one and then signs the old device's termination with its
-  words, so members remove it from MLS. See Agent accounts in the root AGENTS.md.
+  and put the new one in `agent.toml`: the owner types the agent's words into the renew, their core signs
+  the old device's termination, and the server ends it so members remove it from MLS. keryx-agent,
+  starting with no snapshot, then registers a new device. See Agent accounts in the root AGENTS.md.
+- **The token is a JWT, chosen by the author:** keryx-agent reads its `sub` to ask its device-login
+  challenge by account, and logs in again with it whenever its session ends.
 - **It keeps its connection and retries forever**, as the author's first sketch said.
 - **Presence only, chosen by the author:** online while connected, offline when it is down, as any
   device. No typing while it works.
@@ -124,6 +160,8 @@ agent/tests/            integration tests, the fake LLM, and AGENTS.md with the 
   message     (chat, seq, kind, content_kind, device, pointer, topic, thread_seq, saved_at, frame)
               PK (chat, seq)                            the archive of raw frames, as Android's
   call_row    (chat, call_seq, n, kind, outcome, frame)
+  chat_event  (chat, n, audience, server_at, frame)  PK (chat, n)
+                                                        a group's or channel's history rows, as Android's
   event       (id PK, kind, chat?, topic?, thread_seq?, seq?, body JSON, received_at,
                state 0 waiting | 1 taken | 2 deferred, until?, run?, step?)
               index (state, received_at)
@@ -138,6 +176,10 @@ agent/tests/            integration tests, the fake LLM, and AGENTS.md with the 
   memory      (id PK, chat?, text, run, step, source_chat?, seq?, made_at, updated_at)
   ```
 
+- **`chat_event` keeps a group's or channel's history rows as the server sent them, chosen by the author
+  while building:** core's `SaveRows` hands them over and its `ReadRows` asks for them back, and
+  `keryx.history_list` reads them, so they last across restarts and a delete's copies stay ciphertext
+  on disk.
 - **Events are one table and stay once taken, chosen by the author**, pointing at the run and step that
   took them, as the run log's record of what woke it, with no copy in the step.
 - **Each print and each action is its own `step_output` row, chosen by the author**, inserted as it
@@ -149,11 +191,13 @@ agent/tests/            integration tests, the fake LLM, and AGENTS.md with the 
   on. Before the first connection they return `offline`.
 - **The search index is a tantivy directory, `index/`, beside `agent.db`, chosen by the author.** Messages
   are indexed only when `[search] plain` is on; memory notes always are, since `memory.note_list`
-  searches them. `agent.db` is the truth: the index's last commit names the newest row it covers, and a
-  missing or stale index is rebuilt from it at startup.
+  searches them. The index stores each note's document key so a hit can be resolved to its note.
+  The index's last commit names the newest row it covers. Startup rebuilds a missing or
+  incompatible index from `agent.db`, preserving the notes and the archive, as the author chose.
 - **The plain search database is optional, chosen by the author.** Turning it on means the owner trusts
-  the environment to hold plaintext, and gives the LLM rich search. Off, search scans the archive as
-  core's search does, which is slow and hard for the LLM.
+  the environment to hold plaintext, and gives the LLM rich search. Off, the agent uses core's
+  archive scan and continues through older pages until it fills the requested page with matches
+  that pass the filters or reaches the end, as the author chose.
 - **It follows borhan's design in keryx-agent's own copy, chosen by the author:** tantivy and not FTS5,
   since borhan does not use FTS5, borhan's normalizer vendored, and borhan's query syntax and coverage.
   One session per conversation, with its folders, topics, threads and senders stored too. Unlike borhan
@@ -199,24 +243,32 @@ agent/tests/            integration tests, the fake LLM, and AGENTS.md with the 
 
 - **One main loop, chosen by the author.** No runs in parallel: events from every chat and schedule feed
   the one loop.
-- **Each wake starts fresh, chosen by the author:** the system message, the waiting events, and around
-  each event a configurable number of nearby messages from its chat. What it did before is reachable
-  only through Starlark, in its past runs, its memory and its skills.
+- **Each wake starts fresh, chosen by the author.** The model gets the system message, the waiting
+  events and their chat background. It can reach past runs, memory and skills through Starlark.
 - **The system message is `agent.toml`'s prompt as written, then a fixed preamble, with no templating,
   chosen by the author:** who it is (`ME`, `OWNER`), the time, that it acts only through `starlark`, the
   tool's rules, and the skills' names and descriptions. Events go in the user message as grouped JSON.
 - **Waiting events go in all at once, grouped by chat, then topic, then thread, chosen by the author**,
-  each group with its context.
+  each group with its context. **Within each group, events appear in the order they were received,
+  chosen by the author**, so a deferred event keeps its place. The fresh event that wakes the run
+  still selects its rule, so an older deferred event cannot change the run's overrides.
 - **New events are added before each LLM call, chosen by the author**, so the model always sees the
   latest without asking.
-- **Context already in the loop is not sent again, chosen by the author**, until after a compaction.
+- **One background budget per chat, topic and thread group, chosen by the author.** `[context]`
+  `around` and `around_bytes` default to 10 messages and 16 KiB of serialized JSON. Both can be
+  overridden by `[wake.context]`. The agent takes the nearest earlier messages and stops when
+  the next one exceeds the remaining budget, so the model sees the closest exchange in order.
+  A thread's starter is included in full when available, even when it exceeds the limit. It gives
+  the replies their context and gets the first slot before any other background messages.
+- **Messages shown as events or background are tracked through restarts and excluded from later
+  background in the same wake until compaction, chosen by the author.**
 - **What is shown is taken, chosen by the author.** `inbox.defer(ids, after?)` puts events back, per
   event or per group, for the next wake or a later time. The author first asked for an explicit ack;
   taken-by-default was chosen so a model that forgets to ack cannot cause endless redelivery.
 - **Each message is one JSON object, chosen by the author:** seq, sender username and display name,
   time, kind, topic, thread, reply-to, text or caption, and files as name, type and size without their
   bytes.
-- **The final text is not sent by default, chosen by the author:** the agent acts on the server through
+- **The final text is not sent by default, chosen by the author:** the model acts on the server through
   Starlark only. `send_final` sends it as a reply to the trigger, for models that answer in text anyway.
 - **Compaction, chosen by the author:** the config holds a compaction prompt, with a default, and a
   maximum context size in bytes. When the input reaches that size, or the provider answers with a
@@ -235,14 +287,32 @@ agent/tests/            integration tests, the fake LLM, and AGENTS.md with the 
   ids, chat type, folder, topic, thread, sender usernames, content kind, event kind, mentions me and
   replies to me, with action wake or ignore. No match ignores. A rule may override the prompts and the
   context size.
+- **Its keys, chosen by the author:** lists `chat` (chat ids), `chat_type` (`self`, `direct`, `group`,
+  `channel`), `folder` (names, folded as search folds), `topic` (topic ids), `sender` (usernames),
+  `content_kind` and `event` (`message`, `reaction`, `answer`, `ack`, `added`, `removed`, `invitation`,
+  `join_request`, `edit`, `delete`); booleans `thread` (true only in threads, false only in main lists),
+  `mentions_me` and `replies_to_me`; `script`; and `action`. Every condition set must hold, any item of a
+  list may match, and a rule with none matches everything. **Overrides are `[wake.prompt]` and
+  `[wake.context]`, with the keys of the top-level tables.**
 - **A rule may carry a Starlark script defining `wake(event)`, returning True or False, chosen by the
   author.** `event` is the JSON the loop would see, with its chat's context. It may read, with keryx's
-  reading functions, search and memory, but not write, send or call HTTP. An `err` or a crash means do
-  not wake, and is logged.
+  reading functions, search and memory. **A failing script or an attempt to write, send or call HTTP
+  skips the rule and is always logged, chosen by the author.** Later rules can still match the event.
+  **`report_failure = false` is per rule, chosen by the author.** When enabled, each failure sends
+  one encrypted text message with the rule number and a short reason to the owner's direct chat.
+  The agent opens the chat with its usual permissions if needed. The report carries no chat
+  content or script output, so failures in other chats can be reported without sharing their contents.
 - **Rules match these events, chosen by the author:** content messages; reactions on its messages;
   answers to its questions and acks of its suggestions; membership, being added, removed or invited,
   or a join request where it may let people in; and edits and deletes. Schedules and the `storage`
   event wake on their own.
+- **Membership additions wait up to the existing five-second hold for the group or channel
+  name, chosen by the author.** At expiry the wake carries the chat ID and any name available.
+- **The agent matches verified delete events to their saved archive rows, chosen by the author.**
+  This works when core reports the delete before the row arrives. The saved row supplies the
+  sending device and time for the wake rules.
+- **Wake scripts have separate background limits, chosen by the author.**
+  `[context_limits.wake_script]` has `count = 10` and `bytes = "16KiB"` by default.
 - **An invitation wakes the loop to decide, chosen by the author**, which accepts or declines it from
   Starlark.
 
@@ -255,6 +325,11 @@ agent/tests/            integration tests, the fake LLM, and AGENTS.md with the 
   the loop is idle.
 - **Firing gives the loop the note, the planned and actual times, and each named chat's nearby messages,
   chosen by the author**, deduplicated as events' context is. No chats means the note alone.
+  `[context_limits.schedule]` independently sets the per-chat background limits. The defaults are
+  `count = 10` and `bytes = "16KiB"`.
+- **`agent.toml`'s top-level `timezone`, an IANA name, `"UTC"` by default, chosen by the author**, is
+  `schedule.cron`'s zone when it names none, and the preamble shows the time in it beside UTC, so the
+  model knows its owner's day. Built-ins still take and return UTC.
 - **A fire that is late still fires, chosen by the author**, and the loop is told how late and why: the
   agent was down, or the schedule waited for the loop to end.
 
@@ -269,7 +344,8 @@ agent/tests/            integration tests, the fake LLM, and AGENTS.md with the 
 - **An optional skills folder, chosen by the author:** `[skills] directory`, unset by default. Every
   `.md` file in it has frontmatter with `name` and `description`; their names and descriptions go into
   the preamble, and `skills.read(name, ...)` prints whole skills into the loop. A file without valid
-  frontmatter is skipped and logged.
+  frontmatter is skipped and logged by `run`, so valid skills remain available. As the author chose,
+  `check` reports the invalid file and exits 1 so it can be caught before deploying.
 - **With `writable = true`, the model can create, replace and remove skills, chosen by the author**, and
   the preamble tells it to do so only when a person in the chat asks or agrees.
 
@@ -370,7 +446,7 @@ keryx.message_list(chat, before=None, after=None, limit=20, topic=None, thread=N
   -> {message_list, more}                                oldest first; neither before nor after: the newest
 keryx.message(chat, seq) -> message + reaction_list, edit_list, thread_count, answer_list
 keryx.member_list(chat, role=None, limit=200)
-  -> {member_list: [{id, username, display_name, role, agent}], more}
+  -> {member_list: [{id, username, display_name, role, agent}], more}  groups and channels only
 keryx.request_list(chat) -> {request_list: [{id, username, note, at}], more}
 keryx.invitation_list() -> {invitation_list: [{chat, inviter, name, note, at}], more}
 keryx.times(chat, seq) -> {username: {received_at, seen_at}}
@@ -464,7 +540,7 @@ file.remove(path)
 # schedule, inbox, llm, time
 schedule.at(time, note, chat_list=[], join=False) -> {id}
 schedule.every(duration, note, chat_list=[], join=False, start=None) -> {id}
-schedule.cron(expr, note, tz="UTC", chat_list=[], join=False) -> {id}
+schedule.cron(expr, note, tz=None, chat_list=[], join=False) -> {id}   tz None: agent.toml's timezone
 schedule.schedule_list() -> {schedule_list: [{id, kind, when, next_at, note, chat_list, join}], more}
 schedule.remove(id)
 inbox.defer(id_list, after=None)                         ids of events or groups
@@ -475,6 +551,12 @@ time.now() -> "2026-11-15T09:12:00Z"    time.add(time, duration)    time.diff(a,
 CONNECTED    ME {id, username, display_name}    OWNER {id, username, display_name}
 ```
 
+**`keryx.member_list` is for groups and channels, chosen by the author.** A direct chat returns
+`not_group`. The model can check the chat type in `keryx.chat(chat)` before calling.
+
+**`keryx.create` waits for the new group or channel to appear in the agent's chat view, chosen by the
+author.** The next command can use it immediately. Topic edits use the acknowledged topics switch.
+
 ## `agent.toml`, approved by the author
 
 ```toml
@@ -482,6 +564,7 @@ url = "http://127.0.0.1:7777"
 token = "..."
 words = "..."
 directory = "/var/lib/keryx-agent"   # agent.db, index/, tmp/, chats/<chat id>/
+timezone = "UTC"                     # IANA name: schedules' default tz, and the preamble's local time
 
 [llm]
 protocol = "chat_completions"        # later: "responses"
@@ -498,7 +581,16 @@ send_final = false
 
 [context]
 max = "256KiB"                       # input bytes before compaction
-around = 20                          # nearby messages per event
+around = 10                          # earlier messages per chat/topic/thread group
+around_bytes = "16KiB"               # total JSON bytes of that background
+
+[context_limits.schedule]
+count = 10
+bytes = "16KiB"
+
+[context_limits.wake_script]
+count = 10
+bytes = "16KiB"
 
 [search]
 plain = false
@@ -538,7 +630,8 @@ action = "wake"
 # sender = ["sara"]
 # event = ["message"]
 # mentions_me = true
-# script = "wake/sara.star"          # defines wake(event)
+# script = "/var/lib/keryx-agent/wake/sara.star"   # defines wake(event)
+# report_failure = false              # true: send each script failure to the owner in a direct chat
 # action = "wake"
 ```
 
