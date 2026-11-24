@@ -19,6 +19,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -102,6 +103,8 @@ import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -164,6 +167,7 @@ private const val DECODED_BYTES = 16 shl 20
 /** Profiles as core shows them, their photos, and the save an editor waits on. */
 internal class Profiles(
     private val engine: Engine,
+    private val people: Map<String, AccountBrief>,
 ) {
     val shown = mutableStateMapOf<String, ShownProfile>()
 
@@ -175,6 +179,7 @@ internal class Profiles(
 
     /** Where each person is, from the server; dropped while this device is offline, as it cannot know. */
     val presence = mutableStateMapOf<String, PresenceItem>()
+    private val presenceText = mutableStateMapOf<String, String>()
 
     /** A new photo while it goes up, drawn on your page with a turning ring. */
     val uploading = mutableStateOf<ImageBitmap?>(null)
@@ -196,8 +201,16 @@ internal class Profiles(
                     shown[it.account] = it.copy(username = event.account.username, display_name = event.account.display_name)
                 }
             is Event.Photo -> bump(event.photo)
-            is Event.Presence -> presence[event.presence.account] = event.presence
-            is Event.Offline -> presence.clear()
+            is Event.Presence -> {
+                val account = event.presence.account
+                presence[account] = event.presence
+                val text = event.text
+                if (text != null) presenceText[account] = text else presenceText.remove(account)
+            }
+            is Event.Offline -> {
+                presence.clear()
+                presenceText.clear()
+            }
             is Event.ProfileSaved -> {
                 saving.value = false
                 uploading.value = null
@@ -213,6 +226,7 @@ internal class Profiles(
             is Event.LoggedOut -> {
                 shown.clear()
                 presence.clear()
+                presenceText.clear()
                 kept.clear()
                 me = null
                 saving.value = false
@@ -222,6 +236,13 @@ internal class Profiles(
             else -> Unit
         }
     }
+
+    fun isAgent(
+        account: String,
+        username: String? = null,
+    ): Boolean = shown[account]?.agent == true || (username ?: shown[account]?.username ?: people[account]?.username).isAgentUsername()
+
+    fun troubleDetail(account: String): String? = presenceText[account]?.takeIf { me != null && shown[account]?.owner == me }
 
     private fun bump(id: String) {
         kept[id] = (kept[id] ?: 0) + 1
@@ -250,10 +271,13 @@ internal class Profiles(
         id: String,
     ) = engine.photo(account, id)
 
-    fun open(account: String) {
+    fun open(
+        account: String,
+        refreshPresence: Boolean = false,
+    ) {
         engine.send(Command.Profile(account))
         // Someone sharing no chat is asked about once, as the root AGENTS.md says.
-        if (account != me && account !in presence) engine.send(Command.PresenceOf(account))
+        if (account != me && (refreshPresence || account !in presence)) engine.send(Command.PresenceOf(account))
     }
 
     /** Sends an editor's change, which closes it once saved or shows the refusal. */
@@ -278,6 +302,10 @@ internal class Profiles(
 
 internal val LocalProfiles = staticCompositionLocalOf<Profiles?> { null }
 
+internal const val AGENT_SUFFIX = "_agent"
+
+private fun String?.isAgentUsername() = this?.endsWith(AGENT_SUFFIX) == true
+
 /**
  * A person's round photo: the opened photo once kept, its BlurHash while it is fetched, or the
  * first letter of their name on blue when they have none.
@@ -288,23 +316,47 @@ internal fun Avatar(
     name: String,
     size: Dp,
     modifier: Modifier = Modifier,
+    username: String? = null,
+    badgeRing: Color = ink().page,
+    badgeSize: Dp = 14.dp,
 ) {
     val profiles = LocalProfiles.current
     val photo = account?.let { profiles?.shown?.get(it)?.photo }
-    Box(modifier.size(size).clip(CircleShape).background(tile), contentAlignment = Alignment.Center) {
-        val image = if (profiles != null && account != null && photo != null) photoOf(profiles, account, photo) else null
-        val blur = photo?.let { blurOf(it.blurhash) }
-        when {
-            image != null -> Image(image, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
-            blur != null -> Image(blur, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
-            else ->
-                Text(
-                    name.firstOrNull()?.uppercaseChar()?.toString() ?: "",
-                    color = Color.White,
-                    fontSize = (size.value * 0.38f).sp,
-                    fontWeight = FontWeight.SemiBold,
-                )
+    Box(modifier.size(size), contentAlignment = Alignment.Center) {
+        Box(Modifier.fillMaxSize().clip(CircleShape).background(tile), contentAlignment = Alignment.Center) {
+            val image = if (profiles != null && account != null && photo != null) photoOf(profiles, account, photo) else null
+            val blur = photo?.let { blurOf(it.blurhash) }
+            when {
+                image != null -> Image(image, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                blur != null -> Image(blur, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                else ->
+                    Text(
+                        name.firstOrNull()?.uppercaseChar()?.toString() ?: "",
+                        color = Color.White,
+                        fontSize = (size.value * 0.38f).sp,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+            }
         }
+        if (account != null && (profiles?.isAgent(account, username) == true || username.isAgentUsername())) {
+            AgentBadge(Modifier.align(Alignment.BottomStart), badgeSize, badgeRing)
+        }
+    }
+}
+
+@Composable
+private fun AgentBadge(
+    modifier: Modifier,
+    size: Dp,
+    ring: Color,
+) {
+    val label = stringResource(R.string.agent_badge)
+    Box(
+        modifier.size(size).clip(CircleShape).background(ring).padding(2.dp).clip(CircleShape).background(tile)
+            .semantics { contentDescription = label },
+        contentAlignment = Alignment.Center,
+    ) {
+        Glyph(Glyphs.cpu, Color.White, (size - 4.dp) * 0.9f, width = 1.8f)
     }
 }
 
@@ -349,6 +401,8 @@ internal fun ProfileScreen(
     brief: AccountBrief?,
     onBack: () -> Unit,
     onDevices: () -> Unit,
+    onAgents: () -> Unit,
+    onOwner: (String) -> Unit,
     onLogOut: () -> Unit,
     theme: String,
     onTheme: (String) -> Unit,
@@ -437,6 +491,8 @@ internal fun ProfileScreen(
                     { sheet = true },
                     { viewing = it },
                     onDevices,
+                    onAgents,
+                    onOwner,
                     onLogOut,
                     Looks(theme, onTheme, language, onLanguage),
                 )
@@ -484,6 +540,8 @@ private fun Page(
     onPhoto: () -> Unit,
     onFull: (String) -> Unit,
     onDevices: () -> Unit,
+    onAgents: () -> Unit,
+    onOwner: (String) -> Unit,
     onLogOut: () -> Unit,
     looks: Looks,
 ) {
@@ -499,15 +557,10 @@ private fun Page(
         }
     }
     val dark = isDark()
-    val rtl = LocalLayoutDirection.current == LayoutDirection.Rtl
     val ground = if (dark) Color(0xFF0F151D) else Color(0xFFF2F4F8)
     val card = if (dark) Color(0xFF1A2330) else Color.White
     val scroll = rememberScrollState()
     val top = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
-    val density = LocalDensity.current
-    val solid = with(density) { scroll.value > (HERO - 56.dp).toPx() }
-    val fade by animateFloatAsState(if (solid) 1f else 0f, label = "bar")
-    Bars(if (solid) ink.page else Color.Transparent, if (solid) dark else true)
     val links = profile?.link_list.orEmpty()
     Box(Modifier.fillMaxSize().background(ground)) {
         Column(Modifier.fillMaxSize().verticalScroll(scroll)) {
@@ -596,6 +649,7 @@ private fun Page(
                             }
                         },
                         { Line(Glyphs.devices, stringResource(R.string.devices), null, ink, chevron = true, onClick = onDevices) },
+                        { Line(Glyphs.cpu, stringResource(R.string.agents_title), null, ink, chevron = true, onClick = onAgents) },
                     ),
                 )
                 Spacer(Modifier.height(12.dp))
@@ -622,6 +676,17 @@ private fun Page(
                     card,
                     ink,
                     buildList<@Composable () -> Unit> {
+                        profile?.owner?.let { owner ->
+                            add {
+                                val ownerProfile = profiles.shown[owner]
+                                LaunchedEffect(owner) { profiles.open(owner) }
+                                val label = stringResource(R.string.agent_owner)
+                                val name = ownerProfile?.display_name ?: ownerProfile?.username
+                                Line(Glyphs.person, name ?: label, if (name != null) label else null, ink, chevron = true) {
+                                    onOwner(owner)
+                                }
+                            }
+                        }
                         profile?.bio?.takeIf { it.isNotBlank() }?.let { bio ->
                             add { Line(Glyphs.info, bio, stringResource(R.string.profile_bio), ink, onClick = null) }
                         }
@@ -659,31 +724,7 @@ private fun Page(
             }
             Spacer(Modifier.windowInsetsPadding(WindowInsets.navigationBars).padding(bottom = 12.dp))
         }
-        // The bar over the photo: white marks on it, then the page's own once the photo has gone.
-        val mark = lerp(Color.White, ink.text, fade)
-        Row(
-            Modifier
-                .fillMaxWidth()
-                .background(ink.page.copy(alpha = fade))
-                .windowInsetsPadding(WindowInsets.statusBars)
-                .height(56.dp)
-                .padding(start = 4.dp, end = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            IconButton(stringResource(R.string.back), onBack, 48.dp) { BackMark(mark, rtl) }
-            Text(
-                name,
-                Modifier.weight(1f).padding(horizontal = 4.dp).alpha(fade),
-                color = ink.text,
-                fontSize = 18.sp,
-                fontWeight = FontWeight.SemiBold,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            if (mine) {
-                IconButton(stringResource(R.string.profile_change_photo), onPhoto, 48.dp) { Glyph(Glyphs.cam, mark, 24.dp) }
-            }
-        }
+        ProfileBar(name, ink, scroll, onBack, onPhoto.takeIf { mine })
         when (choosing) {
             "lang" ->
                 Choices(
@@ -721,6 +762,42 @@ private fun Page(
                 color = Color.White,
                 fontSize = 14.sp,
             )
+        }
+    }
+}
+
+/** Stays over the profile photo and takes the page's colours once it scrolls away. */
+@Composable
+internal fun ProfileBar(
+    name: String,
+    ink: Ink,
+    scroll: ScrollState,
+    onBack: () -> Unit,
+    onPhoto: (() -> Unit)?,
+) {
+    val dark = isDark()
+    val rtl = LocalLayoutDirection.current == LayoutDirection.Rtl
+    val solid = with(LocalDensity.current) { scroll.value > (HERO - 56.dp).toPx() }
+    val fade by animateFloatAsState(if (solid) 1f else 0f, label = "bar")
+    Bars(if (solid) ink.page else Color.Transparent, if (solid) dark else true)
+    val mark = lerp(Color.White, ink.text, fade)
+    Row(
+        Modifier.fillMaxWidth().background(ink.page.copy(alpha = fade))
+            .windowInsetsPadding(WindowInsets.statusBars).height(56.dp).padding(start = 4.dp, end = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        IconButton(stringResource(R.string.back), onBack, 48.dp) { BackMark(mark, rtl) }
+        Text(
+            name,
+            Modifier.weight(1f).padding(horizontal = 4.dp).alpha(fade),
+            color = ink.text,
+            fontSize = 18.sp,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        if (onPhoto != null) {
+            IconButton(stringResource(R.string.profile_change_photo), onPhoto, 48.dp) { Glyph(Glyphs.cam, mark, 24.dp) }
         }
     }
 }
@@ -779,6 +856,7 @@ private fun heroTone(state: String?): Color? =
         "online" -> Color(0xFF7EE2A0)
         "call" -> Color(0xFFFF8A8A)
         "away" -> Color(0xFFFFC27A)
+        "trouble" -> troubleTone(dark = true)
         else -> null
     }
 
@@ -788,7 +866,7 @@ private fun heroTone(state: String?): Color? =
  * the photo sheet on yours, and the whole photo on theirs, as before, chosen by the author.
  */
 @Composable
-private fun Hero(
+internal fun Hero(
     profiles: Profiles,
     account: String,
     mine: Boolean,
@@ -797,12 +875,19 @@ private fun Hero(
     top: Dp,
     onPhoto: () -> Unit,
     onFull: (String) -> Unit,
+    agent: Boolean = profiles.isAgent(account, username),
+    editable: Boolean = mine,
 ) {
     val photo = profiles.shown[account]?.photo
     val going = profiles.uploading.value.takeIf { mine }
     val tap =
         when {
-            mine -> Modifier.clickable(role = Role.Button, onClickLabel = stringResource(R.string.profile_change_photo), onClick = onPhoto)
+            editable ->
+                Modifier.clickable(
+                    role = Role.Button,
+                    onClickLabel = stringResource(R.string.profile_change_photo),
+                    onClick = onPhoto,
+                )
             photo != null -> Modifier.clickable(role = Role.Button) { onFull(photo.id) }
             else -> Modifier
         }
@@ -852,7 +937,10 @@ private fun Hero(
                 .height(140.dp)
                 .background(Brush.verticalGradient(listOf(Color.Transparent, Color.Black.copy(alpha = 0.55f)))),
         )
-        Column(Modifier.align(Alignment.BottomStart).padding(start = 18.dp, end = 18.dp, bottom = 14.dp)) {
+        Column(
+            Modifier.align(Alignment.BottomStart).fillMaxWidth()
+                .padding(start = 18.dp, end = if (agent) 58.dp else 18.dp, bottom = 14.dp),
+        ) {
             Text(
                 name,
                 color = Color.White,
@@ -870,6 +958,13 @@ private fun Hero(
                 color = heroTone(item?.state).takeIf { line != null } ?: Color.White.copy(alpha = 0.88f),
                 fontSize = 15.sp,
                 style = if (line == null) ltr else TextStyle.Default,
+            )
+        }
+        if (agent) {
+            AgentBadge(
+                Modifier.align(Alignment.BottomEnd).padding(end = 18.dp, bottom = 14.dp),
+                28.dp,
+                Color.White.copy(alpha = 0.7f),
             )
         }
     }
@@ -1676,6 +1771,8 @@ internal object Glyphs {
         "a$r $r 0 0 1 ${-r} ${-r}v${-(h - 2 * r)}a$r $r 0 0 1 $r ${-r}z"
 
     val check = listOf("M5 12.5l4.5 4.5L19 7")
+    val cpu = listOf("M6 6h12v12H6zM9 9h6v6H9z", "M9 3v3m6-3v3m6 3h-3m3 6h-3m-3 6v-3m-6 3v-3m-6-3h3m-3-6h3")
+    val bolt = listOf("M13 2L4 14h7l-1 8 10-12h-7z")
     val cam = listOf("M4 8h3l2-3h6l2 3h3v11H4z", circle(12f, 13f, 3.5f))
     val person = listOf(circle(12f, 8f, 4f), "M4 20c1.5-4 4.5-6 8-6s6.5 2 8 6")
     val at = listOf(circle(12f, 12f, 4f), "M16 12v1.5a2.5 2.5 0 0 0 5 0V12a9 9 0 1 0-4 7.5")
@@ -1735,8 +1832,11 @@ internal fun presenceTone(state: String?): Color? =
         "online" -> Color(0xFF2EAD5B)
         "call" -> Color(0xFFD94040)
         "away" -> Color(0xFFE8912D)
+        "trouble" -> Color(0xFFF1BF40)
         else -> null
     }
+
+internal fun troubleTone(dark: Boolean): Color = if (dark) Color(0xFFFFDF81) else Color(0xFF8C6115)
 
 /**
  * The dot on a person's photo, with a thin ring of the background's colour: 9 dp on the list's 48 dp
@@ -1752,6 +1852,8 @@ internal fun PresenceDot(
     modifier: Modifier = Modifier,
 ) {
     val tone = presenceTone(state) ?: return
+    val trouble = state == "trouble"
+    val label = if (trouble) stringResource(R.string.agent_trouble) else null
     Box(
         modifier
             .size(dot + ring * 2)
@@ -1759,8 +1861,12 @@ internal fun PresenceDot(
             .background(page)
             .padding(ring)
             .clip(CircleShape)
-            .background(tone),
-    )
+            .background(tone)
+            .then(if (label != null) Modifier.semantics { contentDescription = label } else Modifier),
+        contentAlignment = Alignment.Center,
+    ) {
+        if (trouble) Glyph(listOf("M12 5v8M12 18v.5"), Color(0xFF362500), dot, width = 3f)
+    }
 }
 
 /** The clock, read again every 30 seconds, so "4m ago" moves on. */
@@ -1799,6 +1905,7 @@ internal fun presenceLine(item: PresenceItem?): String? {
         "online" -> return stringResource(R.string.presence_online)
         "call" -> return stringResource(R.string.presence_call)
         "away" -> return stringResource(R.string.presence_away)
+        "trouble" -> return stringResource(R.string.agent_trouble)
     }
     val at = item.in_app_at ?: return null
     val now = rememberNow()
@@ -1819,12 +1926,13 @@ internal fun presenceState(state: String?): String? =
         "online" -> stringResource(R.string.presence_state_online)
         "call" -> stringResource(R.string.presence_state_call)
         "away" -> stringResource(R.string.presence_state_away)
+        "trouble" -> stringResource(R.string.agent_trouble)
         else -> null
     }
 
 /** A profile line's full day and time, with how long ago inside the first hour. */
 @Composable
-private fun presenceWhen(at: Long): String {
+internal fun presenceWhen(at: Long): String {
     val now = rememberNow()
     val today = LocalDate.now()
     val day =

@@ -47,6 +47,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -366,16 +367,16 @@ internal class GroupState {
             is Event.ChatEventShown -> {
                 val shown = event.event
                 if (event.copy_list.isNotEmpty()) copies[shown.chat to shown.n] = event.copy_list
-                // A membership change, live: the member list is asked again while it is shown.
-                if (shown.audience == 0 && shown.action in 1..8 && members.containsKey(shown.chat)) members.remove(shown.chat)
+                // Owners and moderators get the history audience for the same membership changes.
+                // Either audience invalidates the cached roster so a visible page asks again.
+                if (shown.audience in 0..1 && shown.action in 1..8 && members.containsKey(shown.chat)) members.remove(shown.chat)
                 // This account's own role, live, so its controls show without opening the members.
                 val role = mapOf(6 to "owner", 7 to "moderator", 8 to "member")[shown.action]
                 if (shown.audience == 0 && role != null && shown.target == me) {
                     infos[shown.chat]?.let { infos[shown.chat] = it.copy(role = role) }
                 }
             }
-            // That frame skips the device whose action it was, which gets the line, so a line asks
-            // again too, and a role line naming this account changes its role.
+            // A membership line also refreshes the roster. A role line naming this account changes its role.
             is Event.Line -> {
                 if (members.containsKey(event.chat)) members.remove(event.chat)
                 val role = mapOf("made_owner" to "owner", "made_moderator" to "moderator", "made_member" to "member")[event.action]
@@ -1113,6 +1114,8 @@ internal fun Field(
     count: Boolean = false,
     lead: List<String>? = null,
     height: Dp = 52.dp,
+    enabled: Boolean = true,
+    keyboardOptions: KeyboardOptions = KeyboardOptions.Default,
 ) {
     val interaction = remember { MutableInteractionSource() }
     val focused by interaction.collectIsFocusedAsState()
@@ -1136,6 +1139,8 @@ internal fun Field(
                     // A box of several lines takes a tap anywhere in it, not only on its first line.
                     if (single) Modifier.fillMaxWidth() else Modifier.fillMaxWidth().heightIn(min = height - 20.dp),
                     singleLine = single,
+                    enabled = enabled,
+                    keyboardOptions = keyboardOptions,
                     textStyle = TextStyle(color = ink.text, fontSize = 16.sp, textDirection = TextDirection.Content),
                     cursorBrush = SolidColor(accent),
                     interactionSource = interaction,
@@ -1903,7 +1908,7 @@ private fun PickRow(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Avatar(account, name, 40.dp)
+        Avatar(account, name, 40.dp, username = username)
         Column(Modifier.weight(1f)) {
             Text(
                 name,
@@ -2428,7 +2433,7 @@ private fun MemberRow(
         horizontalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         Box {
-            Avatar(member.account, name, 40.dp)
+            Avatar(member.account, name, 40.dp, badgeRing = fill, badgeSize = 11.dp)
             PresenceDot(presence?.state, 7.dp, 2.dp, fill, Modifier.align(Alignment.BottomEnd))
         }
         Column(Modifier.weight(1f)) {

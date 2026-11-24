@@ -1358,7 +1358,8 @@ async fn run_send(
     // A commit is read against the chat's public group, so what it changes in MLS is what the
     // server allowed: a device joining by itself is the device sending it, an add brings in
     // devices of the action's accounts or of accounts already in, and a removal takes out the
-    // action's accounts, ended devices or accounts no longer in.
+    // action's accounts, ended devices or accounts no longer in. An external rejoin can also
+    // replace the sender's own leaf using the registered device key.
     let mut public_group = None;
     if frame.kind == Kind::Commit {
         let Some(state) = app.storage.public_group(chat).await? else {
@@ -1418,6 +1419,14 @@ async fn run_send(
                     && !ended.contains(&leaf.device)
                     && member_list[..members_before].contains(&leaf.account)
                 {
+                    if read.joined == Some(*leaf)
+                        && let Some(key) = app.storage.device_key(device).await?
+                        && !key.ended
+                        && key.account == session.account
+                        && key.public_key.as_slice() == leaf.device_public
+                    {
+                        continue;
+                    }
                     return Err(bad_commit("That commit removes someone it does not name"));
                 }
             }

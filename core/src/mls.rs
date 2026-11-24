@@ -779,11 +779,12 @@ fn wire_in(expected: &'static str, mut bytes: &[u8]) -> Result<MlsMessageIn, Mls
     }
 }
 
-/// A device in a chat's group, as its credential names it.
+/// A device in a chat's group, with its credential's ids and its leaf signing key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Leaf {
     pub account: Ulid,
     pub device: Ulid,
+    pub device_public: [u8; 32],
 }
 
 /// What a commit changes, read by the server from the chat's public group.
@@ -802,6 +803,7 @@ fn leaf_of(leaf: &LeafNode) -> Result<Leaf, MlsError> {
     Ok(Leaf {
         account: record.account,
         device: record.device,
+        device_public: record.device_public,
     })
 }
 

@@ -45,6 +45,7 @@ import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -196,7 +197,14 @@ private sealed interface Line {
     data class One(
         val bubble: Bubble,
         val joined: Boolean,
-    ) : Line
+        val activities: MutableList<Bubble>? = null,
+        val expanded: Boolean = false,
+        val firstActivityAt: Long = bubble.at,
+    ) : Line {
+        val shownBubble: Bubble get() = if (expanded) bubble else activities?.lastOrNull() ?: bubble
+
+        fun holds(key: String) = bubble.key == key || activities?.any { it.key == key } == true
+    }
 
     data class Note(
         val bubble: Bubble,
@@ -363,7 +371,19 @@ internal fun ChatScreen(
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) toast = copied
     }
 
-    val rows = rowsOf(list).asReversed()
+    val expandedActivities = remember(talk.chat, here, thread) { mutableStateListOf<String>() }
+    val expandedKeys = expandedActivities.toList()
+    val rows = remember(list, expandedKeys) { rowsOf(list, expandedKeys.toSet()).asReversed() }
+    val ends =
+        remember(rows) {
+            rows.filterIsInstance<Line.One>()
+                .mapNotNull { row ->
+                    val shown = row.shownBubble
+                    shown.seq?.takeIf { shown.key != row.bubble.key }?.let { row.bubble.key to it }
+                }
+                .toMap()
+        }
+    val latestInRow by rememberUpdatedState(ends)
     BackHandler(enabled = true) {
         when {
             form != null -> form = null
@@ -461,7 +481,8 @@ internal fun ChatScreen(
         previous = newest?.key
         if (newest == null || before == null) return@LaunchedEffect
         // The old newest message still on screen means the reader was at the end: follow.
-        val wasAtEnd = state.layoutInfo.visibleItemsInfo.any { it.key == before }
+        val previousRow = rows.firstOrNull { it is Line.One && it.holds(before) }?.let(::rowKey) ?: before
+        val wasAtEnd = state.layoutInfo.visibleItemsInfo.any { it.key == previousRow }
         if (wasAtEnd || newest.mine) state.scrollToItem(0)
     }
     // The newest message that has been on screen. The down button counts the others' messages after it,
@@ -470,7 +491,8 @@ internal fun ChatScreen(
     LaunchedEffect(state, talk.chat) {
         snapshotFlow {
             state.layoutInfo.visibleItemsInfo.maxOfOrNull { item ->
-                (item.key as? String)?.takeIf { it.startsWith("s") }?.drop(1)?.toLongOrNull() ?: 0L
+                val key = item.key as? String
+                if (key == null) 0L else latestInRow[key] ?: key.takeIf { it.startsWith("s") }?.drop(1)?.toLongOrNull() ?: 0L
             } ?: 0L
         }.collect { if (it > lookedAt) lookedAt = it }
     }
@@ -490,7 +512,7 @@ internal fun ChatScreen(
     }
 
     fun jump(seq: Long) {
-        val at = rows.indexOfFirst { it is Line.One && it.bubble.seq == seq }
+        val at = rows.indexOfFirst { it is Line.One && it.holds("s$seq") }
         if (at >= 0) {
             flash = "s$seq"
             talk.seeking = null
@@ -499,16 +521,28 @@ internal fun ChatScreen(
             onOlder()
         }
     }
-    LaunchedEffect(flash, rows.size) {
+    LaunchedEffect(flash, rows) {
         val key = flash ?: return@LaunchedEffect
-        val at = rows.indexOfFirst { it is Line.One && it.bubble.key == key }
-        if (at >= 0) state.animateScrollToItem(at)
+        val at = rows.indexOfFirst { it is Line.One && it.holds(key) }
+        val matched = rows.getOrNull(at) as? Line.One ?: return@LaunchedEffect
+        if (matched.shownBubble.key != key) {
+            matched.activities?.let { expandedActivities.addAll(it.map(Bubble::key)) }
+        } else {
+            state.animateScrollToItem(at)
+        }
     }
-    LaunchedEffect(talk.seeking, rows.size, talk.hasOlder, talk.paged) {
+    LaunchedEffect(talk.seeking, rows, talk.hasOlder, talk.paged) {
         val seq = talk.seeking ?: return@LaunchedEffect
         // A chat opened at a message, from search, waits for its first page before looking further up.
         if (!talk.paged) return@LaunchedEffect
-        if (rows.any { it is Line.One && it.bubble.seq == seq }) {
+        if (main && group != null) {
+            val activityThread = talk.bySeq(seq)?.takeIf { it.kind == CONTENT_ACTIVITY }?.thread
+            if (activityThread != null) {
+                group.onThread(activityThread)
+                return@LaunchedEffect
+            }
+        }
+        if (rows.any { it is Line.One && it.holds("s$seq") }) {
             flash = "s$seq"
             talk.seeking = null
         } else if (talk.hasOlder) {
@@ -578,13 +612,15 @@ internal fun ChatScreen(
                 val person = if (type == 0) me else other
                 val handle = other?.let { people[it]?.username }?.let { "@$it" }
                 // A direct chat's header shows the state, or when they were last in the app, chosen by the author.
-                val presence = if (link == Link.Connected) other?.let { LocalProfiles.current?.presence?.get(it) } else null
-                val line = presenceLine(presence)
+                val profiles = LocalProfiles.current
+                val presence = if (link == Link.Connected) other?.let { profiles?.presence?.get(it) } else null
+                val detail = if (presence?.state == "trouble") other?.let { profiles?.troubleDetail(it) } else null
+                val line = detail?.let { troubleLine(it) } ?: presenceLine(presence)
                 TopBar(
                     title,
                     person,
                     if (link != Link.Connected) statusText(link) else line ?: handle,
-                    presenceTone(presence?.state)?.takeIf { line != null },
+                    presence?.state?.let { if (it == "trouble") troubleTone(dark) else presenceTone(it) }?.takeIf { line != null },
                     presence?.state,
                     ink,
                     onBack,
@@ -597,7 +633,7 @@ internal fun ChatScreen(
                 state = state,
                 reverseLayout = true,
             ) {
-                items(rows, key = { rowKey(it) }) { row ->
+                itemsIndexed(rows, key = { _, row -> rowKey(row) }) { index, row ->
                     CompositionLocalProvider(LocalMention provides (people to onProfile)) {
                         when (row) {
                             is Line.Day -> DayRow(row.at, ink, dark)
@@ -627,9 +663,39 @@ internal fun ChatScreen(
                                         onThread = { row.bubble.seq?.let { group?.onThread?.invoke(it) } },
                                     )
                                 }
-                            is Line.One ->
+                            is Line.One -> {
+                                val bubble = row.shownBubble
+                                val activity = bubble.kind == CONTENT_ACTIVITY
+                                val footer =
+                                    row.activities?.takeIf { it.size > 1 }?.let { steps ->
+                                        ActivityFooter(steps.size, row.expanded) {
+                                            val keys = steps.map(Bubble::key)
+                                            val firstVisible = state.firstVisibleItemIndex
+                                            val visibleKey = state.layoutInfo.visibleItemsInfo.firstOrNull { it.index == firstVisible }?.key
+                                            if (row.expanded) {
+                                                expandedActivities.removeAll(keys.toSet())
+                                                if (flash in keys) flash = null
+                                            } else {
+                                                expandedActivities.addAll(keys)
+                                            }
+                                            // Keep the bottom of this group in view when it anchors the chat.
+                                            if (visibleKey is String && visibleKey in keys) {
+                                                state.requestScrollToItem(if (row.expanded) index - steps.lastIndex else index)
+                                            }
+                                        }
+                                    }
+                                val name =
+                                    if (group != null && !row.joined && !bubble.mine) {
+                                        if (channel && bubble.thread == null) title else personName(bubble.account, people)
+                                    } else {
+                                        null
+                                    }
+                                val onName =
+                                    bubble.account?.takeIf { !(channel && bubble.thread == null) }?.let { account ->
+                                        { onProfile(account) }
+                                    }
                                 MessageRow(
-                                    bubble = row.bubble,
+                                    bubble = bubble,
                                     joined = row.joined,
                                     type = type,
                                     me = me,
@@ -637,69 +703,60 @@ internal fun ChatScreen(
                                     marks = marks,
                                     talk = talk,
                                     selecting = selecting,
-                                    flashing = flash == row.bubble.key,
+                                    flashing = flash == bubble.key,
                                     ink = ink,
                                     dark = dark,
-                                    onOpen = {
-                                        modal = if (row.bubble.locked) Modal.NoKey else Modal.Options(row.bubble)
-                                    },
-                                    onSelect = { talk.toggle(row.bubble) },
+                                    onOpen = { modal = if (bubble.locked) Modal.NoKey else Modal.Options(bubble) },
+                                    onSelect = { talk.toggle(bubble) },
                                     onCopy = ::copy,
                                     onTime = {
-                                        if (row.bubble.seq != null) {
-                                            onTimes(row.bubble.seq)
-                                            modal = Modal.Times(row.bubble)
+                                        if (bubble.seq != null) {
+                                            onTimes(bubble.seq)
+                                            modal = Modal.Times(bubble)
                                         }
                                     },
                                     onReply = {
                                         editing = null
-                                        replying = row.bubble
+                                        replying = bubble
                                     },
                                     onJump = ::jump,
                                     onFile = onFile,
                                     stickers = stickers,
-                                    chips = talk.chips(row.bubble),
+                                    chips = talk.chips(bubble),
                                     onChip = { chip ->
                                         val yours = chip.mine
                                         if (mayReact) {
                                             if (yours != null) {
                                                 onUnreact(yours)
                                             } else {
-                                                onReact(row.bubble, chip.emoji)
+                                                onReact(bubble, chip.emoji)
                                             }
                                         }
                                     },
                                     onAnswer = {
-                                        val tree = row.bubble.question
-                                        if (tree != null) openForm(Form(row.bubble, tree, null, null))
+                                        val tree = bubble.question
+                                        if (tree != null) openForm(Form(bubble, tree, null, null))
                                     },
                                     onAccept = {
-                                        val folder = row.bubble.suggestion?.folder
-                                        if (folder != null && folder.move && wouldLeave(row.bubble)) {
-                                            modal = Modal.MoveAsk(row.bubble, folder.name.trim())
+                                        val folder = bubble.suggestion?.folder
+                                        if (folder != null && folder.move && wouldLeave(bubble)) {
+                                            modal = Modal.MoveAsk(bubble, folder.name.trim())
                                         } else {
-                                            onAccept(row.bubble)
+                                            onAccept(bubble)
                                         }
                                     },
-                                    onDecline = { onDecline(row.bubble) },
+                                    onDecline = { onDecline(bubble) },
                                     onFolder = onFolder,
-                                    name =
-                                        if (group != null && !row.joined && !row.bubble.mine) {
-                                            // A channel's post shows the channel's name, chosen by the author.
-                                            if (channel && row.bubble.thread == null) title else personName(row.bubble.account, people)
-                                        } else {
-                                            null
-                                        },
-                                    onName =
-                                        row.bubble.account?.takeIf { !(channel && row.bubble.thread == null) }?.let {
-                                                account ->
-                                            { onProfile(account) }
-                                        },
-                                    mentioned = me != null && me in row.bubble.mentions,
-                                    replies = threadCount(group, groups, row.bubble, main),
-                                    onThread = { row.bubble.seq?.let { group?.onThread?.invoke(it) } },
+                                    name = name,
+                                    onName = onName,
+                                    mentioned = !activity && me != null && me in bubble.mentions,
+                                    replies = if (activity) null else threadCount(group, groups, bubble, main),
+                                    onThread = { bubble.seq?.let { group?.onThread?.invoke(it) } },
                                     mayReply = mayWrite,
+                                    activityFooter = footer,
+                                    showDate = activity && dayOf(bubble.at) != dayOf(row.firstActivityAt),
                                 )
+                            }
                         }
                     }
                 }
@@ -1000,11 +1057,23 @@ private fun rowKey(row: Line): String =
 
 private fun dayOf(at: Long): LocalDate = Instant.ofEpochMilli(at).atZone(ZoneId.systemDefault()).toLocalDate()
 
-private fun rowsOf(list: List<Bubble>): List<Line> {
+private fun rowsOf(
+    list: List<Bubble>,
+    expanded: Set<String>,
+): List<Line> {
     val out = ArrayList<Line>()
     var day: LocalDate? = null
     var before: Bubble? = null
     for (bubble in list) {
+        val activity = bubble.kind == CONTENT_ACTIVITY && !bubble.locked && bubble.seq != null
+        val previous = (out.lastOrNull() as? Line.One)?.activities
+        if (activity && previous != null && before != null && bubble.account != null &&
+            before.account == bubble.account && before.topic.orEmpty() == bubble.topic.orEmpty() && before.thread == bubble.thread
+        ) {
+            previous.add(bubble)
+            before = bubble
+            continue
+        }
         val today = dayOf(bubble.at)
         if (today != day) {
             out.add(Line.Day(bubble.at))
@@ -1022,10 +1091,24 @@ private fun rowsOf(list: List<Bubble>): List<Line> {
             continue
         }
         // A run is one sender's messages in a row: its first shows their name in a group.
-        out.add(Line.One(bubble, before != null && before.mine == bubble.mine && (bubble.mine || before.account == bubble.account)))
+        val joined = before != null && before.mine == bubble.mine && (bubble.mine || before.account == bubble.account)
+        out.add(Line.One(bubble, joined, if (activity) mutableListOf(bubble) else null))
         before = bubble
     }
-    return out
+    if (expanded.isEmpty()) return out
+    return buildList {
+        for (row in out) {
+            val steps = (row as? Line.One)?.activities
+            if (row is Line.One && steps != null && steps.size > 1 && steps.any { it.key in expanded }) {
+                add(row.copy(expanded = true))
+                for (step in steps.drop(1)) {
+                    add(Line.One(step, joined = true, firstActivityAt = row.bubble.at))
+                }
+            } else {
+                add(row)
+            }
+        }
+    }
 }
 
 internal fun firstLine(text: String): String {
@@ -1067,7 +1150,7 @@ private fun TopBar(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Box(Modifier.padding(start = 2.dp, end = 10.dp)) {
-                Avatar(person, title, 44.dp)
+                Avatar(person, title, 44.dp, badgeSize = 13.dp)
                 PresenceDot(state, 9.dp, 2.dp, ink.page, Modifier.align(Alignment.BottomEnd))
             }
             Column(Modifier.weight(1f)) {
@@ -1085,12 +1168,30 @@ private fun TopBar(
                         color = statusTone ?: ink.muted,
                         fontSize = 13.sp,
                         maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
                         style = TextStyle(textDirection = TextDirection.Content),
                     )
                 }
             }
         }
     }
+}
+
+@Composable
+private fun troubleLine(text: String): String {
+    val reason = text.substringBefore(':')
+    val label =
+        stringResource(
+            when (reason) {
+                "llm_failing" -> R.string.agent_trouble_llm
+                "stuck" -> R.string.agent_trouble_stuck
+                "storage_warn" -> R.string.agent_trouble_storage_warn
+                "storage_full" -> R.string.agent_trouble_storage_full
+                else -> R.string.agent_trouble
+            },
+        )
+    val detail = text.substringAfter(':', "").trim()
+    return if (detail.isEmpty()) label else stringResource(R.string.agent_trouble_detail, label, detail)
 }
 
 @Composable
@@ -1193,6 +1294,8 @@ private fun MessageRow(
     replies: ThreadCount? = null,
     onThread: () -> Unit = {},
     mayReply: Boolean = true,
+    activityFooter: ActivityFooter? = null,
+    showDate: Boolean = false,
 ) {
     val rtl = LocalLayoutDirection.current == LayoutDirection.Rtl
     val density = LocalDensity.current
@@ -1304,7 +1407,7 @@ private fun MessageRow(
                                 onTap = {
                                     if (selecting) {
                                         onSelect()
-                                    } else if (bubble.locked) {
+                                    } else if (bubble.locked || bubble.kind == CONTENT_ACTIVITY) {
                                         onOpen()
                                     }
                                 },
@@ -1357,11 +1460,18 @@ private fun MessageRow(
                                 fontWeight = FontWeight.SemiBold,
                             )
                         } else {
+                            val time = timeOf(bubble.at)
+                            val stamp =
+                                if (showDate) {
+                                    "${DateTimeFormatter.ofLocalizedDate(FormatStyle.MEDIUM).format(dayOf(bubble.at))} $time"
+                                } else {
+                                    time
+                                }
                             if (bubble.edited) {
                                 Text(stringResource(R.string.chat_edited), Modifier.padding(end = 4.dp), color = quiet, fontSize = 11.sp)
                             }
                             Text(
-                                timeOf(bubble.at),
+                                stamp,
                                 Modifier
                                     .clip(RoundedCornerShape(8.dp))
                                     .clickable(enabled = !selecting && bubble.seq != null, role = Role.Button, onClick = onTime)
@@ -1374,7 +1484,11 @@ private fun MessageRow(
                         }
                     }
                     Chips(chips, onBubble = true, mine = bubble.mine, dark = dark, ink = ink, enabled = !selecting, onChip = onChip)
-                    if (replies != null) ThreadFoot(replies, bubble.mine, onFill, !selecting, onThread)
+                    if (activityFooter != null) {
+                        ActivityFoot(activityFooter, bubble.mine, onFill, !selecting)
+                    } else if (replies != null) {
+                        ThreadFoot(replies, bubble.mine, onFill, !selecting, onThread)
+                    }
                 },
             )
         }
@@ -1384,6 +1498,43 @@ private fun MessageRow(
 private const val TEXT_ID = "text"
 private const val TIME_ID = "time"
 private const val FOOT_ID = "foot"
+
+private data class ActivityFooter(
+    val count: Int,
+    val expanded: Boolean,
+    val toggle: () -> Unit,
+)
+
+@Composable
+private fun ActivityFoot(
+    footer: ActivityFooter,
+    mine: Boolean,
+    onFill: Color,
+    enabled: Boolean,
+) {
+    val tone = if (mine) onFill else kit().accent
+    val divider = if (isDark() || mine) Color.White.copy(alpha = 0.08f) else Color.Black.copy(alpha = 0.08f)
+    val label = stringResource(if (footer.expanded) R.string.activity_collapse else R.string.activity_expand)
+    Row(
+        Modifier
+            .layoutId(FOOT_ID)
+            .drawBehind { drawLine(divider, Offset.Zero, Offset(size.width, 0f), 1.dp.toPx()) }
+            .clickable(enabled = enabled, onClickLabel = label, role = Role.Button, onClick = footer.toggle)
+            .padding(horizontal = 10.dp, vertical = 7.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Text(
+            stringResource(R.string.activity_count, exact(footer.count.toLong())),
+            Modifier.weight(1f),
+            color = tone,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.Bold,
+            maxLines = 1,
+        )
+        Glyph(if (footer.expanded) GroupGlyphs.up else GroupGlyphs.down, tone, 16.dp)
+    }
+}
 
 /** The width of a bubble's last text line, set as its text is laid out, or null when the time cannot share it. */
 private class LastLine {
@@ -1575,6 +1726,7 @@ private fun kindLabel(kind: Int?): String =
             5 -> R.string.kind_video
             6 -> R.string.kind_doc
             9 -> R.string.kind_bundle
+            CONTENT_ACTIVITY -> R.string.activity_label
             else -> R.string.kind_file
         },
     )
@@ -1647,6 +1799,18 @@ private fun Content(
             }
         }
         answer != null -> AnswerLines(answer, talk, bubble.mine, onFill, quiet, selecting, onJump)
+        bubble.kind == CONTENT_ACTIVITY -> {
+            Row(horizontalArrangement = Arrangement.spacedBy(7.dp), verticalAlignment = Alignment.Top) {
+                Box(Modifier.padding(top = 2.dp)) { Glyph(Glyphs.bolt, if (bubble.mine) onFill else kit().accent, 16.dp) }
+                Text(
+                    bubble.text.orEmpty(),
+                    Modifier.weight(1f, fill = false),
+                    color = onFill,
+                    fontSize = 15.sp,
+                    style = TextStyle(textDirection = TextDirection.Content),
+                )
+            }
+        }
         else -> {
             for (file in bubble.files) {
                 Text(
@@ -1937,7 +2101,7 @@ private fun OptionsModal(
         if (onEditAnswer != null) {
             OptionRow(stringResource(R.string.chat_edit), ink.text, onEditAnswer) { PencilMark(ink.text) }
         }
-        if (bubble.kind == CONTENT_TEXT && !bubble.text.isNullOrEmpty()) {
+        if ((bubble.kind == CONTENT_TEXT || bubble.kind == CONTENT_ACTIVITY) && !bubble.text.isNullOrEmpty()) {
             OptionRow(stringResource(R.string.chat_copy), ink.text, onCopy) { CopyMark(ink.text) }
         }
         if (bubble.mine && bubble.line == null) {

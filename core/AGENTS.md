@@ -171,6 +171,8 @@ come. **It stops at 20 hits, chosen by the author**, and `more` says whether old
 **Case and Persian forms are folded, chosen by the author:** lower case, Arabic ي and ى read as Persian
 ی, ك as ک, Arabic and Persian digits as ASCII ones, and ZWNJ and the short vowel marks left out, so "10"
 finds "۱۰" and "علي" finds "علی".
+**Activity text is searchable, chosen by the author,** so someone can return to a specific step. Each
+matching activity returns a hit with its own sequence id.
 
 **It accepts and declines suggestions, chosen by the author**, so every client does it the same way: see
 Suggestions in the root [AGENTS.md](../AGENTS.md). `Command::SendSuggestion {chat, text?, suggestion}`

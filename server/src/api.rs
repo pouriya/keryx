@@ -37,8 +37,8 @@ use keryx_core::mls::{
     verify_logout, verify_password_reset, verify_revocation,
 };
 use keryx_core::protocol::{
-    AccountInfo, AccountKeysBody, AccountListReply, AccountReply, AgentClaims, AgentEndBody,
-    AgentListReply, AgentLoginBody, AgentStatement, AgentTokenReply, Audience, Bytes,
+    AccountInfo, AccountKeysBody, AccountListReply, AccountReply, AgentCapabilities, AgentClaims,
+    AgentEndBody, AgentListReply, AgentLoginBody, AgentStatement, AgentTokenReply, Audience, Bytes,
     ChallengeBody, ChallengeReply, ChatAction, ChatDeviceListReply, ChatEvent, ChatFolders,
     ChatOptions, ChatProfileBody, ChatProfileItem, ChatReply, ChatRole, ChatType, ClaimBody,
     ClientFrame, ContentKind, CountReply, CreateAccountBody, CreateAgentBody, CreateChatBody,
@@ -1714,12 +1714,28 @@ pub async fn run_create_agent(
     })
 }
 
-/// `GET /api/v1/agents`: the caller's own agents.
+/// `GET /api/v1/agents`: the caller's own agents and what they may grant them.
 pub async fn run_agents(app: &App, caller: &Caller) -> Result<AgentListReply, Refused> {
     check(app, caller, Need::Device).await?;
     let session = caller.session()?;
+    let mut grantable_permission_list = Vec::new();
+    for &name in SERVER_PERMISSION_LIST {
+        if name != AGENT_CREATE && app.storage.server_permitted(session.account, name).await? {
+            grantable_permission_list.push(name.to_string());
+        }
+    }
     Ok(AgentListReply {
         agent_list: app.storage.agents(session.account).await?,
+        capabilities: AgentCapabilities {
+            enabled: app.settings.agents.is_some(),
+            can_create: app
+                .storage
+                .server_permitted(session.account, AGENT_CREATE)
+                .await?,
+            can_grant_admin: app.storage.is_admin(session.account).await?,
+            grantable_permission_list,
+            limit: app.settings.limits.agents,
+        },
     })
 }
 

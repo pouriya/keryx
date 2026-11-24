@@ -599,6 +599,17 @@ class Engine(
 
     fun send(command: Command) = thread.execute { handle(command) }
 
+    fun send(
+        tag: Long,
+        command: Command,
+    ) = thread.execute {
+        if (client < 0) {
+            show(Event.Answered(tag, code = "offline"))
+        } else {
+            feed(Input.Tagged(tag, command))
+        }
+    }
+
     /** The app came on screen or left it: core sends it now if connected, and on every connection. */
     fun inApp(on: Boolean) =
         thread.execute {

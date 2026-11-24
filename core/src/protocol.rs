@@ -2481,6 +2481,19 @@ pub struct AgentItem {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentListReply {
     pub agent_list: Vec<AgentItem>,
+    #[serde(default)]
+    pub capabilities: AgentCapabilities,
+}
+
+/// What the owner may choose when creating or changing an agent.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentCapabilities {
+    pub enabled: bool,
+    pub can_create: bool,
+    pub can_grant_admin: bool,
+    pub grantable_permission_list: Vec<String>,
+    pub limit: u64,
 }
 
 /// `PUT /api/v1/agents/{id}`: what is given changes.

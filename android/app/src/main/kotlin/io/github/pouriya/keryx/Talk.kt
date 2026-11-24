@@ -94,6 +94,7 @@ internal const val CONTENT_ANSWER = 11
 internal const val CONTENT_STICKER = 12
 internal const val CONTENT_SUGGESTION = 13
 internal const val CONTENT_ACK = 14
+internal const val CONTENT_ACTIVITY = 15
 
 /** The open chat's messages, oldest first, kept up to date from core's events. */
 internal class Talk {

@@ -259,9 +259,10 @@ Welcome. The same epoch 0 bytes sent again are accepted, as a resend whose answe
 Commits are MLS public messages, and the server reads each one, in every kind of chat. A device
 joining by itself must be the device sending the commit. An add may bring in only devices of the
 accounts its action names, or of accounts already in the chat. A removal may take out only the
-accounts its action names, ended devices, or accounts no longer in the chat. A commit that breaks
-these rules, or cannot be read, is refused with `bad_commit`. Epoch 0's `group_info` must be the
-chat's own, or it is refused with `bad_message`.
+accounts its action names, ended devices, or accounts no longer in the chat. On an external rejoin,
+the old leaf may also be replaced if both leaves match the sending account, device and the active
+device's registered signing key. A commit that breaks these rules, or cannot be read, is refused
+with `bad_commit`. Epoch 0's `group_info` must be the chat's own, or it is refused with `bad_message`.
 
 ## Groups and channels
 

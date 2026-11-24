@@ -79,7 +79,7 @@ fn agent_named(app: &mut App, username: &str) -> Option<Ulid> {
     app.events
         .retain(|event| !matches!(event, Event::Agents { .. }));
     app.command(Command::Agents);
-    let Event::Agents { agent_list } = app.wait(|event| matches!(event, Event::Agents { .. }))
+    let Event::Agents { agent_list, .. } = app.wait(|event| matches!(event, Event::Agents { .. }))
     else {
         unreachable!()
     };
@@ -138,7 +138,7 @@ fn agent_command(app: &mut App, rest: &str) {
         }
         "list" => {
             app.command(Command::Agents);
-            let Event::Agents { agent_list } =
+            let Event::Agents { agent_list, .. } =
                 app.wait(|event| matches!(event, Event::Agents { .. }))
             else {
                 unreachable!()

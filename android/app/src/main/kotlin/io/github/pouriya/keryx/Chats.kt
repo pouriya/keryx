@@ -1206,7 +1206,7 @@ private fun PersonRow(
         Modifier.fillMaxWidth().clickable(role = Role.Button, onClick = onClick).padding(horizontal = 16.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Avatar(account.id, name, 48.dp)
+        Avatar(account.id, name, 48.dp, username = account.username)
         Column(Modifier.padding(start = 12.dp).weight(1f)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
@@ -1298,7 +1298,7 @@ private fun Conversation(
                     name,
                     54.dp,
                     if (person != null) {
-                        Modifier.clip(CircleShape).combinedClickable(role = Role.Button, onLongClick = {}) { onProfile(person) }
+                        Modifier.combinedClickable(role = Role.Button, onLongClick = {}) { onProfile(person) }
                     } else {
                         Modifier
                     },

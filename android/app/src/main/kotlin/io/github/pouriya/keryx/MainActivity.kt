@@ -169,6 +169,7 @@ class MainActivity : ComponentActivity() {
     private var lookingFor: String? = null
     private lateinit var engine: Engine
     private lateinit var profiles: Profiles
+    private lateinit var agentAccounts: AgentAccounts
 
     /** This account's groups and channels, kept from core's events. */
     private val groups = GroupState()
@@ -194,6 +195,8 @@ class MainActivity : ComponentActivity() {
 
     /** Whose profile is open over the list or the chat, if anyone's. */
     private val profileOf = mutableStateOf<String?>(null)
+    private val ownerProfileOf = mutableStateOf<String?>(null)
+    private val agentsOpen = mutableStateOf(false)
     private var netUp = true
     private var probeGen = 0
     private var leaving = false
@@ -328,7 +331,8 @@ class MainActivity : ComponentActivity() {
                 },
                 { runOnUiThread { blink() } },
             )
-        profiles = Profiles(engine)
+        profiles = Profiles(engine, people)
+        agentAccounts = AgentAccounts(engine)
         groupHost = GroupHost(groups, engine) { me.value }
         groupLabel = { chat -> groups.name(chat) }
         netUp = connectivity.activeNetwork != null
@@ -501,29 +505,43 @@ class MainActivity : ComponentActivity() {
                         }
                         GroupLayers()
                         profileOf.value?.let { account ->
-                            ProfileScreen(
-                                account = account,
-                                mine = account == me.value,
-                                brief = people[account],
-                                onBack = { profileOf.value = null },
-                                onDevices = {},
-                                onLogOut = ::logOut,
-                                theme = (settings["theme"] as? JsonPrimitive)?.contentOrNull ?: "system",
-                                onTheme = { setSetting("theme", JsonPrimitive(it)) },
-                                language = language.value,
-                                onLanguage = { setSetting("lang", JsonPrimitive(it)) },
-                                server =
-                                    listOfNotNull(
-                                        serverName.value?.takeIf { it.isNotBlank() },
-                                        hostOf(server.value),
-                                    ).joinToString(" · "),
-                                actions = actionsOf(account),
-                            )
+                            PersonProfile(account) { profileOf.value = null }
+                        }
+                        ownerProfileOf.value?.let { account ->
+                            PersonProfile(account) { ownerProfileOf.value = null }
+                        }
+                        if (agentsOpen.value) {
+                            AgentsScreen(agentAccounts, profiles, server.value, linkState.value) {
+                                agentsOpen.value = false
+                            }
                         }
                     }
                 Place.Test -> Surface(Modifier.fillMaxSize()) { Bare() }
             }
         }
+    }
+
+    @Composable
+    private fun PersonProfile(
+        account: String,
+        onBack: () -> Unit,
+    ) {
+        ProfileScreen(
+            account = account,
+            mine = account == me.value,
+            brief = people[account],
+            onBack = onBack,
+            onDevices = {},
+            onAgents = { agentsOpen.value = true },
+            onOwner = { if (it != account) ownerProfileOf.value = it },
+            onLogOut = ::logOut,
+            theme = (settings["theme"] as? JsonPrimitive)?.contentOrNull ?: "system",
+            onTheme = { setSetting("theme", JsonPrimitive(it)) },
+            language = language.value,
+            onLanguage = { setSetting("lang", JsonPrimitive(it)) },
+            server = listOfNotNull(serverName.value?.takeIf { it.isNotBlank() }, hostOf(server.value)).joinToString(" · "),
+            actions = actionsOf(account),
+        )
     }
 
     /** What groups and channels draw over the list or the chat: the + menu, making one, a group's page, an invitation, a findable chat. */
@@ -804,6 +822,9 @@ class MainActivity : ComponentActivity() {
     /** The list closes with nothing said. The address stays. The name and the password do not. */
     private fun leaveForLogin() {
         profileOf.value = null
+        ownerProfileOf.value = null
+        agentsOpen.value = false
+        agentAccounts.clear()
         settings.clear()
         probeGen++
         leaving = false
@@ -861,6 +882,7 @@ class MainActivity : ComponentActivity() {
             CONTENT_ANSWER -> getString(R.string.kind_answered)
             CONTENT_STICKER -> getString(R.string.kind_sticker)
             CONTENT_SUGGESTION -> text ?: suggestionPreview(bubble.suggestion)
+            CONTENT_ACTIVITY -> text ?: getString(R.string.activity_label)
             else -> text.orEmpty()
         }
     }
@@ -881,6 +903,7 @@ class MainActivity : ComponentActivity() {
             CONTENT_ANSWER -> getString(R.string.kind_answered)
             CONTENT_STICKER -> getString(R.string.kind_sticker)
             CONTENT_SUGGESTION -> text ?: suggestionPreview(message.suggestion)
+            CONTENT_ACTIVITY -> text ?: getString(R.string.activity_label)
             else -> text.orEmpty()
         }
     }
@@ -1280,6 +1303,7 @@ class MainActivity : ComponentActivity() {
             return
         }
         profiles.apply(event)
+        agentAccounts.apply(event)
         folders.apply(event)
         groups.apply(event, me.value)
         happened.add(0, event::class.simpleName ?: "?")
@@ -1536,6 +1560,8 @@ class MainActivity : ComponentActivity() {
             }
             is Event.LoggedOut -> {
                 profileOf.value = null
+                ownerProfileOf.value = null
+                agentsOpen.value = false
                 newMenu.value = false
                 creatingType.value = null
                 groupOpen.value = null
@@ -1771,6 +1797,7 @@ class MainActivity : ComponentActivity() {
         return ProfileActions(
             onMessage = {
                 profileOf.value = null
+                ownerProfileOf.value = null
                 when {
                     direct == null -> engine.send(Command.StartChat(account))
                     talk.chat != direct -> openChat(direct)

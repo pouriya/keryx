@@ -1084,6 +1084,37 @@ fn a_commit_is_read_by_the_server_and_changes_only_what_it_allowed() {
 }
 
 #[test]
+fn a_live_device_can_rejoin_by_replacing_its_own_leaf() {
+    let mut pair = pair();
+    let chat = pair.chat;
+    let accounts = [pair.sara.key.clone(), pair.babak.key.clone()];
+    let group_info = pair.sara.device.group_info(chat).unwrap();
+    pair.babak.device.forget_chat(chat).unwrap();
+    let join = pair
+        .babak
+        .device
+        .join_external(chat, &group_info, Ulid::now(), &accounts, None)
+        .unwrap();
+    let frame = commit_frame(&pair.babak.device, chat, &join, Vec::new());
+    seq_of(post(&mut pair.babak_socket, frame));
+    pair.babak
+        .device
+        .commit_accepted(chat, Ulid::now())
+        .unwrap();
+    pair.sara
+        .device
+        .process_commit(chat, &join.commit, Ulid::now())
+        .unwrap();
+    let frame = sealed(&pair.babak, chat, Kind::Content, None, b"Back in the chat");
+    let seq = seq_of(post(&mut pair.babak_socket, frame));
+    let message = pair.sara_socket.message(chat, seq);
+    assert_eq!(
+        open_message(&pair.sara.device, &pair.babak.device, &message),
+        b"Back in the chat"
+    );
+}
+
+#[test]
 fn frames_that_break_the_rules_are_refused_with_their_reference() {
     let mut pair = pair();
     let chat = pair.chat;
@@ -8597,7 +8628,7 @@ fn refused_with(app: &mut App, server: &Server, code: &str) {
 
 fn agent_list(app: &mut App, server: &Server) -> Vec<keryx_core::protocol::AgentItem> {
     app.command(server, Command::Agents);
-    let Event::Agents { agent_list } =
+    let Event::Agents { agent_list, .. } =
         app.wait(server, |event| matches!(event, Event::Agents { .. }))
     else {
         unreachable!();
@@ -8681,6 +8712,9 @@ fn an_agent_made_by_its_owner_logs_in_with_its_token_and_its_words() {
             if message.content_kind == Some(ContentKind::Activity))
     }));
     assert_eq!(text_of(&message), Some("Reading the chat"));
+    let (found, ..) = search(&server, &mut sara, "Reading the chat");
+    assert_eq!(found.len(), 1);
+    assert_eq!((found[0].chat, found[0].seq), (chat, message.seq));
     agent.command(
         &server,
         Command::SendActivity {
@@ -8872,7 +8906,7 @@ fn renewing_revoking_and_disabling_end_the_agents_device_and_token() {
         },
     );
     sara.wait(&server, |event| {
-        matches!(event, Event::Agents { agent_list }
+        matches!(event, Event::Agents { agent_list, .. }
             if agent_list.iter().any(|item| item.id == second && item.token_at.is_none()))
     });
     let mut revoked = App::new();

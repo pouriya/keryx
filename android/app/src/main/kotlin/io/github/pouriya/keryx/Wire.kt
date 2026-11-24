@@ -510,6 +510,56 @@ sealed interface Command {
         val password: String? = null,
     ) : Command
 
+    @Serializable
+    @SerialName("agents")
+    data object Agents : Command
+
+    @Serializable
+    @SerialName("create_agent")
+    class CreateAgent(
+        val username: String,
+        val display_name: String,
+        val permission_list: List<String>,
+        val admin: Boolean,
+    ) : Command
+
+    @Serializable
+    @SerialName("update_agent")
+    data class UpdateAgent(
+        val agent: String,
+        val display_name: String? = null,
+        val permission_list: List<String>? = null,
+        val admin: Boolean? = null,
+    ) : Command
+
+    @Serializable
+    @SerialName("renew_agent_token")
+    class RenewAgentToken(val agent: String, val words: String) : Command
+
+    @Serializable
+    @SerialName("revoke_agent_token")
+    class RevokeAgentToken(val agent: String, val words: String) : Command
+
+    @Serializable
+    @SerialName("disable_agent")
+    class DisableAgent(val agent: String, val words: String) : Command
+
+    @Serializable
+    @SerialName("agent_profile")
+    data class AgentProfile(
+        val agent: String,
+        val bio: String?,
+        val link_list: List<ProfileLink>,
+    ) : Command
+
+    @Serializable
+    @SerialName("agent_photo")
+    class AgentPhoto(
+        val agent: String,
+        @Serializable(with = Octets::class) val jpeg: ByteArray,
+        val thumbnail: Thumbnail,
+    ) : Command
+
     /** A group (2) or channel (3), made with this account as its owner, answered with `started` then `chat_ready`. */
     @Serializable
     @SerialName("create_chat")
@@ -903,6 +953,30 @@ data class ShownProfile(
     val bio: String? = null,
     val link_list: List<ProfileLink> = emptyList(),
     val photo: ShownPhoto? = null,
+    val agent: Boolean = false,
+    val owner: String? = null,
+)
+
+@Serializable
+data class AgentItem(
+    val id: String,
+    val username: String,
+    val display_name: String? = null,
+    val disabled: Boolean,
+    val admin: Boolean,
+    val permission_list: List<String>,
+    val token_at: Long? = null,
+    val last_connected_at: Long? = null,
+    val device: String? = null,
+)
+
+@Serializable
+data class AgentCapabilities(
+    val enabled: Boolean,
+    val can_create: Boolean,
+    val can_grant_admin: Boolean,
+    val grantable_permission_list: List<String>,
+    val limit: Long,
 )
 
 /** A question message's tree: each node a choice or a number, and rules saying which comes next. */
@@ -1008,7 +1082,7 @@ data class Setting(
 )
 
 /**
- * Where someone is: `online`, `call`, `away` or `offline`, with the times this account may see, in
+ * Where someone is: `online`, `call`, `away`, `trouble` or `offline`, with the times this account may see, in
  * server milliseconds. What it may not see is missing.
  */
 @Serializable
@@ -1069,6 +1143,10 @@ sealed interface Input {
     data class Run(
         val command: Command,
     ) : Input
+
+    @Serializable
+    @SerialName("tagged")
+    data class Tagged(val tag: Long, val command: Command) : Input
 
     @Serializable
     @SerialName("loaded")
@@ -1831,6 +1909,35 @@ sealed interface Event {
     @SerialName("presence")
     data class Presence(
         val presence: PresenceItem,
+        val text: String? = null,
+    ) : Event
+
+    @Serializable
+    @SerialName("agents")
+    data class Agents(
+        val agent_list: List<AgentItem>,
+        val capabilities: AgentCapabilities,
+    ) : Event
+
+    @Serializable
+    @SerialName("agent_created")
+    class AgentCreated(
+        val account: String,
+        val username: String,
+        val token: String,
+        val words: String,
+    ) : Event
+
+    @Serializable
+    @SerialName("agent_token")
+    class AgentToken(val agent: String, val token: String) : Event
+
+    @Serializable
+    @SerialName("answered")
+    data class Answered(
+        val tag: Long,
+        val code: String? = null,
+        val message: String? = null,
     ) : Event
 
     /** This account's settings, opened, whenever they change here or on the server. */

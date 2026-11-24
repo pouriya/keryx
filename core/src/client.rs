@@ -34,24 +34,24 @@ use crate::mls::{
 };
 use crate::protocol::{
     AccountBrief, AccountInfo, AccountKeysBody, AccountListReply, AccountReply, Ack, ActionKind,
-    AgentClaims, AgentEndBody, AgentItem, AgentListReply, AgentLoginBody, AgentStatement,
-    AgentTokenReply, Answer, Bytes, CallBody, CallEvent, CallEventKind, CallOutcome, CallText,
-    CaptchaAnswer, CaptchaReply, ChallengeBody, ChallengeReply, ChatAction, ChatDevice,
-    ChatDeviceListReply, ChatEvent, ChatFolders, ChatItem, ChatOptions, ChatProfileBody,
-    ChatProfileItem, ChatProfilePlain, ChatReply, ChatRole, ChatType, ClaimBody, ClientFrame,
-    CommitAction, ContentKind, CountReply, CreateAgentBody, CreateChatBody, CreateFileBody,
-    CreatedAgentReply, DeviceProof, DeviceReply, DevicesReply, DraftBody, DraftItem, EmptyReply,
-    FeaturesReply, FileReply, FindableBody, FindableItem, FolderItem, FolderSuggestion, FoundChat,
-    GroupInfoReply, Header, InvitationItem, InvitationPlain, InvitationShown, InviteStatement,
-    KeyPackageItem, KeyPackageListReply, KeyPackagesBody, Kind, KvChange, KvItem, LineAction,
-    LineBody, LoginBody, LoginReply, MarkItem, MemberItem, MessageFrame, NamesBody, PhotoReply,
-    PresenceItem, ProfileBody, ProfileKeyItem, ProfileKeyShare, ProfileLink, ProfilePhoto,
-    ProfileReply, PutProfileBody, Question, RefusedReply, RegisterBody, RegisterDeviceBody,
-    RequestItem, RequestListReply, RequestState, SelfChatReply, SendFrame, ServerFrame, SetupBody,
-    SetupReply, SignedBody, SignedProfile, StickerListReply, StickerPack, Suggestion, SyncPosition,
-    TimesItem, TopicItem, TopicName, TopicOptionsBody, TopicProfileItem, TopicProfilePlain,
-    TopicsBody, UpdateAgentBody, VersionReply, WelcomeItem, WrapEntry, WrapItem, WrapListReply,
-    call_text_header,
+    AgentCapabilities, AgentClaims, AgentEndBody, AgentItem, AgentListReply, AgentLoginBody,
+    AgentStatement, AgentTokenReply, Answer, Bytes, CallBody, CallEvent, CallEventKind,
+    CallOutcome, CallText, CaptchaAnswer, CaptchaReply, ChallengeBody, ChallengeReply, ChatAction,
+    ChatDevice, ChatDeviceListReply, ChatEvent, ChatFolders, ChatItem, ChatOptions,
+    ChatProfileBody, ChatProfileItem, ChatProfilePlain, ChatReply, ChatRole, ChatType, ClaimBody,
+    ClientFrame, CommitAction, ContentKind, CountReply, CreateAgentBody, CreateChatBody,
+    CreateFileBody, CreatedAgentReply, DeviceProof, DeviceReply, DevicesReply, DraftBody,
+    DraftItem, EmptyReply, FeaturesReply, FileReply, FindableBody, FindableItem, FolderItem,
+    FolderSuggestion, FoundChat, GroupInfoReply, Header, InvitationItem, InvitationPlain,
+    InvitationShown, InviteStatement, KeyPackageItem, KeyPackageListReply, KeyPackagesBody, Kind,
+    KvChange, KvItem, LineAction, LineBody, LoginBody, LoginReply, MarkItem, MemberItem,
+    MessageFrame, NamesBody, PhotoReply, PresenceItem, ProfileBody, ProfileKeyItem,
+    ProfileKeyShare, ProfileLink, ProfilePhoto, ProfileReply, PutProfileBody, Question,
+    RefusedReply, RegisterBody, RegisterDeviceBody, RequestItem, RequestListReply, RequestState,
+    SelfChatReply, SendFrame, ServerFrame, SetupBody, SetupReply, SignedBody, SignedProfile,
+    StickerListReply, StickerPack, Suggestion, SyncPosition, TimesItem, TopicItem, TopicName,
+    TopicOptionsBody, TopicProfileItem, TopicProfilePlain, TopicsBody, UpdateAgentBody,
+    VersionReply, WelcomeItem, WrapEntry, WrapItem, WrapListReply, call_text_header,
 };
 use crate::queue::{Level, Queue, Target};
 use crate::seed::{self, AccountKeys};
@@ -1532,9 +1532,10 @@ pub enum Event {
         token: Secret,
         words: Secret,
     },
-    /// The owner's agents.
+    /// The owner's agents and the permissions the owner can grant.
     Agents {
         agent_list: Vec<AgentItem>,
+        capabilities: AgentCapabilities,
     },
     /// An agent's renewed token, shown once.
     AgentToken {
@@ -4823,12 +4824,9 @@ impl Client {
         );
     }
 
-    /// A renew, revoke or disable asks for the agent's device first, whose termination the words
-    /// sign.
+    /// A renew, revoke or disable asks for the agent's device first. If it has one, the words
+    /// sign its termination.
     fn end_agent(&mut self, agent: Ulid, words: Secret, end: AgentEnd) {
-        if let Err(error) = seed::derive(&words.0) {
-            return self.error("bad_words", &error.to_string());
-        }
         self.get(
             "/api/v1/agents".to_string(),
             Asked::AgentDevice { agent, words, end },
@@ -5074,6 +5072,7 @@ impl Client {
             message.content_kind,
             None | Some(
                 ContentKind::Text
+                    | ContentKind::Activity
                     | ContentKind::Image
                     | ContentKind::Music
                     | ContentKind::Video
@@ -11048,18 +11047,33 @@ impl Client {
                 }
             }
             Asked::Agents => {
-                if let Some(AgentListReply { agent_list }) = self.data(body) {
+                if let Some(AgentListReply {
+                    agent_list,
+                    capabilities,
+                }) = self.data(body)
+                {
                     for agent in &agent_list {
+                        self.names_changed(
+                            agent.id,
+                            agent.username.clone(),
+                            agent.display_name.clone(),
+                        );
+                        if !self.accounts.contains_key(&agent.id) {
+                            self.ask_account(agent.id);
+                        }
                         if !self.profiles.contains_key(&agent.id) {
                             self.ask_profile(agent.id);
                         }
                     }
-                    self.event(Event::Agents { agent_list });
+                    self.event(Event::Agents {
+                        agent_list,
+                        capabilities,
+                    });
                 }
             }
             Asked::AgentChanged => self.get("/api/v1/agents".to_string(), Asked::Agents),
             Asked::AgentDevice { agent, words, end } => {
-                if let Some(AgentListReply { agent_list }) = self.data(body) {
+                if let Some(AgentListReply { agent_list, .. }) = self.data(body) {
                     self.agent_device_known(agent, words, end, agent_list);
                 }
             }
@@ -11175,6 +11189,7 @@ impl Client {
 
     fn account_known(&mut self, info: AccountInfo) {
         let account = info.id;
+        let agent = info.owner.is_some();
         // A reload keeps the device and loses the name, so the page hears `signed_in` when it comes back.
         let device_id = self.device.as_ref().map(|device| device.record().device);
         if self.account == Some(account) && self.username.is_none() {
@@ -11225,6 +11240,8 @@ impl Client {
             .is_some_and(|state| state.signed.is_some())
         {
             self.open_stored(account);
+        } else if agent {
+            self.show_profile(account);
         }
     }
 

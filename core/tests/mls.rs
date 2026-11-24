@@ -855,6 +855,7 @@ fn the_server_reads_each_commit_from_a_public_group_it_moves_on() {
     let babak_leaf = Leaf {
         account: babak.id,
         device: babak_device.record().device,
+        device_public: babak_device.record().device_public,
     };
     let accounts = [sara.key.clone(), babak.key.clone()];
     let package = babak_device.key_package().unwrap();
@@ -897,6 +898,7 @@ fn the_server_reads_each_commit_from_a_public_group_it_moves_on() {
         Some(Leaf {
             account: sara.id,
             device: second.record().device,
+            device_public: second.record().device_public,
         })
     );
 

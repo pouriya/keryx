@@ -1380,7 +1380,9 @@ about groups and channels stands; this section adds what the author decides as t
   rewritten on each commit. **A refused commit gets `bad_commit`, chosen by the author**, a 403 of its own.
   **Every chat type's commits are checked, chosen by the author**, so there is one path. **A device
   joining by itself must be the device sending the commit, chosen by the author**, so a device only
-  ever joins as itself. Epoch 0's group info that is not the chat's own is `bad_message`.
+  ever joins as itself. **An external rejoin may replace its own leaf, chosen by the author**, so a
+  live device can resync. Both leaves must match the sending account, device and the active device's
+  registered signing key. Epoch 0's group info that is not the chat's own is `bad_message`.
 - **Content sealed under an older key than the chat's current one is refused with `stale_epoch`, in every
   chat type, chosen by the author:** core applies the commits it missed and seals it again. Nothing new
   is ever sealed under a key a removed person still holds, and someone who joins reads everything after
@@ -2611,7 +2613,8 @@ store their words. How `keryx-agent` itself works is in [agent/AGENTS.md](agent/
   POST /api/v1/agents  agent.create: username, display_name, permission_list (each one the owner holds)
          -> account, token        at most [limits] agents
   GET  /api/v1/agents  the owner's -> agent_list{id, username, display_name, disabled, admin,
-         permission_list, token_at, last_connected_at, device?}
+         permission_list, token_at, last_connected_at, device?}, capabilities{enabled, can_create,
+         can_grant_admin, grantable_permission_list, limit}
   PUT  /api/v1/agents/{id}  owner: display_name?, permission_list?
   POST /api/v1/agents/{id}/token    owner: renew, statement? -> token
   DEL  /api/v1/agents/{id}/token    owner: revoke, statement?
@@ -2631,6 +2634,8 @@ store their words. How `keryx-agent` itself works is in [agent/AGENTS.md](agent/
   `agent_list` carries each agent's live `device`, the one a renew, revoke or disable's statement names;
   the owner's routes need a registered device, as chats do; a disabled agent refuses every owner change
   with `agent_disabled`; and a presence text is at most 1 KiB sealed, as it lives in memory. An agent cannot log in with a password.
+- **The owner's grantable capabilities come from `GET /api/v1/agents` for now, chosen by the author
+  for Android.**
 - **Built in this order, chosen by the author:** first the parts of `keryx-agent` that do not touch the
   server or core (cron, `agent.db`, search, Starlark and the LLM against a fake server), since main's
   `server/` and `core/` were being reworked in another session; then, once main settles, the server and
@@ -2756,7 +2761,9 @@ first, as everywhere.
 
 **Accounts**
 
-- Android's Agents page: its design, drawn first, once the agent has proved itself
+- Carry the owner's capabilities in a JWT in a future auth change, chosen by the author.
+- Disabling an agent that never enrolled a device leaves its group and channel memberships in
+  place. The account is disabled and cannot connect. The author deferred this to a later pass.
 - Rate limits. None in the first build: operators who expose a server turn on `[captcha]`, which
   runs before Argon2, and a server without one can be guessed against at Argon2's speed
 - RBAC: the management UI, and what stops a non-admin who may manage roles from granting themselves
@@ -2766,6 +2773,10 @@ first, as everywhere.
 
 **Chat**
 
+- A direct chat opened before an agent first enrolls a device can be created without an MLS
+  group because the agent has no key package. On the Galaxy A54, opening the existing chat
+  after enrollment still left it unable to send. A second `StartChat` for the same pair
+  initialized the existing chat. The author deferred the fix to a later pass.
 - What the REST fallback looks like: how a client receives without a socket
 - Files: quotas, by the author's choice none for now
 - A call chosen as recorded when neither device can encode H.264: the client should say so
